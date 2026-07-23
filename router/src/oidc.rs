@@ -12,7 +12,7 @@
 use axum::{
     Json, Router,
     extract::{Query, State},
-    http::{StatusCode, header},
+    http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Redirect, Response},
     routing::{get, post},
 };
@@ -203,7 +203,16 @@ async fn login(State(ctx): State<WebCtx>) -> Result<Response, OidcError> {
     .await
     .map_err(|_| OidcError::DatabaseUnavailable)?;
 
-    Ok(Redirect::to(authorize_url.as_str()).into_response())
+    // Bind the flow to the initiating browser: the callback must present this
+    // cookie matching the `state` query parameter, so a login-CSRF or session
+    // fixation attempt that replays a stolen authorization response fails even
+    // though the DB state row is globally visible to every task instance.
+    let mut response = Redirect::to(authorize_url.as_str()).into_response();
+    response.headers_mut().append(
+        header::SET_COOKIE,
+        oidc_state_cookie_header(state.secret(), ctx.config.secure_cookies),
+    );
+    Ok(response)
 }
 
 // No `Debug` derive: the authorization code must never reach a log line.
@@ -218,6 +227,7 @@ struct CallbackParams {
 /// verify the identity token, resolve the user, and establish a session.
 async fn callback(
     State(ctx): State<WebCtx>,
+    headers: HeaderMap,
     Query(params): Query<CallbackParams>,
 ) -> Result<Response, OidcError> {
     let Some(settings) = ctx.config.oidc.as_ref() else {
@@ -229,6 +239,14 @@ async fn callback(
         .map(str::trim)
         .filter(|state| !state.is_empty())
         .ok_or(OidcError::StateInvalid)?;
+
+    // The browser that began the login must present the matching state cookie;
+    // a callback lacking it (or carrying a different value) is not the browser
+    // that initiated this flow.
+    let cookie_state = oidc_state_cookie_value(&headers).ok_or(OidcError::StateInvalid)?;
+    if !constant_time_eq(cookie_state.as_bytes(), state.as_bytes()) {
+        return Err(OidcError::StateInvalid);
+    }
 
     // Single use: consume the login state before anything else, so a replayed
     // callback can never be exchanged twice.
@@ -295,7 +313,10 @@ async fn callback(
     if email.is_empty() {
         return Err(OidcError::EmailRequired);
     }
-    if claims.email_verified() == Some(false) {
+    // Fail closed on unknown verification status: an absent `email_verified`
+    // claim (`None`) is treated as unverified, not verified, so a provider
+    // that omits the claim cannot be used to claim an admin-provisioned row.
+    if claims.email_verified() != Some(true) {
         return Err(OidcError::EmailUnverified);
     }
 
@@ -333,6 +354,10 @@ async fn callback(
             ctx.config.session_ttl.as_secs(),
             ctx.config.secure_cookies,
         ),
+    );
+    response.headers_mut().append(
+        header::SET_COOKIE,
+        clear_oidc_state_cookie_header(ctx.config.secure_cookies),
     );
     Ok(response)
 }
@@ -511,6 +536,57 @@ fn normalize_email(raw: &str) -> String {
     raw.trim().to_lowercase()
 }
 
+const OIDC_STATE_COOKIE: &str = "zr_oidc_state";
+const OIDC_STATE_TTL_SECS: u64 = 600;
+
+fn oidc_state_cookie_header(state: &str, secure: bool) -> HeaderValue {
+    let secure_attr = if secure { "; Secure" } else { "" };
+    let cookie = format!(
+        "{OIDC_STATE_COOKIE}={state}; Path=/auth; HttpOnly; SameSite=Lax; Max-Age={OIDC_STATE_TTL_SECS}{secure_attr}"
+    );
+    HeaderValue::from_str(&cookie).unwrap_or_else(|_| {
+        HeaderValue::from_static("zr_oidc_state=; Path=/auth; HttpOnly; Max-Age=0")
+    })
+}
+
+fn clear_oidc_state_cookie_header(secure: bool) -> HeaderValue {
+    let secure_attr = if secure { "; Secure" } else { "" };
+    let cookie =
+        format!("{OIDC_STATE_COOKIE}=; Path=/auth; HttpOnly; SameSite=Lax; Max-Age=0{secure_attr}");
+    HeaderValue::from_str(&cookie).unwrap_or_else(|_| {
+        HeaderValue::from_static("zr_oidc_state=; Path=/auth; HttpOnly; Max-Age=0")
+    })
+}
+
+fn oidc_state_cookie_value(headers: &HeaderMap) -> Option<String> {
+    for header_value in headers.get_all(header::COOKIE) {
+        let raw = header_value.to_str().ok()?;
+        for pair in raw.split(';') {
+            let mut split = pair.trim().splitn(2, '=');
+            let name = split.next()?.trim();
+            if name == OIDC_STATE_COOKIE {
+                let value = split.next()?.trim();
+                if !value.is_empty() {
+                    return Some(value.to_owned());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Length-checked constant-time byte comparison.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -583,5 +659,32 @@ mod tests {
             OidcError::EmailConflict.response_parts().2,
             "email_conflict"
         );
+    }
+
+    #[test]
+    fn constant_time_eq_matches_only_identical_slices() {
+        assert!(constant_time_eq(b"abc123", b"abc123"));
+        assert!(!constant_time_eq(b"abc123", b"abc124"));
+        assert!(!constant_time_eq(b"abc", b"abcd"));
+        assert!(!constant_time_eq(b"", b"x"));
+        assert!(constant_time_eq(b"", b""));
+    }
+
+    #[test]
+    fn state_cookie_round_trips_and_is_scoped_to_auth() {
+        let header = oidc_state_cookie_header("state-value", true);
+        let text = header.to_str().expect("cookie header should be ascii");
+        assert!(text.contains("HttpOnly"));
+        assert!(text.contains("SameSite=Lax"));
+        assert!(text.contains("Path=/auth"));
+        assert!(text.contains("Secure"));
+
+        let mut headers = HeaderMap::new();
+        headers.append(header::COOKIE, "zr_oidc_state=state-value".parse().unwrap());
+        assert_eq!(
+            oidc_state_cookie_value(&headers).as_deref(),
+            Some("state-value")
+        );
+        assert!(oidc_state_cookie_value(&HeaderMap::new()).is_none());
     }
 }

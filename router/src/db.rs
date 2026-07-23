@@ -38,6 +38,7 @@ pub struct UsageSession {
     reservation_id: Uuid,
     api_key_id: Uuid,
     user_id: Uuid,
+    require_credits: bool,
 }
 
 const DATABASE_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -45,8 +46,26 @@ const RESERVATION_TTL: Duration = Duration::from_secs(20 * 60);
 
 pub async fn database_pool_from_env() -> Result<PgPool> {
     let pool = if let Ok(database_url) = env::var("DATABASE_URL") {
-        let options = PgConnectOptions::from_str(&database_url)
+        let mut options = PgConnectOptions::from_str(&database_url)
             .map_err(|_| anyhow!("DATABASE_URL is invalid"))?;
+        // The DATABASE_URL path is a developer convenience for a loopback
+        // database. A non-loopback target must be at least as hardened as the
+        // production DB_* path: verify-full TLS with the pinned CA. Otherwise
+        // this branch would silently weaken the documented TLS invariant.
+        if !is_loopback_host(options.get_host()) {
+            let ssl_root_cert = env::var("DB_SSL_ROOT_CERT")
+                .ok()
+                .filter(|v| !v.trim().is_empty());
+            let Some(ssl_root_cert) = ssl_root_cert else {
+                bail!(
+                    "DATABASE_URL points at a non-loopback host without DB_SSL_ROOT_CERT; \
+                     use the DB_HOST/DB_* variables (which enforce verify-full TLS) for remote databases"
+                );
+            };
+            options = options
+                .ssl_mode(PgSslMode::VerifyFull)
+                .ssl_root_cert(&ssl_root_cert);
+        }
         PgPoolOptions::new()
             .max_connections(10)
             .acquire_timeout(DATABASE_ACQUIRE_TIMEOUT)
@@ -96,6 +115,13 @@ pub async fn migrate(pool: &PgPool) -> Result<()> {
                 Cow::Borrowed("billing and web"),
                 MigrationType::Simple,
                 Cow::Borrowed(include_str!("../migrations/0002_billing_and_web.sql")),
+                false,
+            ),
+            Migration::new(
+                3,
+                Cow::Borrowed("balance nonnegative"),
+                MigrationType::Simple,
+                Cow::Borrowed(include_str!("../migrations/0003_balance_nonnegative.sql")),
                 false,
             ),
         ]),
@@ -276,6 +302,7 @@ pub async fn begin_usage_session(
         reservation_id,
         api_key_id: key.id,
         user_id: key.user_id,
+        require_credits,
     }))
 }
 
@@ -303,18 +330,18 @@ impl UsageSession {
             .execute(&mut *transaction)
             .await?;
 
-        let reservation_exists = sqlx::query_scalar::<_, bool>(
-            "SELECT EXISTS(SELECT 1 FROM usage_reservations WHERE id = $1 AND api_key_id = $2)",
+        // Settle the reservation and recover what admission reserved in the
+        // same statement; a missing row means it was already settled or expired.
+        let reserved_cost_usd = sqlx::query_scalar::<_, Decimal>(
+            "DELETE FROM usage_reservations WHERE id = $1 AND api_key_id = $2 RETURNING reserved_cost_usd",
         )
         .bind(self.reservation_id)
         .bind(self.api_key_id)
-        .fetch_one(&mut *transaction)
-        .await?;
-        if !reservation_exists {
-            return Err(sqlx::Error::Protocol(
-                "usage reservation is missing or already settled".to_owned(),
-            ));
-        }
+        .fetch_optional(&mut *transaction)
+        .await?
+        .ok_or_else(|| {
+            sqlx::Error::Protocol("usage reservation is missing or already settled".to_owned())
+        })?;
 
         sqlx::query(
             r#"
@@ -347,55 +374,52 @@ impl UsageSession {
         .bind(record.status)
         .execute(&mut *transaction)
         .await?;
-        let deleted = sqlx::query("DELETE FROM usage_reservations WHERE id = $1")
-            .bind(self.reservation_id)
-            .execute(&mut *transaction)
-            .await?;
-        if deleted.rows_affected() != 1 {
-            return Err(sqlx::Error::Protocol(
-                "usage reservation could not be settled".to_owned(),
-            ));
-        }
 
         // Debit the prepaid balance in the same transaction that settles the
         // reservation; the unique request_id and the settle-exactly-once
-        // reservation guarantee make the debit idempotent. Zero-cost events
-        // write no ledger row (the ledger forbids zero amounts) and leave the
-        // balance untouched.
-        if record.cost_usd > Decimal::ZERO {
-            let balance_after = sqlx::query_scalar::<_, Decimal>(
-                r#"
-                UPDATE users
-                SET credit_balance_usd = credit_balance_usd - $2
-                WHERE id = $1
-                RETURNING credit_balance_usd
-                "#,
-            )
-            .bind(self.user_id)
-            .bind(record.cost_usd)
-            .fetch_optional(&mut *transaction)
-            .await?
-            .ok_or_else(|| {
-                sqlx::Error::Protocol("usage settlement found no owning user".to_owned())
-            })?;
-            sqlx::query(
-                r#"
-                INSERT INTO credit_ledger (
-                    user_id,
-                    entry_type,
-                    amount_usd,
-                    balance_after_usd,
-                    request_id
+        // reservation make the debit idempotent. The debit is clamped to what
+        // admission reserved (and thus verified against the balance), so actual
+        // usage exceeding the reserved output bound can never overdraw. The
+        // balance is only touched when credits gate admission — cap-only
+        // deployments record usage_events for metering without moving money.
+        // Zero-cost debits write no ledger row (the ledger forbids zero amounts).
+        if self.require_credits {
+            let debit = record.cost_usd.min(reserved_cost_usd);
+            if debit > Decimal::ZERO {
+                let balance_after = sqlx::query_scalar::<_, Decimal>(
+                    r#"
+                    UPDATE users
+                    SET credit_balance_usd = credit_balance_usd - $2
+                    WHERE id = $1
+                    RETURNING credit_balance_usd
+                    "#,
                 )
-                VALUES ($1, 'usage', $2, $3, $4)
-                "#,
-            )
-            .bind(self.user_id)
-            .bind(-record.cost_usd)
-            .bind(balance_after)
-            .bind(self.reservation_id)
-            .execute(&mut *transaction)
-            .await?;
+                .bind(self.user_id)
+                .bind(debit)
+                .fetch_optional(&mut *transaction)
+                .await?
+                .ok_or_else(|| {
+                    sqlx::Error::Protocol("usage settlement found no owning user".to_owned())
+                })?;
+                sqlx::query(
+                    r#"
+                    INSERT INTO credit_ledger (
+                        user_id,
+                        entry_type,
+                        amount_usd,
+                        balance_after_usd,
+                        request_id
+                    )
+                    VALUES ($1, 'usage', $2, $3, $4)
+                    "#,
+                )
+                .bind(self.user_id)
+                .bind(-debit)
+                .bind(balance_after)
+                .bind(self.reservation_id)
+                .execute(&mut *transaction)
+                .await?;
+            }
         }
         transaction.commit().await
     }
@@ -404,6 +428,13 @@ impl UsageSession {
 fn checked_token_count(value: u64, field: &'static str) -> Result<i32, sqlx::Error> {
     i32::try_from(value)
         .map_err(|_| sqlx::Error::Protocol(format!("{field} exceeds the database integer range")))
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    matches!(host, "localhost" | "127.0.0.1" | "::1")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
 }
 
 fn required_env(name: &str) -> Result<String> {

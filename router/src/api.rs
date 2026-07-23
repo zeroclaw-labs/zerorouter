@@ -265,12 +265,14 @@ async fn run_non_streaming(
     let selected = tokio::select! {
         biased;
         () = shutdown.cancelled() => {
+            // No tokens were delivered; release the reservation without a
+            // charge rather than billing the conservative estimate.
             persist_usage(
                 usage_session,
                 &resolved.requested_model,
                 "fallback-chain",
                 &resolved.requested_model,
-                reservation_usage,
+                OpenAiUsage::default(),
                 resolved.sell_rates,
                 started,
                 503,
@@ -291,12 +293,14 @@ async fn run_non_streaming(
     let selected = match selected {
         Ok(Ok(selected)) => selected,
         Ok(Err(_)) => {
+            // Every candidate failed and no tokens were delivered; release the
+            // reservation without a charge.
             persist_usage(
                 usage_session,
                 &resolved.requested_model,
                 "fallback-chain",
                 &resolved.requested_model,
-                reservation_usage,
+                OpenAiUsage::default(),
                 resolved.sell_rates,
                 started,
                 502,
@@ -310,12 +314,14 @@ async fn run_non_streaming(
             return Err(ApiError::UpstreamUnavailable);
         }
         Err(_) => {
+            // The deadline elapsed with no delivered tokens; release without a
+            // charge.
             persist_usage(
                 usage_session,
                 &resolved.requested_model,
                 "fallback-chain",
                 &resolved.requested_model,
-                reservation_usage,
+                OpenAiUsage::default(),
                 resolved.sell_rates,
                 started,
                 504,
@@ -726,12 +732,20 @@ async fn stream_to_channel(
                 send_stream_error(&sender, &ApiError::MeteringUnavailable).await;
                 return;
             };
+            // Charge only when tokens actually reached the client: metered
+            // usage if the upstream reported it, else the conservative estimate.
+            // If nothing was delivered, release the reservation without a charge.
+            let settled_usage = if client_output_sent {
+                usage.unwrap_or(reservation_usage)
+            } else {
+                OpenAiUsage::default()
+            };
             let metering = persist_usage(
                 session,
                 &resolved.requested_model,
                 &candidate.definition().provider,
                 &candidate.definition().model,
-                usage.unwrap_or(reservation_usage),
+                settled_usage,
                 resolved.sell_rates,
                 started,
                 if client_connected { 502 } else { 499 },
@@ -750,12 +764,14 @@ async fn stream_to_channel(
     }
 
     let error = if let (Some(candidate), Some(session)) = (last_candidate, usage_session.take()) {
+        // Every candidate failed before streaming any tokens; release the
+        // reservation without a charge.
         match persist_usage(
             session,
             &resolved.requested_model,
             &candidate.provider,
             &candidate.model,
-            reservation_usage,
+            OpenAiUsage::default(),
             resolved.sell_rates,
             started,
             502,

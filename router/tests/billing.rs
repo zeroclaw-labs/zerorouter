@@ -310,3 +310,88 @@ async fn ledger_entries_are_scoped_to_their_user_and_newest_first() {
     assert_eq!(limited.len(), 1);
     assert_eq!(limited[0].entry_type, "purchase");
 }
+
+#[tokio::test]
+async fn settlement_debit_is_clamped_to_the_reservation_and_cannot_overdraw() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let user_id = create_user(&pool, "clamp").await;
+    let key = create_key(&pool, user_id).await;
+    // Fund exactly the reserved amount, then have actual usage exceed it.
+    credit_purchase(&pool, user_id, Decimal::from(2), &unique_session_id(), None)
+        .await
+        .expect("funding purchase must apply");
+
+    let session = match begin_usage_session(&pool, &key, 1_000, Decimal::from(2), true)
+        .await
+        .expect("funded admission must query")
+    {
+        UsageAdmission::Allowed(session) => session,
+        _ => panic!("funded admission should be allowed"),
+    };
+    // Actual settled cost (5) exceeds the reservation (2): the debit must clamp
+    // to 2 so the balance lands at exactly zero, never negative.
+    session
+        .record(&usage_record(Decimal::from(5)))
+        .await
+        .expect("settlement must succeed even when actual usage exceeds the reservation");
+
+    assert_eq!(
+        balance(&pool, user_id).await.expect("balance must query"),
+        Decimal::ZERO,
+        "settlement must clamp to the reservation and never overdraw"
+    );
+    let entries = ledger_entries(&pool, user_id, 10)
+        .await
+        .expect("ledger must query");
+    let usage_row = entries
+        .iter()
+        .find(|entry| entry.entry_type == "usage")
+        .expect("a usage ledger row must exist");
+    assert_eq!(usage_row.amount_usd, -Decimal::from(2));
+    assert_eq!(usage_row.balance_after_usd, Decimal::ZERO);
+}
+
+#[tokio::test]
+async fn cap_only_settlement_records_usage_without_touching_the_balance() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let user_id = create_user(&pool, "caponly").await;
+    let key = create_key(&pool, user_id).await;
+    // require_credits = false: no balance is funded, and settlement must record
+    // the usage event for metering without moving money below zero.
+    let session = match begin_usage_session(&pool, &key, 1_000, Decimal::from(2), false)
+        .await
+        .expect("cap-only admission must query")
+    {
+        UsageAdmission::Allowed(session) => session,
+        _ => panic!("cap-only admission should be allowed"),
+    };
+    session
+        .record(&usage_record(Decimal::ONE))
+        .await
+        .expect("cap-only settlement must succeed");
+
+    assert_eq!(
+        balance(&pool, user_id).await.expect("balance must query"),
+        Decimal::ZERO,
+        "cap-only settlement must not move the balance"
+    );
+    let usage_events =
+        query_scalar::<_, i64>("SELECT COUNT(*) FROM usage_events WHERE api_key_id = $1")
+            .bind(key.id)
+            .fetch_one(&pool)
+            .await
+            .expect("usage event count must query");
+    assert_eq!(usage_events, 1, "usage is still metered in cap-only mode");
+    let usage_ledger = query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM credit_ledger WHERE user_id = $1 AND entry_type = 'usage'",
+    )
+    .bind(user_id)
+    .fetch_one(&pool)
+    .await
+    .expect("usage ledger count must query");
+    assert_eq!(usage_ledger, 0, "cap-only mode writes no money ledger row");
+}

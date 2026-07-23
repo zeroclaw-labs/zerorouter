@@ -523,6 +523,20 @@ async fn expire_stale_authorizations(pool: &PgPool) -> Result<(), OauthError> {
     .execute(pool)
     .await
     .map_err(oauth_database_error)?;
+    // Reclaim terminal rows past a grace window so an unauthenticated flood of
+    // /auth/device/code cannot grow the table without bound; the 15-minute grant
+    // TTL means nothing relevant is ever this old, and a claimed grant's minted
+    // key is stored on api_keys, not here, so deleting the record loses nothing.
+    sqlx::query(
+        r#"
+        DELETE FROM device_authorizations
+        WHERE status IN ('expired', 'denied', 'claimed')
+          AND expires_at <= NOW() - INTERVAL '24 hours'
+        "#,
+    )
+    .execute(pool)
+    .await
+    .map_err(oauth_database_error)?;
     Ok(())
 }
 

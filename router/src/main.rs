@@ -87,6 +87,10 @@ async fn serve() -> Result<()> {
                 .merge(device::router())
                 .merge(stripe::router())
                 .merge(portal::router())
+                // Bound the memory an unauthenticated request can force the
+                // web plane to buffer (Stripe events and device/OIDC bodies are
+                // small); the inference plane keeps its own 8 MiB chat limit.
+                .layer(axum::extract::DefaultBodyLimit::max(256 * 1024))
                 .with_state(ctx),
         );
         if portal_dist.is_dir() {

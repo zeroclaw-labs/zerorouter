@@ -425,6 +425,12 @@ impl OpenAiUsage {
         let usage = usage?;
         let input = usage.input_tokens?;
         let output = usage.output_tokens?;
+        // A real completion always consumes prompt tokens; an all-zero report
+        // is unusable, so route it through the missing-usage path rather than
+        // metering a request as free.
+        if input == 0 && output == 0 {
+            return None;
+        }
         let cached = usage.cached_input_tokens.unwrap_or(0).min(input);
         Some(Self {
             prompt_tokens: input,
@@ -607,6 +613,31 @@ pub fn usage_cost(rates: ModelRates, usage: OpenAiUsage) -> Decimal {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn all_zero_token_usage_is_rejected_as_unusable() {
+        // A provider reporting 0 input + 0 output must not meter as a free
+        // success; it routes through the missing-usage path instead.
+        let usage = TokenUsage {
+            input_tokens: Some(0),
+            output_tokens: Some(0),
+            cached_input_tokens: None,
+        };
+        assert!(OpenAiUsage::try_from_provider(Some(&usage)).is_none());
+    }
+
+    #[test]
+    fn nonzero_token_usage_is_accepted() {
+        let usage = TokenUsage {
+            input_tokens: Some(10),
+            output_tokens: Some(0),
+            cached_input_tokens: None,
+        };
+        let converted =
+            OpenAiUsage::try_from_provider(Some(&usage)).expect("prompt-only usage is meterable");
+        assert_eq!(converted.prompt_tokens, 10);
+        assert_eq!(converted.completion_tokens, 0);
+    }
 
     #[test]
     fn converts_openai_tool_history_to_zeroclaw_wire_markers() {

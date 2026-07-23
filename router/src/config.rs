@@ -116,7 +116,10 @@ impl TierCatalog {
                 .cloned()
                 .map(|candidate| ResolvedRoute {
                     requested_model: requested_model.to_owned(),
-                    sell_rates: candidate.rates,
+                    // A pinned concrete candidate meters at its owning tier's
+                    // sell rate, never the per-candidate cost basis, so pinning
+                    // a model cannot undercut the tier price.
+                    sell_rates: tier.rates,
                     candidates: vec![candidate],
                 })
         })
@@ -252,6 +255,40 @@ output_per_mtok = 2
             .expect("concrete model should resolve");
         assert_eq!(route.candidates.len(), 1);
         assert_eq!(route.candidates[0].model, "upstream-model");
+    }
+
+    #[test]
+    fn concrete_model_bills_at_the_owning_tier_sell_rate() {
+        // The tier sell rate differs from the candidate cost basis; pinning a
+        // concrete candidate must meter at the tier sell rate, never the
+        // cheaper cost basis (margin-leak regression guard).
+        let catalog: TierCatalog = toml::from_str(
+            r#"
+schema_version = 1
+[tiers."zero/test"]
+[tiers."zero/test".rates]
+input_per_mtok = 10
+output_per_mtok = 20
+[[tiers."zero/test".candidates]]
+id = "provider/model"
+provider = "fireworks"
+model = "upstream-model"
+[tiers."zero/test".candidates.rates]
+input_per_mtok = 1
+output_per_mtok = 2
+"#,
+        )
+        .expect("catalog should parse");
+        validate_tier_catalog(&catalog).expect("catalog should validate");
+
+        let tier = catalog.resolve("zero/test").expect("tier should resolve");
+        let concrete = catalog
+            .resolve("provider/model")
+            .expect("concrete model should resolve");
+        assert_eq!(
+            concrete.sell_rates, tier.sell_rates,
+            "a pinned candidate must bill at the tier sell rate"
+        );
     }
 
     #[test]

@@ -47,6 +47,7 @@ const WEBHOOK_TOLERANCE: Duration = Duration::from_secs(300);
 const STRIPE_CHECKOUT_SESSIONS_URL: &str = "https://api.stripe.com/v1/checkout/sessions";
 const STRIPE_HTTP_TIMEOUT: Duration = Duration::from_secs(15);
 const CHECKOUT_COMPLETED_EVENT: &str = "checkout.session.completed";
+const CHECKOUT_ASYNC_SUCCEEDED_EVENT: &str = "checkout.session.async_payment_succeeded";
 const CHECKOUT_PRODUCT_NAME: &str = "ZeroRouter credits";
 /// SQLSTATE for a foreign-key violation: the metadata user does not exist.
 const PG_FOREIGN_KEY_VIOLATION: &str = "23503";
@@ -434,7 +435,9 @@ async fn stripe_webhook(
         tracing::warn!("stripe webhook rejected: event is not valid JSON");
         StripeHttpError::MalformedEvent
     })?;
-    if event.event_type != CHECKOUT_COMPLETED_EVENT {
+    if event.event_type != CHECKOUT_COMPLETED_EVENT
+        && event.event_type != CHECKOUT_ASYNC_SUCCEEDED_EVENT
+    {
         // Acknowledged without action so Stripe does not retry event types
         // this deployment does not consume.
         return Ok(received());
