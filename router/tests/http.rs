@@ -42,7 +42,7 @@ async fn completion_authentication_precedes_body_buffering() {
     let options = PgConnectOptions::from_str("postgresql://unused@127.0.0.1/unused")
         .expect("lazy test database options should parse");
     let pool = PgPoolOptions::new().connect_lazy_with(options);
-    let response = app(RouterState::with_database(tier_config_path(), pool))
+    let response = app(RouterState::with_database(tier_config_path(), pool, false))
         .oneshot(
             Request::builder()
                 .method("POST")

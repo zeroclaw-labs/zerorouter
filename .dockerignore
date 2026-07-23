@@ -1,0 +1,10 @@
+# Build-context excludes for the repo-root Dockerfile (context = repo root).
+.git
+.github
+docs
+**/target
+**/node_modules
+portal/dist
+**/.env
+**/.env.*
+**/*.log

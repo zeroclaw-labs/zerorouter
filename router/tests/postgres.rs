@@ -51,12 +51,13 @@ async fn postgres_enforces_reservations_revocation_and_append_only_usage() {
         .await
         .expect("stored key must authenticate");
     assert_eq!(key.id, key_id);
+    assert_eq!(key.user_id, user_id);
     assert!(matches!(
         authenticator.authenticate(&pool, &generate_api_key()).await,
         Err(AuthenticationError::Invalid)
     ));
 
-    let session = match begin_usage_session(&pool, &key, 1_000, Decimal::ONE)
+    let session = match begin_usage_session(&pool, &key, 1_000, Decimal::ONE, false)
         .await
         .expect("first admission must query")
     {
@@ -64,7 +65,7 @@ async fn postgres_enforces_reservations_revocation_and_append_only_usage() {
         _ => panic!("first reservation should be admitted"),
     };
     assert!(matches!(
-        begin_usage_session(&pool, &key, 1_000, Decimal::from(20))
+        begin_usage_session(&pool, &key, 1_000, Decimal::from(20), false)
             .await
             .expect("second admission must query"),
         UsageAdmission::SpendExceeded
@@ -109,8 +110,8 @@ async fn postgres_enforces_reservations_revocation_and_append_only_usage() {
         .await
         .expect("velocity cap must update");
     let (first, second) = tokio::join!(
-        begin_usage_session(&pool, &key, 800, Decimal::ZERO),
-        begin_usage_session(&pool, &key, 800, Decimal::ZERO),
+        begin_usage_session(&pool, &key, 800, Decimal::ZERO, false),
+        begin_usage_session(&pool, &key, 800, Decimal::ZERO, false),
     );
     let mut admitted = 0;
     let mut rejected = 0;
@@ -154,7 +155,7 @@ async fn postgres_enforces_reservations_revocation_and_append_only_usage() {
         .await
         .expect("immutable key identity may remain cached during its TTL");
     assert!(matches!(
-        begin_usage_session(&pool, &cached_key, 1, Decimal::ZERO)
+        begin_usage_session(&pool, &cached_key, 1, Decimal::ZERO, false)
             .await
             .expect("revoked admission must query"),
         UsageAdmission::Unauthorized

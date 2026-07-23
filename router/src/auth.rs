@@ -15,6 +15,7 @@ const DUMMY_HASH: &str = "000000000000000000000000000000000000000000000000000000
 #[derive(Clone, Debug)]
 pub struct AuthenticatedKey {
     pub id: Uuid,
+    pub user_id: Uuid,
 }
 
 #[derive(Clone, Debug)]
@@ -63,9 +64,9 @@ impl KeyAuthenticator {
             return Ok(key);
         }
 
-        let row = sqlx::query_as::<_, (Uuid, String, bool)>(
+        let row = sqlx::query_as::<_, (Uuid, Uuid, String, bool)>(
             r#"
-            SELECT id, key_hash, disabled
+            SELECT id, user_id, key_hash, disabled
             FROM api_keys
             WHERE key_hash = $1
             "#,
@@ -75,14 +76,15 @@ impl KeyAuthenticator {
         .await
         .map_err(AuthenticationError::Database)?;
 
-        let stored_hash = row.as_ref().map_or(DUMMY_HASH, |record| record.1.as_str());
+        let stored_hash = row.as_ref().map_or(DUMMY_HASH, |record| record.2.as_str());
         let hashes_match = constant_time_eq(stored_hash, &hash);
-        let Some((id, _, _)) = row.filter(|row| syntactically_valid && hashes_match && !row.2)
+        let Some((id, user_id, _, _)) =
+            row.filter(|row| syntactically_valid && hashes_match && !row.3)
         else {
             return Err(AuthenticationError::Invalid);
         };
 
-        let key = AuthenticatedKey { id };
+        let key = AuthenticatedKey { id, user_id };
         let mut cache = self.cache.write().await;
         cache.retain(|_, entry| entry.expires_at > now);
         cache.insert(

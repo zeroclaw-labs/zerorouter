@@ -2,12 +2,15 @@ use std::{env, net::SocketAddr, path::PathBuf};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use tower_http::services::{ServeDir, ServeFile};
 use tracing_subscriber::EnvFilter;
 use zerorouter::{
     DEFAULT_TIER_CONFIG_PATH, RouterState, TIER_CONFIG_PATH_ENV,
     admin::{self, AdminArgs},
     app,
     db::{database_pool_from_env, migrate},
+    device, oidc, portal, stripe,
+    web::{WebConfig, WebCtx, credits_required_from_env},
 };
 
 const DEFAULT_BIND_ADDRESS: &str = "0.0.0.0:8080";
@@ -57,16 +60,47 @@ async fn serve() -> Result<()> {
     let tier_config_path = env::var_os(TIER_CONFIG_PATH_ENV)
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(DEFAULT_TIER_CONFIG_PATH));
+    let require_credits = credits_required_from_env()?;
+    let web_config = WebConfig::from_env()?;
     let pool = database_pool_from_env().await?;
     migrate(&pool).await?;
 
     let listener = tokio::net::TcpListener::bind(bind_address)
         .await
         .with_context(|| format!("failed to bind ZeroRouter to {bind_address}"))?;
-    tracing::info!(%bind_address, "ZeroRouter listening");
-    let state = RouterState::with_database(tier_config_path, pool);
+    tracing::info!(
+        %bind_address,
+        require_credits,
+        web_plane = web_config.is_some(),
+        "ZeroRouter listening"
+    );
+    let state = RouterState::with_database(tier_config_path, pool.clone(), require_credits);
+    let mut router = app(state.clone());
+    if let Some(config) = web_config {
+        let portal_dist = config.portal_dist_path.clone();
+        let oidc_enabled = config.oidc.is_some();
+        let stripe_enabled = config.stripe.is_some();
+        let ctx = WebCtx::new(pool, config);
+        router = router.merge(
+            axum::Router::new()
+                .merge(oidc::router())
+                .merge(device::router())
+                .merge(stripe::router())
+                .merge(portal::router())
+                .with_state(ctx),
+        );
+        if portal_dist.is_dir() {
+            router = router.fallback_service(
+                ServeDir::new(&portal_dist)
+                    .fallback(ServeFile::new(portal_dist.join("index.html"))),
+            );
+        } else {
+            tracing::warn!(path = %portal_dist.display(), "portal dist directory not found; SPA disabled");
+        }
+        tracing::info!(oidc_enabled, stripe_enabled, "web plane enabled");
+    }
     let shutdown_state = state.clone();
-    let server_result = axum::serve(listener, app(state.clone()))
+    let server_result = axum::serve(listener, router)
         .with_graceful_shutdown(async move {
             shutdown_signal().await;
             shutdown_state.begin_shutdown();

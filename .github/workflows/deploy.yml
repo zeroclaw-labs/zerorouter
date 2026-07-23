@@ -2,9 +2,8 @@ name: Deploy Router
 
 on:
   workflow_dispatch:
-  workflow_run:
-    workflows: ["Router CI"]
-    types: [completed]
+  push:
+    branches: [main]
 
 concurrency:
   group: deploy-router-main
@@ -18,18 +17,15 @@ env:
   AWS_STS_REGION: us-east-1
   AWS_DEPLOY_ROLE_ARN: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
   ECS_CONTAINER_NAME: router
-  DEPLOY_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
-  DEPLOY_REF: ${{ github.event.workflow_run.head_branch || github.ref_name }}
+  DEPLOY_SHA: ${{ github.sha }}
+  DEPLOY_REF: ${{ github.ref_name }}
 
 jobs:
   deploy:
     name: Build and deploy ARM64 router
-    if: >-
-      github.event_name == 'workflow_dispatch' ||
-      (github.event.workflow_run.conclusion == 'success' &&
-       github.event.workflow_run.event == 'push' &&
-       github.event.workflow_run.head_repository.full_name == github.repository &&
-       github.event.workflow_run.head_branch == 'main')
+    # No-op cleanly on forks and before the AWS cutover: the job only runs in
+    # the zeroclaw-labs org and only once the deploy role variable is set.
+    if: github.repository_owner == 'zeroclaw-labs' && vars.AWS_DEPLOY_ROLE_ARN != ''
     runs-on: ubuntu-latest
     timeout-minutes: 45
 
@@ -195,8 +191,10 @@ jobs:
         if: steps.image.outputs.exists != 'true'
         uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
         with:
-          context: ./router
-          file: ./router/Dockerfile
+          # The Dockerfile lives at the repo root so its context reaches both
+          # router/ and portal/ (moved from router/Dockerfile).
+          context: .
+          file: ./Dockerfile
           platforms: linux/arm64
           push: true
           tags: ${{ steps.image.outputs.image_uri }}

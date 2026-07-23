@@ -89,7 +89,9 @@ impl WebConfig {
                 STRIPE_WEBHOOK_SECRET_ENV,
             ] {
                 if optional_env(name).is_some() {
-                    bail!("{name} is set but {PUBLIC_BASE_URL_ENV} is not; refusing to run with a partially configured web plane");
+                    bail!(
+                        "{name} is set but {PUBLIC_BASE_URL_ENV} is not; refusing to run with a partially configured web plane"
+                    );
                 }
             }
             return Ok(None);
@@ -278,9 +280,12 @@ mod tests {
                 .expect("absent group is fine")
                 .is_none()
         );
-        let full = feature_group("t", [("A", Some("1".to_owned())), ("B", Some("2".to_owned()))])
-            .expect("full group is fine")
-            .expect("group should be present");
+        let full = feature_group(
+            "t",
+            [("A", Some("1".to_owned())), ("B", Some("2".to_owned()))],
+        )
+        .expect("full group is fine")
+        .expect("group should be present");
         assert_eq!(full, ["1".to_owned(), "2".to_owned()]);
         assert!(feature_group("t", [("A", Some("1".to_owned())), ("B", None)]).is_err());
     }

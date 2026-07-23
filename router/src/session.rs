@@ -72,10 +72,7 @@ impl IntoResponse for SessionRejection {
 impl axum::extract::FromRequestParts<WebCtx> for PortalUser {
     type Rejection = SessionRejection;
 
-    async fn from_request_parts(
-        parts: &mut Parts,
-        ctx: &WebCtx,
-    ) -> Result<Self, Self::Rejection> {
+    async fn from_request_parts(parts: &mut Parts, ctx: &WebCtx) -> Result<Self, Self::Rejection> {
         if !matches!(parts.method, Method::GET | Method::HEAD)
             && !parts.headers.contains_key(CSRF_HEADER)
         {
@@ -106,10 +103,7 @@ fn session_cookie_value(parts: &Parts) -> Option<String> {
     None
 }
 
-async fn resolve_session(
-    pool: &PgPool,
-    token: &str,
-) -> Result<Option<PortalUser>, sqlx::Error> {
+async fn resolve_session(pool: &PgPool, token: &str) -> Result<Option<PortalUser>, sqlx::Error> {
     if !valid_session_token_shape(token) {
         return Ok(None);
     }
@@ -190,8 +184,9 @@ pub fn clear_session_cookie_header(secure: bool) -> HeaderValue {
 
 fn build_cookie(value: &str, max_age_secs: u64, secure: bool) -> HeaderValue {
     let secure_attr = if secure { "; Secure" } else { "" };
-    let cookie =
-        format!("{SESSION_COOKIE}={value}; Path=/; HttpOnly; SameSite=Lax; Max-Age={max_age_secs}{secure_attr}");
+    let cookie = format!(
+        "{SESSION_COOKIE}={value}; Path=/; HttpOnly; SameSite=Lax; Max-Age={max_age_secs}{secure_attr}"
+    );
     HeaderValue::from_str(&cookie)
         .unwrap_or_else(|_| HeaderValue::from_static("zr_session=; Path=/; HttpOnly; Max-Age=0"))
 }

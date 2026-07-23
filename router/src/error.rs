@@ -13,6 +13,7 @@ pub enum ApiError {
     UnsupportedRequestFields,
     Unauthorized,
     SpendCapExceeded,
+    InsufficientCredits,
     VelocityCapExceeded,
     ModelNotFound,
     TierCatalogUnavailable,
@@ -89,6 +90,13 @@ impl ApiError {
                 "billing_error",
                 None,
                 "spend_cap_exceeded",
+            ),
+            Self::InsufficientCredits => (
+                StatusCode::PAYMENT_REQUIRED,
+                "This account has insufficient prepaid credits for the request.",
+                "billing_error",
+                None,
+                "insufficient_credits",
             ),
             Self::VelocityCapExceeded => (
                 StatusCode::TOO_MANY_REQUESTS,

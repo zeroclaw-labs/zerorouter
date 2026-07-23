@@ -1,4 +1,7 @@
 # syntax=docker/dockerfile:1
+# NOTE: this Dockerfile moved from router/Dockerfile to the repository root so
+# the build context can reach both router/ (Rust crate) and portal/ (SPA).
+# All COPY paths are relative to the repo-root build context.
 FROM --platform=$BUILDPLATFORM rust:1.96.1-slim-bookworm@sha256:e18a79fc84dfcfc3ab5ba72290398a644c135c97eaa881447fddc354ee4701a3 AS builder
 
 ARG BUILDARCH
@@ -21,10 +24,10 @@ RUN set -eux; \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
-COPY Cargo.toml Cargo.lock ./
-COPY src ./src
-COPY migrations ./migrations
-COPY config ./config
+COPY router/Cargo.toml router/Cargo.lock ./
+COPY router/src ./src
+COPY router/migrations ./migrations
+COPY router/config ./config
 RUN set -eux; \
     if [ "${BUILDARCH}" = "${TARGETARCH}" ]; then \
         cargo build --locked --release; \
@@ -36,6 +39,18 @@ RUN set -eux; \
             cargo build --locked --release --target aarch64-unknown-linux-gnu; \
         cp target/aarch64-unknown-linux-gnu/release/zerorouter /build/zerorouter; \
     fi
+
+FROM --platform=$BUILDPLATFORM node:22-slim@sha256:6c74791e557ce11fc957704f6d4fe134a7bc8d6f5ca4403205b2966bd488f6b3 AS portal
+
+# Corepack must never stop for an interactive download prompt in CI.
+ENV COREPACK_ENABLE_DOWNLOAD_PROMPT=0
+RUN corepack enable
+
+WORKDIR /portal
+COPY portal/package.json portal/pnpm-lock.yaml ./
+RUN pnpm install --frozen-lockfile
+COPY portal ./
+RUN pnpm build
 
 FROM --platform=$BUILDPLATFORM debian:bookworm-slim@sha256:60eac759739651111db372c07be67863818726f754804b8707c90979bda511df AS certificates
 
@@ -55,10 +70,12 @@ FROM gcr.io/distroless/cc-debian12:nonroot@sha256:ce0d66bc0f64aae46e6a03add867b0
 COPY --from=builder /build/zerorouter /usr/local/bin/zerorouter
 COPY --from=certificates /rds-global-bundle.pem /etc/zerorouter/rds-global-bundle.pem
 COPY --from=busybox /bin/busybox /bin/busybox
-COPY config/tiers.toml /etc/zerorouter/tiers.toml
+COPY --from=portal /portal/dist /srv/portal
+COPY router/config/tiers.toml /etc/zerorouter/tiers.toml
 
 ENV ZEROROUTER_BIND=0.0.0.0:8080
 ENV ZEROROUTER_TIERS_PATH=/etc/zerorouter/tiers.toml
+ENV ZEROROUTER_PORTAL_DIST=/srv/portal
 EXPOSE 8080
 
 USER 10001:10001

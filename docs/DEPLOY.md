@@ -1,0 +1,115 @@
+# Deploying ZeroRouter
+
+## Infrastructure ownership
+
+All Terraform for the live stack lives in
+**`zeroclaw-labs/zeroclaw-infrastructure`**, under
+`environments/zerorouter-beta`. That repository is the **sole IaC owner**:
+VPC, ALB, ECS cluster/service, RDS, Secrets Manager containers, IAM, and the
+GitHub-OIDC deploy role are all defined there and only there.
+
+This repository ships exactly two deployment artifacts:
+
+- the application image (the root `Dockerfile`: Rust router + built portal
+  SPA, `linux/arm64`, distroless);
+- the deploy workflow (`.github/workflows/deploy.yml`), which builds and
+  pushes the image to the Terraform-owned ECR repository and rolls the
+  Terraform-owned ECS service. The workflow discovers its ECR/ECS
+  coordinates from the deploy role's inline IAM policy, so it carries no
+  hardcoded account or resource names.
+
+Do not add Terraform, task-definition JSON, or AWS resource names to this
+repository.
+
+## The live stack contract
+
+The app is built to satisfy the `zerorouter-beta` environment as Terraform
+defines it:
+
+- **`ZEROROUTER_BIND=0.0.0.0:8080`** — the container listens on 8080
+  (baked into the image as a default).
+- **`GET /healthz`** is the ALB target-group health check (and the
+  container `HEALTHCHECK`).
+- **`ZEROROUTER_TIERS_PATH=/etc/zerorouter/tiers.toml`** — the image bakes
+  the canonical `router/config/tiers.toml` at that path.
+- **Database**: `DB_HOST`, `DB_NAME`, `DB_PORT`, `DB_USERNAME`,
+  `DB_PASSWORD` plus `DB_SSL_ROOT_CERT`; this path always connects with
+  `verify-full` TLS against the checksum-pinned RDS CA bundle shipped in
+  the image at `/etc/zerorouter/rds-global-bundle.pem`.
+- **Provider keys** (`ANTHROPIC_API_KEY`, `BEDROCK_API_KEY`, …) are injected
+  from AWS Secrets Manager via task-definition `secrets`, never plain env in
+  Terraform or the task definition.
+- **Platform**: ARM64 on Fargate; the workflow builds `linux/arm64` only.
+
+The deploy workflow re-registers the task-definition family's latest ACTIVE
+revision with only the image swapped, so Terraform-authored env/secret/role
+changes are picked up on the next deploy without workflow edits.
+
+> **Note — secret rotation:** ECS resolves Secrets Manager references **at
+> task start**. Rotating a secret does nothing to running tasks; run the
+> deploy workflow (or `aws ecs update-service --force-new-deployment`) to
+> pick up rotated values.
+
+## Cutover checklist: old `zerorouter` repo → this repo
+
+The beta environment currently deploys from the old TypeScript-era
+`zeroclaw-labs/zerorouter` repository. To cut it over:
+
+1. **Infrastructure repo** (`zeroclaw-labs/zeroclaw-infrastructure`,
+   `environments/zerorouter-beta`):
+   - point the `sources/zerorouter` submodule at this repository;
+   - extend the GitHub-OIDC deploy-role trust policy to accept
+     `repo:zeroclaw-labs/<this repo>:ref:refs/heads/main` as a subject
+     (keep or drop the old repo's subject as desired — the trust policy is
+     the only thing binding "who may deploy").
+2. **This repo**: set the repository variable `AWS_DEPLOY_ROLE_ARN` to the
+   deploy role's ARN. The workflow validates the ARN shape and refuses to
+   run without it.
+3. **Task definition (Terraform)** — add the new web-plane configuration:
+   - plain environment: `ZEROROUTER_PUBLIC_BASE_URL`,
+     `ZEROROUTER_REQUIRE_CREDITS`, `ZEROROUTER_SIGNUP_CREDIT_USD`;
+   - new Secrets Manager containers, following the existing
+     `<name>/providers/<secret>` naming convention, wired as task-definition
+     `secrets`: `OIDC_CLIENT_SECRET`, `STRIPE_SECRET_KEY`,
+     `STRIPE_WEBHOOK_SECRET`. (`OIDC_ISSUER_URL` and `OIDC_CLIENT_ID` are
+     not secret and may be plain env; remember the OIDC group is
+     all-or-nothing — a partial group aborts the task at startup, which the
+     circuit breaker will surface as a rollback.)
+4. **Deploy**: run the `Deploy Router` workflow manually, or merge to
+   `main` (the workflow triggers on push to `main`). Verify the run's
+   deployment summary and that
+   ECS stabilized on the requested task definition **without a
+   circuit-breaker rollback** — the workflow fails loudly if the PRIMARY
+   deployment did not complete.
+
+> ## ⚠️ The beta ALB cannot receive Stripe webhooks or OIDC redirects yet
+>
+> The beta ALB listener is **HTTP on port 80** with a **/32 source-IP
+> allowlist**. Stripe requires a publicly reachable **HTTPS** endpoint for
+> webhooks, and any real IdP will refuse a plain-HTTP redirect URI on a
+> non-loopback host. Until the environment gains a domain, an ACM
+> certificate, and an HTTPS listener — with `/webhooks/stripe` reachable
+> from Stripe's IP ranges — production-shaped billing/login **cannot work
+> against the beta ALB**.
+>
+> Interim setup for beta testing:
+>
+> - **Stripe**: run `stripe listen --forward-to <allowlisted
+>   address>/webhooks/stripe` from an allowlisted machine and use the CLI's
+>   signing secret as `STRIPE_WEBHOOK_SECRET`.
+> - **OIDC**: register the IdP redirect URI against the allowlisted
+>   HTTP address (IdPs that permit `http://` redirect URIs only for
+>   development tenants; use a dev tenant).
+> - Set `ZEROROUTER_PUBLIC_BASE_URL` to that same allowlisted address so
+>   generated URLs match. Note that on `http://` origins session cookies are
+>   issued without the `Secure` attribute — acceptable for the allowlisted
+>   beta only.
+>
+> Treat the HTTPS listener as a blocker for any external user traffic.
+
+## Rollback
+
+The workflow deploys immutable per-commit image tags. To roll back, re-run
+the deploy workflow from the last good commit (`workflow_dispatch` checks
+out and verifies the ref before deploying); ECS's deployment circuit breaker
+also rolls back automatically if new tasks fail to stabilize.

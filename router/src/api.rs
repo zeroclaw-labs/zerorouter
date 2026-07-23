@@ -57,6 +57,7 @@ struct RouterServices {
     pool: PgPool,
     authenticator: KeyAuthenticator,
     runtime: RuntimeControl,
+    require_credits: bool,
 }
 
 #[derive(Clone)]
@@ -85,13 +86,18 @@ impl RouterState {
     }
 
     #[must_use]
-    pub fn with_database(tier_config_path: impl Into<PathBuf>, pool: PgPool) -> Self {
+    pub fn with_database(
+        tier_config_path: impl Into<PathBuf>,
+        pool: PgPool,
+        require_credits: bool,
+    ) -> Self {
         Self {
             tier_config_path: Arc::new(tier_config_path.into()),
             services: Some(Arc::new(RouterServices {
                 pool,
                 authenticator: KeyAuthenticator::new(),
                 runtime: RuntimeControl::new(),
+                require_credits,
             })),
         }
     }
@@ -188,6 +194,7 @@ async fn chat_completions(
         &authenticated,
         reserved_tokens,
         reserved_cost,
+        services.require_credits,
     )
     .await?;
     let runtime = services.runtime.clone();
@@ -1076,8 +1083,9 @@ async fn admit_usage(
     key: &AuthenticatedKey,
     reserved_tokens: i64,
     reserved_cost: rust_decimal::Decimal,
+    require_credits: bool,
 ) -> Result<UsageSession, ApiError> {
-    match begin_usage_session(pool, key, reserved_tokens, reserved_cost)
+    match begin_usage_session(pool, key, reserved_tokens, reserved_cost, require_credits)
         .await
         .map_err(|_| ApiError::DatabaseUnavailable)?
     {
@@ -1085,6 +1093,7 @@ async fn admit_usage(
         UsageAdmission::Unauthorized => Err(ApiError::Unauthorized),
         UsageAdmission::SpendExceeded => Err(ApiError::SpendCapExceeded),
         UsageAdmission::VelocityExceeded => Err(ApiError::VelocityCapExceeded),
+        UsageAdmission::InsufficientCredits => Err(ApiError::InsufficientCredits),
     }
 }
 

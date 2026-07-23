@@ -30,12 +30,14 @@ pub enum UsageAdmission {
     Unauthorized,
     SpendExceeded,
     VelocityExceeded,
+    InsufficientCredits,
 }
 
 pub struct UsageSession {
     pool: PgPool,
     reservation_id: Uuid,
     api_key_id: Uuid,
+    user_id: Uuid,
 }
 
 const DATABASE_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -81,13 +83,22 @@ pub async fn database_pool_from_env() -> Result<PgPool> {
 
 pub async fn migrate(pool: &PgPool) -> Result<()> {
     let migrator = Migrator {
-        migrations: Cow::Owned(vec![Migration::new(
-            1,
-            Cow::Borrowed("b0 schema"),
-            MigrationType::Simple,
-            Cow::Borrowed(include_str!("../migrations/0001_b0_schema.sql")),
-            false,
-        )]),
+        migrations: Cow::Owned(vec![
+            Migration::new(
+                1,
+                Cow::Borrowed("b0 schema"),
+                MigrationType::Simple,
+                Cow::Borrowed(include_str!("../migrations/0001_b0_schema.sql")),
+                false,
+            ),
+            Migration::new(
+                2,
+                Cow::Borrowed("billing and web"),
+                MigrationType::Simple,
+                Cow::Borrowed(include_str!("../migrations/0002_billing_and_web.sql")),
+                false,
+            ),
+        ]),
         ignore_missing: false,
         locking: true,
         no_tx: false,
@@ -103,6 +114,7 @@ pub async fn begin_usage_session(
     key: &AuthenticatedKey,
     reserved_tokens: i64,
     reserved_cost_usd: Decimal,
+    require_credits: bool,
 ) -> Result<UsageAdmission, sqlx::Error> {
     if reserved_tokens < 0 || reserved_cost_usd < Decimal::ZERO {
         return Err(sqlx::Error::Protocol(
@@ -114,8 +126,11 @@ pub async fn begin_usage_session(
     sqlx::query("SET LOCAL lock_timeout = '5s'")
         .execute(&mut *transaction)
         .await?;
+    // Serialize admission per USER (not per key) so concurrent requests
+    // across a user's keys observe each other's reservations and cannot
+    // jointly overdraw the prepaid balance.
     sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1::TEXT, 0))")
-        .bind(key.id.to_string())
+        .bind(key.user_id.to_string())
         .execute(&mut *transaction)
         .await?;
 
@@ -203,6 +218,34 @@ pub async fn begin_usage_session(
         return Ok(UsageAdmission::VelocityExceeded);
     }
 
+    if require_credits {
+        let balance =
+            sqlx::query_scalar::<_, Decimal>("SELECT credit_balance_usd FROM users WHERE id = $1")
+                .bind(key.user_id)
+                .fetch_optional(&mut *transaction)
+                .await?;
+        let Some(balance) = balance else {
+            transaction.rollback().await?;
+            return Ok(UsageAdmission::Unauthorized);
+        };
+        let active_user_reserved = sqlx::query_scalar::<_, Decimal>(
+            r#"
+            SELECT COALESCE(SUM(usage_reservations.reserved_cost_usd), 0)
+            FROM usage_reservations
+            INNER JOIN api_keys ON api_keys.id = usage_reservations.api_key_id
+            WHERE api_keys.user_id = $1
+              AND usage_reservations.expires_at > NOW()
+            "#,
+        )
+        .bind(key.user_id)
+        .fetch_one(&mut *transaction)
+        .await?;
+        if balance - active_user_reserved < reserved_cost_usd {
+            transaction.rollback().await?;
+            return Ok(UsageAdmission::InsufficientCredits);
+        }
+    }
+
     let reservation_id = Uuid::new_v4();
     let reservation_ttl_seconds = i64::try_from(RESERVATION_TTL.as_secs()).map_err(|_| {
         sqlx::Error::Protocol("usage reservation lifetime exceeds the database range".to_owned())
@@ -232,6 +275,7 @@ pub async fn begin_usage_session(
         pool: pool.clone(),
         reservation_id,
         api_key_id: key.id,
+        user_id: key.user_id,
     }))
 }
 
@@ -252,8 +296,10 @@ impl UsageSession {
         sqlx::query("SET LOCAL lock_timeout = '5s'")
             .execute(&mut *transaction)
             .await?;
+        // Same USER-keyed lock as admission so settlement serializes against
+        // concurrent admissions and balance reads for this user.
         sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1::TEXT, 0))")
-            .bind(self.api_key_id.to_string())
+            .bind(self.user_id.to_string())
             .execute(&mut *transaction)
             .await?;
 
@@ -309,6 +355,47 @@ impl UsageSession {
             return Err(sqlx::Error::Protocol(
                 "usage reservation could not be settled".to_owned(),
             ));
+        }
+
+        // Debit the prepaid balance in the same transaction that settles the
+        // reservation; the unique request_id and the settle-exactly-once
+        // reservation guarantee make the debit idempotent. Zero-cost events
+        // write no ledger row (the ledger forbids zero amounts) and leave the
+        // balance untouched.
+        if record.cost_usd > Decimal::ZERO {
+            let balance_after = sqlx::query_scalar::<_, Decimal>(
+                r#"
+                UPDATE users
+                SET credit_balance_usd = credit_balance_usd - $2
+                WHERE id = $1
+                RETURNING credit_balance_usd
+                "#,
+            )
+            .bind(self.user_id)
+            .bind(record.cost_usd)
+            .fetch_optional(&mut *transaction)
+            .await?
+            .ok_or_else(|| {
+                sqlx::Error::Protocol("usage settlement found no owning user".to_owned())
+            })?;
+            sqlx::query(
+                r#"
+                INSERT INTO credit_ledger (
+                    user_id,
+                    entry_type,
+                    amount_usd,
+                    balance_after_usd,
+                    request_id
+                )
+                VALUES ($1, 'usage', $2, $3, $4)
+                "#,
+            )
+            .bind(self.user_id)
+            .bind(-record.cost_usd)
+            .bind(balance_after)
+            .bind(self.reservation_id)
+            .execute(&mut *transaction)
+            .await?;
         }
         transaction.commit().await
     }
