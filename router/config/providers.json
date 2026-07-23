@@ -1,0 +1,37 @@
+{
+  "providers": [
+    {
+      "key": "anthropic",
+      "adapter": "anthropic",
+      "credential_env": "ANTHROPIC_API_KEY",
+      "secret_name": "anthropic-api-key"
+    },
+    {
+      "key": "bedrock",
+      "adapter": "bedrock",
+      "credential_env": "BEDROCK_API_KEY",
+      "secret_name": "bedrock-api-key"
+    },
+    {
+      "key": "deepinfra",
+      "adapter": "openai_compatible",
+      "credential_env": "DEEPINFRA_API_KEY",
+      "secret_name": "deepinfra-api-key",
+      "base_url": "https://api.deepinfra.com/v1/openai"
+    },
+    {
+      "key": "fireworks",
+      "adapter": "openai_compatible",
+      "credential_env": "FIREWORKS_API_KEY",
+      "secret_name": "fireworks-api-key",
+      "base_url": "https://api.fireworks.ai/inference/v1"
+    },
+    {
+      "key": "together",
+      "adapter": "openai_compatible",
+      "credential_env": "TOGETHER_API_KEY",
+      "secret_name": "together-api-key",
+      "base_url": "https://api.together.ai/v1"
+    }
+  ]
+}

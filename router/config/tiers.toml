@@ -1,0 +1,150 @@
+schema_version = 1
+
+# This file is the sole source of truth for the public catalog, fallback order,
+# upstream model IDs, and metering rates. Prices were verified on 2026-07-11.
+
+[tiers."zero/low-cost"]
+
+[tiers."zero/low-cost".rates]
+input_per_mtok = 0.30
+cached_input_per_mtok = 0.06
+output_per_mtok = 1.20
+
+[[tiers."zero/low-cost".candidates]]
+id = "fireworks/accounts/fireworks/models/minimax-m3"
+provider = "fireworks"
+model = "accounts/fireworks/models/minimax-m3"
+
+[tiers."zero/low-cost".candidates.rates]
+input_per_mtok = 0.30
+cached_input_per_mtok = 0.06
+output_per_mtok = 1.20
+
+[[tiers."zero/low-cost".candidates]]
+id = "together/MiniMaxAI/MiniMax-M3"
+provider = "together"
+model = "MiniMaxAI/MiniMax-M3"
+
+[tiers."zero/low-cost".candidates.rates]
+input_per_mtok = 0.30
+cached_input_per_mtok = 0.06
+output_per_mtok = 1.20
+
+[[tiers."zero/low-cost".candidates]]
+id = "deepinfra/deepseek-ai/DeepSeek-V4-Flash"
+provider = "deepinfra"
+model = "deepseek-ai/DeepSeek-V4-Flash"
+
+[tiers."zero/low-cost".candidates.rates]
+input_per_mtok = 0.09
+cached_input_per_mtok = 0.018
+output_per_mtok = 0.18
+
+# Bedrock-only private-beta fallback. Keep western OpenAI-compatible hosts
+# ahead of it when their credentials are enabled.
+[[tiers."zero/low-cost".candidates]]
+id = "bedrock/minimax.minimax-m2.5"
+provider = "bedrock"
+model = "minimax.minimax-m2.5"
+
+[tiers."zero/low-cost".candidates.rates]
+input_per_mtok = 0.30
+output_per_mtok = 1.20
+
+[tiers."zero/balanced"]
+
+[tiers."zero/balanced".rates]
+input_per_mtok = 1.74
+cached_input_per_mtok = 0.14
+output_per_mtok = 3.48
+
+[[tiers."zero/balanced".candidates]]
+id = "fireworks/accounts/fireworks/models/deepseek-v4-pro"
+provider = "fireworks"
+model = "accounts/fireworks/models/deepseek-v4-pro"
+
+[tiers."zero/balanced".candidates.rates]
+input_per_mtok = 1.74
+cached_input_per_mtok = 0.14
+output_per_mtok = 3.48
+
+[[tiers."zero/balanced".candidates]]
+id = "deepinfra/deepseek-ai/DeepSeek-V4-Pro"
+provider = "deepinfra"
+model = "deepseek-ai/DeepSeek-V4-Pro"
+
+[tiers."zero/balanced".candidates.rates]
+input_per_mtok = 1.30
+cached_input_per_mtok = 0.10
+output_per_mtok = 2.60
+
+[[tiers."zero/balanced".candidates]]
+id = "anthropic/claude-haiku-4-5"
+provider = "anthropic"
+model = "claude-haiku-4-5-20251001"
+
+[tiers."zero/balanced".candidates.rates]
+input_per_mtok = 1.00
+cached_input_per_mtok = 0.10
+output_per_mtok = 5.00
+
+# Bedrock-only private-beta fallback. This is priced at the canonical Bedrock
+# us-east-1 on-demand rate while the tier keeps its existing sell rate.
+[[tiers."zero/balanced".candidates]]
+id = "bedrock/deepseek.v3.2"
+provider = "bedrock"
+model = "deepseek.v3.2"
+
+[tiers."zero/balanced".candidates.rates]
+input_per_mtok = 0.62
+output_per_mtok = 1.85
+
+[tiers."zero/high-end"]
+
+# Sonnet 5 introductory pricing ends after 2026-08-31. Update this canonical
+# table before customer traffic continues at the standard rate.
+[tiers."zero/high-end".rates]
+input_per_mtok = 2.00
+cached_input_per_mtok = 0.20
+output_per_mtok = 10.00
+
+[[tiers."zero/high-end".candidates]]
+id = "anthropic/claude-sonnet-5"
+provider = "anthropic"
+model = "claude-sonnet-5"
+
+[tiers."zero/high-end".candidates.rates]
+input_per_mtok = 2.00
+cached_input_per_mtok = 0.20
+output_per_mtok = 10.00
+
+[[tiers."zero/high-end".candidates]]
+id = "bedrock/us.anthropic.claude-sonnet-5"
+provider = "bedrock"
+# Bedrock exposes Sonnet 5 through an inference profile, not direct invocation.
+model = "us.anthropic.claude-sonnet-5"
+
+[tiers."zero/high-end".candidates.rates]
+input_per_mtok = 2.00
+cached_input_per_mtok = 0.20
+output_per_mtok = 10.00
+
+[[tiers."zero/high-end".candidates]]
+id = "anthropic/claude-opus-4-8"
+provider = "anthropic"
+model = "claude-opus-4-8"
+
+[tiers."zero/high-end".candidates.rates]
+input_per_mtok = 5.00
+cached_input_per_mtok = 0.50
+output_per_mtok = 25.00
+
+[[tiers."zero/high-end".candidates]]
+id = "bedrock/us.anthropic.claude-opus-4-8"
+provider = "bedrock"
+model = "us.anthropic.claude-opus-4-8"
+
+[tiers."zero/high-end".candidates.rates]
+input_per_mtok = 5.00
+cached_input_per_mtok = 0.50
+output_per_mtok = 25.00

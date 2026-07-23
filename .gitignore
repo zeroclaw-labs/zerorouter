@@ -1,0 +1,7 @@
+target/
+node_modules/
+portal/dist/
+.env
+.env.*
+*.log
+.DS_Store
