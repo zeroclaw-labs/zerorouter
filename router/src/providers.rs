@@ -369,11 +369,10 @@ where
     let fallback_chain = available
         .iter()
         .map(|candidate| {
-            let pinned = ModelPinnedProvider::new(
-                &candidate.definition.id,
-                &candidate.definition.model,
-                Box::new(Arc::clone(&candidate.provider)),
-            );
+            let pinned = ModelPinnedProvider::builder(&candidate.definition.id)
+                .pinned_model(&candidate.definition.model)
+                .inner(Box::new(Arc::clone(&candidate.provider)))
+                .build();
             (
                 candidate.definition.id.clone(),
                 Box::new(pinned) as Box<dyn ModelProvider>,
@@ -408,16 +407,25 @@ fn create_provider(
     let alias = metadata.key.as_str();
     let provider: Arc<dyn ModelProvider> = match metadata.adapter {
         ProviderAdapter::Anthropic => {
-            let provider = AnthropicModelProvider::with_base_url(
-                alias,
-                Some(credential),
-                metadata.base_url.as_deref(),
-            );
-            Arc::new(provider.with_max_tokens(max_output_tokens))
+            let mut builder = AnthropicModelProvider::builder(alias)
+                .credential(Some(credential))
+                .max_tokens(max_output_tokens)
+                // The pinned adapter hardcoded ~120s; honor ZR's 15-minute
+                // UPSTREAM_REQUEST_TIMEOUT budget (api.rs) instead.
+                .timeout_secs(900);
+            if let Some(base_url) = metadata.base_url.as_deref() {
+                builder = builder.base_url(base_url);
+            }
+            Arc::new(builder.build())
         }
         ProviderAdapter::Bedrock => {
-            let provider = BedrockModelProvider::with_bearer_token(alias, credential);
-            Arc::new(provider.with_max_tokens(max_output_tokens))
+            // `.bearer_token` pins the credential and skips every ambient AWS probe.
+            Arc::new(
+                BedrockModelProvider::builder(alias)
+                    .bearer_token(credential)
+                    .max_tokens(max_output_tokens)
+                    .build(),
+            )
         }
         ProviderAdapter::OpenAiCompatible => {
             let Some(base_url) = metadata.base_url.as_deref() else {
@@ -429,15 +437,16 @@ fn create_provider(
                 });
             };
             let name = metadata.display_name.as_deref().unwrap_or(alias);
+            // `build()` panics unless display_name, base_url, and auth_style
+            // are all set — set all three explicitly.
             Arc::new(
-                OpenAiCompatibleModelProvider::new(
-                    alias,
-                    name,
-                    base_url,
-                    Some(credential),
-                    AuthStyle::Bearer,
-                )
-                .with_max_tokens(Some(max_output_tokens)),
+                OpenAiCompatibleModelProvider::builder(alias)
+                    .display_name(name)
+                    .base_url(base_url)
+                    .auth_style(AuthStyle::Bearer)
+                    .credential(Some(credential))
+                    .max_tokens(Some(max_output_tokens))
+                    .build(),
             )
         }
     };

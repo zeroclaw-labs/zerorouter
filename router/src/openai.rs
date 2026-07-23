@@ -659,6 +659,39 @@ mod tests {
         assert!(messages[1].content.contains("tool_call_id"));
     }
 
+    // Canary: pins the exact JSON tool-history marker encoding (full strings,
+    // not substrings) that ZR emits in `ChatMessage.content` and that the
+    // pinned zeroclaw `compatible.rs` parses back out (see `to_provider_message`
+    // above). Serde serializes map keys sorted (no `preserve_order` feature), so
+    // these literals are stable. If either the ZR encoding here or the upstream
+    // parser's expectation drifts, this fails loudly — do not "fix" it by
+    // relaxing to substrings; reconcile both sides of the contract first.
+    #[test]
+    fn tool_history_markers_match_exact_wire_encoding() {
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "zero/balanced",
+            "messages": [
+                {"role": "assistant", "content": null, "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "shell", "arguments": "{\"command\":\"pwd\"}"}
+                }]},
+                {"role": "tool", "tool_call_id": "call_1", "content": "/tmp"}
+            ]
+        }))
+        .expect("request should parse");
+
+        let messages = request.provider_messages();
+        assert_eq!(
+            messages[0].content,
+            r#"{"content":"","reasoning_content":null,"tool_calls":[{"arguments":"{\"command\":\"pwd\"}","id":"call_1","name":"shell"}]}"#,
+        );
+        assert_eq!(
+            messages[1].content,
+            r#"{"content":"/tmp","name":null,"tool_call_id":"call_1"}"#,
+        );
+    }
+
     #[test]
     fn cost_separates_cached_and_uncached_input() {
         let cost = usage_cost(

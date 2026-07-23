@@ -34,8 +34,8 @@ tower-http = { version = "0.6", features = ["fs"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 uuid = { version = "1.22", features = ["serde", "v4"] }
-zeroclaw-api = { git = "https://github.com/zeroclaw-labs/zeroclaw.git", rev = "2c2edecbe59a85a60e026a5e2094fed7e863776e" }
-zeroclaw-providers = { git = "https://github.com/zeroclaw-labs/zeroclaw.git", rev = "2c2edecbe59a85a60e026a5e2094fed7e863776e" }
+zeroclaw-api = { git = "https://github.com/zeroclaw-labs/zeroclaw.git", rev = "f4b297e93e6bc64ede951ade59347486baf7f85f" }
+zeroclaw-providers = { git = "https://github.com/zeroclaw-labs/zeroclaw.git", rev = "f4b297e93e6bc64ede951ade59347486baf7f85f" }
 
 [dev-dependencies]
 http-body-util = "0.1"
