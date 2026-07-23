@@ -125,19 +125,42 @@ impl TierCatalog {
         })
     }
 
+    /// The public `/v1/models` catalog: every tier id and every candidate id,
+    /// each paired with who serves it and what it bills at. A candidate's
+    /// `sell_rates` is always its *owning* tier's rate, never its own cost
+    /// basis — mirroring `resolve`'s pinned-candidate rule above, so a model
+    /// listing can never advertise a price cheaper than what a request for
+    /// that id is actually metered at.
     #[must_use]
-    pub fn model_owners(&self) -> BTreeMap<String, String> {
+    pub fn model_listing(&self) -> BTreeMap<String, ModelListing> {
         let mut models = BTreeMap::new();
         for (tier_id, definition) in &self.tiers {
-            models.insert(tier_id.clone(), "zerorouter".to_owned());
+            models.insert(
+                tier_id.clone(),
+                ModelListing {
+                    owned_by: "zerorouter".to_owned(),
+                    sell_rates: definition.rates,
+                },
+            );
             for candidate in &definition.candidates {
                 models
                     .entry(candidate.id.clone())
-                    .or_insert_with(|| candidate.provider.clone());
+                    .or_insert_with(|| ModelListing {
+                        owned_by: candidate.provider.clone(),
+                        sell_rates: definition.rates,
+                    });
             }
         }
         models
     }
+}
+
+/// One row of the public catalog: the provider that serves this id, and the
+/// sell rate a request for it is billed at.
+#[derive(Clone, Debug)]
+pub struct ModelListing {
+    pub owned_by: String,
+    pub sell_rates: ModelRates,
 }
 
 pub async fn load_tier_catalog(path: &Path) -> Result<TierCatalog, TierConfigError> {

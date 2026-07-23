@@ -148,7 +148,7 @@ async fn list_models(State(state): State<RouterState>) -> Result<Json<ModelList>
     let catalog = load_tier_catalog(state.tier_config_path())
         .await
         .map_err(|_| ApiError::TierCatalogUnavailable)?;
-    Ok(Json(ModelList::from_owners(catalog.model_owners())))
+    Ok(Json(ModelList::from_listing(catalog.model_listing())))
 }
 
 async fn chat_completions(

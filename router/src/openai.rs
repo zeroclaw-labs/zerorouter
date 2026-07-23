@@ -358,20 +358,62 @@ pub struct ModelObject {
     pub object: &'static str,
     pub created: u64,
     pub owned_by: String,
+    pub pricing: ModelPricing,
+}
+
+/// OpenRouter-shaped per-token pricing, string-valued. This is ZeroClaw's
+/// consumed wire contract (`ModelPricing`, `crates/zeroclaw-api/src/model_provider.rs`
+/// in the zeroclaw tree): every field is an `Option<String>` decimal USD rate
+/// *per single token* — a numeric JSON value fails that struct's serde, so
+/// these must stay strings. Only the fields ZeroClaw's pricing normalizer
+/// (`zeroclaw-providers/src/pricing.rs::normalize_pricing`) actually reads
+/// are emitted: `prompt`, `completion`, and `input_cache_read`.
+/// `input_cache_write` is part of ZeroClaw's contract but that normalizer
+/// never reads it, so ZR never populates it.
+#[derive(Debug, Serialize)]
+pub struct ModelPricing {
+    pub prompt: String,
+    pub completion: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_cache_read: Option<String>,
+}
+
+impl ModelPricing {
+    /// Convert per-1M-token sell rates (`config/tiers.toml`) into
+    /// OpenRouter's per-single-token decimal-string convention. Division by
+    /// `1_000_000` happens in `Decimal`, never `f64`, and the result is
+    /// trailing-zero-normalized before rendering, so the wire value a
+    /// customer reads never carries a binary-float artifact.
+    #[must_use]
+    pub fn from_sell_rates(rates: ModelRates) -> Self {
+        Self {
+            prompt: per_token_price(rates.input_per_mtok.unwrap_or(0.0)),
+            completion: per_token_price(rates.output_per_mtok.unwrap_or(0.0)),
+            input_cache_read: rates.cached_input_per_mtok.map(per_token_price),
+        }
+    }
+}
+
+fn per_token_price(rate_per_mtok: f64) -> String {
+    let per_mtok = Decimal::from_f64(rate_per_mtok).unwrap_or(Decimal::ZERO);
+    (per_mtok / Decimal::from(1_000_000_u64))
+        .normalize()
+        .to_string()
 }
 
 impl ModelList {
     #[must_use]
-    pub fn from_owners(owners: BTreeMap<String, String>) -> Self {
+    pub fn from_listing(listing: BTreeMap<String, crate::config::ModelListing>) -> Self {
         Self {
             object: "list",
-            data: owners
+            data: listing
                 .into_iter()
-                .map(|(id, owned_by)| ModelObject {
+                .map(|(id, row)| ModelObject {
                     id,
                     object: "model",
                     created: 0,
-                    owned_by,
+                    owned_by: row.owned_by,
+                    pricing: ModelPricing::from_sell_rates(row.sell_rates),
                 })
                 .collect(),
         }
