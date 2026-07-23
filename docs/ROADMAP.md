@@ -57,3 +57,27 @@ runtime exists. Each item carries the reason it was deferred.
   Bifrost/FrankenGate (see the provenance note in the README and
   `ARCHITECTURE.md`) current whenever a new external design is consulted,
   so provenance claims stay auditable.
+
+## Residual items from the initial adversarial review
+
+The first security review's confirmed findings were fixed (see the
+`fix: remediate confirmed findings` commit). Three lower-severity items were
+deliberately deferred rather than fully closed, and are tracked here:
+
+- **Streaming settle-after-deliver window** — a non-streaming request settles
+  before any bytes reach the client, but a streaming request delivers tokens
+  first and settles after. If that final settlement transaction fails durably,
+  the delivered content is unbilled. The debit is idempotent and the failure
+  is logged; the durable fix is to settle expired reservations at their
+  reserved cost during the admission sweep (keyed by the unique `request_id`,
+  so a late-succeeding retry cannot double-charge) instead of releasing them.
+- **Per-IP rate limiting on unauthenticated endpoints** — `/auth/device/code`,
+  `/auth/login`, and `/webhooks/stripe` are bounded by a web-plane request-body
+  limit and by terminal-row reclamation, but there is no per-IP request-rate
+  cap yet. Behind the beta ALB (allowlisted source) this is low risk; a public
+  HTTPS endpoint should add a `tower_governor` layer keyed on the real client
+  IP (behind the load balancer's `X-Forwarded-For`).
+- **Tier catalog re-parsed per request** — `GET /v1/models` and the chat path
+  re-read and re-validate `tiers.toml` on every request. The catalog is
+  immutable at runtime, so it should be loaded once into an `Arc<TierCatalog>`
+  in `RouterState` (or an `ArcSwap` if hot reload is later wanted).
