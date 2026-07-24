@@ -8,9 +8,12 @@
 //! assertions pin router behavior rather than the production candidate list.
 //!
 //! These tests document what the code does TODAY, ahead of the failover-loop
-//! rewrite. Where current behavior looks wrong the actual behavior is still
-//! asserted, with a comment saying so — do not "fix" the code to make one of
-//! these pass; change the assertion deliberately when the behavior changes.
+//! rewrite. Where current behavior is known-wrong but not yet fixable here the
+//! actual behavior is still asserted, with a comment saying so — do not "fix"
+//! the code to make one of these pass; change the assertion deliberately when
+//! the behavior changes. One such assertion is left: the non-streaming walk
+//! keeps no attempt ledger, which is blocked on unrolling that walk (see
+//! `non_streaming_failover_retries_the_first_candidate_twice_then_bills_the_second`).
 //!
 //! Gated on `DATABASE_URL` like `tests/billing.rs`: when unset each test
 //! returns early (skips) instead of failing.
@@ -70,9 +73,22 @@ fn served_sell_cost() -> Decimal {
 }
 
 /// `73 * $3.00/Mtok + 4096 * $6.00/Mtok`: what the reservation bound costs the
-/// customer when a settle site bills it instead of metered usage.
+/// customer. No settle site bills this any more; it is kept as the ceiling the
+/// streaming terminals are asserted to stay under.
 fn reservation_sell_cost() -> Decimal {
     decimal("0.024795")
+}
+
+/// The per-chunk `token_count` lower bound a seven-character delta reports,
+/// which is the whole output side a stream that broke before any usage report
+/// can honestly claim.
+const ESTIMATED_OUTPUT_TOKENS: i32 = 2;
+
+/// `73 * $3.00/Mtok + 2 * $6.00/Mtok`: the conservative estimate billed when
+/// bytes reached the client but the upstream never metered them — the admitted
+/// prompt bound plus [`ESTIMATED_OUTPUT_TOKENS`].
+fn estimated_sell_cost() -> Decimal {
+    decimal("0.000231")
 }
 
 fn decimal(value: &str) -> Decimal {
@@ -439,11 +455,18 @@ async fn non_streaming_failover_retries_the_first_candidate_twice_then_bills_the
     // COGS moves to the second candidate's basis: 1000 * $1.50 + 20 * $3.00.
     assert_eq!(cost_basis_usd, Some(decimal("0.00156")));
 
-    // SUSPECTED DEFECT (api.rs `run_non_streaming`): the three burnt calls on
-    // the first candidate leave no trace. The non-streaming walk writes no
-    // `request_attempts` rows and no `attempts_cost_basis_usd`, so the margin
-    // view reads this request as if only the second candidate ever ran. The
-    // streaming walk does keep that ledger.
+    // CONFIRMED GAP, blocked on the walk rewrite (api.rs `run_non_streaming`):
+    // the three burnt calls on the first candidate leave no trace, because the
+    // non-streaming walk is delegated to zeroclaw's `ReliableModelProvider` and
+    // the only per-request outcome it surfaces is `ProviderFallbackInfo`
+    // (requested/actual provider + model, recorded on success only). Losing
+    // attempts exist there solely as a `Vec<String>` of log lines folded into
+    // the error on total failure, so no honest ledger row can be reconstructed
+    // without unrolling the walk into the router the way the streaming path
+    // already does. NULL is the correct value until then: migration 0004
+    // documents `attempts_cost_basis_usd` as NULL until the router-owned walk
+    // records attempts, and writing a placeholder here would claim the burnt
+    // calls cost nothing.
     assert!(attempt_rows(&pool, api_key_id).await.is_empty());
     let attempts_cogs = query_scalar::<_, Option<Decimal>>(
         "SELECT attempts_cost_basis_usd FROM usage_events WHERE api_key_id = $1",
@@ -565,9 +588,9 @@ async fn non_streaming_timeout_releases_the_reservation_without_charge() {
     state.wait_for_background_tasks().await;
     assert_eq!(body["error"]["code"], "upstream_timeout");
 
-    // The non-streaming deadline releases the reservation at zero cost. Its
-    // streaming sibling does the opposite — see
-    // `streaming_timeout_bills_the_whole_reservation_at_zero_delivery`.
+    // The non-streaming deadline releases the reservation at zero cost, and so
+    // does its streaming sibling — see
+    // `streaming_timeout_releases_the_reservation_without_charge`.
     assert_eq!(
         settled_event(&pool, api_key_id).await,
         (
@@ -726,8 +749,89 @@ async fn streaming_candidate_failing_before_any_bytes_fails_over_to_the_next() {
     );
 }
 
+/// The highest-frequency unmetered settle there is. An OpenAI-compatible
+/// upstream omits the usage chunk unless the caller opted into it, so for such
+/// a provider "the stream succeeded and reported no usage" is the ordinary
+/// case, not a failure mode — and it must not bill the whole output bound.
 #[tokio::test]
-async fn streaming_error_after_delivered_bytes_bills_the_whole_reservation() {
+async fn streaming_success_without_upstream_usage_bills_the_conservative_estimate() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let (api_key_id, key) = create_funded_key(&pool, "stream-unmetered").await;
+    // Seven characters are delivered and the stream runs cleanly to `Final`;
+    // the upstream simply never emits a usage chunk.
+    let solo = FakeModelProvider::new(
+        "solo",
+        vec![FakeOutcome::Stream(vec![
+            FakeStreamStep::text("partial"),
+            FakeStreamStep::Final,
+        ])],
+    );
+    let state = router(pool.clone(), vec![solo.clone()]);
+
+    let response = app(state.clone())
+        .oneshot(completion_request(
+            &key,
+            &completion_body("zero/test-solo", true),
+        ))
+        .await
+        .expect("stream request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    let chunks = sse_chunks(response).await;
+    state.wait_for_background_tasks().await;
+
+    assert_eq!(chunks[0]["choices"][0]["delta"]["role"], "assistant");
+    assert_eq!(chunks[1]["choices"][0]["delta"]["content"], "partial");
+    // The delivered output is still followed by an unmetered marker, so the
+    // gap stays visible to the caller and in the ledger's 502.
+    assert_eq!(
+        chunks
+            .last()
+            .expect("an error chunk should terminate the stream")["error"]["code"],
+        "metering_unavailable"
+    );
+
+    // The billed row is the prompt bound plus the observed output floor. Before
+    // this settle honored the governing rule it charged `reservation_sell_cost`
+    // — the full 4096-token output bound — for a two-token completion, on what
+    // is the normal path for any upstream that does not volunteer usage.
+    assert_eq!(
+        settled_event(&pool, api_key_id).await,
+        (
+            "deepinfra".to_owned(),
+            "upstream/solo".to_owned(),
+            RESERVED_PROMPT_TOKENS,
+            ESTIMATED_OUTPUT_TOKENS,
+            estimated_sell_cost(),
+            502,
+        )
+    );
+    assert!(
+        estimated_sell_cost() < reservation_sell_cost(),
+        "the estimate must stay under the reservation bound it replaced"
+    );
+    assert_eq!(
+        balance(&pool, user_of(&pool, api_key_id).await)
+            .await
+            .expect("balance must query"),
+        Decimal::from(50) - estimated_sell_cost()
+    );
+    assert_eq!(open_reservations(&pool, api_key_id).await, 0);
+
+    // Pre-existing and untouched here: the unmetered branch settles without
+    // pushing an attempt row for the candidate that served, so this request
+    // carries no walk ledger. A telemetry gap, not an overcharge.
+    let (_, cost_basis_usd, attempt_count, _) = settled_provenance(&pool, api_key_id).await;
+    assert_eq!(attempt_count, None);
+    assert!(attempt_rows(&pool, api_key_id).await.is_empty());
+    // COGS is priced on the same usage the customer is billed:
+    // 73 * $1.00/Mtok + 2 * $2.00/Mtok.
+    assert_eq!(cost_basis_usd, Some(decimal("0.000077")));
+}
+
+#[tokio::test]
+async fn streaming_error_after_delivered_bytes_bills_the_conservative_estimate() {
     let Some(pool) = connect().await else {
         return;
     };
@@ -762,24 +866,30 @@ async fn streaming_error_after_delivered_bytes_bills_the_whole_reservation() {
         "upstream_unavailable"
     );
 
-    // SUSPECTED DEFECT (api.rs `stream_to_channel`, the
-    // `if client_output_sent || !client_connected` settle): once any byte has
-    // reached the client, an unmetered break bills `reservation_usage` — the
-    // full 4096-token output bound — for seven delivered characters. The
-    // request's own attempt row prices the same delivery at the per-chunk
-    // estimate of 2 output tokens, so the ledger contradicts itself by three
-    // orders of magnitude, and the customer's balance moves by the larger one.
+    // Tokens reached the client and the upstream never metered them, so the
+    // settle bills the conservative estimate: the prompt bound admission
+    // computed (the input was definitely consumed) plus the per-chunk output
+    // lower bound the stream itself reported — not the 4096-token reservation
+    // bound this used to charge for seven characters.
     assert_eq!(
         settled_event(&pool, api_key_id).await,
         (
             "deepinfra".to_owned(),
             "upstream/solo".to_owned(),
             RESERVED_PROMPT_TOKENS,
-            i32::try_from(MAX_TOKENS).expect("output bound fits"),
-            reservation_sell_cost(),
+            ESTIMATED_OUTPUT_TOKENS,
+            estimated_sell_cost(),
             502,
         )
     );
+    assert!(
+        estimated_sell_cost() < reservation_sell_cost(),
+        "the estimate must stay under the reservation bound it replaced"
+    );
+    // The billed row and the attempt row now reconcile: the same 2 output
+    // tokens, priced at the sell rate on the billed row and at the candidate's
+    // own cost basis on the attempt row, with the billed row additionally
+    // carrying the input side an attempt row deliberately omits.
     let attempt_usage = query_as::<_, (Option<i32>, bool, Option<Decimal>)>(
         r#"
         SELECT output_tokens, tokens_estimated, cost_basis_usd
@@ -791,7 +901,14 @@ async fn streaming_error_after_delivered_bytes_bills_the_whole_reservation() {
     .fetch_one(&pool)
     .await
     .expect("attempt row must query");
-    assert_eq!(attempt_usage, (Some(2), true, Some(decimal("0.000004"))));
+    assert_eq!(
+        attempt_usage,
+        (
+            Some(ESTIMATED_OUTPUT_TOKENS),
+            true,
+            Some(decimal("0.000004"))
+        )
+    );
     assert_eq!(
         attempt_rows(&pool, api_key_id).await,
         vec![(
@@ -806,14 +923,14 @@ async fn streaming_error_after_delivered_bytes_bills_the_whole_reservation() {
         balance(&pool, user_of(&pool, api_key_id).await)
             .await
             .expect("balance must query"),
-        Decimal::from(50) - reservation_sell_cost()
+        Decimal::from(50) - estimated_sell_cost()
     );
 }
 
 /// See `non_streaming_timeout_releases_the_reservation_without_charge` for why
 /// the clock is paused, and paused only here.
 #[tokio::test]
-async fn streaming_timeout_bills_the_whole_reservation_at_zero_delivery() {
+async fn streaming_timeout_releases_the_reservation_without_charge() {
     let Some(pool) = connect().await else {
         return;
     };
@@ -843,34 +960,34 @@ async fn streaming_timeout_bills_the_whole_reservation_at_zero_delivery() {
     assert_eq!(chunks.len(), 1, "only the error chunk reaches the client");
     assert_eq!(chunks[0]["error"]["code"], "upstream_timeout");
 
-    // SUSPECTED DEFECT (api.rs `settle_stream_interruption`, the
-    // `usage.unwrap_or(reservation_usage)` argument): a streaming request that
-    // delivered nothing at all is billed the entire reservation, while the
-    // non-streaming deadline for the identical request releases it at zero
-    // cost. The shutdown terminal shares this settle site and therefore bills
-    // the same way: draining the router for a deploy charges every in-flight
-    // stream its full output bound.
+    // Nothing was delivered, so the streaming deadline releases the reservation
+    // at zero cost — the same answer its non-streaming sibling gives for the
+    // identical request (see
+    // `non_streaming_timeout_releases_the_reservation_without_charge`). The
+    // shutdown terminal shares this settle site, so draining the router for a
+    // deploy no longer charges in-flight streams their full output bound.
     assert_eq!(
         settled_event(&pool, api_key_id).await,
         (
             "deepinfra".to_owned(),
             "upstream/solo".to_owned(),
-            RESERVED_PROMPT_TOKENS,
-            i32::try_from(MAX_TOKENS).expect("output bound fits"),
-            reservation_sell_cost(),
+            0,
+            0,
+            Decimal::ZERO,
             504,
         )
     );
     assert_eq!(
         attempt_rows(&pool, api_key_id).await,
         vec![(1, "deepinfra/solo".to_owned(), "timeout".to_owned(), false)],
-        "no attempt served, yet the request settles at the reservation bound"
+        "the burnt attempt is still recorded even though nothing is billed"
     );
     assert_eq!(
         balance(&pool, user_of(&pool, api_key_id).await)
             .await
             .expect("balance must query"),
-        Decimal::from(50) - reservation_sell_cost()
+        Decimal::from(50),
+        "a stream that delivered nothing must not move the balance"
     );
 }
 

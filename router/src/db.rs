@@ -442,8 +442,8 @@ impl UsageSession {
         // Telemetry derived at settle from the candidate's cost-basis rates and
         // the buffered walk attempts (migration 0004). COGS is priced from the
         // same usage the customer is billed on, so an unmetered row settled at
-        // the reservation bound keeps a comparable basis instead of reading as
-        // pure margin.
+        // the conservative estimate keeps a comparable basis instead of reading
+        // as pure margin.
         let telemetry = &record.telemetry;
         let cost_basis_usd = telemetry
             .basis_rates

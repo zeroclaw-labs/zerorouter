@@ -108,6 +108,11 @@ fn build_attempt(
 
 /// A conservative lower-bound usage from the per-chunk `token_count` a stream
 /// already reports, used only to price an abandoned streaming attempt's COGS.
+///
+/// Deliberately carries no input side: an attempt row prices ZeroRouter's own
+/// cost for output the customer may never have seen. Never bill a customer
+/// with this — use [`StreamDelivery::settled_usage`], which keeps the input
+/// tokens admission already bounded.
 fn estimated_stream_usage(estimated_output: u64) -> Option<OpenAiUsage> {
     (estimated_output > 0).then_some(OpenAiUsage {
         prompt_tokens: 0,
@@ -115,6 +120,55 @@ fn estimated_stream_usage(estimated_output: u64) -> Option<OpenAiUsage> {
         total_tokens: estimated_output,
         prompt_tokens_details: None,
     })
+}
+
+/// What the walk actually put on the wire for the candidate being settled.
+///
+/// `client_output_sent` is the outer-walk flag (`stream_to_channel`): once any
+/// frame reaches the client it stays true for the rest of the request.
+/// `estimated_output` is the per-candidate `token_count` lower bound
+/// accumulated while those frames were produced, and is zero at any terminal
+/// reached before a stream was polled.
+#[derive(Clone, Copy)]
+struct StreamDelivery {
+    client_output_sent: bool,
+    estimated_output: u64,
+}
+
+impl StreamDelivery {
+    /// The single implementation of the streaming billing policy: charge only
+    /// when tokens actually reached the client — metered usage if the upstream
+    /// reported it, else the conservative estimate. If nothing was delivered,
+    /// release the reservation without a charge.
+    fn settled_usage(
+        self,
+        usage: Option<OpenAiUsage>,
+        reservation_usage: OpenAiUsage,
+    ) -> OpenAiUsage {
+        if !self.client_output_sent {
+            return OpenAiUsage::default();
+        }
+        usage.unwrap_or_else(|| self.conservative_usage(reservation_usage))
+    }
+
+    /// The billed estimate for a delivery the upstream never metered: the
+    /// prompt bound admission already computed — those input tokens were
+    /// definitely consumed, and dropping them would turn an overcharge into an
+    /// undercharge — plus the observed output lower bound, never more output
+    /// than admission reserved. `total_tokens` is the sum of the two parts.
+    fn conservative_usage(self, reservation_usage: OpenAiUsage) -> OpenAiUsage {
+        let completion_tokens = self
+            .estimated_output
+            .min(reservation_usage.completion_tokens);
+        OpenAiUsage {
+            prompt_tokens: reservation_usage.prompt_tokens,
+            completion_tokens,
+            total_tokens: reservation_usage
+                .prompt_tokens
+                .saturating_add(completion_tokens),
+            prompt_tokens_details: reservation_usage.prompt_tokens_details,
+        }
+    }
 }
 
 const SSE_CHANNEL_CAPACITY: usize = 32;
@@ -689,6 +743,15 @@ async fn stream_to_channel(
                 std::mem::take(&mut attempts),
                 started,
                 client_connected,
+                // No stream has been polled for this candidate, so there is no
+                // output lower bound to report. `client_output_sent` is passed
+                // rather than assumed, but it is necessarily false here: every
+                // terminal that can follow a delivery returns, so the only way
+                // the walk reaches another iteration is with nothing delivered.
+                StreamDelivery {
+                    client_output_sent,
+                    estimated_output: 0,
+                },
                 StreamInterruption::Timeout,
             )
             .await;
@@ -734,6 +797,15 @@ async fn stream_to_channel(
                         std::mem::take(&mut attempts),
                         started,
                         client_connected,
+                        // This candidate cannot stream: the only site that
+                        // writes anything for it is `complete_synthetic_stream`,
+                        // which runs after `chat` returns and is not reached
+                        // here, so nothing has been delivered for it and there
+                        // is no output lower bound.
+                        StreamDelivery {
+                            client_output_sent,
+                            estimated_output: 0,
+                        },
                         StreamInterruption::Shutdown,
                     )
                     .await;
@@ -805,6 +877,13 @@ async fn stream_to_channel(
                         std::mem::take(&mut attempts),
                         started,
                         client_connected,
+                        // The non-streaming call timed out, so
+                        // `complete_synthetic_stream` never ran and nothing was
+                        // written for this candidate.
+                        StreamDelivery {
+                            client_output_sent,
+                            estimated_output: 0,
+                        },
                         StreamInterruption::Timeout,
                     )
                     .await;
@@ -949,6 +1028,14 @@ async fn stream_to_channel(
                 std::mem::take(&mut attempts),
                 started,
                 client_connected,
+                // This candidate's stream was polled, so both halves of the
+                // delivery signal are real: whether any frame reached the
+                // client, and the per-chunk output lower bound observed
+                // before the interruption.
+                StreamDelivery {
+                    client_output_sent,
+                    estimated_output,
+                },
                 interruption,
             )
             .await;
@@ -980,6 +1067,13 @@ async fn stream_to_channel(
                 } else {
                     499
                 },
+                // Only consulted when the upstream reported no usage; both
+                // halves are real, since this candidate's stream ran to
+                // completion.
+                StreamDelivery {
+                    client_output_sent,
+                    estimated_output,
+                },
                 started,
             )
             .await;
@@ -995,11 +1089,11 @@ async fn stream_to_channel(
             // Charge only when tokens actually reached the client: metered
             // usage if the upstream reported it, else the conservative estimate.
             // If nothing was delivered, release the reservation without a charge.
-            let settled_usage = if client_output_sent {
-                usage.unwrap_or(reservation_usage)
-            } else {
-                OpenAiUsage::default()
-            };
+            let settled_usage = StreamDelivery {
+                client_output_sent,
+                estimated_output,
+            }
+            .settled_usage(usage, reservation_usage);
             // The customer received this candidate's partial output, so it is
             // the served attempt even though the stream broke.
             let served = client_output_sent;
@@ -1139,6 +1233,7 @@ async fn settle_stream_interruption(
     attempts: Vec<AttemptRecord>,
     started: Instant,
     client_connected: bool,
+    delivery: StreamDelivery,
     interruption: StreamInterruption,
 ) {
     let client_connected = client_connected && !sender.is_closed();
@@ -1146,6 +1241,12 @@ async fn settle_stream_interruption(
         ("fallback-chain", resolved.requested_model.as_str()),
         |candidate| (candidate.provider.as_str(), candidate.model.as_str()),
     );
+    // Same rule as every other streaming terminal: an interruption bills what
+    // reached the client — metered usage when the upstream reported it, else
+    // the conservative estimate — and releases the reservation without a charge
+    // when nothing was delivered. A drained deploy (`Shutdown`) and an upstream
+    // deadline (`Timeout`) both settle here.
+    let settled_usage = delivery.settled_usage(usage, reservation_usage);
     let error = if let Some(session) = usage_session.take() {
         match persist_usage(
             session,
@@ -1153,7 +1254,7 @@ async fn settle_stream_interruption(
             upstream_provider,
             upstream_model,
             candidate,
-            usage.unwrap_or(reservation_usage),
+            settled_usage,
             resolved.sell_rates,
             features,
             None,
@@ -1208,6 +1309,16 @@ async fn complete_synthetic_stream(
         return;
     };
     let Some(usage) = OpenAiUsage::try_from_provider(response.usage.as_ref()) else {
+        // Deliberately NOT the streaming delivery rule, and not a bug to be
+        // "fixed" by reaching for `StreamDelivery`. Nothing has been written to
+        // the client at this point, but the whole response is already in hand
+        // and is replayed in full immediately below, so treating this as a
+        // zero-delivery release would hand the customer a fully served answer
+        // for free — an undercharge, not a correction. The right answer is an
+        // estimate derived from the response content available right here
+        // (`response.text` / `tool_calls`), which is a pricing-policy decision
+        // and not a mechanical application of the delivery rule. Until that
+        // policy exists this settles at the reservation bound.
         let _ = persist_usage(
             session,
             &resolved.requested_model,
@@ -1335,6 +1446,7 @@ async fn finish_successful_stream(
     attempt_no: usize,
     attempt_started: Instant,
     completion_status: i16,
+    delivery: StreamDelivery,
     started: Instant,
 ) {
     let Some(session) = usage_session.take() else {
@@ -1342,13 +1454,19 @@ async fn finish_successful_stream(
         return;
     };
     let Some(usage) = usage else {
+        // The stream ran to `Final` but the upstream never reported usage —
+        // routine for OpenAI-compatible upstreams, which omit it unless the
+        // caller asked for it. The governing rule applies unchanged: the tokens
+        // reached the client, so bill the conservative estimate (prompt bound
+        // plus the observed output floor) rather than the whole output bound.
+        // The row is still labelled unmetered so the gap stays visible.
         let _ = persist_usage(
             session,
             &resolved.requested_model,
             &candidate.definition().provider,
             &candidate.definition().model,
             Some(candidate.definition()),
-            reservation_usage,
+            delivery.settled_usage(None, reservation_usage),
             resolved.sell_rates,
             features,
             None,
@@ -1825,11 +1943,12 @@ mod tests {
         assert_eq!(status, 200);
     }
 
-    /// An interrupted stream bills the reservation bound, so it is the most
-    /// expensive row the ledger carries: it must still name the candidate that
-    /// ran and its COGS, or the margin view silently reads it as pure margin.
+    /// An interruption that delivered nothing settles at zero, but it still has
+    /// to name the candidate that ran: the reservation is released without a
+    /// charge, and the row keeps candidate provenance so the burnt attempt stays
+    /// attributable in the ledger instead of vanishing.
     #[tokio::test]
-    async fn interrupted_stream_settles_with_candidate_provenance_and_cogs() {
+    async fn interrupted_stream_releases_without_charge_but_keeps_provenance() {
         let Some((pool, key)) = walk_fixture().await else {
             return;
         };
@@ -1863,10 +1982,10 @@ mod tests {
         .await;
         client.await.expect("client task should join");
 
-        let (settled_candidate, cost_basis_usd, status) =
-            query_as::<_, (Option<String>, Option<Decimal>, i16)>(
+        let (settled_candidate, cost_usd, cost_basis_usd, output_tokens, status) =
+            query_as::<_, (Option<String>, Decimal, Option<Decimal>, i32, i16)>(
                 r#"
-                SELECT candidate_id, cost_basis_usd, status
+                SELECT candidate_id, cost_usd, cost_basis_usd, output_tokens, status
                 FROM usage_events
                 WHERE request_id = $1
                 "#,
@@ -1877,9 +1996,16 @@ mod tests {
             .expect("settled row must query");
         assert_eq!(settled_candidate.as_deref(), Some(candidate.id.as_str()));
         assert_eq!(
+            cost_usd,
+            Decimal::ZERO,
+            "the shutdown arrived before a single frame reached the client, so \
+             the reservation is released without a charge"
+        );
+        assert_eq!(output_tokens, 0);
+        assert_eq!(
             cost_basis_usd,
-            Some(usage_cost(candidate.rates, reservation_usage)),
-            "an unmetered settle prices COGS on the same usage it bills"
+            Some(usage_cost(candidate.rates, OpenAiUsage::default())),
+            "COGS is still priced on the same usage the customer is billed"
         );
         assert_eq!(status, 503);
 
