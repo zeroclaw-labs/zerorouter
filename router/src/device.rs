@@ -6,6 +6,10 @@
 //! (the token poll after approval) inside a single transaction, so the
 //! plaintext key exists exactly once, in the successful token response.
 //!
+//! The claim mint is a self-service mint and carries the same per-user key
+//! limits as the portal's ([`crate::db::admit_key_mint`]); a claim refused by
+//! them reports `access_denied`.
+//!
 //! Endpoints:
 //! - `POST /auth/device/code` — start a grant (form or JSON body).
 //! - `POST /auth/device/token` — poll for the key (form or JSON body).
@@ -27,6 +31,7 @@ use uuid::Uuid;
 
 use crate::{
     auth::{generate_api_key, hash_api_key},
+    db::{KeyMintAdmission, admit_key_mint},
     session::PortalUser,
     sqlx::{self, PgPool},
     web::WebCtx,
@@ -367,6 +372,35 @@ async fn poll_device_token(
                 tracing::error!(authorization = %id, "approved device authorization has no user");
                 return Err(OauthError::ServerError);
             };
+            // A device claim is a self-service mint like the portal's, so it
+            // takes the same limits — before this check it was the mint path
+            // that bypassed them entirely, which let one user hold unlimited
+            // simultaneous keys. Lock the owning user's row first, exactly as
+            // `portal::create_key` does, so two concurrent claims cannot both
+            // observe a count below the limit. The device_authorizations row is
+            // already locked (`FOR UPDATE` above) and portal mints never take
+            // that lock, so the ordering introduces no cycle.
+            sqlx::query_scalar::<_, Uuid>("SELECT id FROM users WHERE id = $1 FOR UPDATE")
+                .bind(user_id)
+                .fetch_one(&mut *transaction)
+                .await
+                .map_err(oauth_database_error)?;
+            if matches!(
+                admit_key_mint(&mut transaction, user_id)
+                    .await
+                    .map_err(oauth_database_error)?,
+                KeyMintAdmission::LimitReached
+            ) {
+                // Terminal for the polling client (RFC 8628 §3.5), and the
+                // transaction rolls back, so the grant keeps its 'approved'
+                // status and no key is minted.
+                tracing::warn!(
+                    authorization = %id,
+                    user_id = %user_id,
+                    "device authorization refused: the user is at its API key limit"
+                );
+                return Err(OauthError::AccessDenied);
+            }
             let api_key = generate_api_key();
             let key_id = Uuid::new_v4();
             let name = key_name

@@ -11,6 +11,34 @@
 //! Stripe session id, so a redelivered event is acknowledged without a second
 //! credit.
 //!
+//! # What the signature does and does not prove
+//!
+//! A valid HMAC proves the event came from Stripe. It proves nothing about
+//! who created the session it describes: `metadata` is chosen by whoever
+//! created the Checkout Session, and any party able to create a paid session
+//! in this Stripe account — a second integration, an operational mistake, a
+//! leaked restricted API key — can attach arbitrary `credit_usd` and
+//! `user_id` to a session Stripe will then sign legitimately. Crediting the
+//! metadata alone lets $1 collected mint $1000 of inference credit.
+//!
+//! Two independent preconditions therefore gate every credit, both applied
+//! before [`billing::credit_purchase`] is reached:
+//!
+//! 1. **The event must corroborate itself.** The session's own `amount_total`
+//!    and `currency` — what Stripe actually collected — must match the
+//!    claimed credit, converted through the single [`usd_to_cents`] helper
+//!    that also produces the quote, so the two directions agree by
+//!    construction and no float ever touches money.
+//! 2. **ZeroRouter must have priced the session.** A
+//!    `stripe_checkout_intents` row written at session creation
+//!    (migration `0005`) must exist and agree on user, amount, and currency.
+//!    Layer 1 alone still trusts that any paid session in the account is ours;
+//!    this layer does not.
+//!
+//! The dollars credited and the user credited both come from that stored
+//! record, never from the event. A session created before migration 0005 has
+//! no record and is rejected — see [`stripe_webhook`].
+//!
 //! Nothing in this module ever logs the Stripe secret key, the webhook
 //! secret, a signature value, or a request/response body.
 
@@ -49,6 +77,12 @@ const STRIPE_HTTP_TIMEOUT: Duration = Duration::from_secs(15);
 const CHECKOUT_COMPLETED_EVENT: &str = "checkout.session.completed";
 const CHECKOUT_ASYNC_SUCCEEDED_EVENT: &str = "checkout.session.async_payment_succeeded";
 const CHECKOUT_PRODUCT_NAME: &str = "ZeroRouter credits";
+/// The one ISO-4217 currency ZeroRouter prices checkout in. Quoted to Stripe
+/// at session creation, stored on the pending record, and re-checked against
+/// the webhook's `currency` — an amount match alone is not proof of the price,
+/// because the smallest unit of a zero-decimal currency (1000 JPY, roughly $6)
+/// numerically equals a cents amount ($10.00).
+const CHECKOUT_CURRENCY: &str = "usd";
 /// SQLSTATE for a foreign-key violation: the metadata user does not exist.
 const PG_FOREIGN_KEY_VIOLATION: &str = "23503";
 
@@ -167,6 +201,11 @@ enum StripeHttpError {
     CheckoutFailed,
     InvalidSignature,
     MalformedEvent,
+    /// The signed event does not corroborate itself, or contradicts what
+    /// ZeroRouter quoted for that session.
+    AmountMismatch,
+    /// A paid session ZeroRouter has no pending-purchase record for.
+    UnknownSession,
     UnknownUser,
     DatabaseUnavailable,
 }
@@ -198,6 +237,19 @@ impl IntoResponse for StripeHttpError {
                 StatusCode::BAD_REQUEST,
                 "The webhook event is malformed.",
                 "malformed_event",
+            ),
+            // 4xx rather than a silent 200: a mismatch is a security event,
+            // and leaving it visibly failing in Stripe's webhook dashboard is
+            // the alerting channel this deployment has.
+            Self::AmountMismatch => (
+                StatusCode::BAD_REQUEST,
+                "The webhook event does not match the recorded checkout amount.",
+                "amount_mismatch",
+            ),
+            Self::UnknownSession => (
+                StatusCode::BAD_REQUEST,
+                "The webhook event references a checkout session this deployment did not create.",
+                "unknown_session",
             ),
             Self::UnknownUser => (
                 StatusCode::BAD_REQUEST,
@@ -253,6 +305,31 @@ async fn create_checkout(
         },
     )
     .await?;
+    // Persist what this session is worth BEFORE handing back the redirect
+    // url. The session id only exists after Stripe mints it, so the record
+    // cannot precede the session — but it can precede the user ever seeing
+    // the payment page. If this insert fails the url is withheld, so the
+    // session is unreachable and expires unpaid rather than becoming a
+    // payment the webhook would (correctly) refuse to credit.
+    if let Err(error) = billing::record_checkout_intent(
+        &ctx.pool,
+        &session.id,
+        user.user_id,
+        unit_amount_cents,
+        amount_usd,
+        CHECKOUT_CURRENCY,
+    )
+    .await
+    {
+        tracing::error!(
+            user_id = %user.user_id,
+            stripe_session_id = %session.id,
+            %error,
+            "stripe checkout session created but its pending purchase record could not be \
+             persisted; withholding the redirect url so the session is never paid"
+        );
+        return Err(StripeHttpError::CheckoutFailed);
+    }
     tracing::info!(
         user_id = %user.user_id,
         stripe_session_id = %session.id,
@@ -271,16 +348,28 @@ fn validate_checkout_amount(
     amount_usd: Decimal,
     settings: &StripeSettings,
 ) -> Result<i64, StripeHttpError> {
-    if amount_usd.normalize().scale() > 2 {
-        return Err(StripeHttpError::InvalidAmount);
-    }
     if amount_usd < settings.checkout_min_usd || amount_usd > settings.checkout_max_usd {
         return Err(StripeHttpError::InvalidAmount);
     }
-    (amount_usd * Decimal::ONE_HUNDRED)
-        .normalize()
-        .to_i64()
-        .ok_or(StripeHttpError::InvalidAmount)
+    usd_to_cents(amount_usd).ok_or(StripeHttpError::InvalidAmount)
+}
+
+/// Convert decimal USD to the integer smallest currency unit Stripe quotes,
+/// collects, and reports in `amount_total`.
+///
+/// The single conversion in this module: the checkout quote and the webhook's
+/// amount check both go through it, so "what we asked Stripe to collect" and
+/// "what we require Stripe to have collected" agree by construction rather
+/// than by two independently maintained expressions. Exact `Decimal`
+/// arithmetic throughout — no float ever touches money.
+///
+/// `None` when the amount is finer than a cent (anything finer would silently
+/// round money) or does not fit an `i64`.
+fn usd_to_cents(amount_usd: Decimal) -> Option<i64> {
+    if amount_usd.normalize().scale() > 2 {
+        return None;
+    }
+    (amount_usd * Decimal::ONE_HUNDRED).normalize().to_i64()
 }
 
 struct CheckoutSessionParams<'a> {
@@ -340,7 +429,7 @@ async fn create_checkout_session(
     let credit_usd = params.credit_usd.to_string();
     let form: [(&str, &str); 10] = [
         ("mode", "payment"),
-        ("line_items[0][price_data][currency]", "usd"),
+        ("line_items[0][price_data][currency]", CHECKOUT_CURRENCY),
         ("line_items[0][price_data][unit_amount]", &unit_amount),
         (
             "line_items[0][price_data][product_data][name]",
@@ -475,6 +564,109 @@ async fn stripe_webhook(
         );
         return Err(StripeHttpError::MalformedEvent);
     }
+
+    // --- Layer 1: the event must corroborate itself ------------------------
+    //
+    // `metadata` is chosen by whoever created the session; `amount_total` and
+    // `currency` are what Stripe actually collected. Requiring them to agree
+    // means forged metadata on a session we did create cannot inflate the
+    // credit beyond the money that moved.
+    let amount_total_cents = object.get("amount_total").and_then(Value::as_i64);
+    let currency = object
+        .get("currency")
+        .and_then(Value::as_str)
+        .map(str::to_ascii_lowercase);
+    let (Some(amount_total_cents), Some(currency)) = (amount_total_cents, currency) else {
+        tracing::warn!(
+            stripe_session_id = %session_id,
+            "stripe webhook rejected: paid session is missing amount_total or currency"
+        );
+        return Err(StripeHttpError::MalformedEvent);
+    };
+    let Some(claimed_cents) = usd_to_cents(credit_usd) else {
+        tracing::warn!(
+            stripe_session_id = %session_id,
+            "stripe webhook rejected: metadata credit is finer than a cent or out of range"
+        );
+        return Err(StripeHttpError::MalformedEvent);
+    };
+    if claimed_cents != amount_total_cents || currency != CHECKOUT_CURRENCY {
+        // Loud and detailed: this is the shape of a credit-minting attempt,
+        // not a transient fault. Everything logged here is already public to
+        // whoever produced the event.
+        tracing::error!(
+            stripe_session_id = %session_id,
+            metadata_user_id = %user_id,
+            metadata_credit_usd = %credit_usd,
+            claimed_cents,
+            amount_total_cents,
+            %currency,
+            expected_currency = CHECKOUT_CURRENCY,
+            "stripe webhook rejected: paid session does not corroborate its own metadata; \
+             crediting nothing"
+        );
+        return Err(StripeHttpError::AmountMismatch);
+    }
+
+    // --- Layer 2: ZeroRouter must have priced this session ------------------
+    //
+    // Layer 1 still assumes every paid session in the Stripe account is ours.
+    // A session created by anything else — another integration, a leaked
+    // restricted key — can be internally consistent and still not be a
+    // purchase this deployment sold.
+    let intent = match billing::checkout_intent(&ctx.pool, session_id).await {
+        Ok(intent) => intent,
+        Err(_) => {
+            // Retryable: the record may well exist and be unreadable right
+            // now. Fail closed and let Stripe redeliver.
+            tracing::warn!(
+                stripe_session_id = %session_id,
+                "stripe webhook deferred: pending purchase record could not be read; \
+                 stripe will retry"
+            );
+            return Err(StripeHttpError::DatabaseUnavailable);
+        }
+    };
+    let Some(intent) = intent else {
+        // POLICY — pre-existing sessions: sessions created before migration
+        // 0005 also land here, and are rejected rather than credited. Failing
+        // closed is the point of the record; a "credit it anyway and warn"
+        // fallback would leave the original hole open behind a log line. The
+        // exposure is bounded — Checkout Sessions expire after 24h, so at most
+        // one day of in-flight purchases — and each is reconcilable by hand
+        // from the Stripe dashboard with an 'adjustment' ledger entry.
+        tracing::error!(
+            stripe_session_id = %session_id,
+            metadata_user_id = %user_id,
+            metadata_credit_usd = %credit_usd,
+            amount_total_cents,
+            "stripe webhook rejected: paid session has no pending purchase record; \
+             crediting nothing (reconcile by hand if this predates migration 0005)"
+        );
+        return Err(StripeHttpError::UnknownSession);
+    };
+    if intent.user_id != user_id
+        || intent.expected_amount_cents != amount_total_cents
+        || intent.currency != currency
+    {
+        tracing::error!(
+            stripe_session_id = %session_id,
+            metadata_user_id = %user_id,
+            recorded_user_id = %intent.user_id,
+            amount_total_cents,
+            recorded_amount_cents = intent.expected_amount_cents,
+            %currency,
+            recorded_currency = %intent.currency,
+            "stripe webhook rejected: paid session contradicts its pending purchase record; \
+             crediting nothing"
+        );
+        return Err(StripeHttpError::AmountMismatch);
+    }
+
+    // Both the recipient and the dollars come from ZeroRouter's own record.
+    // The metadata has now been checked against it and is not used again.
+    let user_id = intent.user_id;
+    let credit_usd = intent.expected_credit_usd;
     let payment_intent = object.get("payment_intent").and_then(Value::as_str);
     match billing::credit_purchase(&ctx.pool, user_id, credit_usd, session_id, payment_intent).await
     {
@@ -490,6 +682,18 @@ async fn stripe_webhook(
                     user_id = %user_id,
                     amount_usd = %credit_usd,
                     "applied stripe purchase credit"
+                );
+            }
+            // Stamped only after the credit has committed, and deliberately
+            // not fatal: idempotence belongs to the unique index on
+            // `credit_ledger.stripe_session_id`, so a lost marker costs a
+            // reconciliation query, while stamping first would risk a
+            // settled-but-uncredited session on a retry.
+            if let Err(error) = billing::settle_checkout_intent(&ctx.pool, session_id).await {
+                tracing::warn!(
+                    stripe_session_id = %session_id,
+                    %error,
+                    "stripe purchase credited but its pending record could not be marked settled"
                 );
             }
             Ok(received())
@@ -574,6 +778,28 @@ mod tests {
                 "{raw} should be rejected"
             );
         }
+    }
+
+    #[test]
+    fn cents_conversion_is_exact_in_both_directions() {
+        // The quote and the webhook's amount check share this function, so a
+        // value that can be quoted must verify against the amount Stripe then
+        // reports, and nothing finer than a cent survives either way.
+        let settings = settings();
+        for raw in ["5", "25.00", "25.1000", "999.99", "1000"] {
+            let amount = decimal(raw);
+            assert_eq!(
+                validate_checkout_amount(amount, &settings).ok(),
+                usd_to_cents(amount),
+                "{raw} must quote and verify to the same cents"
+            );
+        }
+        assert_eq!(usd_to_cents(decimal("0.01")), Some(1));
+        assert_eq!(usd_to_cents(decimal("1000")), Some(100_000));
+        // Sub-cent amounts cannot be represented as an `amount_total`, so a
+        // metadata credit claiming one can never corroborate a real payment.
+        assert_eq!(usd_to_cents(decimal("25.001")), None);
+        assert_eq!(usd_to_cents(decimal("0.005")), None);
     }
 
     #[test]

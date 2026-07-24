@@ -198,13 +198,40 @@ impl WebConfig {
 /// Whether inference admission additionally requires a positive prepaid
 /// credit balance. Independent of the web plane so that self-hosted
 /// deployments can run cap-only without any billing configuration.
+///
+/// The default stays `false` on purpose: cap-only is a legitimate deployment
+/// choice and flipping the default would break self-hosters who rely on it.
+/// Running cap-only is a *deployment decision with a cost*, though, so it is
+/// announced at startup rather than left silent — see [`warn_if_cap_only`].
 pub fn credits_required_from_env() -> Result<bool> {
-    match optional_env(REQUIRE_CREDITS_ENV).as_deref() {
-        None => Ok(false),
-        Some("true" | "1") => Ok(true),
-        Some("false" | "0") => Ok(false),
+    let required = match optional_env(REQUIRE_CREDITS_ENV).as_deref() {
+        None => false,
+        Some("true" | "1") => true,
+        Some("false" | "0") => false,
         Some(other) => bail!("{REQUIRE_CREDITS_ENV} must be true or false, got {other:?}"),
+    };
+    warn_if_cap_only(required);
+    Ok(required)
+}
+
+/// Name the exposure a cap-only deployment accepts, once, at startup.
+///
+/// With credits not required, nothing verifies that spend is backed by money:
+/// the per-key and derived per-user spend/velocity caps on `api_keys` are the
+/// only ceiling on what a user can consume, and those caps are self-service
+/// (the portal lets a user raise a key's own `spend_cap_usd`). An operator who
+/// wants inference gated on a funded prepaid balance must opt in.
+fn warn_if_cap_only(required: bool) {
+    if required {
+        return;
     }
+    tracing::warn!(
+        setting = REQUIRE_CREDITS_ENV,
+        "credit enforcement is OFF: inference is bounded only by the per-key and \
+         derived per-user spend/velocity caps on api_keys, which users can raise \
+         themselves from the portal, and no prepaid balance is required or debited. \
+         Set ZEROROUTER_REQUIRE_CREDITS=true to require a funded balance"
+    );
 }
 
 /// Shared state for every web-plane router.

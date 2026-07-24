@@ -13,7 +13,10 @@ use uuid::Uuid;
 use zeroclaw_providers::pricing::ModelRates;
 use zerorouter::{
     auth::{AuthenticatedKey, generate_api_key, hash_api_key},
-    billing::{CreditOutcome, balance, credit_purchase, grant_promo, ledger_entries},
+    billing::{
+        CheckoutIntent, CreditOutcome, balance, checkout_intent, credit_purchase, grant_promo,
+        ledger_entries, record_checkout_intent, settle_checkout_intent,
+    },
     db::{RequestTelemetry, UsageAdmission, UsageRecord, begin_usage_session, migrate},
     openai::OpenAiUsage,
 };
@@ -141,6 +144,100 @@ async fn duplicate_stripe_sessions_credit_exactly_once() {
             .await
             .is_err(),
         "non-positive purchase amounts must be rejected"
+    );
+}
+
+#[tokio::test]
+async fn checkout_intents_are_immutable_quotes_that_settle_once() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let user_id = create_user(&pool, "intent").await;
+    let session_id = unique_session_id();
+    assert_eq!(
+        checkout_intent(&pool, &session_id)
+            .await
+            .expect("missing intent must query"),
+        None,
+        "a session ZeroRouter never priced has no record"
+    );
+
+    record_checkout_intent(&pool, &session_id, user_id, 2_500, Decimal::from(25), "usd")
+        .await
+        .expect("intent must insert");
+    let stored = checkout_intent(&pool, &session_id)
+        .await
+        .expect("intent must query")
+        .expect("intent must exist");
+    assert_eq!(
+        stored,
+        CheckoutIntent {
+            stripe_session_id: session_id.clone(),
+            user_id,
+            expected_amount_cents: 2_500,
+            expected_credit_usd: Decimal::from(25),
+            currency: "usd".to_owned(),
+            settled_at: None,
+        }
+    );
+
+    // Settlement advances exactly once; the second call is the replay path and
+    // must be a silent no-op rather than an error or a re-stamp.
+    assert!(
+        settle_checkout_intent(&pool, &session_id)
+            .await
+            .expect("settle must query"),
+        "the first settle stamps the record"
+    );
+    let settled_at = checkout_intent(&pool, &session_id)
+        .await
+        .expect("intent must query")
+        .expect("intent must exist")
+        .settled_at
+        .expect("settled record must carry a timestamp");
+    assert!(
+        !settle_checkout_intent(&pool, &session_id)
+            .await
+            .expect("replayed settle must query"),
+        "a replayed settle stamps nothing"
+    );
+    assert_eq!(
+        checkout_intent(&pool, &session_id)
+            .await
+            .expect("intent must query")
+            .expect("intent must exist")
+            .settled_at,
+        Some(settled_at),
+        "the settlement timestamp is final"
+    );
+
+    // The quote itself is immutable and the row cannot be removed: rewriting a
+    // pending record is equivalent to rewriting the price of a sale, and
+    // deleting one erases the evidence that a payment was ever quoted.
+    for statement in [
+        "UPDATE stripe_checkout_intents SET expected_amount_cents = 100000, \
+         expected_credit_usd = 1000 WHERE stripe_session_id = $1",
+        "UPDATE stripe_checkout_intents SET user_id = gen_random_uuid() \
+         WHERE stripe_session_id = $1",
+        "UPDATE stripe_checkout_intents SET settled_at = NULL WHERE stripe_session_id = $1",
+        "DELETE FROM stripe_checkout_intents WHERE stripe_session_id = $1",
+    ] {
+        assert!(
+            query(statement)
+                .bind(&session_id)
+                .execute(&pool)
+                .await
+                .is_err(),
+            "{statement} must be rejected"
+        );
+    }
+    // A duplicate session id is a collision on Stripe's unique id — something
+    // other than create_checkout wrote it; never silently overwrite.
+    assert!(
+        record_checkout_intent(&pool, &session_id, user_id, 2_500, Decimal::from(25), "usd")
+            .await
+            .is_err(),
+        "a second record for the same session must be rejected"
     );
 }
 

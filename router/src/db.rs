@@ -4,6 +4,10 @@ use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde_json::json;
+// Named directly rather than through the `crate::sqlx` shim: the shim exists to
+// keep the sqlx-core/sqlx-postgres split out of call sites, and [`admit_key_mint`]
+// is the only place in the crate that needs a bare connection handle.
+use sqlx_postgres::PgConnection;
 use uuid::Uuid;
 use zeroclaw_providers::pricing::ModelRates;
 
@@ -94,6 +98,29 @@ fn rates_snapshot(rates: &ModelRates) -> String {
     .to_string()
 }
 
+/// The outcome of a cap/credit admission decision.
+///
+/// # Quota model
+///
+/// Spend and velocity are enforced at TWO scopes and the tighter one wins:
+///
+/// * **per key** — the presenting key's own settled + in-flight usage against
+///   its own `api_keys.spend_cap_usd` / `velocity_cap_tokens_per_min`. This is
+///   B0's original check, unchanged.
+/// * **per user** — every key the owning user holds, settled + in-flight,
+///   against a ceiling *derived* from the same columns: the largest cap
+///   configured on any of the user's live keys.
+///
+/// The user scope exists because keys are free and churnable (`disable_key` is
+/// a flag flip, `portal::disable_key`), so a per-key-only quota is reset by
+/// minting a new key and multiplied by holding several at once. Counting a
+/// user's whole key set closes both.
+///
+/// The ceiling is **derived, not configured**: the schema has no per-user cap
+/// column and this change deliberately adds no configuration surface for one.
+/// Taking the maximum over the user's live keys means minting more keys can
+/// never raise the ceiling past what one key could already reach, while a
+/// single-key user's behavior is unchanged (the maximum is that key's own cap).
 pub enum UsageAdmission {
     Allowed(UsageSession),
     Unauthorized,
@@ -208,6 +235,15 @@ pub async fn migrate(pool: &PgPool) -> Result<()> {
                 )),
                 false,
             ),
+            Migration::new(
+                5,
+                Cow::Borrowed("stripe checkout intents"),
+                MigrationType::Simple,
+                Cow::Borrowed(include_str!(
+                    "../migrations/0005_stripe_checkout_intents.sql"
+                )),
+                false,
+            ),
         ]),
         ignore_missing: false,
         locking: true,
@@ -246,17 +282,51 @@ pub async fn begin_usage_session(
         .execute(&mut *transaction)
         .await?;
 
-    let key_state = sqlx::query_as::<_, (bool, Decimal, i32)>(
+    // Both ceilings in one round trip. `spend_cap_usd` /
+    // `velocity_cap_tokens_per_min` are the presenting key's own caps; the two
+    // derived columns are the USER ceiling (see [`UsageAdmission`] on why a
+    // user ceiling exists and why it is derived rather than configured, and on
+    // why it is the MAX and not the sum). The presenting key must still be live for
+    // admission to proceed, so it is always inside the sibling MAX: the
+    // derived ceiling can never fall below the presenting key's own cap, and a
+    // single-key user's admission is bit-for-bit the pre-change one.
+    //
+    // Matching `presenting.user_id` against the id the advisory lock was taken
+    // on makes the lock's scope and the query's scope provably the same set of
+    // rows; a stale [`AuthenticatedKey`] whose cached owner disagrees with the
+    // row finds nothing and is rejected.
+    let key_state = sqlx::query_as::<_, (bool, Decimal, i32, Decimal, i32)>(
         r#"
-        SELECT disabled, spend_cap_usd, velocity_cap_tokens_per_min
-        FROM api_keys
-        WHERE id = $1
+        SELECT
+            presenting.disabled,
+            presenting.spend_cap_usd,
+            presenting.velocity_cap_tokens_per_min,
+            COALESCE((
+                SELECT MAX(sibling.spend_cap_usd)
+                FROM api_keys AS sibling
+                WHERE sibling.user_id = $2 AND NOT sibling.disabled
+            ), presenting.spend_cap_usd) AS user_spend_cap_usd,
+            COALESCE((
+                SELECT MAX(sibling.velocity_cap_tokens_per_min)
+                FROM api_keys AS sibling
+                WHERE sibling.user_id = $2 AND NOT sibling.disabled
+            ), presenting.velocity_cap_tokens_per_min) AS user_velocity_cap
+        FROM api_keys AS presenting
+        WHERE presenting.id = $1 AND presenting.user_id = $2
         "#,
     )
     .bind(key.id)
+    .bind(key.user_id)
     .fetch_optional(&mut *transaction)
     .await?;
-    let Some((disabled, spend_cap_usd, velocity_cap_tokens_per_min)) = key_state else {
+    let Some((
+        disabled,
+        spend_cap_usd,
+        velocity_cap_tokens_per_min,
+        user_spend_cap_usd,
+        user_velocity_cap_tokens_per_min,
+    )) = key_state
+    else {
         transaction.rollback().await?;
         return Ok(UsageAdmission::Unauthorized);
     };
@@ -273,59 +343,132 @@ pub async fn begin_usage_session(
         .execute(&mut *transaction)
         .await?;
 
-    let (monthly_spend, recent_tokens) = sqlx::query_as::<_, (Decimal, i64)>(
-        r#"
+    // Settled usage, aggregated across EVERY key the user owns (disabled ones
+    // included — a disabled key's history is still the user's spend) and, in
+    // the same scan, restricted to the presenting key so the per-key ceiling
+    // can be checked without a second round trip.
+    //
+    // Access path, measured on 500k `usage_events` with a 20-key user holding
+    // 50k of them: nested loop over `api_keys_user_id_idx` (0001), then one
+    // per-key range scan of `usage_events_key_timestamp_idx (api_key_id, ts
+    // DESC)` (0001). No sequential scan, so the existing indexes serve this and
+    // no new one is needed. The cost that DOES grow is row count — the scan
+    // reads a user's whole month-to-date history (~14 ms for 30k rows here).
+    // If that ever gets hot, the measured fix is widening the 0001 index to
+    // INCLUDE (cost_usd, input_tokens, output_tokens), which turns it into an
+    // index-only scan (0 heap fetches, ~5 ms for the same 30k rows).
+    let (user_monthly_spend, user_recent_tokens, monthly_spend, recent_tokens) =
+        sqlx::query_as::<_, (Decimal, i64, Decimal, i64)>(
+            r#"
         SELECT
             COALESCE(
-                SUM(cost_usd) FILTER (
-                    WHERE ts >= date_trunc('month', NOW() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'
+                SUM(usage_events.cost_usd) FILTER (
+                    WHERE usage_events.ts
+                        >= date_trunc('month', NOW() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'
+                ),
+                0
+            ) AS user_monthly_spend,
+            COALESCE(
+                SUM(usage_events.input_tokens::BIGINT + usage_events.output_tokens::BIGINT) FILTER (
+                    WHERE usage_events.ts >= NOW() - INTERVAL '1 minute'
+                ),
+                0
+            )::BIGINT AS user_recent_tokens,
+            COALESCE(
+                SUM(usage_events.cost_usd) FILTER (
+                    WHERE usage_events.api_key_id = $2
+                      AND usage_events.ts
+                        >= date_trunc('month', NOW() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'
                 ),
                 0
             ) AS monthly_spend,
             COALESCE(
-                SUM(input_tokens::BIGINT + output_tokens::BIGINT) FILTER (
-                    WHERE ts >= NOW() - INTERVAL '1 minute'
+                SUM(usage_events.input_tokens::BIGINT + usage_events.output_tokens::BIGINT) FILTER (
+                    WHERE usage_events.api_key_id = $2
+                      AND usage_events.ts >= NOW() - INTERVAL '1 minute'
                 ),
                 0
             )::BIGINT AS recent_tokens
         FROM usage_events
-        WHERE api_key_id = $1
-          AND ts >= LEAST(
+        INNER JOIN api_keys ON api_keys.id = usage_events.api_key_id
+        WHERE api_keys.user_id = $1
+          AND usage_events.ts >= LEAST(
               date_trunc('month', NOW() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC',
               NOW() - INTERVAL '1 minute'
           )
         "#,
-    )
-    .bind(key.id)
-    .fetch_one(&mut *transaction)
-    .await?;
-    let (active_reserved_cost, active_reserved_tokens) = sqlx::query_as::<_, (Decimal, i64)>(
+        )
+        .bind(key.user_id)
+        .bind(key.id)
+        .fetch_one(&mut *transaction)
+        .await?;
+    // In-flight reservations, same two scopes. Expired rows were deleted above,
+    // and the `expires_at > NOW()` predicate is kept so a row that expires
+    // between the two statements is not counted.
+    let (
+        user_active_reserved_cost,
+        user_active_reserved_tokens,
+        active_reserved_cost,
+        active_reserved_tokens,
+    ) = sqlx::query_as::<_, (Decimal, i64, Decimal, i64)>(
         r#"
         SELECT
-            COALESCE(SUM(reserved_cost_usd), 0),
-            COALESCE(SUM(reserved_tokens), 0)::BIGINT
+            COALESCE(SUM(usage_reservations.reserved_cost_usd), 0),
+            COALESCE(SUM(usage_reservations.reserved_tokens), 0)::BIGINT,
+            COALESCE(
+                SUM(usage_reservations.reserved_cost_usd) FILTER (
+                    WHERE usage_reservations.api_key_id = $2
+                ),
+                0
+            ),
+            COALESCE(
+                SUM(usage_reservations.reserved_tokens) FILTER (
+                    WHERE usage_reservations.api_key_id = $2
+                ),
+                0
+            )::BIGINT
         FROM usage_reservations
-        WHERE api_key_id = $1
-          AND expires_at > NOW()
+        INNER JOIN api_keys ON api_keys.id = usage_reservations.api_key_id
+        WHERE api_keys.user_id = $1
+          AND usage_reservations.expires_at > NOW()
         "#,
     )
+    .bind(key.user_id)
     .bind(key.id)
     .fetch_one(&mut *transaction)
     .await?;
 
-    let projected_spend = monthly_spend + active_reserved_cost + reserved_cost_usd;
-    if monthly_spend + active_reserved_cost >= spend_cap_usd || projected_spend > spend_cap_usd {
+    // Both ceilings are enforced and the tighter one wins: a request is
+    // admitted only if it fits under the presenting key's own cap AND under the
+    // user's derived cap. Aggregating across the user's keys is what makes
+    // disable-and-remint (and device-grant fan-out) stop multiplying the
+    // allowance — the churned keys' usage still counts.
+    if !spend_within_cap(
+        monthly_spend,
+        active_reserved_cost,
+        reserved_cost_usd,
+        spend_cap_usd,
+    ) || !spend_within_cap(
+        user_monthly_spend,
+        user_active_reserved_cost,
+        reserved_cost_usd,
+        user_spend_cap_usd,
+    ) {
         transaction.rollback().await?;
         return Ok(UsageAdmission::SpendExceeded);
     }
 
-    let velocity_cap = i64::from(velocity_cap_tokens_per_min);
-    let projected_tokens = recent_tokens
-        .checked_add(active_reserved_tokens)
-        .and_then(|tokens| tokens.checked_add(reserved_tokens));
-    if recent_tokens.saturating_add(active_reserved_tokens) >= velocity_cap
-        || projected_tokens.is_none_or(|tokens| tokens > velocity_cap)
-    {
+    if !velocity_within_cap(
+        recent_tokens,
+        active_reserved_tokens,
+        reserved_tokens,
+        i64::from(velocity_cap_tokens_per_min),
+    ) || !velocity_within_cap(
+        user_recent_tokens,
+        user_active_reserved_tokens,
+        reserved_tokens,
+        i64::from(user_velocity_cap_tokens_per_min),
+    ) {
         transaction.rollback().await?;
         return Ok(UsageAdmission::VelocityExceeded);
     }
@@ -656,6 +799,98 @@ impl UsageSession {
     }
 }
 
+/// Whether one spend ceiling still admits `additional` on top of what is
+/// already settled and reserved against it.
+///
+/// Two conditions, both inherited verbatim from B0's single-scope check: a
+/// ceiling already reached exactly admits nothing (so a zero-cost reservation
+/// cannot slip through an exhausted cap), and the projection must land at or
+/// below the ceiling.
+fn spend_within_cap(
+    settled: Decimal,
+    reserved: Decimal,
+    additional: Decimal,
+    cap: Decimal,
+) -> bool {
+    let committed = settled + reserved;
+    committed < cap && committed + additional <= cap
+}
+
+/// Velocity counterpart of [`spend_within_cap`]. Saturating on the committed
+/// side and checked on the projection, so an overflowing projection is refused
+/// rather than wrapping into an admission.
+fn velocity_within_cap(settled: i64, reserved: i64, additional: i64, cap: i64) -> bool {
+    settled.saturating_add(reserved) < cap
+        && settled
+            .checked_add(reserved)
+            .and_then(|committed| committed.checked_add(additional))
+            .is_some_and(|projected| projected <= cap)
+}
+
+/// The most live (non-disabled) keys one user may hold at once.
+pub const MAX_ACTIVE_KEYS_PER_USER: i64 = 20;
+/// The most keys one user may CREATE inside [`KEY_CREATION_WINDOW_HOURS`],
+/// counting keys they have since disabled.
+pub const MAX_KEYS_CREATED_PER_WINDOW: i64 = 20;
+/// Trailing window the creation throttle counts over.
+pub const KEY_CREATION_WINDOW_HOURS: i64 = 24;
+
+/// Whether a user may mint another API key.
+pub enum KeyMintAdmission {
+    Allowed,
+    LimitReached,
+}
+
+/// Decide whether `user_id` may mint another API key, inside the caller's
+/// transaction.
+///
+/// Two limits, both required:
+///
+/// 1. **Active-key cap** — at most [`MAX_ACTIVE_KEYS_PER_USER`] non-disabled
+///    keys. This is the original limit and it counts live keys only.
+/// 2. **Creation throttle** — at most [`MAX_KEYS_CREATED_PER_WINDOW`] keys
+///    *created* in the trailing [`KEY_CREATION_WINDOW_HOURS`], counting
+///    disabled ones. Limit 1 alone is resettable: disabling a key is a flag
+///    flip, so a user could exhaust a key's quota, disable it, mint a fresh one
+///    and repeat without bound. Counting creations over a window makes the
+///    churn itself the scarce resource.
+///
+/// The caller must already hold a serializing lock on the owning user (both
+/// mint paths take `SELECT ... FROM users WHERE id = $1 FOR UPDATE`), otherwise
+/// two concurrent mints can each observe a count below the limit.
+///
+/// Scope note: this governs the two SELF-SERVICE mint paths only —
+/// `portal::create_key` and the device-claim mint in [`crate::device`]. The
+/// `admin mint-key` CLI is operator-only (it needs database credentials, not a
+/// session) and is deliberately left exempt, so an operator can always issue a
+/// key for a user who has hit the throttle.
+pub async fn admit_key_mint(
+    connection: &mut PgConnection,
+    user_id: Uuid,
+) -> Result<KeyMintAdmission, sqlx::Error> {
+    let (active_keys, recently_created_keys) = sqlx::query_as::<_, (i64, i64)>(
+        r#"
+        SELECT
+            COUNT(*) FILTER (WHERE NOT disabled) AS active_keys,
+            COUNT(*) FILTER (
+                WHERE created_at > NOW() - ($2 * INTERVAL '1 hour')
+            ) AS recently_created_keys
+        FROM api_keys
+        WHERE user_id = $1
+        "#,
+    )
+    .bind(user_id)
+    .bind(KEY_CREATION_WINDOW_HOURS)
+    .fetch_one(connection)
+    .await?;
+    if active_keys >= MAX_ACTIVE_KEYS_PER_USER
+        || recently_created_keys >= MAX_KEYS_CREATED_PER_WINDOW
+    {
+        return Ok(KeyMintAdmission::LimitReached);
+    }
+    Ok(KeyMintAdmission::Allowed)
+}
+
 fn checked_token_count(value: u64, field: &'static str) -> Result<i32, sqlx::Error> {
     i32::try_from(value)
         .map_err(|_| sqlx::Error::Protocol(format!("{field} exceeds the database integer range")))
@@ -691,5 +926,65 @@ mod tests {
             i32::MAX
         );
         assert!(checked_token_count(i32::MAX as u64 + 1, "tokens").is_err());
+    }
+
+    #[test]
+    fn spend_cap_refuses_at_the_ceiling_and_past_the_projection() {
+        let cap = Decimal::from(20);
+        assert!(spend_within_cap(
+            Decimal::from(5),
+            Decimal::from(5),
+            Decimal::from(10),
+            cap
+        ));
+        // The projection may land exactly on the ceiling.
+        assert!(spend_within_cap(
+            Decimal::from(19),
+            Decimal::ZERO,
+            Decimal::ONE,
+            cap
+        ));
+        // ...but one cent past it is refused.
+        assert!(!spend_within_cap(
+            Decimal::from(19),
+            Decimal::ZERO,
+            Decimal::from(2),
+            cap
+        ));
+        // A ceiling already reached admits nothing, not even a zero-cost
+        // reservation: that is what stops a free request from being smuggled
+        // past an exhausted cap.
+        assert!(!spend_within_cap(
+            Decimal::from(20),
+            Decimal::ZERO,
+            Decimal::ZERO,
+            cap
+        ));
+        assert!(!spend_within_cap(
+            Decimal::from(15),
+            Decimal::from(5),
+            Decimal::ZERO,
+            cap
+        ));
+    }
+
+    #[test]
+    fn velocity_cap_refuses_at_the_ceiling_and_on_overflow() {
+        assert!(velocity_within_cap(400, 400, 200, 1_000));
+        assert!(!velocity_within_cap(400, 400, 201, 1_000));
+        assert!(!velocity_within_cap(1_000, 0, 0, 1_000));
+        assert!(!velocity_within_cap(600, 400, 0, 1_000));
+        // An overflowing projection must fail closed rather than wrap.
+        assert!(!velocity_within_cap(1, i64::MAX, 1, i64::MAX));
+        assert!(!velocity_within_cap(0, 0, i64::MAX, 10));
+    }
+
+    #[test]
+    fn key_creation_throttle_is_not_looser_than_the_active_cap() {
+        // The throttle must be able to bite before the active-key cap does,
+        // otherwise disable-and-remint stays free: a user who disables every
+        // key they mint never accumulates active keys.
+        const { assert!(MAX_KEYS_CREATED_PER_WINDOW <= MAX_ACTIVE_KEYS_PER_USER) };
+        const { assert!(KEY_CREATION_WINDOW_HOURS > 0) };
     }
 }

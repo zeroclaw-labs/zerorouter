@@ -1,13 +1,40 @@
-//! Pure unit tests for Stripe webhook signature verification.
+//! Stripe webhook tests: signature verification, and the preconditions that
+//! must hold before a signed event is allowed to move money.
 //!
-//! No network and no database: signatures are constructed locally with the
-//! same `hmac` crate the router verifies with.
+//! The signature tests are pure — no network, no database — and construct
+//! signatures locally with the same `hmac` crate the router verifies with.
+//!
+//! The end-to-end tests drive the real `/webhooks/stripe` handler with
+//! correctly signed payloads, because a valid signature is exactly the
+//! attacker's starting position: anything able to create a paid Checkout
+//! Session in the Stripe account gets Stripe to sign its metadata for it. What
+//! those tests assert is that a *legitimately signed* event still cannot mint
+//! credit it did not pay for. Every rejection asserts the balance and the
+//! ledger are untouched, not merely that a non-2xx came back. Gated on
+//! `DATABASE_URL` like `tests/billing.rs`: unset means the test returns early.
 
-use std::time::Duration;
+use std::{path::PathBuf, str::FromStr, time::Duration};
 
+use axum::{
+    body::Body,
+    http::{Request, StatusCode},
+};
+use chrono::Utc;
 use hmac::{Hmac, Mac};
+use http_body_util::BodyExt;
+use rust_decimal::Decimal;
+use serde_json::{Value, json};
 use sha2::Sha256;
-use zerorouter::stripe::{WebhookVerifyError, verify_webhook_signature};
+use sqlx_core::{query::query, query_scalar::query_scalar};
+use sqlx_postgres::{PgConnectOptions, PgPool, PgPoolOptions};
+use tower::ServiceExt;
+use uuid::Uuid;
+use zerorouter::{
+    billing::{balance, checkout_intent, record_checkout_intent},
+    db::migrate,
+    stripe::{self, STRIPE_SIGNATURE_HEADER, WebhookVerifyError, verify_webhook_signature},
+    web::{StripeSettings, WebConfig, WebCtx},
+};
 
 const SECRET: &str = "whsec_test_secret";
 const TOLERANCE: Duration = Duration::from_secs(300);
@@ -133,4 +160,293 @@ fn candidate_set_with_no_match_fails() {
         verify_webhook_signature(PAYLOAD, &header, SECRET, TOLERANCE, NOW),
         Err(WebhookVerifyError::SignatureMismatch)
     );
+}
+
+// ---------------------------------------------------------------------------
+// End-to-end: a correctly signed event still has to pay for what it claims
+// ---------------------------------------------------------------------------
+
+async fn connect() -> Option<PgPool> {
+    let database_url = std::env::var("DATABASE_URL").ok()?;
+    let options = PgConnectOptions::from_str(&database_url).expect("test database URL must parse");
+    let pool = PgPoolOptions::new()
+        .max_connections(5)
+        .connect_with(options)
+        .await
+        .expect("test database must connect");
+    migrate(&pool).await.expect("migration must succeed");
+    Some(pool)
+}
+
+async fn create_user(pool: &PgPool, label: &str) -> Uuid {
+    let user_id = Uuid::new_v4();
+    query("INSERT INTO users (id, email) VALUES ($1, $2)")
+        .bind(user_id)
+        .bind(format!("webhook-{label}-{user_id}@example.invalid"))
+        .execute(pool)
+        .await
+        .expect("test user must insert");
+    user_id
+}
+
+fn unique_session_id() -> String {
+    format!("cs_test_{}", Uuid::new_v4().simple())
+}
+
+fn webhook_app(pool: &PgPool) -> axum::Router {
+    let config = WebConfig {
+        public_base_url: "http://127.0.0.1".to_owned(),
+        secure_cookies: false,
+        oidc: None,
+        stripe: Some(StripeSettings {
+            secret_key: "sk_test_unused".to_owned(),
+            webhook_secret: SECRET.to_owned(),
+            checkout_min_usd: Decimal::from(5),
+            checkout_max_usd: Decimal::from(1000),
+        }),
+        signup_credit_usd: Decimal::ZERO,
+        portal_dist_path: PathBuf::from("portal/dist"),
+        session_ttl: Duration::from_secs(3_600),
+        device_client_ids: vec!["zeroclaw".to_owned()],
+    };
+    stripe::router().with_state(WebCtx::new(pool.clone(), config))
+}
+
+/// A `checkout.session.completed` object shaped like Stripe's, with every
+/// money-bearing field independently controllable so a test can make the
+/// metadata disagree with what was actually collected.
+fn paid_session_event(
+    session_id: &str,
+    user_id: Uuid,
+    metadata_credit_usd: &str,
+    amount_total: i64,
+    currency: &str,
+) -> String {
+    json!({
+        "id": "evt_test",
+        "type": "checkout.session.completed",
+        "data": {
+            "object": {
+                "id": session_id,
+                "object": "checkout.session",
+                "payment_status": "paid",
+                "amount_total": amount_total,
+                "currency": currency,
+                "payment_intent": "pi_test_webhook",
+                "metadata": {
+                    "user_id": user_id.to_string(),
+                    "credit_usd": metadata_credit_usd,
+                },
+            }
+        }
+    })
+    .to_string()
+}
+
+/// POST a correctly signed payload at the real handler.
+async fn post_webhook(pool: &PgPool, payload: &str) -> (StatusCode, Value) {
+    // Signed at the current time: the handler checks tolerance against the
+    // real clock, so these events are as authentic as Stripe's own.
+    let timestamp = Utc::now().timestamp();
+    let signature = sign(SECRET, timestamp, payload.as_bytes());
+    let request = Request::builder()
+        .method("POST")
+        .uri("/webhooks/stripe")
+        .header(STRIPE_SIGNATURE_HEADER, header(timestamp, &[&signature]))
+        .header("content-type", "application/json")
+        .body(Body::from(payload.to_owned()))
+        .expect("webhook request should build");
+    let response = webhook_app(pool)
+        .oneshot(request)
+        .await
+        .expect("webhook request should complete");
+    let status = response.status();
+    let bytes = response
+        .into_body()
+        .collect()
+        .await
+        .expect("webhook response body should be readable")
+        .to_bytes();
+    let json = serde_json::from_slice(&bytes).expect("webhook response should be JSON");
+    (status, json)
+}
+
+async fn purchase_count(pool: &PgPool, user_id: Uuid) -> i64 {
+    query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM credit_ledger WHERE user_id = $1 AND entry_type = 'purchase'",
+    )
+    .bind(user_id)
+    .fetch_one(pool)
+    .await
+    .expect("purchase ledger count must query")
+}
+
+/// The balance and the ledger both had to stay still — a rejection that
+/// returned 4xx after already crediting would still be a minted dollar.
+async fn assert_nothing_credited(pool: &PgPool, user_id: Uuid, context: &str) {
+    assert_eq!(
+        balance(pool, user_id).await.expect("balance must query"),
+        Decimal::ZERO,
+        "{context}: balance must be untouched"
+    );
+    assert_eq!(
+        purchase_count(pool, user_id).await,
+        0,
+        "{context}: no purchase ledger row may be written"
+    );
+}
+
+#[tokio::test]
+async fn recorded_purchase_credits_exactly_once_and_replays_are_idempotent() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let user_id = create_user(&pool, "happy").await;
+    let session_id = unique_session_id();
+    record_checkout_intent(&pool, &session_id, user_id, 2_500, Decimal::from(25), "usd")
+        .await
+        .expect("pending purchase record must insert");
+    let event = paid_session_event(&session_id, user_id, "25.00", 2_500, "usd");
+
+    let (status, body) = post_webhook(&pool, &event).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["received"], json!(true));
+    assert_eq!(
+        balance(&pool, user_id).await.expect("balance must query"),
+        Decimal::from(25)
+    );
+    let settled = checkout_intent(&pool, &session_id)
+        .await
+        .expect("intent must query")
+        .expect("intent must exist");
+    assert!(
+        settled.settled_at.is_some(),
+        "a delivered purchase must be marked settled"
+    );
+
+    // Stripe redelivers on any non-2xx and on its own schedule; the second
+    // delivery must be acknowledged without a second credit.
+    let (replay_status, _) = post_webhook(&pool, &event).await;
+    assert_eq!(replay_status, StatusCode::OK);
+    assert_eq!(
+        balance(&pool, user_id).await.expect("balance must query"),
+        Decimal::from(25),
+        "a replayed event must not credit twice"
+    );
+    assert_eq!(purchase_count(&pool, user_id).await, 1);
+}
+
+#[tokio::test]
+async fn metadata_claiming_more_than_was_paid_credits_nothing() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let user_id = create_user(&pool, "inflated").await;
+    let session_id = unique_session_id();
+    // ZeroRouter sold $5.00. The event Stripe signs claims $1000.
+    record_checkout_intent(&pool, &session_id, user_id, 500, Decimal::from(5), "usd")
+        .await
+        .expect("pending purchase record must insert");
+    let event = paid_session_event(&session_id, user_id, "1000.00", 500, "usd");
+
+    let (status, body) = post_webhook(&pool, &event).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["code"], json!("amount_mismatch"));
+    assert_nothing_credited(&pool, user_id, "inflated metadata").await;
+    let intent = checkout_intent(&pool, &session_id)
+        .await
+        .expect("intent must query")
+        .expect("intent must exist");
+    assert!(
+        intent.settled_at.is_none(),
+        "a rejected event must not settle the pending record"
+    );
+}
+
+#[tokio::test]
+async fn wrong_currency_credits_nothing_even_when_the_amount_matches() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let user_id = create_user(&pool, "currency").await;
+    let session_id = unique_session_id();
+    record_checkout_intent(&pool, &session_id, user_id, 1_000, Decimal::from(10), "usd")
+        .await
+        .expect("pending purchase record must insert");
+    // 1000 JPY is roughly $6 but is also numerically 1000 in the smallest
+    // currency unit, so it passes an amount-only check while claiming $10.
+    // The currency comparison is the control that catches it.
+    let event = paid_session_event(&session_id, user_id, "10.00", 1_000, "jpy");
+
+    let (status, body) = post_webhook(&pool, &event).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["code"], json!("amount_mismatch"));
+    assert_nothing_credited(&pool, user_id, "zero-decimal currency").await;
+}
+
+#[tokio::test]
+async fn paid_session_without_a_pending_record_credits_nothing() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let user_id = create_user(&pool, "unrecorded").await;
+    // Internally consistent in every way — $1000 claimed, $1000 collected, in
+    // USD — and signed by Stripe. It is still not a session ZeroRouter priced,
+    // which is what a session minted through a second integration or a leaked
+    // restricted key looks like. Sessions predating migration 0005 land here
+    // too: the policy is to reject and reconcile by hand, never to credit.
+    let event = paid_session_event(&unique_session_id(), user_id, "1000.00", 100_000, "usd");
+
+    let (status, body) = post_webhook(&pool, &event).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["code"], json!("unknown_session"));
+    assert_nothing_credited(&pool, user_id, "no pending record").await;
+}
+
+#[tokio::test]
+async fn metadata_cannot_redirect_a_purchase_to_another_user() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let payer = create_user(&pool, "payer").await;
+    let attacker = create_user(&pool, "attacker").await;
+    let session_id = unique_session_id();
+    record_checkout_intent(&pool, &session_id, payer, 2_500, Decimal::from(25), "usd")
+        .await
+        .expect("pending purchase record must insert");
+    // Money, amount, and currency all check out; only the recipient is forged.
+    let event = paid_session_event(&session_id, attacker, "25.00", 2_500, "usd");
+
+    let (status, body) = post_webhook(&pool, &event).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["code"], json!("amount_mismatch"));
+    assert_nothing_credited(&pool, attacker, "forged recipient").await;
+    assert_nothing_credited(&pool, payer, "forged recipient (payer)").await;
+}
+
+#[tokio::test]
+async fn unpaid_session_is_acknowledged_without_crediting() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let user_id = create_user(&pool, "unpaid").await;
+    let session_id = unique_session_id();
+    record_checkout_intent(&pool, &session_id, user_id, 2_500, Decimal::from(25), "usd")
+        .await
+        .expect("pending purchase record must insert");
+    let mut event: Value = serde_json::from_str(&paid_session_event(
+        &session_id,
+        user_id,
+        "25.00",
+        2_500,
+        "usd",
+    ))
+    .expect("event must parse");
+    event["data"]["object"]["payment_status"] = json!("unpaid");
+
+    // Acknowledged so Stripe stops retrying; the later `paid` event carries
+    // the money. A pending record alone must never be enough to credit.
+    let (status, _) = post_webhook(&pool, &event.to_string()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_nothing_credited(&pool, user_id, "unpaid session").await;
 }
