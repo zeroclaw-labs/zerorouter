@@ -1,0 +1,1006 @@
+//! Characterization tests for the authenticated request path: `POST
+//! /v1/chat/completions` through admission, the candidate walk, and settlement.
+//!
+//! Every test drives the real axum handler over a real Postgres; only the
+//! upstream leaf is swapped, via `RouterState::with_injected_route` and the
+//! scriptable fakes in `zerorouter::testing` (both behind the `testing`
+//! feature). The catalog is `tests/request_path_tiers.toml`, so these
+//! assertions pin router behavior rather than the production candidate list.
+//!
+//! These tests document what the code does TODAY, ahead of the failover-loop
+//! rewrite. Where current behavior looks wrong the actual behavior is still
+//! asserted, with a comment saying so — do not "fix" the code to make one of
+//! these pass; change the assertion deliberately when the behavior changes.
+//!
+//! Gated on `DATABASE_URL` like `tests/billing.rs`: when unset each test
+//! returns early (skips) instead of failing.
+
+use std::{path::PathBuf, str::FromStr, sync::Arc, time::Duration};
+
+use axum::{
+    body::Body,
+    http::{Request, StatusCode},
+};
+use http_body_util::BodyExt;
+use rust_decimal::Decimal;
+use serde_json::{Value, json};
+use sqlx_core::{query::query, query_as::query_as, query_scalar::query_scalar};
+use sqlx_postgres::{PgConnectOptions, PgPool, PgPoolOptions};
+use tower::ServiceExt;
+use uuid::Uuid;
+use zeroclaw_providers::traits::{TokenUsage, ToolCall};
+use zerorouter::{
+    RouterState,
+    api::InjectedRoute,
+    app,
+    auth::{generate_api_key, hash_api_key},
+    billing::{balance, grant_promo},
+    config::ResolvedRoute,
+    db::migrate,
+    providers::{ProviderCandidate, ProviderRoute},
+    testing::{FakeModelProvider, FakeOutcome, FakeStreamStep},
+};
+
+/// Output bound every request asks for. Large enough that metered usage stays
+/// under the reservation, so the settle debit is the metered cost and not the
+/// reservation clamp (which `tests/billing.rs` already pins).
+const MAX_TOKENS: u32 = 4_096;
+
+/// The reservation `zero/test-pair` and `zero/test-solo` admit for
+/// [`completion_body`]: 64 + len("user") + len("hello") prompt-byte bound plus
+/// [`MAX_TOKENS`] of output.
+const RESERVED_PROMPT_TOKENS: i32 = 73;
+
+/// Pooled connections each test opens up front. Two is enough for a request
+/// that admits, walks, and settles in sequence while the test reads back rows.
+const POOL_CONNECTIONS: u32 = 2;
+
+/// What the fakes report when they serve. Chosen well below the reservation.
+fn served_usage() -> TokenUsage {
+    TokenUsage {
+        input_tokens: Some(1_000),
+        output_tokens: Some(20),
+        cached_input_tokens: None,
+    }
+}
+
+/// `1000 * $3.00/Mtok + 20 * $6.00/Mtok` at the fixture tier's sell rate.
+fn served_sell_cost() -> Decimal {
+    decimal("0.00312")
+}
+
+/// `73 * $3.00/Mtok + 4096 * $6.00/Mtok`: what the reservation bound costs the
+/// customer when a settle site bills it instead of metered usage.
+fn reservation_sell_cost() -> Decimal {
+    decimal("0.024795")
+}
+
+fn decimal(value: &str) -> Decimal {
+    Decimal::from_str(value).expect("test decimal must parse")
+}
+
+fn tier_config_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/request_path_tiers.toml")
+}
+
+async fn connect() -> Option<PgPool> {
+    let database_url = std::env::var("DATABASE_URL").ok()?;
+    let options = PgConnectOptions::from_str(&database_url).expect("test database URL must parse");
+    let pool = PgPoolOptions::new()
+        .max_connections(POOL_CONNECTIONS)
+        // The deadline tests reach a 15-minute constant by pausing the clock,
+        // and a paused runtime auto-advances to the nearest timer whenever it
+        // parks on socket I/O. A liveness ping would arm the acquire timeout
+        // around exactly such a park, so acquire is kept timer-free and every
+        // connection is opened up front by `warm_pool`.
+        .test_before_acquire(false)
+        .connect_with(options)
+        .await
+        .expect("test database must connect");
+    migrate(&pool).await.expect("migration must succeed");
+    warm_pool(&pool).await;
+    Some(pool)
+}
+
+/// Open every pooled connection so no later acquire has to dial out.
+async fn warm_pool(pool: &PgPool) {
+    let mut connections = Vec::with_capacity(POOL_CONNECTIONS as usize);
+    for _ in 0..POOL_CONNECTIONS {
+        connections.push(pool.acquire().await.expect("pool connection must open"));
+    }
+    drop(connections);
+}
+
+/// A funded user with one API key, returned as `(api_key_id, plaintext key)`.
+/// Every test gets its own so `usage_events` can be scoped by key.
+async fn create_funded_key(pool: &PgPool, label: &str) -> (Uuid, String) {
+    let user_id = Uuid::new_v4();
+    query("INSERT INTO users (id, email) VALUES ($1, $2)")
+        .bind(user_id)
+        .bind(format!("request-path-{label}-{user_id}@example.invalid"))
+        .execute(pool)
+        .await
+        .expect("test user must insert");
+    let key_id = Uuid::new_v4();
+    let plaintext = generate_api_key();
+    query(
+        r#"
+        INSERT INTO api_keys (id, user_id, key_hash, name, spend_cap_usd, velocity_cap_tokens_per_min)
+        VALUES ($1, $2, $3, 'request-path', 20, 1000000)
+        "#,
+    )
+    .bind(key_id)
+    .bind(user_id)
+    .bind(hash_api_key(&plaintext))
+    .execute(pool)
+    .await
+    .expect("test API key must insert");
+    grant_promo(pool, user_id, Decimal::from(50), "request-path")
+        .await
+        .expect("funding promo must apply");
+    (key_id, plaintext)
+}
+
+async fn user_of(pool: &PgPool, api_key_id: Uuid) -> Uuid {
+    query_scalar::<_, Uuid>("SELECT user_id FROM api_keys WHERE id = $1")
+        .bind(api_key_id)
+        .fetch_one(pool)
+        .await
+        .expect("owning user must query")
+}
+
+/// A router whose candidates are served by `fakes` in tier order. Panics if a
+/// resolved route has more candidates than the test scripted, which would
+/// silently leave a real (credential-less) upstream in the walk.
+fn router(pool: PgPool, fakes: Vec<Arc<FakeModelProvider>>) -> RouterState {
+    let route: InjectedRoute = Arc::new(move |resolved: &ResolvedRoute, _max_output_tokens| {
+        assert_eq!(
+            resolved.candidates.len(),
+            fakes.len(),
+            "every resolved candidate needs a scripted fake"
+        );
+        ProviderRoute::from_candidates(
+            resolved
+                .candidates
+                .iter()
+                .cloned()
+                .zip(fakes.iter().cloned())
+                .map(|(definition, fake)| ProviderCandidate::with_provider(definition, fake))
+                .collect(),
+        )
+    });
+    RouterState::with_injected_route(tier_config_path(), pool, true, route)
+}
+
+fn completion_body(model: &str, stream: bool) -> Value {
+    let mut body = json!({
+        "model": model,
+        "messages": [{ "role": "user", "content": "hello" }],
+        "max_tokens": MAX_TOKENS,
+        "temperature": 0.25,
+        "stream": stream,
+    });
+    if stream {
+        body["stream_options"] = json!({ "include_usage": true });
+    }
+    body
+}
+
+fn completion_request(key: &str, body: &Value) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("authorization", format!("Bearer {key}"))
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .expect("completion request should build")
+}
+
+fn header(response: &axum::response::Response, name: &str) -> String {
+    response
+        .headers()
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_owned()
+}
+
+async fn json_body(response: axum::response::Response) -> Value {
+    let bytes = response
+        .into_body()
+        .collect()
+        .await
+        .expect("response body should be readable")
+        .to_bytes();
+    serde_json::from_slice(&bytes).expect("response body should be JSON")
+}
+
+/// The `data:` payloads of an SSE body, in order. Keep-alive comment lines are
+/// not `data:` frames and drop out here.
+async fn sse_payloads(response: axum::response::Response) -> Vec<String> {
+    let bytes = response
+        .into_body()
+        .collect()
+        .await
+        .expect("stream body should be readable")
+        .to_bytes();
+    String::from_utf8(bytes.to_vec())
+        .expect("stream body should be UTF-8")
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: ").map(str::to_owned))
+        .collect()
+}
+
+/// The JSON `data:` payloads, dropping the terminal `[DONE]` sentinel.
+async fn sse_chunks(response: axum::response::Response) -> Vec<Value> {
+    sse_payloads(response)
+        .await
+        .into_iter()
+        .filter(|payload| payload != "[DONE]")
+        .map(|payload| serde_json::from_str(&payload).expect("stream chunk should be JSON"))
+        .collect()
+}
+
+/// `(upstream_provider, upstream_model, input_tokens, output_tokens, cost_usd, status)`
+async fn settled_event(
+    pool: &PgPool,
+    api_key_id: Uuid,
+) -> (String, String, i32, i32, Decimal, i16) {
+    query_as(
+        r#"
+        SELECT upstream_provider, upstream_model, input_tokens, output_tokens, cost_usd, status
+        FROM usage_events
+        WHERE api_key_id = $1
+        "#,
+    )
+    .bind(api_key_id)
+    .fetch_one(pool)
+    .await
+    .expect("settled row must query")
+}
+
+/// `(candidate_id, cost_basis_usd, attempt_count, finish_reason)`
+async fn settled_provenance(
+    pool: &PgPool,
+    api_key_id: Uuid,
+) -> (Option<String>, Option<Decimal>, Option<i16>, Option<String>) {
+    query_as(
+        r#"
+        SELECT candidate_id, cost_basis_usd, attempt_count, finish_reason
+        FROM usage_events
+        WHERE api_key_id = $1
+        "#,
+    )
+    .bind(api_key_id)
+    .fetch_one(pool)
+    .await
+    .expect("settled provenance must query")
+}
+
+/// `(attempt_no, candidate_id, outcome, served)` for every walk attempt.
+async fn attempt_rows(pool: &PgPool, api_key_id: Uuid) -> Vec<(i16, String, String, bool)> {
+    query_as(
+        r#"
+        SELECT attempt_no, candidate_id, outcome, served
+        FROM request_attempts
+        WHERE api_key_id = $1
+        ORDER BY attempt_no
+        "#,
+    )
+    .bind(api_key_id)
+    .fetch_all(pool)
+    .await
+    .expect("attempt rows must query")
+}
+
+async fn open_reservations(pool: &PgPool, api_key_id: Uuid) -> i64 {
+    query_scalar::<_, i64>("SELECT COUNT(*) FROM usage_reservations WHERE api_key_id = $1")
+        .bind(api_key_id)
+        .fetch_one(pool)
+        .await
+        .expect("reservation count must query")
+}
+
+#[tokio::test]
+async fn non_streaming_first_candidate_serves_and_settles_its_metered_usage() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let (api_key_id, key) = create_funded_key(&pool, "serve").await;
+    let primary = FakeModelProvider::new(
+        "primary",
+        vec![FakeOutcome::chat("hello from primary", served_usage())],
+    );
+    let secondary = FakeModelProvider::new("secondary", Vec::new());
+    let state = router(pool.clone(), vec![primary.clone(), secondary.clone()]);
+
+    let response = app(state.clone())
+        .oneshot(completion_request(
+            &key,
+            &completion_body("zero/test-pair", false),
+        ))
+        .await
+        .expect("completion request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(header(&response, "x-zerorouter-provider"), "fireworks");
+    assert_eq!(header(&response, "x-zerorouter-model"), "upstream/primary");
+    let request_id = header(&response, "x-request-id");
+    assert!(request_id.starts_with("chatcmpl-"));
+    let body = json_body(response).await;
+    state.wait_for_background_tasks().await;
+
+    assert_eq!(body["id"], request_id.as_str());
+    assert_eq!(body["model"], "zero/test-pair");
+    assert_eq!(
+        body["choices"][0]["message"]["content"],
+        "hello from primary"
+    );
+    assert_eq!(body["choices"][0]["finish_reason"], "stop");
+    assert_eq!(body["usage"]["prompt_tokens"], 1_000);
+    assert_eq!(body["usage"]["completion_tokens"], 20);
+
+    // Dispatch actually happened, against the candidate's pinned upstream model
+    // and carrying the request's temperature — never the tier id.
+    assert_eq!(primary.call_count(), 1);
+    assert_eq!(secondary.call_count(), 0);
+    let call = primary.calls().remove(0);
+    assert_eq!(call.model, "upstream/primary");
+    assert_eq!(call.temperature, Some(0.25));
+    assert_eq!(call.message_count, 1);
+    assert!(!call.streaming);
+
+    assert_eq!(
+        settled_event(&pool, api_key_id).await,
+        (
+            "fireworks".to_owned(),
+            "upstream/primary".to_owned(),
+            1_000,
+            20,
+            served_sell_cost(),
+            200,
+        )
+    );
+    let (candidate_id, cost_basis_usd, attempt_count, finish_reason) =
+        settled_provenance(&pool, api_key_id).await;
+    assert_eq!(candidate_id.as_deref(), Some("fireworks/primary"));
+    // COGS at the candidate's own cost basis: 1000 * $1.00 + 20 * $2.00 per Mtok.
+    assert_eq!(cost_basis_usd, Some(decimal("0.00104")));
+    assert_eq!(finish_reason.as_deref(), Some("stop"));
+    // The non-streaming walk keeps no attempt ledger; only the streaming walk
+    // records `request_attempts` rows today.
+    assert_eq!(attempt_count, None);
+    assert!(attempt_rows(&pool, api_key_id).await.is_empty());
+
+    assert_eq!(
+        balance(&pool, user_of(&pool, api_key_id).await)
+            .await
+            .expect("balance must query"),
+        Decimal::from(50) - served_sell_cost()
+    );
+    assert_eq!(open_reservations(&pool, api_key_id).await, 0);
+}
+
+#[tokio::test]
+async fn non_streaming_failover_retries_the_first_candidate_twice_then_bills_the_second() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let (api_key_id, key) = create_funded_key(&pool, "failover").await;
+    // Today's `ReliableModelProvider` is built with 2 retries and a 500ms base
+    // backoff (providers.rs `PROVIDER_RETRIES` / `PROVIDER_BACKOFF_MS`), so a
+    // retryable failure costs 3 upstream calls and ~1.5s before the walk moves
+    // on. Scripting exactly 3 failures pins that budget: a 4th call would fall
+    // off the script and fail the request instead of failing over.
+    let primary = FakeModelProvider::new(
+        "primary",
+        vec![
+            FakeOutcome::Transport,
+            FakeOutcome::Transport,
+            FakeOutcome::Transport,
+        ],
+    );
+    let secondary = FakeModelProvider::new(
+        "secondary",
+        vec![FakeOutcome::chat("hello from secondary", served_usage())],
+    );
+    let state = router(pool.clone(), vec![primary.clone(), secondary.clone()]);
+
+    let response = app(state.clone())
+        .oneshot(completion_request(
+            &key,
+            &completion_body("zero/test-pair", false),
+        ))
+        .await
+        .expect("completion request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(header(&response, "x-zerorouter-provider"), "together");
+    assert_eq!(
+        header(&response, "x-zerorouter-model"),
+        "upstream/secondary"
+    );
+    let body = json_body(response).await;
+    state.wait_for_background_tasks().await;
+
+    assert_eq!(
+        body["choices"][0]["message"]["content"],
+        "hello from secondary"
+    );
+    assert_eq!(primary.call_count(), 3, "one attempt plus two retries");
+    assert_eq!(secondary.call_count(), 1);
+
+    let (upstream_provider, upstream_model, _, _, cost_usd, status) =
+        settled_event(&pool, api_key_id).await;
+    assert_eq!(upstream_provider, "together");
+    assert_eq!(upstream_model, "upstream/secondary");
+    assert_eq!(cost_usd, served_sell_cost(), "the sell rate is the tier's");
+    assert_eq!(status, 200);
+    let (candidate_id, cost_basis_usd, _, _) = settled_provenance(&pool, api_key_id).await;
+    assert_eq!(candidate_id.as_deref(), Some("together/secondary"));
+    // COGS moves to the second candidate's basis: 1000 * $1.50 + 20 * $3.00.
+    assert_eq!(cost_basis_usd, Some(decimal("0.00156")));
+
+    // SUSPECTED DEFECT (api.rs `run_non_streaming`): the three burnt calls on
+    // the first candidate leave no trace. The non-streaming walk writes no
+    // `request_attempts` rows and no `attempts_cost_basis_usd`, so the margin
+    // view reads this request as if only the second candidate ever ran. The
+    // streaming walk does keep that ledger.
+    assert!(attempt_rows(&pool, api_key_id).await.is_empty());
+    let attempts_cogs = query_scalar::<_, Option<Decimal>>(
+        "SELECT attempts_cost_basis_usd FROM usage_events WHERE api_key_id = $1",
+    )
+    .bind(api_key_id)
+    .fetch_one(&pool)
+    .await
+    .expect("attempts COGS must query");
+    assert_eq!(attempts_cogs, None);
+}
+
+#[tokio::test]
+async fn non_streaming_rate_limited_candidate_moves_on_without_burning_retries() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let (api_key_id, key) = create_funded_key(&pool, "ratelimit").await;
+    let primary = FakeModelProvider::new("primary", vec![FakeOutcome::RateLimited]);
+    let secondary = FakeModelProvider::new(
+        "secondary",
+        vec![FakeOutcome::chat("hello from secondary", served_usage())],
+    );
+    let state = router(pool.clone(), vec![primary.clone(), secondary.clone()]);
+
+    let response = app(state.clone())
+        .oneshot(completion_request(
+            &key,
+            &completion_body("zero/test-pair", false),
+        ))
+        .await
+        .expect("completion request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    state.wait_for_background_tasks().await;
+
+    // A 429 is classified retryable-but-cool-down, so the walk abandons the
+    // candidate after a single call instead of spending the retry budget.
+    assert_eq!(primary.call_count(), 1);
+    assert_eq!(secondary.call_count(), 1);
+    let (candidate_id, _, _, _) = settled_provenance(&pool, api_key_id).await;
+    assert_eq!(candidate_id.as_deref(), Some("together/secondary"));
+}
+
+#[tokio::test]
+async fn non_streaming_every_candidate_failing_releases_the_reservation_without_charge() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let (api_key_id, key) = create_funded_key(&pool, "allfail").await;
+    let primary = FakeModelProvider::new("primary", vec![FakeOutcome::RateLimited]);
+    let secondary = FakeModelProvider::new("secondary", vec![FakeOutcome::RateLimited]);
+    let state = router(pool.clone(), vec![primary.clone(), secondary.clone()]);
+
+    let response = app(state.clone())
+        .oneshot(completion_request(
+            &key,
+            &completion_body("zero/test-pair", false),
+        ))
+        .await
+        .expect("completion request should complete");
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let body = json_body(response).await;
+    state.wait_for_background_tasks().await;
+    assert_eq!(body["error"]["code"], "upstream_unavailable");
+
+    assert_eq!(primary.call_count(), 1);
+    assert_eq!(secondary.call_count(), 1);
+    // No tokens were delivered, so the reservation is released with a
+    // zero-cost sentinel row rather than a charge.
+    assert_eq!(
+        settled_event(&pool, api_key_id).await,
+        (
+            "fallback-chain".to_owned(),
+            "zero/test-pair".to_owned(),
+            0,
+            0,
+            Decimal::ZERO,
+            502,
+        )
+    );
+    let (candidate_id, cost_basis_usd, _, _) = settled_provenance(&pool, api_key_id).await;
+    assert_eq!(candidate_id, None, "no candidate was selected");
+    assert_eq!(cost_basis_usd, None);
+    assert_eq!(
+        balance(&pool, user_of(&pool, api_key_id).await)
+            .await
+            .expect("balance must query"),
+        Decimal::from(50),
+        "a failed request must not move the balance"
+    );
+    assert_eq!(open_reservations(&pool, api_key_id).await, 0);
+}
+
+/// The 15-minute `UPSTREAM_REQUEST_TIMEOUT` is a compile-time constant, so the
+/// deadline is reached on a paused clock rather than in wall time. The clock is
+/// paused only after the fixtures are in place, since the pool cannot dial out
+/// while the runtime is auto-advancing.
+#[tokio::test]
+async fn non_streaming_timeout_releases_the_reservation_without_charge() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let (api_key_id, key) = create_funded_key(&pool, "timeout-sync").await;
+    let solo = FakeModelProvider::new(
+        "solo",
+        vec![FakeOutcome::Stall(Duration::from_secs(20 * 60))],
+    );
+    let state = router(pool.clone(), vec![solo.clone()]);
+    tokio::time::pause();
+
+    let response = app(state.clone())
+        .oneshot(completion_request(
+            &key,
+            &completion_body("zero/test-solo", false),
+        ))
+        .await
+        .expect("completion request should complete");
+    assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+    let body = json_body(response).await;
+    state.wait_for_background_tasks().await;
+    assert_eq!(body["error"]["code"], "upstream_timeout");
+
+    // The non-streaming deadline releases the reservation at zero cost. Its
+    // streaming sibling does the opposite — see
+    // `streaming_timeout_bills_the_whole_reservation_at_zero_delivery`.
+    assert_eq!(
+        settled_event(&pool, api_key_id).await,
+        (
+            "fallback-chain".to_owned(),
+            "zero/test-solo".to_owned(),
+            0,
+            0,
+            Decimal::ZERO,
+            504,
+        )
+    );
+    assert_eq!(
+        balance(&pool, user_of(&pool, api_key_id).await)
+            .await
+            .expect("balance must query"),
+        Decimal::from(50)
+    );
+}
+
+#[tokio::test]
+async fn streaming_happy_path_emits_deltas_then_usage_and_settles_the_metered_row() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let (api_key_id, key) = create_funded_key(&pool, "stream-ok").await;
+    let solo = FakeModelProvider::new(
+        "solo",
+        vec![FakeOutcome::Stream(vec![
+            FakeStreamStep::text("hel"),
+            FakeStreamStep::text("lo"),
+            FakeStreamStep::Usage(served_usage()),
+            FakeStreamStep::Final,
+        ])],
+    );
+    let state = router(pool.clone(), vec![solo.clone()]);
+
+    let response = app(state.clone())
+        .oneshot(completion_request(
+            &key,
+            &completion_body("zero/test-solo", true),
+        ))
+        .await
+        .expect("stream request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(header(&response, "x-request-id").starts_with("chatcmpl-"));
+    // The streaming response carries no upstream attribution headers: the
+    // candidate is not known when the SSE head is written.
+    assert_eq!(header(&response, "x-zerorouter-provider"), "");
+    let payloads = sse_payloads(response).await;
+    state.wait_for_background_tasks().await;
+
+    assert_eq!(payloads.last().map(String::as_str), Some("[DONE]"));
+    let chunks = payloads
+        .iter()
+        .filter(|payload| payload.as_str() != "[DONE]")
+        .map(|payload| serde_json::from_str::<Value>(payload).expect("chunk should be JSON"))
+        .collect::<Vec<_>>();
+    // role primer, two content deltas, the finish delta, then the usage chunk.
+    assert_eq!(chunks.len(), 5);
+    assert_eq!(chunks[0]["choices"][0]["delta"]["role"], "assistant");
+    assert_eq!(chunks[1]["choices"][0]["delta"]["content"], "hel");
+    assert_eq!(chunks[2]["choices"][0]["delta"]["content"], "lo");
+    assert_eq!(chunks[3]["choices"][0]["finish_reason"], "stop");
+    assert_eq!(chunks[4]["usage"]["completion_tokens"], 20);
+    assert!(chunks[4]["choices"].as_array().expect("choices").is_empty());
+
+    let call = solo.calls().remove(0);
+    assert_eq!(call.model, "upstream/solo");
+    assert!(call.streaming);
+
+    assert_eq!(
+        settled_event(&pool, api_key_id).await,
+        (
+            "deepinfra".to_owned(),
+            "upstream/solo".to_owned(),
+            1_000,
+            20,
+            served_sell_cost(),
+            200,
+        )
+    );
+    let (candidate_id, cost_basis_usd, attempt_count, finish_reason) =
+        settled_provenance(&pool, api_key_id).await;
+    assert_eq!(candidate_id.as_deref(), Some("deepinfra/solo"));
+    assert_eq!(cost_basis_usd, Some(decimal("0.00104")));
+    assert_eq!(attempt_count, Some(1));
+    assert_eq!(finish_reason.as_deref(), Some("stop"));
+    assert_eq!(
+        attempt_rows(&pool, api_key_id).await,
+        vec![(1, "deepinfra/solo".to_owned(), "ok".to_owned(), true)]
+    );
+    assert_eq!(
+        balance(&pool, user_of(&pool, api_key_id).await)
+            .await
+            .expect("balance must query"),
+        Decimal::from(50) - served_sell_cost()
+    );
+}
+
+#[tokio::test]
+async fn streaming_candidate_failing_before_any_bytes_fails_over_to_the_next() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let (api_key_id, key) = create_funded_key(&pool, "stream-failover").await;
+    let primary = FakeModelProvider::new(
+        "primary",
+        vec![FakeOutcome::Stream(vec![FakeStreamStep::Error(
+            "upstream exploded".to_owned(),
+        )])],
+    );
+    let secondary = FakeModelProvider::new(
+        "secondary",
+        vec![FakeOutcome::Stream(vec![
+            FakeStreamStep::text("served"),
+            FakeStreamStep::Usage(served_usage()),
+            FakeStreamStep::Final,
+        ])],
+    );
+    let state = router(pool.clone(), vec![primary.clone(), secondary.clone()]);
+
+    let response = app(state.clone())
+        .oneshot(completion_request(
+            &key,
+            &completion_body("zero/test-pair", true),
+        ))
+        .await
+        .expect("stream request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    let chunks = sse_chunks(response).await;
+    state.wait_for_background_tasks().await;
+
+    // The failed candidate is invisible to the client: no error chunk is
+    // emitted before the second candidate's output.
+    assert_eq!(chunks[0]["choices"][0]["delta"]["role"], "assistant");
+    assert_eq!(chunks[1]["choices"][0]["delta"]["content"], "served");
+    assert!(chunks.iter().all(|chunk| chunk.get("error").is_none()));
+    assert_eq!(primary.call_count(), 1, "a stream error is not retried");
+    assert_eq!(secondary.call_count(), 1);
+
+    let (upstream_provider, _, _, _, cost_usd, status) = settled_event(&pool, api_key_id).await;
+    assert_eq!(upstream_provider, "together");
+    assert_eq!(cost_usd, served_sell_cost());
+    assert_eq!(status, 200);
+    assert_eq!(
+        attempt_rows(&pool, api_key_id).await,
+        vec![
+            (
+                1,
+                "fireworks/primary".to_owned(),
+                "stream_error".to_owned(),
+                false
+            ),
+            (2, "together/secondary".to_owned(), "ok".to_owned(), true),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn streaming_error_after_delivered_bytes_bills_the_whole_reservation() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let (api_key_id, key) = create_funded_key(&pool, "stream-broken").await;
+    // Seven characters reach the client, then the upstream dies without ever
+    // reporting usage.
+    let solo = FakeModelProvider::new(
+        "solo",
+        vec![FakeOutcome::Stream(vec![
+            FakeStreamStep::text("partial"),
+            FakeStreamStep::Error("upstream exploded".to_owned()),
+        ])],
+    );
+    let state = router(pool.clone(), vec![solo.clone()]);
+
+    let response = app(state.clone())
+        .oneshot(completion_request(
+            &key,
+            &completion_body("zero/test-solo", true),
+        ))
+        .await
+        .expect("stream request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    let chunks = sse_chunks(response).await;
+    state.wait_for_background_tasks().await;
+
+    assert_eq!(chunks[1]["choices"][0]["delta"]["content"], "partial");
+    assert_eq!(
+        chunks
+            .last()
+            .expect("an error chunk should terminate the stream")["error"]["code"],
+        "upstream_unavailable"
+    );
+
+    // SUSPECTED DEFECT (api.rs `stream_to_channel`, the
+    // `if client_output_sent || !client_connected` settle): once any byte has
+    // reached the client, an unmetered break bills `reservation_usage` — the
+    // full 4096-token output bound — for seven delivered characters. The
+    // request's own attempt row prices the same delivery at the per-chunk
+    // estimate of 2 output tokens, so the ledger contradicts itself by three
+    // orders of magnitude, and the customer's balance moves by the larger one.
+    assert_eq!(
+        settled_event(&pool, api_key_id).await,
+        (
+            "deepinfra".to_owned(),
+            "upstream/solo".to_owned(),
+            RESERVED_PROMPT_TOKENS,
+            i32::try_from(MAX_TOKENS).expect("output bound fits"),
+            reservation_sell_cost(),
+            502,
+        )
+    );
+    let attempt_usage = query_as::<_, (Option<i32>, bool, Option<Decimal>)>(
+        r#"
+        SELECT output_tokens, tokens_estimated, cost_basis_usd
+        FROM request_attempts
+        WHERE api_key_id = $1
+        "#,
+    )
+    .bind(api_key_id)
+    .fetch_one(&pool)
+    .await
+    .expect("attempt row must query");
+    assert_eq!(attempt_usage, (Some(2), true, Some(decimal("0.000004"))));
+    assert_eq!(
+        attempt_rows(&pool, api_key_id).await,
+        vec![(
+            1,
+            "deepinfra/solo".to_owned(),
+            "stream_error".to_owned(),
+            true
+        )],
+        "the broken candidate is still the served one"
+    );
+    assert_eq!(
+        balance(&pool, user_of(&pool, api_key_id).await)
+            .await
+            .expect("balance must query"),
+        Decimal::from(50) - reservation_sell_cost()
+    );
+}
+
+/// See `non_streaming_timeout_releases_the_reservation_without_charge` for why
+/// the clock is paused, and paused only here.
+#[tokio::test]
+async fn streaming_timeout_bills_the_whole_reservation_at_zero_delivery() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let (api_key_id, key) = create_funded_key(&pool, "stream-timeout").await;
+    let solo = FakeModelProvider::new(
+        "solo",
+        vec![FakeOutcome::Stream(vec![
+            FakeStreamStep::Stall(Duration::from_secs(20 * 60)),
+            FakeStreamStep::text("never sent"),
+            FakeStreamStep::Final,
+        ])],
+    );
+    let state = router(pool.clone(), vec![solo.clone()]);
+    tokio::time::pause();
+
+    let response = app(state.clone())
+        .oneshot(completion_request(
+            &key,
+            &completion_body("zero/test-solo", true),
+        ))
+        .await
+        .expect("stream request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    let chunks = sse_chunks(response).await;
+    state.wait_for_background_tasks().await;
+
+    assert_eq!(chunks.len(), 1, "only the error chunk reaches the client");
+    assert_eq!(chunks[0]["error"]["code"], "upstream_timeout");
+
+    // SUSPECTED DEFECT (api.rs `settle_stream_interruption`, the
+    // `usage.unwrap_or(reservation_usage)` argument): a streaming request that
+    // delivered nothing at all is billed the entire reservation, while the
+    // non-streaming deadline for the identical request releases it at zero
+    // cost. The shutdown terminal shares this settle site and therefore bills
+    // the same way: draining the router for a deploy charges every in-flight
+    // stream its full output bound.
+    assert_eq!(
+        settled_event(&pool, api_key_id).await,
+        (
+            "deepinfra".to_owned(),
+            "upstream/solo".to_owned(),
+            RESERVED_PROMPT_TOKENS,
+            i32::try_from(MAX_TOKENS).expect("output bound fits"),
+            reservation_sell_cost(),
+            504,
+        )
+    );
+    assert_eq!(
+        attempt_rows(&pool, api_key_id).await,
+        vec![(1, "deepinfra/solo".to_owned(), "timeout".to_owned(), false)],
+        "no attempt served, yet the request settles at the reservation bound"
+    );
+    assert_eq!(
+        balance(&pool, user_of(&pool, api_key_id).await)
+            .await
+            .expect("balance must query"),
+        Decimal::from(50) - reservation_sell_cost()
+    );
+}
+
+#[tokio::test]
+async fn synthetic_stream_serves_a_candidate_that_cannot_stream() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let (api_key_id, key) = create_funded_key(&pool, "synthetic").await;
+    let solo = FakeModelProvider::without_streaming(
+        "solo",
+        vec![FakeOutcome::Chat {
+            text: Some("whole answer".to_owned()),
+            tool_calls: vec![ToolCall {
+                id: "call_1".to_owned(),
+                name: "shell".to_owned(),
+                arguments: r#"{"command":"pwd"}"#.to_owned(),
+                extra_content: None,
+            }],
+            usage: Some(served_usage()),
+        }],
+    );
+    let state = router(pool.clone(), vec![solo.clone()]);
+
+    let response = app(state.clone())
+        .oneshot(completion_request(
+            &key,
+            &completion_body("zero/test-solo", true),
+        ))
+        .await
+        .expect("stream request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    let chunks = sse_chunks(response).await;
+    state.wait_for_background_tasks().await;
+
+    // A non-streaming candidate is served as one buffered turn replayed as SSE:
+    // role primer, the whole body, each tool call, the finish delta, usage.
+    assert_eq!(chunks.len(), 5);
+    assert_eq!(chunks[0]["choices"][0]["delta"]["role"], "assistant");
+    assert_eq!(chunks[1]["choices"][0]["delta"]["content"], "whole answer");
+    assert_eq!(
+        chunks[2]["choices"][0]["delta"]["tool_calls"][0]["function"]["name"],
+        "shell"
+    );
+    assert_eq!(chunks[3]["choices"][0]["finish_reason"], "tool_calls");
+    assert_eq!(chunks[4]["usage"]["prompt_tokens"], 1_000);
+
+    // The router reached it through `chat`, not `stream_chat`.
+    let call = solo.calls().remove(0);
+    assert!(!call.streaming);
+    assert_eq!(call.model, "upstream/solo");
+
+    assert_eq!(
+        settled_event(&pool, api_key_id).await,
+        (
+            "deepinfra".to_owned(),
+            "upstream/solo".to_owned(),
+            1_000,
+            20,
+            served_sell_cost(),
+            200,
+        )
+    );
+    let (_, _, attempt_count, finish_reason) = settled_provenance(&pool, api_key_id).await;
+    assert_eq!(attempt_count, Some(1));
+    assert_eq!(finish_reason.as_deref(), Some("tool_calls"));
+    assert_eq!(
+        attempt_rows(&pool, api_key_id).await,
+        vec![(1, "deepinfra/solo".to_owned(), "ok".to_owned(), true)]
+    );
+}
+
+#[tokio::test]
+async fn streaming_client_disconnect_mid_stream_still_bills_the_metered_usage() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let (api_key_id, key) = create_funded_key(&pool, "disconnect").await;
+    // The stall holds the upstream open long enough for the test to read the
+    // opening frames and hang up before the rest arrives.
+    let solo = FakeModelProvider::new(
+        "solo",
+        vec![FakeOutcome::Stream(vec![
+            FakeStreamStep::text("first"),
+            FakeStreamStep::Stall(Duration::from_millis(250)),
+            FakeStreamStep::text("second"),
+            FakeStreamStep::Usage(served_usage()),
+            FakeStreamStep::Final,
+        ])],
+    );
+    let state = router(pool.clone(), vec![solo.clone()]);
+
+    let response = app(state.clone())
+        .oneshot(completion_request(
+            &key,
+            &completion_body("zero/test-solo", true),
+        ))
+        .await
+        .expect("stream request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut body = response.into_body();
+    let mut delivered = 0_usize;
+    while delivered < 2 {
+        assert!(
+            body.frame().await.is_some(),
+            "the role primer and first delta should arrive"
+        );
+        delivered += 1;
+    }
+    drop(body);
+    state.wait_for_background_tasks().await;
+
+    // A client that hangs up mid-stream is still billed the upstream's metered
+    // usage — the tokens were generated — but the row is labelled 499 so the
+    // delivery failure stays visible in the ledger.
+    assert_eq!(
+        settled_event(&pool, api_key_id).await,
+        (
+            "deepinfra".to_owned(),
+            "upstream/solo".to_owned(),
+            1_000,
+            20,
+            served_sell_cost(),
+            499,
+        )
+    );
+    assert_eq!(
+        balance(&pool, user_of(&pool, api_key_id).await)
+            .await
+            .expect("balance must query"),
+        Decimal::from(50) - served_sell_cost()
+    );
+}

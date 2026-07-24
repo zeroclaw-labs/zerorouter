@@ -177,6 +177,22 @@ impl ProviderCandidate {
     }
 }
 
+#[cfg(feature = "testing")]
+impl ProviderCandidate {
+    /// Put a pre-built provider client behind a canonical tier candidate.
+    ///
+    /// The only way anything other than a configured upstream can serve a
+    /// candidate, so it is gated on the `testing` feature and cannot exist in
+    /// a production binary.
+    #[must_use]
+    pub fn with_provider(definition: TierCandidate, provider: Arc<dyn ModelProvider>) -> Self {
+        Self {
+            definition,
+            provider,
+        }
+    }
+}
+
 impl ProviderCandidate {
     #[must_use]
     pub fn definition(&self) -> &TierCandidate {
@@ -247,6 +263,18 @@ impl ProviderRoute {
         max_output_tokens: u32,
     ) -> Result<Self, ProviderBuildError> {
         build_with_credentials(candidates, max_output_tokens, read_credential)
+    }
+
+    /// Assemble a route from pre-built candidates.
+    ///
+    /// Goes through the same [`assemble_route`] wiring as [`Self::new`], so the
+    /// non-streaming retry/fallback chain a test drives is the production one
+    /// and only the leaf provider clients differ. Gated on the `testing`
+    /// feature for the same reason [`ProviderCandidate::with_provider`] is.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn from_candidates(candidates: Vec<ProviderCandidate>) -> Self {
+        assemble_route(candidates)
     }
 
     #[must_use]
@@ -387,7 +415,13 @@ where
         });
     }
 
-    let fallback_chain = available
+    Ok(assemble_route(available))
+}
+
+/// Wrap ordered candidates in the model-pinned retry/fallback chain the
+/// non-streaming path dispatches through.
+fn assemble_route(candidates: Vec<ProviderCandidate>) -> ProviderRoute {
+    let fallback_chain = candidates
         .iter()
         .map(|candidate| {
             let pinned = ModelPinnedProvider::builder(&candidate.definition.id)
@@ -407,10 +441,10 @@ where
         PROVIDER_BACKOFF_MS,
     ));
 
-    Ok(ProviderRoute {
-        candidates: available,
+    ProviderRoute {
+        candidates,
         non_streaming,
-    })
+    }
 }
 
 fn read_credential(name: &str) -> Option<String> {

@@ -1,0 +1,54 @@
+schema_version = 1
+
+# Fixture catalog for tests/request_path.rs. Kept separate from
+# config/tiers.toml so the characterization assertions pin router behavior and
+# not the production candidate list, which moves for commercial reasons.
+#
+# Sell rates are deliberately a clean multiple of the candidate cost bases so
+# the settled cost_usd, cost_basis_usd, and margin are all exact decimals, and
+# the two candidates of the pair tier price differently so a failover row can
+# be told apart from a primary row by its COGS alone.
+
+[tiers."zero/test-pair"]
+
+[tiers."zero/test-pair".rates]
+input_per_mtok = 3.00
+cached_input_per_mtok = 0.60
+output_per_mtok = 6.00
+
+[[tiers."zero/test-pair".candidates]]
+id = "fireworks/primary"
+provider = "fireworks"
+model = "upstream/primary"
+
+[tiers."zero/test-pair".candidates.rates]
+input_per_mtok = 1.00
+cached_input_per_mtok = 0.20
+output_per_mtok = 2.00
+
+[[tiers."zero/test-pair".candidates]]
+id = "together/secondary"
+provider = "together"
+model = "upstream/secondary"
+
+[tiers."zero/test-pair".candidates.rates]
+input_per_mtok = 1.50
+cached_input_per_mtok = 0.30
+output_per_mtok = 3.00
+
+[tiers."zero/test-solo"]
+
+[tiers."zero/test-solo".rates]
+input_per_mtok = 3.00
+cached_input_per_mtok = 0.60
+output_per_mtok = 6.00
+
+[[tiers."zero/test-solo".candidates]]
+id = "deepinfra/solo"
+provider = "deepinfra"
+model = "upstream/solo"
+
+[tiers."zero/test-solo".candidates.rates]
+input_per_mtok = 1.00
+cached_input_per_mtok = 0.20
+output_per_mtok = 2.00

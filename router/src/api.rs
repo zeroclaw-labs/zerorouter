@@ -123,6 +123,13 @@ const SSE_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 const UPSTREAM_REQUEST_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const MAX_REQUEST_BODY_BYTES: usize = 8 * 1024 * 1024;
 
+/// Supplies the per-request [`ProviderRoute`] the walk runs over, standing in
+/// for the credential-built one. Test-only, so a production binary has no way
+/// to substitute an upstream; the arguments are exactly what the production
+/// [`ProviderRoute::new`] call site passes.
+#[cfg(feature = "testing")]
+pub type InjectedRoute = Arc<dyn Fn(&ResolvedRoute, u32) -> ProviderRoute + Send + Sync>;
+
 #[derive(Clone)]
 pub struct RouterState {
     tier_config_path: Arc<PathBuf>,
@@ -134,6 +141,8 @@ struct RouterServices {
     authenticator: KeyAuthenticator,
     runtime: RuntimeControl,
     require_credits: bool,
+    #[cfg(feature = "testing")]
+    injected_route: Option<InjectedRoute>,
 }
 
 #[derive(Clone)]
@@ -174,6 +183,31 @@ impl RouterState {
                 authenticator: KeyAuthenticator::new(),
                 runtime: RuntimeControl::new(),
                 require_credits,
+                #[cfg(feature = "testing")]
+                injected_route: None,
+            })),
+        }
+    }
+
+    /// Serve the walk over `route` instead of one built from upstream
+    /// credentials. Everything else — authentication, admission, the walk, and
+    /// settlement — is the production path.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn with_injected_route(
+        tier_config_path: impl Into<PathBuf>,
+        pool: PgPool,
+        require_credits: bool,
+        route: InjectedRoute,
+    ) -> Self {
+        Self {
+            tier_config_path: Arc::new(tier_config_path.into()),
+            services: Some(Arc::new(RouterServices {
+                pool,
+                authenticator: KeyAuthenticator::new(),
+                runtime: RuntimeControl::new(),
+                require_credits,
+                injected_route: Some(route),
             })),
         }
     }
@@ -200,6 +234,24 @@ impl RouterState {
             services.runtime.tasks.close();
             services.runtime.tasks.wait().await;
         }
+    }
+}
+
+impl RouterServices {
+    /// The provider route this request walks: built from upstream credentials,
+    /// or supplied by the injected route when one is configured. Never cache
+    /// the result — fallback selection metadata is request-scoped.
+    fn provider_route(
+        &self,
+        resolved: &ResolvedRoute,
+        max_output_tokens: u32,
+    ) -> Result<ProviderRoute, ApiError> {
+        #[cfg(feature = "testing")]
+        if let Some(route) = &self.injected_route {
+            return Ok(route(resolved, max_output_tokens));
+        }
+        ProviderRoute::new(resolved.candidates.clone(), max_output_tokens)
+            .map_err(|_| ApiError::NoProviderAvailable)
     }
 }
 
@@ -259,8 +311,7 @@ async fn chat_completions(
         .resolve(&request.model)
         .ok_or(ApiError::ModelNotFound)?;
     let max_output_tokens = *request.max_tokens.get_or_insert(BASELINE_MAX_TOKENS);
-    let provider_route = ProviderRoute::new(resolved.candidates.clone(), max_output_tokens)
-        .map_err(|_| ApiError::NoProviderAvailable)?;
+    let provider_route = services.provider_route(&resolved, max_output_tokens)?;
     let reservation_usage = request.reservation_usage(max_output_tokens);
     let reserved_tokens =
         i64::try_from(reservation_usage.total_tokens).map_err(|_| ApiError::InvalidRequest)?;

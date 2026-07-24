@@ -13,6 +13,8 @@ pub mod providers;
 pub mod session;
 mod sqlx;
 pub mod stripe;
+#[cfg(feature = "testing")]
+pub mod testing;
 pub mod web;
 
 pub use api::{RouterState, app};
