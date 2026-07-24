@@ -10,12 +10,15 @@ use rust_decimal::Decimal;
 use sqlx_core::{query::query, query_scalar::query_scalar};
 use sqlx_postgres::{PgConnectOptions, PgPool, PgPoolOptions};
 use uuid::Uuid;
+use zeroclaw_providers::pricing::ModelRates;
 use zerorouter::{
     auth::{AuthenticatedKey, generate_api_key, hash_api_key},
     billing::{CreditOutcome, balance, credit_purchase, grant_promo, ledger_entries},
-    db::{UsageAdmission, UsageRecord, begin_usage_session, migrate},
+    db::{RequestTelemetry, UsageAdmission, UsageRecord, begin_usage_session, migrate},
     openai::OpenAiUsage,
 };
+
+const TEST_SIGNATURE: &str = "0123456789abcdef";
 
 async fn connect() -> Option<PgPool> {
     let database_url = std::env::var("DATABASE_URL").ok()?;
@@ -79,6 +82,23 @@ fn usage_record(cost_usd: Decimal) -> UsageRecord {
         cost_usd,
         latency_ms: 10,
         status: 200,
+        telemetry: RequestTelemetry {
+            requested_max_tokens: 4096,
+            stream: false,
+            prompt_bytes: 128,
+            message_count: 1,
+            tool_count: 0,
+            candidate_id: None,
+            basis_rates: None,
+            sell_rates: ModelRates {
+                input_per_mtok: Some(2.0),
+                output_per_mtok: Some(10.0),
+                cached_input_per_mtok: Some(0.2),
+            },
+            finish_reason: None,
+            shape_ok: None,
+        },
+        attempts: Vec::new(),
     }
 }
 
@@ -135,9 +155,17 @@ async fn usage_settlement_debits_the_balance_exactly_once() {
         .await
         .expect("funding purchase must apply");
 
-    let session = match begin_usage_session(&pool, &key, 1_000, Decimal::from(2), true)
-        .await
-        .expect("funded admission must query")
+    let session = match begin_usage_session(
+        &pool,
+        &key,
+        1_000,
+        500,
+        Decimal::from(2),
+        TEST_SIGNATURE.to_owned(),
+        true,
+    )
+    .await
+    .expect("funded admission must query")
     {
         UsageAdmission::Allowed(session) => session,
         _ => panic!("funded admission should be allowed"),
@@ -196,16 +224,32 @@ async fn credit_admission_fails_closed_and_cannot_jointly_overdraw() {
         .expect("starter promo must apply");
 
     assert!(matches!(
-        begin_usage_session(&pool, &key_a, 100, Decimal::from(2), true)
-            .await
-            .expect("underfunded admission must query"),
+        begin_usage_session(
+            &pool,
+            &key_a,
+            100,
+            50,
+            Decimal::from(2),
+            TEST_SIGNATURE.to_owned(),
+            true
+        )
+        .await
+        .expect("underfunded admission must query"),
         UsageAdmission::InsufficientCredits
     ));
     // Cap-only mode still admits the same reservation; settle it zero-cost so
     // it neither debits the balance nor lingers as an active reservation.
-    match begin_usage_session(&pool, &key_a, 100, Decimal::from(2), false)
-        .await
-        .expect("cap-only admission must query")
+    match begin_usage_session(
+        &pool,
+        &key_a,
+        100,
+        50,
+        Decimal::from(2),
+        TEST_SIGNATURE.to_owned(),
+        false,
+    )
+    .await
+    .expect("cap-only admission must query")
     {
         UsageAdmission::Allowed(session) => session
             .record(&usage_record(Decimal::ZERO))
@@ -225,8 +269,24 @@ async fn credit_admission_fails_closed_and_cannot_jointly_overdraw() {
         .await
         .expect("top-up promo must apply");
     let (first, second) = tokio::join!(
-        begin_usage_session(&pool, &key_a, 100, Decimal::from(2), true),
-        begin_usage_session(&pool, &key_b, 100, Decimal::from(2), true),
+        begin_usage_session(
+            &pool,
+            &key_a,
+            100,
+            50,
+            Decimal::from(2),
+            TEST_SIGNATURE.to_owned(),
+            true
+        ),
+        begin_usage_session(
+            &pool,
+            &key_b,
+            100,
+            50,
+            Decimal::from(2),
+            TEST_SIGNATURE.to_owned(),
+            true
+        ),
     );
     let mut admitted = 0;
     let mut rejected = 0;
@@ -323,9 +383,17 @@ async fn settlement_debit_is_clamped_to_the_reservation_and_cannot_overdraw() {
         .await
         .expect("funding purchase must apply");
 
-    let session = match begin_usage_session(&pool, &key, 1_000, Decimal::from(2), true)
-        .await
-        .expect("funded admission must query")
+    let session = match begin_usage_session(
+        &pool,
+        &key,
+        1_000,
+        500,
+        Decimal::from(2),
+        TEST_SIGNATURE.to_owned(),
+        true,
+    )
+    .await
+    .expect("funded admission must query")
     {
         UsageAdmission::Allowed(session) => session,
         _ => panic!("funded admission should be allowed"),
@@ -362,9 +430,17 @@ async fn cap_only_settlement_records_usage_without_touching_the_balance() {
     let key = create_key(&pool, user_id).await;
     // require_credits = false: no balance is funded, and settlement must record
     // the usage event for metering without moving money below zero.
-    let session = match begin_usage_session(&pool, &key, 1_000, Decimal::from(2), false)
-        .await
-        .expect("cap-only admission must query")
+    let session = match begin_usage_session(
+        &pool,
+        &key,
+        1_000,
+        500,
+        Decimal::from(2),
+        TEST_SIGNATURE.to_owned(),
+        false,
+    )
+    .await
+    .expect("cap-only admission must query")
     {
         UsageAdmission::Allowed(session) => session,
         _ => panic!("cap-only admission should be allowed"),

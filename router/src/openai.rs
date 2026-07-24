@@ -4,6 +4,7 @@ use chrono::Utc;
 use rust_decimal::{Decimal, prelude::FromPrimitive};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
+use sha2::{Digest, Sha256};
 use zeroclaw_api::tool::ToolSpec;
 use zeroclaw_providers::{
     pricing::ModelRates,
@@ -546,6 +547,81 @@ pub fn finish_reason(
     }
 }
 
+/// First 16 hex chars of sha256 over the user-scoped request-shape segment
+/// key (design: Engine "Task signature"). Keyed per USER — not per API key —
+/// so key churn resets nothing, and coarse buckets make request-shape gaming
+/// self-defeating. Prompt *content* is never part of the key. Fields (sorted
+/// tool names, message-count bucket, log2 prompt-bytes bucket, stream flag,
+/// log2 requested-max_tokens bucket) mirror the `reservation_usage` walk.
+#[must_use]
+pub fn task_signature(
+    user_id: &str,
+    tool_names: &[String],
+    message_count: usize,
+    prompt_bytes: u64,
+    stream: bool,
+    requested_max_tokens: u32,
+) -> String {
+    let mut tools: Vec<&str> = tool_names.iter().map(String::as_str).collect();
+    tools.sort_unstable();
+    let mut hasher = Sha256::new();
+    hasher.update(user_id.as_bytes());
+    hasher.update([0x1f]);
+    hasher.update(tools.join(",").as_bytes());
+    hasher.update([0x1f]);
+    hasher.update(message_count_bucket(message_count).as_bytes());
+    hasher.update([0x1f]);
+    hasher.update(log2_bucket(prompt_bytes).to_string().as_bytes());
+    hasher.update([0x1f]);
+    hasher.update(if stream {
+        b"1".as_slice()
+    } else {
+        b"0".as_slice()
+    });
+    hasher.update([0x1f]);
+    hasher.update(
+        log2_bucket(u64::from(requested_max_tokens))
+            .to_string()
+            .as_bytes(),
+    );
+    let digest = format!("{:x}", hasher.finalize());
+    digest[..16].to_owned()
+}
+
+fn message_count_bucket(count: usize) -> &'static str {
+    match count {
+        0 | 1 => "1",
+        2..=4 => "2-4",
+        5..=16 => "5-16",
+        _ => "17+",
+    }
+}
+
+fn log2_bucket(value: u64) -> u32 {
+    if value == 0 {
+        0
+    } else {
+        63 - value.leading_zeros()
+    }
+}
+
+/// The implicit shape-validator label (migration 0004): output present and
+/// non-empty, every tool-call `arguments` parses as JSON, and the synthesized
+/// finish reason is not length-truncation. Label-only — it never changes
+/// routing, and it labels 100% of served traffic for the success estimator.
+#[must_use]
+pub fn shape_ok(output_nonempty: bool, tool_args_all_json: bool, finish_reason: &str) -> bool {
+    output_nonempty && tool_args_all_json && finish_reason != "length"
+}
+
+/// Whether every tool call's `arguments` is syntactically valid JSON.
+#[must_use]
+pub fn tool_args_all_json(calls: &[ToolCall]) -> bool {
+    calls
+        .iter()
+        .all(|call| serde_json::from_str::<Value>(&call.arguments).is_ok())
+}
+
 #[must_use]
 pub fn tool_call_to_openai(call: ToolCall) -> OpenAiToolCall {
     OpenAiToolCall {
@@ -844,6 +920,89 @@ mod tests {
 
         assert_eq!(chunk["created"], 123);
         assert!(chunk["usage"].is_null());
+    }
+
+    #[test]
+    fn task_signature_is_sixteen_hex_and_deterministic() {
+        let tools = vec!["shell".to_owned(), "read".to_owned()];
+        let first = task_signature("user-a", &tools, 3, 200, false, 4096);
+        let again = task_signature("user-a", &tools, 3, 200, false, 4096);
+        assert_eq!(first, again, "same inputs must hash identically");
+        assert_eq!(first.len(), 16);
+        assert!(first.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn task_signature_is_user_scoped_and_tool_order_insensitive() {
+        let ordered = vec!["a".to_owned(), "b".to_owned()];
+        let reversed = vec!["b".to_owned(), "a".to_owned()];
+        assert_eq!(
+            task_signature("user-a", &ordered, 1, 10, false, 4096),
+            task_signature("user-a", &reversed, 1, 10, false, 4096),
+            "tool names are sorted before hashing"
+        );
+        assert_ne!(
+            task_signature("user-a", &ordered, 1, 10, false, 4096),
+            task_signature("user-b", &ordered, 1, 10, false, 4096),
+            "a different user must land in a different segment"
+        );
+    }
+
+    #[test]
+    fn task_signature_message_count_buckets_change_only_at_boundaries() {
+        let sig = |count| task_signature("user", &[], count, 100, false, 4096);
+        // Bucket edges are {1, 2-4, 5-16, 17+}.
+        assert_eq!(sig(2), sig(4), "2 and 4 share the 2-4 bucket");
+        assert_eq!(sig(5), sig(16), "5 and 16 share the 5-16 bucket");
+        assert_ne!(sig(1), sig(2), "the 1 | 2-4 boundary shifts the bucket");
+        assert_ne!(sig(4), sig(5), "the 2-4 | 5-16 boundary shifts the bucket");
+        assert_ne!(
+            sig(16),
+            sig(17),
+            "the 5-16 | 17+ boundary shifts the bucket"
+        );
+    }
+
+    #[test]
+    fn task_signature_prompt_bytes_buckets_are_log2() {
+        let sig = |bytes| task_signature("user", &[], 1, bytes, false, 4096);
+        assert_eq!(sig(256), sig(300), "256 and 300 share the log2 bucket 8");
+        assert_ne!(
+            sig(255),
+            sig(256),
+            "crossing a power of two changes the bucket"
+        );
+        assert_ne!(sig(256), sig(512), "the next power of two is a new bucket");
+    }
+
+    #[test]
+    fn shape_ok_requires_output_valid_args_and_no_truncation() {
+        assert!(shape_ok(true, true, "stop"));
+        assert!(shape_ok(true, true, "tool_calls"));
+        assert!(
+            !shape_ok(false, true, "stop"),
+            "empty output fails the shape check"
+        );
+        assert!(!shape_ok(true, false, "stop"), "unparseable tool args fail");
+        assert!(!shape_ok(true, true, "length"), "length truncation fails");
+    }
+
+    #[test]
+    fn tool_args_all_json_rejects_malformed_arguments() {
+        let good = vec![ToolCall {
+            id: "call_1".to_owned(),
+            name: "shell".to_owned(),
+            arguments: r#"{"command":"pwd"}"#.to_owned(),
+            extra_content: None,
+        }];
+        let bad = vec![ToolCall {
+            id: "call_2".to_owned(),
+            name: "shell".to_owned(),
+            arguments: "{not json".to_owned(),
+            extra_content: None,
+        }];
+        assert!(tool_args_all_json(&good));
+        assert!(!tool_args_all_json(&bad));
     }
 
     #[test]

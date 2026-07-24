@@ -16,6 +16,7 @@ use axum::{
     response::{IntoResponse, Response, Sse, sse::Event, sse::KeepAlive},
     routing::{get, post},
 };
+use chrono::Utc;
 use futures_util::StreamExt;
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -31,15 +32,90 @@ use zeroclaw_providers::{
 use crate::{
     auth::{AuthenticatedKey, AuthenticationError, KeyAuthenticator},
     config::{ResolvedRoute, TierCandidate, load_tier_catalog},
-    db::{UsageAdmission, UsageRecord, UsageSession, begin_usage_session},
+    db::{
+        AttemptRecord, RequestTelemetry, UsageAdmission, UsageRecord, UsageSession,
+        begin_usage_session,
+    },
     error::{ApiError, streaming_error_json},
     openai::{
         ChatCompletionRequest, ChatCompletionResponse, ModelList, OpenAiUsage, StreamMetadata,
-        finish_reason, stream_delta_json, stream_tool_call_delta, stream_usage_json, usage_cost,
+        finish_reason, shape_ok, stream_delta_json, stream_tool_call_delta, stream_usage_json,
+        task_signature, tool_args_all_json, usage_cost,
     },
     providers::{ProviderCandidate, ProviderRoute},
     sqlx::PgPool,
 };
+
+/// Raw request-shape features captured once per request and written onto the
+/// telemetry substrate at every settle site (migration 0004). Prompt content
+/// is never included — only sizes and counts.
+#[derive(Clone, Copy)]
+struct RequestFeatures {
+    requested_max_tokens: i32,
+    stream: bool,
+    prompt_bytes: i64,
+    message_count: i32,
+    tool_count: i32,
+}
+
+impl RequestFeatures {
+    fn from_request(request: &ChatCompletionRequest, reservation_usage: OpenAiUsage) -> Self {
+        Self {
+            requested_max_tokens: request
+                .max_tokens
+                .map_or(0, |max| i32::try_from(max).unwrap_or(i32::MAX)),
+            stream: request.stream,
+            prompt_bytes: i64::try_from(reservation_usage.prompt_tokens).unwrap_or(i64::MAX),
+            message_count: i32::try_from(request.messages.len()).unwrap_or(i32::MAX),
+            tool_count: i32::try_from(request.tools.len()).unwrap_or(i32::MAX),
+        }
+    }
+}
+
+/// Build one `request_attempts` row from an in-walk candidate outcome. Cost
+/// basis is the candidate's own cost-basis rate applied to whatever usage is
+/// known (a per-chunk `token_count` lower bound for abandoned attempts).
+#[allow(clippy::too_many_arguments)]
+fn build_attempt(
+    attempt_no: usize,
+    candidate: &TierCandidate,
+    outcome: &'static str,
+    served: bool,
+    attempt_started: Instant,
+    usage: Option<OpenAiUsage>,
+    tokens_estimated: bool,
+    finish_reason: Option<&str>,
+) -> AttemptRecord {
+    let latency_ms = i32::try_from(attempt_started.elapsed().as_millis()).unwrap_or(i32::MAX);
+    let started_at = Utc::now() - chrono::Duration::milliseconds(i64::from(latency_ms));
+    let cost_basis_usd = usage.map(|usage| usage_cost(candidate.rates, usage));
+    AttemptRecord {
+        attempt_no: i16::try_from(attempt_no).unwrap_or(i16::MAX),
+        started_at,
+        candidate_id: candidate.id.clone(),
+        upstream_provider: candidate.provider.clone(),
+        upstream_model: candidate.model.clone(),
+        outcome: outcome.to_owned(),
+        served,
+        latency_ms,
+        usage,
+        tokens_estimated,
+        cost_basis_usd,
+        finish_reason: finish_reason.map(str::to_owned),
+        validator_kind: None,
+    }
+}
+
+/// A conservative lower-bound usage from the per-chunk `token_count` a stream
+/// already reports, used only to price an abandoned streaming attempt's COGS.
+fn estimated_stream_usage(estimated_output: u64) -> Option<OpenAiUsage> {
+    (estimated_output > 0).then_some(OpenAiUsage {
+        prompt_tokens: 0,
+        completion_tokens: estimated_output,
+        total_tokens: estimated_output,
+        prompt_tokens_details: None,
+    })
+}
 
 const SSE_CHANNEL_CAPACITY: usize = 32;
 const SSE_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
@@ -189,11 +265,28 @@ async fn chat_completions(
     let reserved_tokens =
         i64::try_from(reservation_usage.total_tokens).map_err(|_| ApiError::InvalidRequest)?;
     let reserved_cost = usage_cost(resolved.sell_rates, reservation_usage);
+    // The user-scoped segmentation key (design: Engine "Task signature"),
+    // computed beside the reservation over the same request-shape fields.
+    let tool_names: Vec<String> = request
+        .tools
+        .iter()
+        .map(|tool| tool.function.name.clone())
+        .collect();
+    let signature = task_signature(
+        &authenticated.user_id.to_string(),
+        &tool_names,
+        request.messages.len(),
+        reservation_usage.prompt_tokens,
+        request.stream,
+        max_output_tokens,
+    );
     let usage_session = admit_usage(
         &services.pool,
         &authenticated,
         reserved_tokens,
+        i64::from(max_output_tokens),
         reserved_cost,
+        signature,
         services.require_credits,
     )
     .await?;
@@ -252,6 +345,7 @@ async fn run_non_streaming(
     reservation_usage: OpenAiUsage,
 ) -> Result<Response, ApiError> {
     let request_id = usage_session.request_id();
+    let features = RequestFeatures::from_request(&request, reservation_usage);
     let messages = request.provider_messages();
     let tools = request.provider_tools();
     let max_tokens = request.max_tokens;
@@ -272,8 +366,13 @@ async fn run_non_streaming(
                 &resolved.requested_model,
                 "fallback-chain",
                 &resolved.requested_model,
+                None,
                 OpenAiUsage::default(),
                 resolved.sell_rates,
+                features,
+                None,
+                None,
+                Vec::new(),
                 started,
                 503,
             )
@@ -300,8 +399,13 @@ async fn run_non_streaming(
                 &resolved.requested_model,
                 "fallback-chain",
                 &resolved.requested_model,
+                None,
                 OpenAiUsage::default(),
                 resolved.sell_rates,
+                features,
+                None,
+                None,
+                Vec::new(),
                 started,
                 502,
             )
@@ -321,8 +425,13 @@ async fn run_non_streaming(
                 &resolved.requested_model,
                 "fallback-chain",
                 &resolved.requested_model,
+                None,
                 OpenAiUsage::default(),
                 resolved.sell_rates,
+                features,
+                None,
+                None,
+                Vec::new(),
                 started,
                 504,
             )
@@ -342,21 +451,44 @@ async fn run_non_streaming(
             &resolved.requested_model,
             &selected.candidate.provider,
             &selected.candidate.model,
+            Some(selected.candidate),
             reservation_usage,
             resolved.sell_rates,
+            features,
+            None,
+            None,
+            Vec::new(),
             started,
             502,
         )
         .await?;
         return Err(ApiError::MeteringUnavailable);
     };
+    let has_tools = !selected.response.tool_calls.is_empty();
+    let synthesized_finish = finish_reason(has_tools, usage, max_tokens);
+    let output_nonempty = selected
+        .response
+        .text
+        .as_deref()
+        .is_some_and(|text| !text.is_empty())
+        || has_tools;
+    let shape_label = shape_ok(
+        output_nonempty,
+        tool_args_all_json(&selected.response.tool_calls),
+        synthesized_finish,
+    );
     persist_usage(
         usage_session,
         &resolved.requested_model,
         &selected.candidate.provider,
         &selected.candidate.model,
+        Some(selected.candidate),
         usage,
         resolved.sell_rates,
+        features,
+        Some(synthesized_finish),
+        Some(shape_label),
+        Vec::new(),
         started,
         200,
     )
@@ -450,11 +582,15 @@ async fn stream_to_channel(
     let messages = request.provider_messages();
     let tools = request.provider_tools();
     let max_tokens = request.max_tokens;
+    let features = RequestFeatures::from_request(&request, reservation_usage);
     let started = Instant::now();
     let mut last_candidate = None;
     let mut usage_session = Some(usage_session);
     let mut client_connected = true;
     let mut client_output_sent = false;
+    // The router-owned walk ledger: one row per candidate tried, drained into
+    // the settle transaction at whichever terminal settles this request.
+    let mut attempts: Vec<AttemptRecord> = Vec::new();
 
     for candidate in &candidates {
         if sender.is_closed() {
@@ -475,8 +611,13 @@ async fn stream_to_channel(
                     &resolved.requested_model,
                     upstream_provider,
                     upstream_model,
+                    last_candidate,
                     usage,
                     resolved.sell_rates,
+                    features,
+                    None,
+                    None,
+                    std::mem::take(&mut attempts),
                     started,
                     499,
                 )
@@ -493,6 +634,8 @@ async fn stream_to_channel(
                 last_candidate,
                 None,
                 reservation_usage,
+                features,
+                std::mem::take(&mut attempts),
                 started,
                 client_connected,
                 StreamInterruption::Timeout,
@@ -505,6 +648,8 @@ async fn stream_to_channel(
             tools: (!tools.is_empty()).then_some(tools.as_slice()),
             thinking: None,
         };
+        let attempt_started = Instant::now();
+        let attempt_no = attempts.len() + 1;
 
         if !candidate.supports_streaming() {
             let candidate_started = AtomicBool::new(false);
@@ -512,6 +657,16 @@ async fn stream_to_channel(
                 biased;
                 () = shutdown.cancelled() => {
                     let interrupted_candidate = if candidate_started.load(Ordering::Relaxed) {
+                        attempts.push(build_attempt(
+                            attempt_no,
+                            candidate.definition(),
+                            "aborted",
+                            false,
+                            attempt_started,
+                            None,
+                            false,
+                            None,
+                        ));
                         Some(candidate.definition())
                     } else {
                         last_candidate
@@ -524,6 +679,8 @@ async fn stream_to_channel(
                         interrupted_candidate,
                         None,
                         reservation_usage,
+                        features,
+                        std::mem::take(&mut attempts),
                         started,
                         client_connected,
                         StreamInterruption::Shutdown,
@@ -552,13 +709,39 @@ async fn stream_to_channel(
                         response,
                         max_tokens,
                         reservation_usage,
+                        features,
+                        attempts,
+                        attempt_no,
+                        attempt_started,
                         started,
                     )
                     .await;
                     return;
                 }
-                Ok(Err(_)) => continue,
+                Ok(Err(_)) => {
+                    attempts.push(build_attempt(
+                        attempt_no,
+                        candidate.definition(),
+                        "upstream_error",
+                        false,
+                        attempt_started,
+                        None,
+                        false,
+                        None,
+                    ));
+                    continue;
+                }
                 Err(_) => {
+                    attempts.push(build_attempt(
+                        attempt_no,
+                        candidate.definition(),
+                        "timeout",
+                        false,
+                        attempt_started,
+                        None,
+                        false,
+                        None,
+                    ));
                     settle_stream_interruption(
                         &sender,
                         &mut usage_session,
@@ -567,6 +750,8 @@ async fn stream_to_channel(
                         Some(candidate.definition()),
                         None,
                         reservation_usage,
+                        features,
+                        std::mem::take(&mut attempts),
                         started,
                         client_connected,
                         StreamInterruption::Timeout,
@@ -589,6 +774,10 @@ async fn stream_to_channel(
         let mut tool_index = 0_u32;
         let mut completed = false;
         let mut interruption = None;
+        // Per-chunk token_count lower bound + tool-arg JSON validity, used to
+        // price and label this attempt if it is abandoned or served.
+        let mut estimated_output = 0_u64;
+        let mut tool_args_ok = true;
 
         loop {
             let Some(remaining) = remaining_upstream_time(started) else {
@@ -614,6 +803,7 @@ async fn stream_to_channel(
             };
             match event {
                 Ok(StreamEvent::TextDelta(chunk)) => {
+                    estimated_output = estimated_output.saturating_add(chunk.token_count as u64);
                     if chunk.delta.is_empty() && chunk.reasoning.as_deref().unwrap_or("").is_empty()
                     {
                         continue;
@@ -645,6 +835,7 @@ async fn stream_to_channel(
                 }
                 Ok(StreamEvent::ToolCall(call)) => {
                     has_tool_calls = true;
+                    tool_args_ok &= serde_json::from_str::<Value>(&call.arguments).is_ok();
                     if !client_connected {
                         tool_index = tool_index.saturating_add(1);
                         continue;
@@ -684,6 +875,17 @@ async fn stream_to_channel(
         }
 
         if let Some(interruption) = interruption {
+            let attempt_usage = usage.or_else(|| estimated_stream_usage(estimated_output));
+            attempts.push(build_attempt(
+                attempt_no,
+                candidate.definition(),
+                interruption.attempt_outcome(),
+                false,
+                attempt_started,
+                attempt_usage,
+                usage.is_none() && attempt_usage.is_some(),
+                None,
+            ));
             settle_stream_interruption(
                 &sender,
                 &mut usage_session,
@@ -692,6 +894,8 @@ async fn stream_to_channel(
                 Some(candidate.definition()),
                 usage,
                 reservation_usage,
+                features,
+                std::mem::take(&mut attempts),
                 started,
                 client_connected,
                 interruption,
@@ -713,8 +917,13 @@ async fn stream_to_channel(
                 candidate,
                 usage,
                 has_tool_calls,
+                tool_args_ok,
                 max_tokens,
                 reservation_usage,
+                features,
+                attempts,
+                attempt_no,
+                attempt_started,
                 if client_connected && !sender.is_closed() {
                     200
                 } else {
@@ -740,13 +949,32 @@ async fn stream_to_channel(
             } else {
                 OpenAiUsage::default()
             };
+            // The customer received this candidate's partial output, so it is
+            // the served attempt even though the stream broke.
+            let served = client_output_sent;
+            let attempt_usage = usage.or_else(|| estimated_stream_usage(estimated_output));
+            attempts.push(build_attempt(
+                attempt_no,
+                candidate.definition(),
+                "stream_error",
+                served,
+                attempt_started,
+                attempt_usage,
+                usage.is_none() && attempt_usage.is_some(),
+                None,
+            ));
             let metering = persist_usage(
                 session,
                 &resolved.requested_model,
                 &candidate.definition().provider,
                 &candidate.definition().model,
+                Some(candidate.definition()),
                 settled_usage,
                 resolved.sell_rates,
+                features,
+                None,
+                None,
+                std::mem::take(&mut attempts),
                 started,
                 if client_connected { 502 } else { 499 },
             )
@@ -761,6 +989,19 @@ async fn stream_to_channel(
             }
             return;
         }
+
+        // Nothing delivered and the stream ended without completing: record a
+        // non-served failure and fall through to the next candidate.
+        attempts.push(build_attempt(
+            attempt_no,
+            candidate.definition(),
+            "stream_error",
+            false,
+            attempt_started,
+            usage.or_else(|| estimated_stream_usage(estimated_output)),
+            usage.is_none() && estimated_output > 0,
+            None,
+        ));
     }
 
     let error = if let (Some(candidate), Some(session)) = (last_candidate, usage_session.take()) {
@@ -771,8 +1012,13 @@ async fn stream_to_channel(
             &resolved.requested_model,
             &candidate.provider,
             &candidate.model,
+            Some(candidate),
             OpenAiUsage::default(),
             resolved.sell_rates,
+            features,
+            None,
+            None,
+            std::mem::take(&mut attempts),
             started,
             502,
         )
@@ -820,6 +1066,13 @@ impl StreamInterruption {
             Self::Shutdown => "shutdown",
         }
     }
+
+    fn attempt_outcome(self) -> &'static str {
+        match self {
+            Self::Timeout => "timeout",
+            Self::Shutdown => "aborted",
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -831,6 +1084,8 @@ async fn settle_stream_interruption(
     candidate: Option<&TierCandidate>,
     usage: Option<OpenAiUsage>,
     reservation_usage: OpenAiUsage,
+    features: RequestFeatures,
+    attempts: Vec<AttemptRecord>,
     started: Instant,
     client_connected: bool,
     interruption: StreamInterruption,
@@ -846,8 +1101,13 @@ async fn settle_stream_interruption(
             &resolved.requested_model,
             upstream_provider,
             upstream_model,
+            candidate,
             usage.unwrap_or(reservation_usage),
             resolved.sell_rates,
+            features,
+            None,
+            None,
+            attempts,
             started,
             if client_connected {
                 interruption.status()
@@ -886,6 +1146,10 @@ async fn complete_synthetic_stream(
     response: ChatResponse,
     max_tokens: Option<u32>,
     reservation_usage: OpenAiUsage,
+    features: RequestFeatures,
+    mut attempts: Vec<AttemptRecord>,
+    attempt_no: usize,
+    attempt_started: Instant,
     started: Instant,
 ) {
     let Some(session) = usage_session.take() else {
@@ -898,8 +1162,13 @@ async fn complete_synthetic_stream(
             &resolved.requested_model,
             &candidate.definition().provider,
             &candidate.definition().model,
+            Some(candidate.definition()),
             reservation_usage,
             resolved.sell_rates,
+            features,
+            None,
+            None,
+            attempts,
             started,
             502,
         )
@@ -908,13 +1177,40 @@ async fn complete_synthetic_stream(
         return;
     };
     let completion_status = if sender.is_closed() { 499 } else { 200 };
+    let has_tool_calls = !response.tool_calls.is_empty();
+    let synthesized_finish = finish_reason(has_tool_calls, usage, max_tokens);
+    let output_nonempty = response
+        .text
+        .as_deref()
+        .is_some_and(|text| !text.is_empty())
+        || has_tool_calls;
+    let shape_label = shape_ok(
+        output_nonempty,
+        tool_args_all_json(&response.tool_calls),
+        synthesized_finish,
+    );
+    attempts.push(build_attempt(
+        attempt_no,
+        candidate.definition(),
+        "ok",
+        true,
+        attempt_started,
+        Some(usage),
+        false,
+        Some(synthesized_finish),
+    ));
     if persist_usage(
         session,
         &resolved.requested_model,
         &candidate.definition().provider,
         &candidate.definition().model,
+        Some(candidate.definition()),
         usage,
         resolved.sell_rates,
+        features,
+        Some(synthesized_finish),
+        Some(shape_label),
+        attempts,
         started,
         completion_status,
     )
@@ -928,7 +1224,6 @@ async fn complete_synthetic_stream(
     if !ensure_stream_role(sender, metadata, false).await {
         return;
     }
-    let has_tool_calls = !response.tool_calls.is_empty();
     if let Some(text) = response.text
         && !send_data(
             sender,
@@ -981,8 +1276,13 @@ async fn finish_successful_stream(
     candidate: &ProviderCandidate,
     usage: Option<OpenAiUsage>,
     has_tool_calls: bool,
+    tool_args_ok: bool,
     max_tokens: Option<u32>,
     reservation_usage: OpenAiUsage,
+    features: RequestFeatures,
+    mut attempts: Vec<AttemptRecord>,
+    attempt_no: usize,
+    attempt_started: Instant,
     completion_status: i16,
     started: Instant,
 ) {
@@ -996,8 +1296,13 @@ async fn finish_successful_stream(
             &resolved.requested_model,
             &candidate.definition().provider,
             &candidate.definition().model,
+            Some(candidate.definition()),
             reservation_usage,
             resolved.sell_rates,
+            features,
+            None,
+            None,
+            attempts,
             started,
             502,
         )
@@ -1005,13 +1310,31 @@ async fn finish_successful_stream(
         send_stream_error(sender, &ApiError::MeteringUnavailable).await;
         return;
     };
+    let synthesized_finish = finish_reason(has_tool_calls, usage, max_tokens);
+    let output_nonempty = usage.completion_tokens > 0 || has_tool_calls;
+    let shape_label = shape_ok(output_nonempty, tool_args_ok, synthesized_finish);
+    attempts.push(build_attempt(
+        attempt_no,
+        candidate.definition(),
+        "ok",
+        true,
+        attempt_started,
+        Some(usage),
+        false,
+        Some(synthesized_finish),
+    ));
     if persist_usage(
         session,
         &resolved.requested_model,
         &candidate.definition().provider,
         &candidate.definition().model,
+        Some(candidate.definition()),
         usage,
         resolved.sell_rates,
+        features,
+        Some(synthesized_finish),
+        Some(shape_label),
+        attempts,
         started,
         completion_status,
     )
@@ -1028,7 +1351,7 @@ async fn finish_successful_stream(
         resolved,
         candidate,
         usage,
-        finish_reason(has_tool_calls, usage, max_tokens),
+        synthesized_finish,
     )
     .await;
 }
@@ -1094,16 +1417,27 @@ async fn send_data(sender: &mpsc::Sender<Event>, data: String) -> bool {
         .is_ok_and(|result| result.is_ok())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn admit_usage(
     pool: &PgPool,
     key: &AuthenticatedKey,
     reserved_tokens: i64,
+    reserved_output_tokens: i64,
     reserved_cost: rust_decimal::Decimal,
+    task_signature: String,
     require_credits: bool,
 ) -> Result<UsageSession, ApiError> {
-    match begin_usage_session(pool, key, reserved_tokens, reserved_cost, require_credits)
-        .await
-        .map_err(|_| ApiError::DatabaseUnavailable)?
+    match begin_usage_session(
+        pool,
+        key,
+        reserved_tokens,
+        reserved_output_tokens,
+        reserved_cost,
+        task_signature,
+        require_credits,
+    )
+    .await
+    .map_err(|_| ApiError::DatabaseUnavailable)?
     {
         UsageAdmission::Allowed(session) => Ok(session),
         UsageAdmission::Unauthorized => Err(ApiError::Unauthorized),
@@ -1119,12 +1453,29 @@ async fn persist_usage(
     requested_model: &str,
     upstream_provider: &str,
     upstream_model: &str,
+    candidate: Option<&TierCandidate>,
     usage: OpenAiUsage,
     sell_rates: ModelRates,
+    features: RequestFeatures,
+    finish_reason: Option<&str>,
+    shape_label: Option<bool>,
+    attempts: Vec<AttemptRecord>,
     started: Instant,
     status: i16,
 ) -> Result<(), ApiError> {
     let latency_ms = i32::try_from(started.elapsed().as_millis()).unwrap_or(i32::MAX);
+    let telemetry = RequestTelemetry {
+        requested_max_tokens: features.requested_max_tokens,
+        stream: features.stream,
+        prompt_bytes: features.prompt_bytes,
+        message_count: features.message_count,
+        tool_count: features.tool_count,
+        candidate_id: candidate.map(|candidate| candidate.id.clone()),
+        basis_rates: candidate.map(|candidate| candidate.rates),
+        sell_rates,
+        finish_reason: finish_reason.map(str::to_owned),
+        shape_ok: shape_label,
+    };
     usage_session
         .record(&UsageRecord {
             tier: requested_model.to_owned(),
@@ -1134,6 +1485,8 @@ async fn persist_usage(
             cost_usd: usage_cost(sell_rates, usage),
             latency_ms,
             status,
+            telemetry,
+            attempts,
         })
         .await
         .map_err(|_| ApiError::MeteringUnavailable)
@@ -1161,8 +1514,17 @@ fn insert_header(response: &mut Response, name: &'static str, value: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::str::FromStr;
+
+    use rust_decimal::Decimal;
+    use uuid::Uuid;
     use zeroclaw_providers::traits::TokenUsage;
+
+    use super::*;
+    use crate::sqlx::{
+        postgres::{PgConnectOptions, PgPoolOptions},
+        query, query_as,
+    };
 
     #[test]
     fn bearer_parser_is_strict_and_case_insensitive() {
@@ -1188,5 +1550,295 @@ mod tests {
         assert_eq!(normalized.prompt_tokens, 1_000);
         assert_eq!(normalized.cached_input_tokens(), 900);
         assert_eq!(normalized.completion_tokens, 20);
+    }
+
+    fn walk_candidate(id: &str) -> TierCandidate {
+        TierCandidate {
+            id: id.to_owned(),
+            provider: "test-upstream".to_owned(),
+            model: format!("upstream/{id}"),
+            rates: ModelRates {
+                input_per_mtok: Some(1.0),
+                output_per_mtok: Some(2.0),
+                cached_input_per_mtok: None,
+            },
+        }
+    }
+
+    /// A local OpenAI-compatible upstream: `/fail` answers 500 so the walk
+    /// moves on, `/ok` streams one delta plus usage and `[DONE]`. Returns the
+    /// two base URLs.
+    async fn scripted_upstream() -> (String, String) {
+        let stream_body = concat!(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hello\"}}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],",
+            "\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":5,\"total_tokens\":16}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let app = Router::new()
+            .route(
+                "/fail/chat/completions",
+                post(|| async {
+                    (
+                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                        "upstream down",
+                    )
+                }),
+            )
+            .route(
+                "/ok/chat/completions",
+                post(move || async move { ([("content-type", "text/event-stream")], stream_body) }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("scripted upstream should bind");
+        let address = listener
+            .local_addr()
+            .expect("scripted upstream should report its address");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (
+            format!("http://{address}/fail"),
+            format!("http://{address}/ok"),
+        )
+    }
+
+    /// A pool plus a funded key ready to admit a reservation, or `None` when
+    /// no scratch database is configured.
+    async fn walk_fixture() -> Option<(PgPool, AuthenticatedKey)> {
+        let database_url = std::env::var("DATABASE_URL").ok()?;
+        let pool = PgPoolOptions::new()
+            .max_connections(2)
+            .connect_with(
+                PgConnectOptions::from_str(&database_url).expect("test database URL must parse"),
+            )
+            .await
+            .expect("test database must connect");
+        crate::db::migrate(&pool).await.expect("migration must run");
+
+        let user_id = Uuid::new_v4();
+        let key = AuthenticatedKey {
+            id: Uuid::new_v4(),
+            user_id,
+        };
+        query("INSERT INTO users (id, email) VALUES ($1, $2)")
+            .bind(user_id)
+            .bind(format!("walk-{user_id}@example.invalid"))
+            .execute(&pool)
+            .await
+            .expect("test user must insert");
+        query(
+            r#"
+            INSERT INTO api_keys (id, user_id, key_hash, name, spend_cap_usd, velocity_cap_tokens_per_min)
+            VALUES ($1, $2, $3, 'walk', 20, 1000000)
+            "#,
+        )
+        .bind(key.id)
+        .bind(user_id)
+        .bind(format!("{:064x}", key.id.as_u128()))
+        .execute(&pool)
+        .await
+        .expect("test API key must insert");
+        Some((pool, key))
+    }
+
+    fn walk_request() -> ChatCompletionRequest {
+        serde_json::from_value(json!({
+            "model": "zero/test",
+            "messages": [{ "role": "user", "content": "hello" }],
+            "stream": true,
+            "max_tokens": 64,
+        }))
+        .expect("walk request should deserialize")
+    }
+
+    fn walk_route(candidates: Vec<TierCandidate>) -> ResolvedRoute {
+        ResolvedRoute {
+            requested_model: "zero/test".to_owned(),
+            candidates,
+            sell_rates: ModelRates {
+                input_per_mtok: Some(3.0),
+                output_per_mtok: Some(6.0),
+                cached_input_per_mtok: None,
+            },
+        }
+    }
+
+    /// Admit a reservation for `request` and return it with the `request_id`
+    /// the settle transaction will key every row on.
+    async fn admit_walk(
+        pool: &PgPool,
+        key: &AuthenticatedKey,
+        resolved: &ResolvedRoute,
+        reservation_usage: OpenAiUsage,
+    ) -> (UsageSession, Uuid) {
+        let session = match begin_usage_session(
+            pool,
+            key,
+            i64::try_from(reservation_usage.total_tokens).expect("reservation should fit"),
+            64,
+            usage_cost(resolved.sell_rates, reservation_usage),
+            "0123456789abcdef".to_owned(),
+            false,
+        )
+        .await
+        .expect("admission must query")
+        {
+            UsageAdmission::Allowed(session) => session,
+            _ => panic!("the walk request should be admitted"),
+        };
+        let request_id = Uuid::parse_str(
+            session
+                .request_id()
+                .strip_prefix("chatcmpl-")
+                .expect("request id should carry the reservation"),
+        )
+        .expect("request id should be a uuid");
+        (session, request_id)
+    }
+
+    /// Drives the router-owned streaming walk over a failing candidate and a
+    /// serving one, and asserts the walk ledger it drains into the settle
+    /// transaction: one row per candidate tried, dense attempt numbers, and
+    /// exactly one `served = true`.
+    #[tokio::test]
+    async fn streaming_walk_records_one_attempt_per_candidate_with_one_served() {
+        let Some((pool, key)) = walk_fixture().await else {
+            return;
+        };
+        let (fail_url, ok_url) = scripted_upstream().await;
+        let first = walk_candidate("failing");
+        let second = walk_candidate("serving");
+        let resolved = walk_route(vec![first.clone(), second.clone()]);
+        let request = walk_request();
+        let reservation_usage = request.reservation_usage(64);
+        let (session, request_id) = admit_walk(&pool, &key, &resolved, reservation_usage).await;
+        let metadata = StreamMetadata::new(session.request_id(), "zero/test".to_owned(), false);
+
+        let (sender, mut receiver) = mpsc::channel(SSE_CHANNEL_CAPACITY);
+        // Keep the client attached for the whole walk: a closed receiver would
+        // divert the walk to its client-disconnected terminal.
+        let client = tokio::spawn(async move {
+            let mut delivered = 0_usize;
+            while receiver.recv().await.is_some() {
+                delivered += 1;
+            }
+            delivered
+        });
+        stream_to_channel(
+            sender,
+            CancellationToken::new(),
+            session,
+            metadata,
+            request,
+            resolved,
+            vec![
+                ProviderCandidate::against_local_upstream(first, &fail_url),
+                ProviderCandidate::against_local_upstream(second.clone(), &ok_url),
+            ],
+            reservation_usage,
+        )
+        .await;
+        assert!(
+            client.await.expect("client task should join") > 0,
+            "the serving candidate should have reached the client"
+        );
+
+        let attempts = query_as::<_, (i16, String, bool)>(
+            "SELECT attempt_no, outcome, served FROM request_attempts WHERE request_id = $1 ORDER BY attempt_no",
+        )
+        .bind(request_id)
+        .fetch_all(&pool)
+        .await
+        .expect("attempts must query");
+        assert_eq!(
+            attempts,
+            vec![
+                (1, "stream_error".to_owned(), false),
+                (2, "ok".to_owned(), true),
+            ],
+            "the walk records one row per candidate tried with exactly one served"
+        );
+
+        let (attempt_count, candidate_id, status) =
+            query_as::<_, (Option<i16>, Option<String>, i16)>(
+                "SELECT attempt_count, candidate_id, status FROM usage_events WHERE request_id = $1",
+            )
+            .bind(request_id)
+            .fetch_one(&pool)
+            .await
+            .expect("settled row must query");
+        assert_eq!(attempt_count, Some(2));
+        assert_eq!(candidate_id.as_deref(), Some(second.id.as_str()));
+        assert_eq!(status, 200);
+    }
+
+    /// An interrupted stream bills the reservation bound, so it is the most
+    /// expensive row the ledger carries: it must still name the candidate that
+    /// ran and its COGS, or the margin view silently reads it as pure margin.
+    #[tokio::test]
+    async fn interrupted_stream_settles_with_candidate_provenance_and_cogs() {
+        let Some((pool, key)) = walk_fixture().await else {
+            return;
+        };
+        let (_, ok_url) = scripted_upstream().await;
+        let candidate = walk_candidate("interrupted");
+        let resolved = walk_route(vec![candidate.clone()]);
+        let request = walk_request();
+        let reservation_usage = request.reservation_usage(64);
+        let (session, request_id) = admit_walk(&pool, &key, &resolved, reservation_usage).await;
+        let metadata = StreamMetadata::new(session.request_id(), "zero/test".to_owned(), false);
+
+        let (sender, mut receiver) = mpsc::channel(SSE_CHANNEL_CAPACITY);
+        let client = tokio::spawn(async move { while receiver.recv().await.is_some() {} });
+        // A shutdown already in flight: the biased select in the stream loop
+        // takes the interruption terminal on its first poll.
+        let shutdown = CancellationToken::new();
+        shutdown.cancel();
+        stream_to_channel(
+            sender,
+            shutdown,
+            session,
+            metadata,
+            request,
+            resolved,
+            vec![ProviderCandidate::against_local_upstream(
+                candidate.clone(),
+                &ok_url,
+            )],
+            reservation_usage,
+        )
+        .await;
+        client.await.expect("client task should join");
+
+        let (settled_candidate, cost_basis_usd, status) =
+            query_as::<_, (Option<String>, Option<Decimal>, i16)>(
+                r#"
+                SELECT candidate_id, cost_basis_usd, status
+                FROM usage_events
+                WHERE request_id = $1
+                "#,
+            )
+            .bind(request_id)
+            .fetch_one(&pool)
+            .await
+            .expect("settled row must query");
+        assert_eq!(settled_candidate.as_deref(), Some(candidate.id.as_str()));
+        assert_eq!(
+            cost_basis_usd,
+            Some(usage_cost(candidate.rates, reservation_usage)),
+            "an unmetered settle prices COGS on the same usage it bills"
+        );
+        assert_eq!(status, 503);
+
+        let attempts = query_as::<_, (String, bool)>(
+            "SELECT outcome, served FROM request_attempts WHERE request_id = $1",
+        )
+        .bind(request_id)
+        .fetch_all(&pool)
+        .await
+        .expect("attempts must query");
+        assert_eq!(attempts, vec![("aborted".to_owned(), false)]);
     }
 }

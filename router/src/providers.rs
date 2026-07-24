@@ -156,6 +156,27 @@ pub struct ProviderCandidate {
     provider: Arc<dyn ModelProvider>,
 }
 
+#[cfg(test)]
+impl ProviderCandidate {
+    /// Aim a candidate at a scripted local upstream so the router-owned
+    /// streaming walk can be driven end to end without a network provider.
+    pub(crate) fn against_local_upstream(definition: TierCandidate, base_url: &str) -> Self {
+        let provider: Arc<dyn ModelProvider> = Arc::new(
+            OpenAiCompatibleModelProvider::builder("test-upstream")
+                .display_name("test upstream")
+                .base_url(base_url)
+                .auth_style(AuthStyle::Bearer)
+                .credential(Some("test-credential"))
+                .max_tokens(Some(zeroclaw_api::model_provider::BASELINE_MAX_TOKENS))
+                .build(),
+        );
+        Self {
+            definition,
+            provider,
+        }
+    }
+}
+
 impl ProviderCandidate {
     #[must_use]
     pub fn definition(&self) -> &TierCandidate {
