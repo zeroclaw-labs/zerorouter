@@ -855,26 +855,97 @@ pub fn stream_tool_call_delta(call: ToolCall, index: u32) -> Value {
     })
 }
 
+/// The largest rate the catalog may express, in USD per million tokens.
+///
+/// This is an *arithmetic* headroom bound, not a business ceiling. It sits four
+/// orders of magnitude above any real frontier price (tens of dollars per MTok
+/// at the time of writing), so it never constrains a rate an operator would
+/// actually write, and it rejects the unit errors and typos that would otherwise
+/// pass validation as "a finite non-negative number".
+///
+/// What the bound buys, precisely: `Decimal`'s maximum magnitude is ~7.9e28 and
+/// token counts are `u64` (< 1.9e19), so each `tokens * rate` product in
+/// [`usage_cost`] is at most ~1.9e25 and their sum at most ~5.6e25 — comfortably
+/// inside `Decimal`'s range even if an upstream reported `u64::MAX` on every
+/// dimension. A rate that passed validation therefore *cannot* overflow the
+/// multiplication, which is the panic this bound exists to remove. The checked
+/// arithmetic in [`usage_cost`] is the belt to that braces.
+pub const MAX_RATE_PER_MTOK: f64 = 1_000_000.0;
+
+/// The `Decimal` a configured rate meters at, or `None` when the `f64` cannot be
+/// billed with at all.
+///
+/// This is the only `f64` → `Decimal` hop in the pricing path, and catalog
+/// validation ([`crate::config`]) and cost calculation ([`usage_cost`]) both go
+/// through it. That is deliberate: a rate the catalog accepted is a rate
+/// metering can price *by construction*, rather than because two separately
+/// written predicates happen to agree.
+///
+/// Three ways a finite, non-negative rate is still unbillable:
+///
+/// - **Above [`MAX_RATE_PER_MTOK`]** — representable, but large enough that
+///   `tokens * rate` could overflow `Decimal` and panic mid-request.
+/// - **Outside `Decimal`'s range** — `1e100` is a perfectly ordinary `f64` and
+///   `Decimal::from_f64` returns `None` for it. The old code substituted
+///   `Decimal::ZERO` here, which turned a fat-fingered rate into a silently free
+///   price dimension: the customer is charged nothing, the catalog still
+///   advertises a price, and nothing but the margin ever notices.
+/// - **Nonzero but rounding to `Decimal` zero** — below ~1e-28 the conversion
+///   lands on zero. Same silent-free-dimension failure as above, reached from
+///   the other end.
 #[must_use]
-pub fn usage_cost(rates: ModelRates, usage: OpenAiUsage) -> Decimal {
-    let input_rate =
-        Decimal::from_f64(rates.input_per_mtok.unwrap_or(0.0)).unwrap_or(Decimal::ZERO);
-    let output_rate =
-        Decimal::from_f64(rates.output_per_mtok.unwrap_or(0.0)).unwrap_or(Decimal::ZERO);
-    let cached_rate = Decimal::from_f64(
+pub fn billable_rate(rate: f64) -> Option<Decimal> {
+    // `contains` on the inclusive range also rejects NaN, which compares false
+    // against every bound.
+    if !(0.0..=MAX_RATE_PER_MTOK).contains(&rate) {
+        return None;
+    }
+    let converted = Decimal::from_f64(rate)?;
+    // A rate the operator wrote as nonzero must not meter as free.
+    if rate > 0.0 && converted.is_zero() {
+        return None;
+    }
+    Some(converted)
+}
+
+/// Price `usage` at `rates`, or `None` when the rates cannot be billed with.
+///
+/// `None` is a **metering failure**, never a zero charge. Every call site either
+/// refuses the request with [`crate::error::ApiError::MeteringUnavailable`] (the
+/// customer-billing sites: reservation sizing and the settled `cost_usd`) or
+/// writes SQL NULL, the ledger's word for "not captured" (the internal COGS
+/// sites). Substituting zero — which is what the `unwrap_or(Decimal::ZERO)` this
+/// replaced did — is the one thing it must not do, because a zero charge is
+/// indistinguishable from a correctly-priced free request.
+///
+/// For a catalog that loaded, `None` is unreachable: [`billable_rate`] is the
+/// same gate `validate_rates` applies at load time. It is checked here anyway so
+/// that the guarantee does not depend on every future caller having come through
+/// a validated catalog.
+///
+/// A dimension the rates leave unset prices at zero (cached input falls back to
+/// the uncached input rate first). That is long-standing behavior and unchanged.
+#[must_use]
+pub fn usage_cost(rates: ModelRates, usage: OpenAiUsage) -> Option<Decimal> {
+    let input_rate = billable_rate(rates.input_per_mtok.unwrap_or(0.0))?;
+    let output_rate = billable_rate(rates.output_per_mtok.unwrap_or(0.0))?;
+    let cached_rate = billable_rate(
         rates
             .cached_input_per_mtok
             .unwrap_or(rates.input_per_mtok.unwrap_or(0.0)),
-    )
-    .unwrap_or(Decimal::ZERO);
+    )?;
     let million = Decimal::from(1_000_000_u64);
     let cached = usage.cached_input_tokens().min(usage.prompt_tokens);
     let uncached = usage.prompt_tokens.saturating_sub(cached);
 
-    (Decimal::from(uncached) * input_rate
-        + Decimal::from(cached) * cached_rate
-        + Decimal::from(usage.completion_tokens) * output_rate)
-        / million
+    // Checked throughout: `Decimal`'s operators are the same routines with a
+    // panic bolted on where these return `None`, so the arithmetic result is
+    // bit-identical and nothing a customer is charged changes.
+    Decimal::from(uncached)
+        .checked_mul(input_rate)?
+        .checked_add(Decimal::from(cached).checked_mul(cached_rate)?)?
+        .checked_add(Decimal::from(usage.completion_tokens).checked_mul(output_rate)?)?
+        .checked_div(million)
 }
 
 #[cfg(test)]
@@ -976,7 +1047,98 @@ mod tests {
                 }),
             },
         );
-        assert_eq!(cost, Decimal::from_f64(1.38).expect("decimal"));
+        assert_eq!(cost, Decimal::from_f64(1.38));
+    }
+
+    /// A rate outside `Decimal`'s range used to convert to `Decimal::ZERO` and
+    /// price its whole dimension free. It must now refuse to price at all.
+    #[test]
+    fn out_of_range_rate_refuses_to_price_instead_of_billing_zero() {
+        assert_eq!(billable_rate(1e100), None);
+        let cost = usage_cost(
+            ModelRates {
+                input_per_mtok: Some(1e100),
+                cached_input_per_mtok: None,
+                output_per_mtok: Some(10.0),
+            },
+            OpenAiUsage {
+                prompt_tokens: 1_000_000,
+                completion_tokens: 1_000_000,
+                total_tokens: 2_000_000,
+                prompt_tokens_details: None,
+            },
+        );
+        assert_eq!(
+            cost, None,
+            "an unpriceable rate is a metering failure, never a free request"
+        );
+    }
+
+    /// A nonzero rate small enough to round to `Decimal` zero is the same
+    /// silent-free-dimension failure reached from the other end.
+    #[test]
+    fn subdecimal_rate_refuses_to_price_instead_of_billing_zero() {
+        assert_eq!(billable_rate(1e-30), None);
+        assert_eq!(billable_rate(0.0), Some(Decimal::ZERO));
+    }
+
+    /// A rate large enough to overflow `tokens * rate` used to panic inside
+    /// `Decimal`'s multiplication even though the post-division result would
+    /// have fit. It is now refused at the bound, and the arithmetic is checked.
+    #[test]
+    fn rate_that_would_overflow_the_multiplication_is_refused() {
+        let overflowing = 1e27;
+        assert!(
+            Decimal::from_f64(overflowing).is_some(),
+            "the rate is representable; it is the product that is not"
+        );
+        assert_eq!(billable_rate(overflowing), None);
+        assert_eq!(
+            usage_cost(
+                ModelRates {
+                    input_per_mtok: Some(overflowing),
+                    cached_input_per_mtok: None,
+                    output_per_mtok: Some(overflowing),
+                },
+                OpenAiUsage {
+                    prompt_tokens: 1_000_000,
+                    completion_tokens: 1_000_000,
+                    total_tokens: 2_000_000,
+                    prompt_tokens_details: None,
+                },
+            ),
+            None
+        );
+    }
+
+    /// The bound has to leave every real price alone: a rate at the ceiling
+    /// still prices, and it prices without panicking on a `u64::MAX` usage
+    /// report from a misbehaving upstream.
+    #[test]
+    fn the_rate_ceiling_still_prices_the_worst_case_usage_report() {
+        assert_eq!(
+            billable_rate(MAX_RATE_PER_MTOK),
+            Decimal::from_f64(MAX_RATE_PER_MTOK)
+        );
+        let cost = usage_cost(
+            ModelRates {
+                input_per_mtok: Some(MAX_RATE_PER_MTOK),
+                cached_input_per_mtok: Some(MAX_RATE_PER_MTOK),
+                output_per_mtok: Some(MAX_RATE_PER_MTOK),
+            },
+            OpenAiUsage {
+                prompt_tokens: u64::MAX,
+                completion_tokens: u64::MAX,
+                total_tokens: u64::MAX,
+                prompt_tokens_details: Some(PromptTokenDetails {
+                    cached_tokens: u64::MAX,
+                }),
+            },
+        );
+        assert!(
+            cost.is_some(),
+            "a validated rate must price any token count a u64 can hold"
+        );
     }
 
     #[test]

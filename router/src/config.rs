@@ -8,7 +8,10 @@ use serde::{Deserialize, Deserializer};
 use thiserror::Error;
 use zeroclaw_providers::pricing::ModelRates;
 
-use crate::providers::is_supported_provider;
+use crate::{
+    openai::{MAX_RATE_PER_MTOK, billable_rate},
+    providers::is_supported_provider,
+};
 
 pub const DEFAULT_TIER_CONFIG_PATH: &str = "config/tiers.toml";
 pub const TIER_CONFIG_PATH_ENV: &str = "ZEROROUTER_TIERS_PATH";
@@ -115,6 +118,16 @@ pub enum TierConfigError {
     InvalidRate {
         tier: String,
         dimension: &'static str,
+    },
+    #[error(
+        "tier {tier} has an unbillable {dimension} rate {rate:e}: a rate must convert to an \
+         exact billing decimal, so it may not exceed {MAX_RATE_PER_MTOK:e} USD per million \
+         tokens and, if nonzero, may not round to zero"
+    )]
+    UnbillableRate {
+        tier: String,
+        dimension: &'static str,
+        rate: f64,
     },
     #[error("tier {tier} contains an invalid candidate")]
     InvalidCandidate { tier: String },
@@ -484,6 +497,32 @@ fn validate_candidate_margin(
     Ok(())
 }
 
+/// Reject rates the biller cannot represent, on the *structural* side of the
+/// split described on [`validate_tier_catalog`].
+///
+/// A rate that no `Decimal` can hold is not an economic claim that happens to be
+/// unprofitable — it is a number the file asserts is a price and that the code
+/// cannot read as money at all. Three things follow, and each of them is a
+/// reason this refuses the file rather than withholding one tier the way
+/// [`validate_candidate_margin`] does:
+///
+/// - The margin rule itself becomes meaningless. `validate_candidate_margin`
+///   compares raw `f64`s; if either side is unrepresentable, the verdict it
+///   produces is about numbers the biller will never see, so there is no sound
+///   basis on which to decide *which* tier to withhold.
+/// - It is not tier-local evidence. A rate of `1e100` is a typo or a unit error,
+///   and a file that contains one has no claim on being trusted about the rates
+///   it got right — exactly the reasoning that already makes a malformed tier id
+///   or an unsupported provider fatal.
+/// - Withholding would hide it. A withheld tier is a running product minus one
+///   model; an operator who fat-fingered a rate would see one tier quietly
+///   vanish and keep serving the rest, which is precisely the silent-margin
+///   failure this check exists to prevent.
+///
+/// So this returns `Err` and `validate_tier_catalog` propagates it, refusing the
+/// load. `load_tier_catalog` runs per request, so the refusal surfaces as
+/// `TierCatalogUnavailable` on every request until the file is fixed — loud, and
+/// with nothing mispriced served in the meantime.
 fn validate_rates(tier: &str, rates: ModelRates) -> Result<(), TierConfigError> {
     validate_rate(tier, "input_per_mtok", rates.input_per_mtok, true)?;
     validate_rate(tier, "output_per_mtok", rates.output_per_mtok, true)?;
@@ -505,6 +544,16 @@ fn validate_rate(
         return Err(TierConfigError::InvalidRate {
             tier: tier.to_owned(),
             dimension,
+        });
+    }
+    // The representability gate is [`billable_rate`] itself rather than a
+    // predicate written to match it, so the catalog accepts exactly the rates
+    // `usage_cost` can price — no second definition to drift.
+    if let Some(rate) = rate.filter(|value| billable_rate(*value).is_none()) {
+        return Err(TierConfigError::UnbillableRate {
+            tier: tier.to_owned(),
+            dimension,
+            rate,
         });
     }
     Ok(())
@@ -668,6 +717,64 @@ model = "upstream-model"
             .expect("a candidate that declares no cached rate must still validate");
     }
 
+    #[test]
+    fn a_rate_the_biller_cannot_represent_refuses_the_catalog() {
+        // `1e100` is a perfectly ordinary f64 and a perfectly ordinary typo. It
+        // used to pass validation as "finite and non-negative", convert to
+        // `Decimal::ZERO` in `usage_cost`, and price its whole dimension free —
+        // visible to nobody but the margin. Same failure from the other end for
+        // a nonzero rate below `Decimal`'s smallest step, and for a rate large
+        // enough that `tokens * rate` would overflow mid-request.
+        for (label, sell, basis, dimension) in [
+            (
+                "sell rate out of Decimal's range",
+                "input_per_mtok = 1e100\noutput_per_mtok = 10.00",
+                "input_per_mtok = 1.00\noutput_per_mtok = 1.00",
+                "input_per_mtok",
+            ),
+            (
+                "candidate basis out of Decimal's range",
+                "input_per_mtok = 2.00\noutput_per_mtok = 10.00",
+                "input_per_mtok = 1.00\noutput_per_mtok = 1e100",
+                "output_per_mtok",
+            ),
+            (
+                "nonzero sell rate that rounds to zero",
+                "input_per_mtok = 2.00\noutput_per_mtok = 10.00\ncached_input_per_mtok = 1e-30",
+                "input_per_mtok = 1.00\noutput_per_mtok = 1.00",
+                "cached_input_per_mtok",
+            ),
+            (
+                "sell rate that would overflow the multiplication",
+                "input_per_mtok = 2.00\noutput_per_mtok = 1e27",
+                "input_per_mtok = 1.00\noutput_per_mtok = 1.00",
+                "output_per_mtok",
+            ),
+        ] {
+            let catalog = catalog_with(sell, basis);
+            let error = validate_tier_catalog(&catalog)
+                .expect_err(&format!("{label} must refuse the catalog"));
+            assert!(
+                matches!(
+                    error,
+                    TierConfigError::UnbillableRate { dimension: found, .. } if found == dimension
+                ),
+                "{label}: unexpected error {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_rate_at_the_billing_ceiling_still_loads() {
+        // The bound is arithmetic headroom, not a business ceiling: it has to
+        // leave every rate an operator would plausibly write alone, including
+        // the ceiling itself.
+        let at_ceiling =
+            format!("input_per_mtok = {MAX_RATE_PER_MTOK}\noutput_per_mtok = {MAX_RATE_PER_MTOK}");
+        validate_tier_catalog(&catalog_with(&at_ceiling, &at_ceiling))
+            .expect("a rate at the ceiling must still load");
+    }
+
     /// Two tiers: `zero/healthy` is priced sanely; `zero/below-cost` sells at
     /// 2/10 but carries a candidate whose input basis is 3. `extra` is spliced
     /// into the below-cost tier so a test can add a second candidate to it.
@@ -784,6 +891,35 @@ output_per_mtok = 0.20
             validate_tier_catalog(&catalog),
             Err(TierConfigError::UnsupportedProvider { .. })
         ));
+    }
+
+    #[test]
+    fn an_unbillable_rate_condemns_the_file_even_inside_a_withheld_tier() {
+        // The exact side of the withhold/refuse split this rule sits on. The
+        // tier carrying the unbillable rate is *already* condemned on economics
+        // and would be withheld while the rest of the file kept serving. It must
+        // not be: a rate the biller cannot represent says the file's numbers
+        // cannot be read as money at all, which is the same class as a malformed
+        // tier id or an unsupported provider, and being absorbed into a withheld
+        // tier is precisely how it would go unnoticed.
+        let catalog = mixed_catalog(
+            r#"
+[[tiers."zero/below-cost".candidates]]
+id = "anthropic/unbillable"
+provider = "anthropic"
+model = "upstream/unbillable"
+[tiers."zero/below-cost".candidates.rates]
+input_per_mtok = 1e100
+output_per_mtok = 10.00
+"#,
+        );
+
+        let error = validate_tier_catalog(&catalog)
+            .expect_err("an unbillable rate must refuse the file, not vanish into a withheld tier");
+        assert!(
+            matches!(error, TierConfigError::UnbillableRate { .. }),
+            "unexpected error {error:?}"
+        );
     }
 
     #[test]

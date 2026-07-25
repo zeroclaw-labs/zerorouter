@@ -88,9 +88,13 @@ fn build_attempt(
 ) -> AttemptRecord {
     let latency_ms = i32::try_from(attempt_started.elapsed().as_millis()).unwrap_or(i32::MAX);
     let started_at = Utc::now() - chrono::Duration::milliseconds(i64::from(latency_ms));
+    // `and_then`, not `map`: a candidate whose rates cannot be priced leaves
+    // this NULL — the ledger's word for "not captured", which also flips the
+    // row's `attempts_cost_basis_complete` FALSE so the COGS sum is read as the
+    // lower bound it is. Never zero, which would claim the attempt was free.
     let cost_basis_usd = tokens
         .priceable()
-        .map(|usage| usage_cost(candidate.rates, usage));
+        .and_then(|usage| usage_cost(candidate.rates, usage));
     AttemptRecord {
         attempt_no: i16::try_from(attempt_no).unwrap_or(i16::MAX),
         started_at,
@@ -570,7 +574,12 @@ async fn chat_completions(
     let reservation_usage = request.reservation_usage(max_output_tokens);
     let reserved_tokens =
         i64::try_from(reservation_usage.total_tokens).map_err(|_| ApiError::InvalidRequest)?;
-    let reserved_cost = usage_cost(resolved.sell_rates, reservation_usage);
+    // Fail closed before admission: a tier whose sell rates cannot be priced
+    // cannot size a reservation, and a request that cannot be metered must not
+    // be dispatched. The catalog validated these rates at load, so this is a
+    // backstop rather than a live path.
+    let reserved_cost =
+        usage_cost(resolved.sell_rates, reservation_usage).ok_or(ApiError::MeteringUnavailable)?;
     // The user-scoped segmentation key (design: Engine "Task signature"),
     // computed beside the reservation over the same request-shape fields.
     let tool_names: Vec<String> = request
@@ -1889,6 +1898,12 @@ async fn persist_usage(
     status: i16,
 ) -> Result<(), ApiError> {
     let latency_ms = i32::try_from(started.elapsed().as_millis()).unwrap_or(i32::MAX);
+    // What the customer owes, computed before anything is written. Rates that
+    // cannot be priced are a metering failure and settle nothing: the request
+    // ends in `MeteringUnavailable` and the reservation is released by the TTL
+    // sweep unspent, rather than a `Decimal::ZERO` charge being recorded as
+    // though the request had genuinely been free.
+    let cost_usd = usage_cost(sell_rates, usage).ok_or(ApiError::MeteringUnavailable)?;
     let telemetry = RequestTelemetry {
         requested_max_tokens: features.requested_max_tokens,
         stream: features.stream,
@@ -1907,7 +1922,7 @@ async fn persist_usage(
             upstream_provider: upstream_provider.to_owned(),
             upstream_model: upstream_model.to_owned(),
             usage,
-            cost_usd: usage_cost(sell_rates, usage),
+            cost_usd,
             latency_ms,
             status,
             telemetry,
@@ -2177,7 +2192,7 @@ mod tests {
             key,
             i64::try_from(reservation_usage.total_tokens).expect("reservation should fit"),
             64,
-            usage_cost(resolved.sell_rates, reservation_usage),
+            usage_cost(resolved.sell_rates, reservation_usage).expect("sell rates must price"),
             task_signature("walk-user", &[], 1, 128, true, 64),
             false,
         )
@@ -2436,7 +2451,7 @@ mod tests {
         .expect("attempts must query");
         let billed = OpenAiUsage::try_from_provider(Some(&upstream_usage))
             .expect("the scripted usage report is usable");
-        let served_basis = usage_cost(candidate.rates, billed);
+        let served_basis = usage_cost(candidate.rates, billed).expect("candidate rates must price");
         assert_eq!(
             attempts,
             vec![("aborted".to_owned(), true, Some(served_basis))],
@@ -2538,7 +2553,7 @@ mod tests {
         assert_eq!(output_tokens, 0);
         assert_eq!(
             cost_basis_usd,
-            Some(usage_cost(candidate.rates, OpenAiUsage::default())),
+            usage_cost(candidate.rates, OpenAiUsage::default()),
             "COGS is still priced on the same usage the customer is billed"
         );
         assert_eq!(status, 503);

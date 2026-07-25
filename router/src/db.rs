@@ -91,8 +91,11 @@ impl RequestTelemetry {
             .find(|attempt| attempt.served)
             .map_or_else(
                 || {
+                    // `and_then`: unpriceable basis rates leave this NULL —
+                    // "not captured" — rather than reporting the request's COGS
+                    // as zero, which would overstate margin by the whole basis.
                     self.basis_rates
-                        .map(|rates| usage_cost(rates, record.usage))
+                        .and_then(|rates| usage_cost(rates, record.usage))
                 },
                 |served| served.cost_basis_usd,
             )
@@ -488,23 +491,64 @@ pub async fn begin_usage_session(
         .execute(&mut *transaction)
         .await?;
 
-    // Both ceilings in one round trip. `spend_cap_usd` /
-    // `velocity_cap_tokens_per_min` are the presenting key's own caps; the two
-    // derived columns are the USER ceiling (see [`UsageAdmission`] on why a
-    // user ceiling exists and why it is derived rather than configured, and on
-    // why it is the MAX and not the sum). The presenting key must still be live for
-    // admission to proceed, so it is always inside the sibling MAX: the
-    // derived ceiling can never fall below the presenting key's own cap, and a
-    // single-key user's admission is bit-for-bit the pre-change one.
+    // The presenting key's liveness and both ceilings, atomically, in one round
+    // trip. `spend_cap_usd` / `velocity_cap_tokens_per_min` are the presenting
+    // key's own caps; the two derived columns are the USER ceiling (see
+    // [`UsageAdmission`] on why a user ceiling exists and why it is derived
+    // rather than configured, and on why it is the MAX and not the sum). The
+    // presenting key must still be live for admission to proceed, so it is
+    // always inside the sibling MAX: the derived ceiling can never fall below
+    // the presenting key's own cap, and a single-key user's admission is
+    // bit-for-bit the pre-change one.
+    //
+    // # Why this is an UPDATE and not a SELECT
+    //
+    // Not for `last_used_at` — that ride-along is incidental. It is an UPDATE
+    // because the unlocked `SELECT ... disabled` it replaces could read
+    // `disabled = false`, have a revocation commit underneath it, and still
+    // admit: the operator got their 204 and the revoked key then dispatched one
+    // more inference. `UPDATE ... WHERE NOT disabled` takes the row lock, and
+    // under READ COMMITTED Postgres re-evaluates the predicate against the
+    // freshly committed row version once any concurrent writer releases it. A
+    // revocation that commits first therefore leaves this matching zero rows,
+    // and admission refuses.
+    //
+    // The converse ordering is equally sound: if admission's UPDATE commits
+    // first, `disable_key`'s own conditional UPDATE blocks on this row lock and
+    // does not return 204 until this transaction is done. So "a successful
+    // disable" and "no further dispatch" never overlap in either direction.
+    //
+    // # How it composes with the rest of admission
+    //
+    // - The per-user advisory lock above is still taken first, so lock ordering
+    //   in this crate is advisory-then-row everywhere. Both revocation paths
+    //   ([`crate::portal`], [`crate::admin`]) take only the api_keys row lock and
+    //   never the advisory lock, so there is no cycle to deadlock on.
+    // - `SET LOCAL lock_timeout = '5s'` covers this statement. Waiting behind a
+    //   revocation that does not commit surfaces as an `Err`, and every error
+    //   path out of this function refuses admission — fail-closed is preserved.
+    // - The user-scoped quota reads below are untouched and still run in this
+    //   same transaction, now with the presenting key's row locked, so a
+    //   revocation cannot land between the liveness check and the reservation.
+    //
+    // The sibling subqueries are evaluated against the statement snapshot, so a
+    // sibling revoked *during* this statement can still widen the derived
+    // ceiling by one statement's worth of staleness. That was true of the SELECT
+    // this replaces and is not what the fix is about: siblings only relax a
+    // ceiling, never authorize the presenting key, which is checked above.
     //
     // Matching `presenting.user_id` against the id the advisory lock was taken
-    // on makes the lock's scope and the query's scope provably the same set of
-    // rows; a stale [`AuthenticatedKey`] whose cached owner disagrees with the
-    // row finds nothing and is rejected.
-    let key_state = sqlx::query_as::<_, (bool, Decimal, i32, Decimal, i32)>(
+    // on makes the lock's scope and the statement's scope provably the same set
+    // of rows; a stale [`AuthenticatedKey`] whose cached owner disagrees with
+    // the row matches nothing and is rejected.
+    let key_state = sqlx::query_as::<_, (Decimal, i32, Decimal, i32)>(
         r#"
-        SELECT
-            presenting.disabled,
+        UPDATE api_keys AS presenting
+        SET last_used_at = NOW()
+        WHERE presenting.id = $1
+          AND presenting.user_id = $2
+          AND NOT presenting.disabled
+        RETURNING
             presenting.spend_cap_usd,
             presenting.velocity_cap_tokens_per_min,
             COALESCE((
@@ -517,16 +561,15 @@ pub async fn begin_usage_session(
                 FROM api_keys AS sibling
                 WHERE sibling.user_id = $2 AND NOT sibling.disabled
             ), presenting.velocity_cap_tokens_per_min) AS user_velocity_cap
-        FROM api_keys AS presenting
-        WHERE presenting.id = $1 AND presenting.user_id = $2
         "#,
     )
     .bind(key.id)
     .bind(key.user_id)
     .fetch_optional(&mut *transaction)
     .await?;
+    // Absent, owned by someone else, or revoked: one answer for all three, so
+    // admission never becomes an oracle over another user's key ids.
     let Some((
-        disabled,
         spend_cap_usd,
         velocity_cap_tokens_per_min,
         user_spend_cap_usd,
@@ -536,14 +579,6 @@ pub async fn begin_usage_session(
         transaction.rollback().await?;
         return Ok(UsageAdmission::Unauthorized);
     };
-    if disabled {
-        transaction.rollback().await?;
-        return Ok(UsageAdmission::Unauthorized);
-    }
-    sqlx::query("UPDATE api_keys SET last_used_at = NOW() WHERE id = $1")
-        .bind(key.id)
-        .execute(&mut *transaction)
-        .await?;
 
     // Reclaim expired reservations, but only the ones that owe nothing. A row
     // carrying a settlement intent is money the customer already received and

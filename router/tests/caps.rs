@@ -190,6 +190,74 @@ async fn spend(pool: &PgPool, key: &AuthenticatedKey, cost_usd: Decimal) {
 }
 
 // ---------------------------------------------------------------------------
+// Revocation
+// ---------------------------------------------------------------------------
+
+/// The revoke-and-dispatch race, staged deterministically.
+///
+/// Admission used to read `disabled` with an unlocked SELECT, so the interleave
+/// below admitted: the SELECT saw `disabled = false` under its own snapshot, the
+/// revocation committed, the operator got their 204 — and the key the operator
+/// had just been told was revoked went on to reserve and dispatch one more
+/// inference. Admission now re-checks liveness inside a conditional UPDATE, so
+/// it cannot pass the revocation without waiting for it.
+///
+/// Two things are asserted, and both matter:
+///
+/// 1. Admission **blocks** while the revocation holds the row. Under the old
+///    SELECT it sailed past and returned `Allowed` in milliseconds.
+/// 2. Once the revocation commits, admission re-evaluates `NOT disabled` against
+///    the newly committed row version and refuses.
+#[tokio::test]
+async fn a_revocation_in_flight_blocks_the_admission_racing_it() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let user_id = create_user(&pool, "revoke-race").await;
+    let key = create_key(&pool, user_id, Decimal::from(100), 1_000_000).await;
+
+    // The operator's disable, held open mid-flight: the api_keys row lock is
+    // taken and the revocation is not yet visible to any other snapshot.
+    let mut revocation = pool.begin().await.expect("revocation must begin");
+    query("UPDATE api_keys SET disabled = TRUE WHERE id = $1 AND NOT disabled")
+        .bind(key.id)
+        .execute(&mut *revocation)
+        .await
+        .expect("revocation must update");
+
+    let racing = pool.clone();
+    let racing_key = key.clone();
+    let mut admission =
+        tokio::spawn(async move { admit(&racing, &racing_key, 1_000, Decimal::ONE).await });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(500), &mut admission)
+            .await
+            .is_err(),
+        "admission must wait for the in-flight revocation instead of reading around it"
+    );
+
+    revocation.commit().await.expect("revocation must commit");
+    assert!(
+        matches!(
+            admission.await.expect("admission task must join"),
+            UsageAdmission::Unauthorized
+        ),
+        "a key whose revocation committed first must not be admitted"
+    );
+
+    let reservations =
+        query_scalar::<_, i64>("SELECT COUNT(*) FROM usage_reservations WHERE api_key_id = $1")
+            .bind(key.id)
+            .fetch_one(&pool)
+            .await
+            .expect("reservation count must query");
+    assert_eq!(
+        reservations, 0,
+        "a refused admission must leave no reservation behind to dispatch against"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Quota scope
 // ---------------------------------------------------------------------------
 

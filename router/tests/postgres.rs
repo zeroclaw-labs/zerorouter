@@ -331,8 +331,8 @@ async fn settled_row_carries_estimate_and_select_telemetry() {
         total_tokens: 40,
         prompt_tokens_details: None,
     };
-    let loser_basis_cost = usage_cost(basis, loser_usage);
-    let served_basis_cost = usage_cost(basis, served_usage);
+    let loser_basis_cost = usage_cost(basis, loser_usage).expect("basis rates must price");
+    let served_basis_cost = usage_cost(basis, served_usage).expect("basis rates must price");
 
     let attempts = vec![
         AttemptRecord {
@@ -384,7 +384,7 @@ async fn settled_row_carries_estimate_and_select_telemetry() {
             upstream_provider: "deepinfra".to_owned(),
             upstream_model: "winner-model".to_owned(),
             usage: served_usage,
-            cost_usd: usage_cost(sell, served_usage),
+            cost_usd: usage_cost(sell, served_usage).expect("sell rates must price"),
             latency_ms: 42,
             status: 200,
             telemetry,
@@ -557,7 +557,7 @@ async fn a_partly_unknown_attempt_cogs_sum_reports_itself_as_a_lower_bound() {
         total_tokens: 125,
         prompt_tokens_details: None,
     };
-    let metered_cost = usage_cost(basis, metered);
+    let metered_cost = usage_cost(basis, metered).expect("basis rates must price");
 
     /// One losing attempt, described by what is known about its tokens.
     fn loser(attempt_no: i16, tokens: AttemptTokens, cost: Option<Decimal>) -> AttemptRecord {
@@ -659,7 +659,8 @@ async fn a_partly_unknown_attempt_cogs_sum_reports_itself_as_a_lower_bound() {
     let floor_cost = usage_cost(
         basis,
         floor.priceable().expect("an output floor is priceable"),
-    );
+    )
+    .expect("basis rates must price");
     let (total, complete) =
         settle_with(&pool, vec![loser(1, floor, Some(floor_cost))], basis).await;
     assert_eq!(

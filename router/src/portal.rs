@@ -364,6 +364,24 @@ async fn disable_key(
     // Keys are disabled, never deleted: usage_events rows reference them. The
     // user_id predicate makes a foreign key id indistinguishable from a
     // missing one.
+    //
+    // The 204 this returns is a promise that no further request can dispatch on
+    // the key, and the row lock this UPDATE takes is what keeps it. Admission
+    // ([`crate::db::begin_usage_session`]) re-checks `NOT disabled` inside its
+    // own conditional UPDATE against the same row, so the two serialize: either
+    // this commits first and the racing admission re-evaluates its predicate
+    // against `disabled = TRUE` and refuses, or admission commits first and this
+    // statement waits behind it — the operator is not told the key is revoked
+    // until the request that beat them has already been admitted. No explicit
+    // lock is needed here beyond the one the UPDATE already takes; adding the
+    // per-user advisory lock would only invert this crate's advisory-then-row
+    // ordering and create a deadlock cycle with admission.
+    //
+    // What this does NOT promise: a request already dispatched upstream keeps
+    // running, and [`crate::auth`]'s 30-second key cache means a revoked key can
+    // still pass authentication (and reach endpoints that never admit, such as
+    // model listing) until its cache entry expires. Revocation is immediate for
+    // *dispatch*, which is what costs money, not for every byte of the surface.
     let result = sqlx::query(
         "UPDATE api_keys SET disabled = TRUE WHERE id = $1 AND user_id = $2 AND NOT disabled",
     )

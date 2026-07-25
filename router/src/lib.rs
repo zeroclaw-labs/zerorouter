@@ -6,6 +6,7 @@ pub mod config;
 pub mod db;
 pub mod device;
 pub mod error;
+pub mod logging;
 pub mod oidc;
 pub mod openai;
 pub mod portal;
