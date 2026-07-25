@@ -33,13 +33,20 @@ use zerorouter::{
         UsageRecord, begin_usage_session, migrate,
     },
     device,
-    openai::OpenAiUsage,
+    openai::{OpenAiUsage, TASK_SIGNATURE_SCHEME, TaskSignature, tool_names_digest},
     portal,
     session::{CSRF_HEADER, SESSION_COOKIE, create_session},
     web::{WebConfig, WebCtx},
 };
 
-const TEST_SIGNATURE: &str = "0123456789abcdef";
+/// A fixed segment key for tests that only need the reservation to carry one.
+fn test_signature() -> TaskSignature {
+    TaskSignature {
+        hex: "0123456789abcdef".to_owned(),
+        scheme: TASK_SIGNATURE_SCHEME,
+        tool_names_sha256: tool_names_digest(&[]),
+    }
+}
 const BASE_URL: &str = "https://caps.test.invalid";
 const GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:device_code";
 
@@ -164,7 +171,7 @@ async fn admit(
         reserved_tokens,
         reserved_tokens.min(64),
         reserved_cost_usd,
-        TEST_SIGNATURE.to_owned(),
+        test_signature(),
         false,
     )
     .await

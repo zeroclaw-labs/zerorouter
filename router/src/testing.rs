@@ -45,6 +45,10 @@ pub enum FakeOutcome {
         text: Option<String>,
         tool_calls: Vec<ToolCall>,
         usage: Option<TokenUsage>,
+        /// Chain-of-thought a thinking model returns. A completion carrying
+        /// only this is a non-empty response, which is what the shape label has
+        /// to see.
+        reasoning_content: Option<String>,
     },
     /// A transport-shaped failure that the retry loop treats as retryable.
     Transport,
@@ -65,6 +69,19 @@ impl FakeOutcome {
             text: Some(text.to_owned()),
             tool_calls: Vec::new(),
             usage: Some(usage),
+            reasoning_content: None,
+        }
+    }
+
+    /// A completion whose entire answer is reasoning content — the shape a
+    /// thinking model returns, and the one that used to read as empty output.
+    #[must_use]
+    pub fn reasoning_only(reasoning: &str, usage: TokenUsage) -> Self {
+        Self::Chat {
+            text: None,
+            tool_calls: Vec::new(),
+            usage: Some(usage),
+            reasoning_content: Some(reasoning.to_owned()),
         }
     }
 }
@@ -74,6 +91,11 @@ impl FakeOutcome {
 #[derive(Clone, Debug)]
 pub enum FakeStreamStep {
     Text(String),
+    /// A reasoning delta. Carries no `token_count`: the provider trait's
+    /// estimate is `delta.len()/4` over the CONTENT delta only, so a reasoning
+    /// chunk contributes nothing to the output floor — which is exactly why the
+    /// shape label cannot be derived from token counts.
+    Reasoning(String),
     Tool(ToolCall),
     Usage(TokenUsage),
     Error(String),
@@ -87,6 +109,12 @@ impl FakeStreamStep {
     #[must_use]
     pub fn text(delta: &str) -> Self {
         Self::Text(delta.to_owned())
+    }
+
+    /// A reasoning delta.
+    #[must_use]
+    pub fn reasoning(delta: &str) -> Self {
+        Self::Reasoning(delta.to_owned())
     }
 }
 
@@ -218,11 +246,12 @@ impl ModelProvider for FakeModelProvider {
                 text,
                 tool_calls,
                 usage,
+                reasoning_content,
             }) => Ok(ChatResponse {
                 text,
                 tool_calls,
                 usage,
-                reasoning_content: None,
+                reasoning_content,
             }),
             Some(FakeOutcome::Transport) => Err(anyhow::anyhow!(TRANSPORT_FAILURE)),
             Some(FakeOutcome::RateLimited) => Err(anyhow::anyhow!(RATE_LIMIT_FAILURE)),
@@ -266,6 +295,9 @@ impl ModelProvider for FakeModelProvider {
                     FakeStreamStep::Text(delta) => Ok(StreamEvent::TextDelta(
                         StreamChunk::delta(delta).with_token_estimate(),
                     )),
+                    FakeStreamStep::Reasoning(delta) => {
+                        Ok(StreamEvent::TextDelta(StreamChunk::reasoning(delta)))
+                    }
                     FakeStreamStep::Tool(call) => Ok(StreamEvent::ToolCall(call)),
                     FakeStreamStep::Usage(usage) => Ok(StreamEvent::Usage(usage)),
                     FakeStreamStep::Final => Ok(StreamEvent::Final),

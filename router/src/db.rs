@@ -14,7 +14,7 @@ use zeroclaw_providers::pricing::ModelRates;
 
 use crate::{
     auth::AuthenticatedKey,
-    openai::{OpenAiUsage, PromptTokenDetails, usage_cost},
+    openai::{OpenAiUsage, PromptTokenDetails, TaskSignature, usage_cost},
     sqlx::{
         self, PgPool,
         migrate::{Migration, MigrationType, Migrator},
@@ -69,6 +69,114 @@ pub struct RequestTelemetry {
     pub shape_ok: Option<bool>,
 }
 
+impl RequestTelemetry {
+    /// The served attempt's COGS for the settled row.
+    ///
+    /// Prefer the served attempt's own priced basis over re-pricing the settled
+    /// usage: on the router-owned walk they agree by construction, and where
+    /// they do not it is because the delivery went unmetered and the customer
+    /// was billed nothing (`StreamDelivery::settled_usage`). Re-pricing the
+    /// billed usage there would report ZeroRouter's cost for that delivery as
+    /// zero while the attempt row carries a floor for it, so the request's real
+    /// COGS would appear on neither side of
+    /// `cost_usd - cost_basis_usd - attempts_cost_basis_usd`.
+    ///
+    /// With no served attempt — every non-streaming settle, and the streaming
+    /// terminals that delivered nothing — this falls back to pricing the
+    /// settled usage, which is what those paths have always done.
+    fn cost_basis(&self, record: &UsageRecord) -> Option<Decimal> {
+        record
+            .attempts
+            .iter()
+            .find(|attempt| attempt.served)
+            .map_or_else(
+                || {
+                    self.basis_rates
+                        .map(|rates| usage_cost(rates, record.usage))
+                },
+                |served| served.cost_basis_usd,
+            )
+    }
+}
+
+/// What is known about one attempt's token consumption.
+///
+/// The three dimensions are independently optional because they are
+/// independently knowable, and `request_attempts` has had three independently
+/// nullable columns since migration 0004. An abandoned stream is the case that
+/// forces it: the per-chunk `token_count` gives an OUTPUT floor and says
+/// nothing whatever about the prompt the attempt certainly consumed. Collapsing
+/// that into one `Option<OpenAiUsage>` meant writing `input_tokens = 0` — the
+/// ledger asserting an upstream call consumed no prompt, which is never true of
+/// a dispatched attempt.
+///
+/// `None` is written as SQL NULL, the ledger's word for "not captured". Zero is
+/// reserved for "measured, and it was zero".
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AttemptTokens {
+    pub input: Option<u64>,
+    pub cached_input: Option<u64>,
+    pub output: Option<u64>,
+}
+
+impl AttemptTokens {
+    /// Every dimension measured, from an upstream usage report.
+    #[must_use]
+    pub fn measured(usage: OpenAiUsage) -> Self {
+        Self {
+            input: Some(usage.prompt_tokens),
+            cached_input: Some(usage.cached_input_tokens()),
+            output: Some(usage.completion_tokens),
+        }
+    }
+
+    /// Nothing measured: the upstream reported no usage and the attempt
+    /// produced no chunk-level floor either.
+    #[must_use]
+    pub fn unknown() -> Self {
+        Self::default()
+    }
+
+    /// An output floor from the per-chunk `token_count` a stream already
+    /// reports, with the prompt side left unknown. See
+    /// `api::attempt_tokens` for why the prompt side stays NULL rather
+    /// than borrowing the reservation's byte bound.
+    #[must_use]
+    pub fn output_floor(output: u64) -> Self {
+        Self {
+            output: Some(output),
+            ..Self::default()
+        }
+    }
+
+    /// The usage to price this attempt's COGS from, or `None` when nothing at
+    /// all is known. Unknown dimensions price as zero — a known-partial cost is
+    /// a floor, which is why anything but [`Self::measured`] marks the
+    /// request's `attempts_cost_basis_complete` FALSE.
+    #[must_use]
+    pub fn priceable(self) -> Option<OpenAiUsage> {
+        self.input.or(self.cached_input).or(self.output)?;
+        let input = self.input.unwrap_or(0);
+        let cached = self.cached_input.unwrap_or(0).min(input);
+        let output = self.output.unwrap_or(0);
+        Some(OpenAiUsage {
+            prompt_tokens: input,
+            completion_tokens: output,
+            total_tokens: input.saturating_add(output),
+            prompt_tokens_details: (cached > 0).then_some(PromptTokenDetails {
+                cached_tokens: cached,
+            }),
+        })
+    }
+
+    /// Whether every dimension is known. Only a fully measured attempt can
+    /// contribute to a COGS sum that claims to be a total.
+    #[must_use]
+    pub fn is_complete(self) -> bool {
+        self.input.is_some() && self.cached_input.is_some() && self.output.is_some()
+    }
+}
+
 /// One row of the append-only `request_attempts` walk ledger (migration
 /// 0004), buffered in memory during the router-owned streaming walk and
 /// inserted in the same transaction as the `usage_events` row, after it.
@@ -80,14 +188,67 @@ pub struct AttemptRecord {
     pub upstream_provider: String,
     pub upstream_model: String,
     pub outcome: String,
+    /// TRUE on the one attempt whose model output reached the customer and
+    /// which the settled row is therefore priced from.
+    ///
+    /// This is the ledger's cost-attribution switch, and exactly one place
+    /// counts each attempt's COGS: the served attempt through
+    /// `usage_events.cost_basis_usd`, every other attempt through
+    /// `usage_events.attempts_cost_basis_usd`. It used to be FALSE on the
+    /// timeout and shutdown terminals even when that attempt's output had been
+    /// delivered and billed, so its COGS was counted on BOTH sides at once —
+    /// understating margin while the walk ledger simultaneously claimed no
+    /// candidate had served the request.
     pub served: bool,
     pub latency_ms: i32,
-    /// `None` when the upstream reported no usage for this attempt.
-    pub usage: Option<OpenAiUsage>,
+    pub tokens: AttemptTokens,
+    /// Whether the known token dimensions come from the per-chunk `token_count`
+    /// floor rather than an upstream usage report.
     pub tokens_estimated: bool,
     pub cost_basis_usd: Option<Decimal>,
     pub finish_reason: Option<String>,
     pub validator_kind: Option<String>,
+}
+
+impl AttemptRecord {
+    /// Whether this attempt's COGS is a measurement rather than a floor or a
+    /// blank. Drives `usage_events.attempts_cost_basis_complete`.
+    fn cogs_is_measured(&self) -> bool {
+        self.cost_basis_usd.is_some() && self.tokens.is_complete() && !self.tokens_estimated
+    }
+}
+
+/// The non-serving attempts' COGS, and whether that number is the whole story.
+///
+/// Both fields are `None` only when no attempts were recorded at all. When
+/// attempts exist but none of them lost (a single-attempt request that served),
+/// the sum is a genuine zero and `complete` is TRUE: there were no losing
+/// attempts, which is a different statement from not knowing what they cost.
+struct AttemptCogs {
+    total: Option<Decimal>,
+    complete: Option<bool>,
+}
+
+impl AttemptCogs {
+    fn summarize(attempts: &[AttemptRecord]) -> Self {
+        if attempts.is_empty() {
+            return Self {
+                total: None,
+                complete: None,
+            };
+        }
+        let losing = attempts.iter().filter(|attempt| !attempt.served);
+        let mut total = Decimal::ZERO;
+        let mut complete = true;
+        for attempt in losing {
+            total += attempt.cost_basis_usd.unwrap_or(Decimal::ZERO);
+            complete &= attempt.cogs_is_measured();
+        }
+        Self {
+            total: Some(total),
+            complete: Some(complete),
+        }
+    }
 }
 
 fn rates_snapshot(rates: &ModelRates) -> String {
@@ -138,8 +299,11 @@ pub struct UsageSession {
     require_credits: bool,
     // Reservation provenance copied into the ledger at settle: the
     // usage_reservations row is destroyed by the settle DELETE...RETURNING, so
-    // these must be carried in memory from admission.
-    task_signature: String,
+    // these must be carried in memory from admission. The signature travels as
+    // a whole [`TaskSignature`] so the scheme that computed it and the tool
+    // digest it was computed from land on the same row as the key itself
+    // (migration 0007) — a key with no provenance cannot be re-keyed later.
+    task_signature: TaskSignature,
     reserved_output_tokens: i32,
     reserved_cost_usd: Decimal,
 }
@@ -279,6 +443,13 @@ pub async fn migrate(pool: &PgPool) -> Result<()> {
                 Cow::Borrowed(include_str!("../migrations/0006_settlement_outbox.sql")),
                 false,
             ),
+            Migration::new(
+                7,
+                Cow::Borrowed("ledger honesty"),
+                MigrationType::Simple,
+                Cow::Borrowed(include_str!("../migrations/0007_ledger_honesty.sql")),
+                false,
+            ),
         ]),
         ignore_missing: false,
         locking: true,
@@ -296,7 +467,7 @@ pub async fn begin_usage_session(
     reserved_tokens: i64,
     reserved_output_tokens: i64,
     reserved_cost_usd: Decimal,
-    task_signature: String,
+    task_signature: TaskSignature,
     require_credits: bool,
 ) -> Result<UsageAdmission, sqlx::Error> {
     if reserved_tokens < 0 || reserved_output_tokens < 0 || reserved_cost_usd < Decimal::ZERO {
@@ -830,21 +1001,15 @@ async fn settle_once(
     // as pure margin.
     let record = &record;
     let telemetry = &record.telemetry;
-    let cost_basis_usd = telemetry
-        .basis_rates
-        .map(|rates| usage_cost(rates, record.usage));
-    let attempts_cost_basis_usd = if record.attempts.is_empty() {
-        None
-    } else {
-        Some(
-            record
-                .attempts
-                .iter()
-                .filter(|attempt| !attempt.served)
-                .filter_map(|attempt| attempt.cost_basis_usd)
-                .sum::<Decimal>(),
-        )
-    };
+    let cost_basis_usd = telemetry.cost_basis(record);
+    // The losing attempts, summed — and flagged when that sum is only a lower
+    // bound. The sum used to be a `filter_map(...).sum()`, which silently
+    // dropped every attempt whose COGS was unknown and reported the remainder
+    // as if it were the total: three burnt upstream calls of which two were
+    // never metered settled as "the attempts cost what the one metered attempt
+    // cost". See migration 0007 on why a partial sum must never present as a
+    // total.
+    let attempts_cogs = AttemptCogs::summarize(&record.attempts);
     let finish_reason_source = telemetry.finish_reason.as_ref().map(|_| "synthetic");
     let attempt_count = if record.attempts.is_empty() {
         None
@@ -885,12 +1050,15 @@ async fn settle_once(
                 shape_ok,
                 reserved_output_tokens,
                 reserved_cost_usd,
-                estimator_basis
+                estimator_basis,
+                attempts_cost_basis_complete,
+                task_signature_scheme,
+                tool_names_sha256
             )
             VALUES (
                 $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
                 $12, $13, $14, $15::JSONB, $16::JSONB, $17, $18, $19, $20, $21,
-                $22, $23, $24, $25, $26, $27, $28, $29
+                $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32
             )
             "#,
     )
@@ -907,7 +1075,7 @@ async fn settle_once(
     .bind(record.status)
     .bind(telemetry.candidate_id.as_deref())
     .bind(cost_basis_usd)
-    .bind(attempts_cost_basis_usd)
+    .bind(attempts_cogs.total)
     .bind(sell_rates_json)
     .bind(basis_rates_json)
     .bind(telemetry.finish_reason.as_deref())
@@ -923,6 +1091,13 @@ async fn settle_once(
     .bind(intent.reserved_output_tokens)
     .bind(reserved_cost_snapshot)
     .bind(ESTIMATOR_BASIS_COLD)
+    .bind(attempts_cogs.complete)
+    // Both NULL when replaying an intent persisted before migration 0007:
+    // the payload predates the fields, and NULL is exactly "scheme 1, tool
+    // digest not captured" (migration 0007). Guessing the current scheme for
+    // a key this build did not compute would mislabel the segment.
+    .bind(intent.task_signature_scheme)
+    .bind(intent.tool_names_sha256.as_deref())
     .execute(&mut *transaction)
     .await;
     if let Err(error) = settled {
@@ -943,19 +1118,26 @@ async fn settle_once(
     // the FK to the UNIQUE usage_events.request_id holds; exactly-once is
     // inherited from the reservation DELETE...RETURNING above.
     for attempt in &record.attempts {
-        let (attempt_input, attempt_cached, attempt_output) = match attempt.usage {
-            Some(usage) => {
-                let input = checked_token_count(usage.prompt_tokens, "attempt_input_tokens")?;
-                let cached = checked_token_count(
-                    usage.cached_input_tokens(),
-                    "attempt_cached_input_tokens",
-                )?
-                .min(input);
-                let output = checked_token_count(usage.completion_tokens, "attempt_output_tokens")?;
-                (Some(input), Some(cached), Some(output))
-            }
-            None => (None, None, None),
-        };
+        // Each dimension is bound independently: an unknown one is SQL NULL,
+        // never 0. An attempt priced from the per-chunk output floor knows
+        // nothing about the prompt it consumed, and writing 0 there would state
+        // that a dispatched upstream call read no prompt.
+        let attempt_input = attempt
+            .tokens
+            .input
+            .map(|tokens| checked_token_count(tokens, "attempt_input_tokens"))
+            .transpose()?;
+        let attempt_cached = attempt
+            .tokens
+            .cached_input
+            .map(|tokens| checked_token_count(tokens, "attempt_cached_input_tokens"))
+            .transpose()?
+            .map(|cached| cached.min(attempt_input.unwrap_or(cached)));
+        let attempt_output = attempt
+            .tokens
+            .output
+            .map(|tokens| checked_token_count(tokens, "attempt_output_tokens"))
+            .transpose()?;
         sqlx::query(
             r#"
                 INSERT INTO request_attempts (
@@ -1376,6 +1558,15 @@ struct SettlementIntent {
     user_id: Uuid,
     require_credits: bool,
     task_signature: String,
+    /// Signature provenance (migration 0007). `#[serde(default)]` rather than a
+    /// payload-version bump: an intent written by a pre-0007 build is still
+    /// perfectly replayable, and `None` is the truthful reading of it — scheme
+    /// 1, tool digest not captured — where a version bump would quarantine a
+    /// recoverable charge over telemetry it does not need.
+    #[serde(default)]
+    task_signature_scheme: Option<i16>,
+    #[serde(default)]
+    tool_names_sha256: Option<String>,
     reserved_output_tokens: i32,
     /// The reservation's admission-verified cost ceiling, snapshotted onto the
     /// settled row. The clamp itself still reads the live value returned by the
@@ -1431,11 +1622,23 @@ struct AttemptPayload {
     outcome: String,
     served: bool,
     latency_ms: i32,
-    usage: Option<UsagePayload>,
+    /// Per-dimension so an intent can carry "output floor known, prompt
+    /// unknown" — the shape an abandoned stream produces. `#[serde(default)]`
+    /// keeps pre-0007 intents (which carried a whole-usage `usage` object)
+    /// replayable: they lose the attempt's token detail, not the charge.
+    #[serde(default)]
+    tokens: AttemptTokensPayload,
     tokens_estimated: bool,
     cost_basis_usd: Option<String>,
     finish_reason: Option<String>,
     validator_kind: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+struct AttemptTokensPayload {
+    input: Option<u64>,
+    cached_input: Option<u64>,
+    output: Option<u64>,
 }
 
 impl SettlementIntent {
@@ -1444,7 +1647,9 @@ impl SettlementIntent {
             version: SETTLEMENT_INTENT_VERSION,
             user_id: session.user_id,
             require_credits: session.require_credits,
-            task_signature: session.task_signature.clone(),
+            task_signature: session.task_signature.hex.clone(),
+            task_signature_scheme: Some(session.task_signature.scheme),
+            tool_names_sha256: Some(session.task_signature.tool_names_sha256.clone()),
             reserved_output_tokens: session.reserved_output_tokens,
             reserved_cost_usd: session.reserved_cost_usd.to_string(),
             tier: record.tier.clone(),
@@ -1478,7 +1683,11 @@ impl SettlementIntent {
                     outcome: attempt.outcome.clone(),
                     served: attempt.served,
                     latency_ms: attempt.latency_ms,
-                    usage: attempt.usage.map(UsagePayload::new),
+                    tokens: AttemptTokensPayload {
+                        input: attempt.tokens.input,
+                        cached_input: attempt.tokens.cached_input,
+                        output: attempt.tokens.output,
+                    },
                     tokens_estimated: attempt.tokens_estimated,
                     cost_basis_usd: attempt.cost_basis_usd.map(|cost| cost.to_string()),
                     finish_reason: attempt.finish_reason.clone(),
@@ -1504,7 +1713,11 @@ impl SettlementIntent {
                 outcome: attempt.outcome.clone(),
                 served: attempt.served,
                 latency_ms: attempt.latency_ms,
-                usage: attempt.usage.map(UsagePayload::to_usage),
+                tokens: AttemptTokens {
+                    input: attempt.tokens.input,
+                    cached_input: attempt.tokens.cached_input,
+                    output: attempt.tokens.output,
+                },
                 tokens_estimated: attempt.tokens_estimated,
                 cost_basis_usd: attempt
                     .cost_basis_usd

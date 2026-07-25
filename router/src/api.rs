@@ -33,14 +33,14 @@ use crate::{
     auth::{AuthenticatedKey, AuthenticationError, KeyAuthenticator},
     config::{ResolvedRoute, TierCandidate, load_tier_catalog},
     db::{
-        AttemptRecord, RequestTelemetry, SettlementRecovery, UsageAdmission, UsageRecord,
-        UsageSession, begin_usage_session, recover_owed_settlements,
+        AttemptRecord, AttemptTokens, RequestTelemetry, SettlementRecovery, UsageAdmission,
+        UsageRecord, UsageSession, begin_usage_session, recover_owed_settlements,
     },
     error::{ApiError, streaming_error_json},
     openai::{
-        ChatCompletionRequest, ChatCompletionResponse, ModelList, OpenAiUsage, StreamMetadata,
-        finish_reason, shape_ok, stream_delta_json, stream_tool_call_delta, stream_usage_json,
-        task_signature, tool_args_all_json, usage_cost,
+        ChatCompletionRequest, ChatCompletionResponse, EmittedOutput, ModelList, OpenAiUsage,
+        StreamMetadata, TaskSignature, finish_reason, shape_ok, stream_delta_json,
+        stream_tool_call_delta, stream_usage_json, task_signature, tool_args_all_json, usage_cost,
     },
     providers::{ProviderCandidate, ProviderRoute},
     sqlx::PgPool,
@@ -73,8 +73,8 @@ impl RequestFeatures {
 }
 
 /// Build one `request_attempts` row from an in-walk candidate outcome. Cost
-/// basis is the candidate's own cost-basis rate applied to whatever usage is
-/// known (a per-chunk `token_count` lower bound for abandoned attempts).
+/// basis is the candidate's own cost-basis rate applied to whatever tokens are
+/// known (a per-chunk `token_count` output floor for abandoned attempts).
 #[allow(clippy::too_many_arguments)]
 fn build_attempt(
     attempt_no: usize,
@@ -82,13 +82,15 @@ fn build_attempt(
     outcome: &'static str,
     served: bool,
     attempt_started: Instant,
-    usage: Option<OpenAiUsage>,
+    tokens: AttemptTokens,
     tokens_estimated: bool,
     finish_reason: Option<&str>,
 ) -> AttemptRecord {
     let latency_ms = i32::try_from(attempt_started.elapsed().as_millis()).unwrap_or(i32::MAX);
     let started_at = Utc::now() - chrono::Duration::milliseconds(i64::from(latency_ms));
-    let cost_basis_usd = usage.map(|usage| usage_cost(candidate.rates, usage));
+    let cost_basis_usd = tokens
+        .priceable()
+        .map(|usage| usage_cost(candidate.rates, usage));
     AttemptRecord {
         attempt_no: i16::try_from(attempt_no).unwrap_or(i16::MAX),
         started_at,
@@ -98,7 +100,7 @@ fn build_attempt(
         outcome: outcome.to_owned(),
         served,
         latency_ms,
-        usage,
+        tokens,
         tokens_estimated,
         cost_basis_usd,
         finish_reason: finish_reason.map(str::to_owned),
@@ -106,20 +108,39 @@ fn build_attempt(
     }
 }
 
-/// A conservative lower-bound usage from the per-chunk `token_count` a stream
-/// already reports, used only to price an abandoned streaming attempt's COGS.
+/// The tokens an attempt is known to have consumed: the upstream's report if it
+/// made one, otherwise the per-chunk `token_count` output floor a stream
+/// already carries, otherwise nothing.
 ///
-/// Deliberately carries no input side: an attempt row prices ZeroRouter's own
-/// cost for output the customer may never have seen. Never bill a customer
-/// with this, or with anything else estimated — customer billing runs through
-/// [`StreamDelivery::settled_usage`], which bills metered actuals only.
-fn estimated_stream_usage(estimated_output: u64) -> Option<OpenAiUsage> {
-    (estimated_output > 0).then_some(OpenAiUsage {
-        prompt_tokens: 0,
-        completion_tokens: estimated_output,
-        total_tokens: estimated_output,
-        prompt_tokens_details: None,
-    })
+/// # Why the prompt side stays unknown
+///
+/// Every dispatched attempt certainly consumed the prompt, so an output-only
+/// figure certainly understates the attempt's real COGS, and the obvious repair
+/// is to add the prompt bound admission already computed. That repair is
+/// rejected: `ChatCompletionRequest::reservation_usage` measures the prompt in
+/// **bytes** (a per-message constant plus `str::len` over every field), and
+/// `usage_cost` prices per TOKEN. Feeding bytes to a per-token rate inflates the
+/// input side by roughly the bytes-per-token ratio — about 4x for English —
+/// which trades a known understatement for an error of unknown size in the
+/// other direction. A floor that is labelled a floor is usable; a number that
+/// might be 4x high in either direction is not, and this ledger exists to be
+/// trusted.
+///
+/// So the prompt dimension is written NULL, not 0, and every non-measured
+/// attempt marks its request's `attempts_cost_basis_complete` FALSE — the sum a
+/// reader sees is explicitly a lower bound rather than a wrong total. The
+/// honest bound arrives for free the day the pinned provider trait carries a
+/// real prompt-token count.
+///
+/// Never bill a customer with this, or with anything else estimated — customer
+/// billing runs through [`StreamDelivery::settled_usage`], which bills metered
+/// actuals only.
+fn attempt_tokens(usage: Option<OpenAiUsage>, estimated_output: u64) -> AttemptTokens {
+    match usage {
+        Some(usage) => AttemptTokens::measured(usage),
+        None if estimated_output > 0 => AttemptTokens::output_floor(estimated_output),
+        None => AttemptTokens::unknown(),
+    }
 }
 
 /// Emit the metering-gap alarm: the upstream produced output for this request
@@ -749,16 +770,14 @@ async fn run_non_streaming(
         .await?;
         return Err(ApiError::MeteringUnavailable);
     };
-    let has_tools = !selected.response.tool_calls.is_empty();
-    let synthesized_finish = finish_reason(has_tools, usage, max_tokens);
-    let output_nonempty = selected
-        .response
-        .text
-        .as_deref()
-        .is_some_and(|text| !text.is_empty())
-        || has_tools;
+    // Labelled from what the model actually emitted — content text, reasoning
+    // content, or tool calls. Reasoning used to be excluded, so a thinking
+    // model that answered entirely in `reasoning_content` was labelled an empty
+    // response and would have trained the success estimator to distrust it.
+    let emitted = EmittedOutput::from_response(&selected.response);
+    let synthesized_finish = finish_reason(emitted.has_tool_calls(), usage, max_tokens);
     let shape_label = shape_ok(
-        output_nonempty,
+        emitted,
         tool_args_all_json(&selected.response.tool_calls),
         synthesized_finish,
     );
@@ -953,7 +972,7 @@ async fn stream_to_channel(
                             "aborted",
                             false,
                             attempt_started,
-                            None,
+                            AttemptTokens::unknown(),
                             false,
                             None,
                         ));
@@ -1019,7 +1038,7 @@ async fn stream_to_channel(
                         "upstream_error",
                         false,
                         attempt_started,
-                        None,
+                        AttemptTokens::unknown(),
                         false,
                         None,
                     ));
@@ -1032,7 +1051,7 @@ async fn stream_to_channel(
                         "timeout",
                         false,
                         attempt_started,
-                        None,
+                        AttemptTokens::unknown(),
                         false,
                         None,
                     ));
@@ -1067,7 +1086,6 @@ async fn stream_to_channel(
         last_candidate = Some(candidate.definition());
         let mut role_sent = false;
         let mut usage = None;
-        let mut has_tool_calls = false;
         let mut tool_index = 0_u32;
         let mut completed = false;
         let mut interruption = None;
@@ -1075,6 +1093,12 @@ async fn stream_to_channel(
         // price and label this attempt if it is abandoned or served.
         let mut estimated_output = 0_u64;
         let mut tool_args_ok = true;
+        // What this candidate actually put out, folded from the deltas
+        // themselves. The shape label used to be derived from
+        // `usage.completion_tokens`, which is the provider's accounting rather
+        // than a transcript: a stream that emitted nothing while the upstream
+        // reported output tokens labelled as a healthy response.
+        let mut emitted = EmittedOutput::default();
 
         loop {
             let Some(remaining) = remaining_upstream_time(started) else {
@@ -1105,6 +1129,12 @@ async fn stream_to_channel(
                     {
                         continue;
                     }
+                    // Recorded before the connectivity check: the shape label
+                    // describes what the MODEL produced, not what survived the
+                    // transport. A hung-up client is a delivery fact, tracked
+                    // separately by `StreamDelivery`.
+                    emitted.record_text(&chunk.delta);
+                    emitted.record_reasoning(chunk.reasoning.as_deref().unwrap_or_default());
                     if !client_connected {
                         continue;
                     }
@@ -1134,7 +1164,7 @@ async fn stream_to_channel(
                     client_connected &= accepted;
                 }
                 Ok(StreamEvent::ToolCall(call)) => {
-                    has_tool_calls = true;
+                    emitted.record_tool_call();
                     tool_args_ok &= serde_json::from_str::<Value>(&call.arguments).is_ok();
                     if !client_connected {
                         tool_index = tool_index.saturating_add(1);
@@ -1177,15 +1207,30 @@ async fn stream_to_channel(
         }
 
         if let Some(interruption) = interruption {
-            let attempt_usage = usage.or_else(|| estimated_stream_usage(estimated_output));
+            let tokens = attempt_tokens(usage, estimated_output);
+            // An interruption does not undo a delivery. If this candidate's
+            // output already reached the customer, `settle_stream_interruption`
+            // bills it and prices it into `usage_events.cost_basis_usd`, so
+            // this attempt is the served one — recording it as a loss put the
+            // SAME COGS into `attempts_cost_basis_usd` as well, understating
+            // margin by exactly the served attempt's cost while the walk ledger
+            // claimed no candidate had served the request at all.
+            //
+            // `model_output_sent` is the outer-walk flag, but it can only be
+            // true for THIS candidate here: every terminal that can follow a
+            // delivery returns, so the walk never reaches a second candidate
+            // with anything delivered. Every site that sets `served` likewise
+            // returns, which is what keeps
+            // `request_attempts_one_served_per_request` satisfiable.
+            let served = delivery.model_output_sent;
             attempts.push(build_attempt(
                 attempt_no,
                 candidate.definition(),
                 interruption.attempt_outcome(),
-                false,
+                served,
                 attempt_started,
-                attempt_usage,
-                usage.is_none() && attempt_usage.is_some(),
+                tokens,
+                usage.is_none() && tokens != AttemptTokens::unknown(),
                 None,
             ));
             settle_stream_interruption(
@@ -1221,7 +1266,7 @@ async fn stream_to_channel(
                 &resolved,
                 candidate,
                 usage,
-                has_tool_calls,
+                emitted,
                 tool_args_ok,
                 max_tokens,
                 features,
@@ -1265,15 +1310,15 @@ async fn stream_to_channel(
             // The customer received this candidate's partial output, so it is
             // the served attempt even though the stream broke.
             let served = delivery.model_output_sent;
-            let attempt_usage = usage.or_else(|| estimated_stream_usage(estimated_output));
+            let tokens = attempt_tokens(usage, estimated_output);
             attempts.push(build_attempt(
                 attempt_no,
                 candidate.definition(),
                 "stream_error",
                 served,
                 attempt_started,
-                attempt_usage,
-                usage.is_none() && attempt_usage.is_some(),
+                tokens,
+                usage.is_none() && tokens != AttemptTokens::unknown(),
                 None,
             ));
             let metering = persist_usage(
@@ -1311,7 +1356,7 @@ async fn stream_to_channel(
             "stream_error",
             false,
             attempt_started,
-            usage.or_else(|| estimated_stream_usage(estimated_output)),
+            attempt_tokens(usage, estimated_output),
             usage.is_none() && estimated_output > 0,
             None,
         ));
@@ -1507,7 +1552,7 @@ async fn complete_synthetic_stream(
             "ok",
             false,
             attempt_started,
-            None,
+            AttemptTokens::unknown(),
             false,
             None,
         ));
@@ -1531,15 +1576,14 @@ async fn complete_synthetic_stream(
         return;
     };
     let completion_status = if sender.is_closed() { 499 } else { 200 };
-    let has_tool_calls = !response.tool_calls.is_empty();
+    // Same evidence as the non-streaming sibling, including reasoning content:
+    // this path replays a buffered response as a stream, and a response that is
+    // entirely reasoning is a non-empty response on both.
+    let emitted = EmittedOutput::from_response(&response);
+    let has_tool_calls = emitted.has_tool_calls();
     let synthesized_finish = finish_reason(has_tool_calls, usage, max_tokens);
-    let output_nonempty = response
-        .text
-        .as_deref()
-        .is_some_and(|text| !text.is_empty())
-        || has_tool_calls;
     let shape_label = shape_ok(
-        output_nonempty,
+        emitted,
         tool_args_all_json(&response.tool_calls),
         synthesized_finish,
     );
@@ -1549,7 +1593,7 @@ async fn complete_synthetic_stream(
         "ok",
         true,
         attempt_started,
-        Some(usage),
+        AttemptTokens::measured(usage),
         false,
         Some(synthesized_finish),
     ));
@@ -1635,7 +1679,7 @@ async fn finish_successful_stream(
     resolved: &ResolvedRoute,
     candidate: &ProviderCandidate,
     usage: Option<OpenAiUsage>,
-    has_tool_calls: bool,
+    emitted: EmittedOutput,
     tool_args_ok: bool,
     max_tokens: Option<u32>,
     features: RequestFeatures,
@@ -1673,7 +1717,7 @@ async fn finish_successful_stream(
             "ok",
             delivery.model_output_sent,
             attempt_started,
-            None,
+            AttemptTokens::unknown(),
             false,
             None,
         ));
@@ -1696,16 +1740,19 @@ async fn finish_successful_stream(
         send_stream_error(sender, &ApiError::MeteringUnavailable).await;
         return;
     };
-    let synthesized_finish = finish_reason(has_tool_calls, usage, max_tokens);
-    let output_nonempty = usage.completion_tokens > 0 || has_tool_calls;
-    let shape_label = shape_ok(output_nonempty, tool_args_ok, synthesized_finish);
+    let synthesized_finish = finish_reason(emitted.has_tool_calls(), usage, max_tokens);
+    // From the deltas this stream actually emitted, never from
+    // `usage.completion_tokens`: the upstream's token count is its accounting,
+    // and a stream that emitted nothing while reporting output tokens must
+    // label as the empty response it was.
+    let shape_label = shape_ok(emitted, tool_args_ok, synthesized_finish);
     attempts.push(build_attempt(
         attempt_no,
         candidate.definition(),
         "ok",
         true,
         attempt_started,
-        Some(usage),
+        AttemptTokens::measured(usage),
         false,
         Some(synthesized_finish),
     ));
@@ -1802,7 +1849,7 @@ async fn admit_usage(
     reserved_tokens: i64,
     reserved_output_tokens: i64,
     reserved_cost: rust_decimal::Decimal,
-    task_signature: String,
+    task_signature: TaskSignature,
     require_credits: bool,
 ) -> Result<UsageSession, ApiError> {
     match begin_usage_session(
@@ -2131,7 +2178,7 @@ mod tests {
             i64::try_from(reservation_usage.total_tokens).expect("reservation should fit"),
             64,
             usage_cost(resolved.sell_rates, reservation_usage),
-            "0123456789abcdef".to_owned(),
+            task_signature("walk-user", &[], 1, 128, true, 64),
             false,
         )
         .await
@@ -2308,6 +2355,125 @@ mod tests {
         assert!(
             !served,
             "an attempt whose output never reached the client is not the served one"
+        );
+    }
+
+    /// An interruption does not undo a delivery: when the customer already has
+    /// this candidate's output and the upstream already reported usage, the
+    /// shutdown terminal bills that usage — so the attempt it records is the
+    /// SERVED one.
+    ///
+    /// It used to be written `served = false`, which put the same COGS on both
+    /// sides of the margin expression at once: once in
+    /// `usage_events.cost_basis_usd` (priced from the billed usage) and again
+    /// in `attempts_cost_basis_usd` (which sums every non-served attempt).
+    /// Margin read low by exactly the served attempt's cost, and the walk
+    /// ledger simultaneously claimed no candidate had served the request.
+    #[tokio::test]
+    async fn a_delivered_attempt_interrupted_mid_stream_is_the_served_attempt() {
+        let Some((pool, key)) = walk_fixture().await else {
+            return;
+        };
+        let candidate = walk_candidate("delivered-then-shutdown");
+        let resolved = walk_route(vec![candidate.clone()]);
+        let request = walk_request();
+        let reservation_usage = request.reservation_usage(64);
+        let (session, request_id) = admit_walk(&pool, &key, &resolved, reservation_usage).await;
+        let metadata = StreamMetadata::new(session.request_id(), "zero/test".to_owned(), false);
+        let upstream_usage = TokenUsage {
+            input_tokens: Some(1_000),
+            output_tokens: Some(20),
+            cached_input_tokens: None,
+        };
+        // Output, then a usage report, then a stall long enough that the only
+        // way out of the stream loop is the shutdown the client triggers below.
+        let fake = FakeModelProvider::new(
+            "delivered-then-shutdown",
+            vec![FakeOutcome::Stream(vec![
+                FakeStreamStep::text("partial"),
+                FakeStreamStep::Usage(upstream_usage.clone()),
+                FakeStreamStep::Stall(Duration::from_secs(600)),
+            ])],
+        );
+
+        let (sender, mut receiver) = mpsc::channel(SSE_CHANNEL_CAPACITY);
+        let shutdown = CancellationToken::new();
+        let client_shutdown = shutdown.clone();
+        // Drain as a real client would, and cancel only once model output has
+        // actually arrived, so the interruption is provably post-delivery.
+        let client = tokio::spawn(async move {
+            let mut fired = false;
+            while let Some(event) = receiver.recv().await {
+                if !fired && format!("{event:?}").contains("partial") {
+                    fired = true;
+                    client_shutdown.cancel();
+                }
+            }
+            fired
+        });
+        stream_to_channel(
+            sender,
+            shutdown,
+            session,
+            metadata,
+            request,
+            resolved,
+            vec![ProviderCandidate::with_provider(candidate.clone(), fake)],
+            reservation_usage,
+        )
+        .await;
+        assert!(
+            client.await.expect("client task should join"),
+            "the content delta must reach the client before the shutdown"
+        );
+
+        let attempts = query_as::<_, (String, bool, Option<Decimal>)>(
+            "SELECT outcome, served, cost_basis_usd FROM request_attempts WHERE request_id = $1",
+        )
+        .bind(request_id)
+        .fetch_all(&pool)
+        .await
+        .expect("attempts must query");
+        let billed = OpenAiUsage::try_from_provider(Some(&upstream_usage))
+            .expect("the scripted usage report is usable");
+        let served_basis = usage_cost(candidate.rates, billed);
+        assert_eq!(
+            attempts,
+            vec![("aborted".to_owned(), true, Some(served_basis))],
+            "the attempt whose output the customer received and was billed for is the served one"
+        );
+
+        let (cost_usd, cost_basis_usd, attempts_cost_basis_usd, complete) =
+            query_as::<_, (Decimal, Option<Decimal>, Option<Decimal>, Option<bool>)>(
+                r#"
+                SELECT cost_usd, cost_basis_usd, attempts_cost_basis_usd,
+                       attempts_cost_basis_complete
+                FROM usage_events
+                WHERE request_id = $1
+                "#,
+            )
+            .bind(request_id)
+            .fetch_one(&pool)
+            .await
+            .expect("settled row must query");
+        assert!(
+            cost_usd > Decimal::ZERO,
+            "billing is unchanged: a delivered, metered interruption still charges"
+        );
+        assert_eq!(
+            cost_basis_usd.map(|value| value.normalize()),
+            Some(served_basis.normalize()),
+            "the served attempt's COGS is the settled row's cost basis"
+        );
+        assert_eq!(
+            attempts_cost_basis_usd,
+            Some(Decimal::ZERO),
+            "no attempt's COGS may be counted on both sides of the margin expression"
+        );
+        assert_eq!(
+            complete,
+            Some(true),
+            "there were no losing attempts, which is a known zero rather than an unknown"
         );
     }
 

@@ -40,6 +40,7 @@ use zerorouter::{
     billing::{balance, grant_promo},
     config::ResolvedRoute,
     db::migrate,
+    openai::{TASK_SIGNATURE_SCHEME, tool_names_digest},
     providers::{ProviderCandidate, ProviderRoute},
     testing::{FakeModelProvider, FakeOutcome, FakeStreamStep},
 };
@@ -329,6 +330,16 @@ async fn unbilled_served_requests(pool: &PgPool, api_key_id: Uuid) -> i64 {
     .fetch_one(pool)
     .await
     .expect("metering-gap count must query")
+}
+
+/// The implicit shape label on the settled row — the success estimator's
+/// day-one training signal.
+async fn settled_shape_ok(pool: &PgPool, api_key_id: Uuid) -> Option<bool> {
+    query_scalar::<_, Option<bool>>("SELECT shape_ok FROM usage_events WHERE api_key_id = $1")
+        .bind(api_key_id)
+        .fetch_one(pool)
+        .await
+        .expect("shape label must query")
 }
 
 async fn open_reservations(pool: &PgPool, api_key_id: Uuid) -> i64 {
@@ -963,8 +974,16 @@ async fn streaming_success_without_upstream_usage_bills_nothing() {
         "no tokens were measured, so none are claimed on the attempt either"
     );
     assert_eq!(unbilled_served_requests(&pool, api_key_id).await, 1);
-    // COGS is priced on the same usage the customer is billed: none.
-    assert_eq!(cost_basis_usd, Some(Decimal::ZERO));
+    // The customer is billed nothing, but ZeroRouter's own cost for this
+    // delivery is not zero — it is UNKNOWN, because the only party who could
+    // have measured it did not. Re-pricing the billed usage here reported
+    // `cost_basis_usd = 0`, an assertion that a real upstream completion was
+    // free; sourcing it from the served attempt (whose token columns are NULL
+    // above) carries the ignorance through instead.
+    assert_eq!(
+        cost_basis_usd, None,
+        "unmetered served COGS is unknown, not zero"
+    );
 }
 
 #[tokio::test]
@@ -1023,9 +1042,9 @@ async fn streaming_error_after_delivered_bytes_bills_nothing() {
     // The estimate survives on the attempt row and only there: it prices
     // ZeroRouter's own COGS for the delivery it just absorbed, flagged
     // `tokens_estimated` so it can never be mistaken for a metered actual.
-    let attempt_usage = query_as::<_, (Option<i32>, bool, Option<Decimal>)>(
+    let attempt_usage = query_as::<_, (Option<i32>, Option<i32>, bool, Option<Decimal>)>(
         r#"
-        SELECT output_tokens, tokens_estimated, cost_basis_usd
+        SELECT input_tokens, output_tokens, tokens_estimated, cost_basis_usd
         FROM request_attempts
         WHERE api_key_id = $1
         "#,
@@ -1037,6 +1056,13 @@ async fn streaming_error_after_delivered_bytes_bills_nothing() {
     assert_eq!(
         attempt_usage,
         (
+            // NULL, not 0. This attempt certainly consumed the prompt, and the
+            // ledger used to write `input_tokens = 0` — an upstream call that
+            // read nothing, which never happens. The only prompt quantity on
+            // hand is the reservation's BYTE bound, and pricing a per-token
+            // rate against bytes inflates the input side about fourfold, so the
+            // honest record is that the prompt side was never measured.
+            None,
             Some(ESTIMATED_OUTPUT_TOKENS),
             true,
             Some(decimal("0.000004"))
@@ -1216,6 +1242,7 @@ async fn synthetic_stream_serves_a_candidate_that_cannot_stream() {
                 extra_content: None,
             }],
             usage: Some(served_usage()),
+            reasoning_content: None,
         }],
     );
     let state = router(pool.clone(), vec![solo.clone()]);
@@ -1285,6 +1312,7 @@ async fn synthetic_stream_without_upstream_usage_bills_nothing() {
             text: Some("whole answer".to_owned()),
             tool_calls: Vec::new(),
             usage: None,
+            reasoning_content: None,
         }],
     );
     let state = router(pool.clone(), vec![solo.clone()]);
@@ -1394,5 +1422,207 @@ async fn streaming_client_disconnect_mid_stream_still_bills_the_metered_usage() 
             .await
             .expect("balance must query"),
         Decimal::from(50) - served_sell_cost()
+    );
+}
+
+/// A thinking model can answer entirely in `reasoning_content`. All three
+/// label sites — the buffered walk, the synthetic stream it replays through,
+/// and the live stream — must see that as a non-empty response. They consulted
+/// only `text` and `tool_calls`, so a reasoning-only answer trained the success
+/// estimator that reasoning models fail.
+#[tokio::test]
+async fn a_reasoning_only_answer_labels_as_output_on_every_path() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+
+    // 1. Buffered (non-streaming) walk.
+    let (buffered_key_id, buffered_key) = create_funded_key(&pool, "reasoning-buffered").await;
+    let buffered = FakeModelProvider::new(
+        "solo",
+        vec![FakeOutcome::reasoning_only(
+            "thinking it over",
+            served_usage(),
+        )],
+    );
+    let state = router(pool.clone(), vec![buffered]);
+    let response = app(state.clone())
+        .oneshot(completion_request(
+            &buffered_key,
+            &completion_body("zero/test-solo", false),
+        ))
+        .await
+        .expect("buffered request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    state.wait_for_background_tasks().await;
+    assert_eq!(
+        body["choices"][0]["message"]["reasoning_content"],
+        "thinking it over"
+    );
+    assert_eq!(
+        settled_shape_ok(&pool, buffered_key_id).await,
+        Some(true),
+        "a buffered answer that is entirely reasoning is a non-empty response"
+    );
+
+    // 2. Synthetic stream: the same buffered response, replayed as SSE.
+    let (synthetic_key_id, synthetic_key) = create_funded_key(&pool, "reasoning-synthetic").await;
+    let synthetic = FakeModelProvider::without_streaming(
+        "solo",
+        vec![FakeOutcome::reasoning_only(
+            "thinking it over",
+            served_usage(),
+        )],
+    );
+    let state = router(pool.clone(), vec![synthetic]);
+    let response = app(state.clone())
+        .oneshot(completion_request(
+            &synthetic_key,
+            &completion_body("zero/test-solo", true),
+        ))
+        .await
+        .expect("synthetic stream should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = sse_chunks(response).await;
+    state.wait_for_background_tasks().await;
+    assert_eq!(
+        settled_shape_ok(&pool, synthetic_key_id).await,
+        Some(true),
+        "the synthetic path labels from the same evidence as its buffered sibling"
+    );
+
+    // 3. Live stream: reasoning deltas and nothing else.
+    let (streamed_key_id, streamed_key) = create_funded_key(&pool, "reasoning-streamed").await;
+    let streamed = FakeModelProvider::new(
+        "solo",
+        vec![FakeOutcome::Stream(vec![
+            FakeStreamStep::reasoning("thinking"),
+            FakeStreamStep::reasoning(" it over"),
+            FakeStreamStep::Usage(served_usage()),
+            FakeStreamStep::Final,
+        ])],
+    );
+    let state = router(pool.clone(), vec![streamed]);
+    let response = app(state.clone())
+        .oneshot(completion_request(
+            &streamed_key,
+            &completion_body("zero/test-solo", true),
+        ))
+        .await
+        .expect("stream request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    let chunks = sse_chunks(response).await;
+    state.wait_for_background_tasks().await;
+    assert_eq!(
+        chunks[1]["choices"][0]["delta"]["reasoning_content"],
+        "thinking"
+    );
+    assert_eq!(
+        settled_shape_ok(&pool, streamed_key_id).await,
+        Some(true),
+        "reasoning deltas are emitted output"
+    );
+}
+
+/// The live streaming path used to infer "did the model produce output?" from
+/// `usage.completion_tokens`, which is the provider's accounting rather than a
+/// transcript. A stream that ran cleanly to `Final` having emitted nothing,
+/// while the upstream cheerfully reported 20 output tokens, therefore labelled
+/// as a healthy response — teaching a success estimator that the empty answer
+/// was the good one.
+#[tokio::test]
+async fn a_stream_that_emitted_nothing_is_not_rescued_by_reported_output_tokens() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let (api_key_id, key) = create_funded_key(&pool, "empty-but-metered").await;
+    let solo = FakeModelProvider::new(
+        "solo",
+        vec![FakeOutcome::Stream(vec![
+            FakeStreamStep::Usage(served_usage()),
+            FakeStreamStep::Final,
+        ])],
+    );
+    let state = router(pool.clone(), vec![solo]);
+
+    let response = app(state.clone())
+        .oneshot(completion_request(
+            &key,
+            &completion_body("zero/test-solo", true),
+        ))
+        .await
+        .expect("stream request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = sse_chunks(response).await;
+    state.wait_for_background_tasks().await;
+
+    assert_eq!(
+        settled_shape_ok(&pool, api_key_id).await,
+        Some(false),
+        "no delta was emitted, so the shape label must say so whatever usage claims"
+    );
+    // Billing is untouched by the label: the upstream metered it, so it bills.
+    assert_eq!(
+        settled_event(&pool, api_key_id).await,
+        (
+            "deepinfra".to_owned(),
+            "upstream/solo".to_owned(),
+            1_000,
+            20,
+            served_sell_cost(),
+            200,
+        )
+    );
+}
+
+/// Migration 0004 said signatures could be re-keyed retroactively from the
+/// persisted raw features. They could not: only `tool_count` was stored, and a
+/// count cannot reproduce a key computed over tool NAMES. The settled row now
+/// carries the exact digest the key was built from, plus the scheme that built
+/// it, so the claim is true instead of aspirational.
+#[tokio::test]
+async fn a_settled_row_carries_the_signature_provenance_a_rekey_needs() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let (api_key_id, key) = create_funded_key(&pool, "signature-provenance").await;
+    let solo = FakeModelProvider::new("solo", vec![FakeOutcome::chat("hello", served_usage())]);
+    let state = router(pool.clone(), vec![solo]);
+
+    let mut body = completion_body("zero/test-solo", false);
+    body["tools"] = json!([
+        { "type": "function", "function": { "name": "shell" } },
+        { "type": "function", "function": { "name": "read" } },
+    ]);
+    let response = app(state.clone())
+        .oneshot(completion_request(&key, &body))
+        .await
+        .expect("request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    state.wait_for_background_tasks().await;
+
+    let (signature, scheme, digest, tool_count) =
+        query_as::<_, (String, Option<i16>, Option<String>, Option<i32>)>(
+            r#"
+        SELECT task_signature, task_signature_scheme, tool_names_sha256, tool_count
+        FROM usage_events WHERE api_key_id = $1
+        "#,
+        )
+        .bind(api_key_id)
+        .fetch_one(&pool)
+        .await
+        .expect("settled row must query");
+    assert_eq!(signature.len(), 16);
+    assert_eq!(
+        scheme,
+        Some(TASK_SIGNATURE_SCHEME),
+        "every key this build writes is stamped with the scheme that produced it"
+    );
+    assert_eq!(tool_count, Some(2));
+    assert_eq!(
+        digest,
+        Some(tool_names_digest(&["read".to_owned(), "shell".to_owned()])),
+        "the digest is the exact tool input the key was hashed from, order-independent"
     );
 }

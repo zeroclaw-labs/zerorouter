@@ -547,12 +547,80 @@ pub fn finish_reason(
     }
 }
 
+/// Which encoding produced a [`TaskSignature::hex`], stamped on every settled
+/// row (`usage_events.task_signature_scheme`, migration 0007).
+///
+/// * **1** — the original scheme. Tool names were joined with `,` before
+///   hashing, so one tool named `a,b` and two tools named `a` and `b` produced
+///   the same key, and only `tool_count` was persisted, so a signature could
+///   not be recomputed from a settled row. Rows carrying scheme 1 have a NULL
+///   `task_signature_scheme` (the column predates them).
+/// * **2** — length-prefixed tool encoding (see [`tool_names_digest`]), with
+///   the scheme number itself in the preimage so a scheme-1 and a scheme-2 key
+///   for the same request can never coincide, and the tool digest persisted
+///   beside the key.
+///
+/// Values are NOT comparable across schemes: two rows with the same
+/// `task_signature` and different `task_signature_scheme` are different
+/// segments, and an estimator must group by the pair.
+pub const TASK_SIGNATURE_SCHEME: i16 = 2;
+
+/// The user-scoped request-shape segment key for one request, plus the
+/// provenance a later re-key needs.
+///
+/// Migration 0004 promised signatures could be "re-bucketed — or re-keyed to a
+/// pooled scheme — retroactively" from the raw features on the settled row, but
+/// the tool dimension was not among them: only `tool_count` was persisted, and
+/// a count cannot reproduce a key computed over names. [`tool_names_sha256`] is
+/// that missing input, and it is the SAME value [`hex`] is derived from, so a
+/// re-key is exact rather than approximate. It is a digest, never the names:
+/// tool names are request metadata (like counts and byte sizes), prompt content
+/// is not, and neither this type nor anything downstream of it ever carries
+/// prompt content.
+///
+/// [`hex`]: TaskSignature::hex
+/// [`tool_names_sha256`]: TaskSignature::tool_names_sha256
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TaskSignature {
+    /// First 16 hex chars of the scheme's sha256 — the persisted segment key.
+    pub hex: String,
+    /// The scheme that produced `hex`; see [`TASK_SIGNATURE_SCHEME`].
+    pub scheme: i16,
+    /// Full sha256 (64 hex chars) of the canonical tool-name multiset
+    /// encoding that fed `hex`.
+    pub tool_names_sha256: String,
+}
+
+/// Full sha256 of the normalized tool-name multiset: sorted, then
+/// **length-prefixed**, so distinct multisets cannot encode identically.
+///
+/// The previous encoding joined the sorted names with `,` and hashed the
+/// result. Tool-name validation only requires a non-empty name, so a single
+/// tool named `a,b` produced the byte string `a,b` — exactly what two tools
+/// named `a` and `b` produced. Any separator has this defect for some input;
+/// prefixing each name with its length removes the separator entirely, so the
+/// encoding is injective over the multiset (the count is prefixed too, so the
+/// tool section cannot be confused with what follows it).
+#[must_use]
+pub fn tool_names_digest(tool_names: &[String]) -> String {
+    let mut tools: Vec<&str> = tool_names.iter().map(String::as_str).collect();
+    tools.sort_unstable();
+    let mut hasher = Sha256::new();
+    hasher.update((tools.len() as u64).to_be_bytes());
+    for name in tools {
+        hasher.update((name.len() as u64).to_be_bytes());
+        hasher.update(name.as_bytes());
+    }
+    format!("{:x}", hasher.finalize())
+}
+
 /// First 16 hex chars of sha256 over the user-scoped request-shape segment
 /// key (design: Engine "Task signature"). Keyed per USER — not per API key —
 /// so key churn resets nothing, and coarse buckets make request-shape gaming
-/// self-defeating. Prompt *content* is never part of the key. Fields (sorted
-/// tool names, message-count bucket, log2 prompt-bytes bucket, stream flag,
-/// log2 requested-max_tokens bucket) mirror the `reservation_usage` walk.
+/// self-defeating. Prompt *content* is never part of the key. Fields (scheme
+/// number, tool-name digest, message-count bucket, log2 prompt-bytes bucket,
+/// stream flag, log2 requested-max_tokens bucket) mirror the
+/// `reservation_usage` walk.
 #[must_use]
 pub fn task_signature(
     user_id: &str,
@@ -561,13 +629,17 @@ pub fn task_signature(
     prompt_bytes: u64,
     stream: bool,
     requested_max_tokens: u32,
-) -> String {
-    let mut tools: Vec<&str> = tool_names.iter().map(String::as_str).collect();
-    tools.sort_unstable();
+) -> TaskSignature {
+    let tool_names_sha256 = tool_names_digest(tool_names);
     let mut hasher = Sha256::new();
+    // The scheme number leads the preimage so a key computed under a later
+    // encoding can never collide with one computed under this encoding, even
+    // if every other field is identical.
+    hasher.update(TASK_SIGNATURE_SCHEME.to_be_bytes());
+    hasher.update([0x1f]);
     hasher.update(user_id.as_bytes());
     hasher.update([0x1f]);
-    hasher.update(tools.join(",").as_bytes());
+    hasher.update(tool_names_sha256.as_bytes());
     hasher.update([0x1f]);
     hasher.update(message_count_bucket(message_count).as_bytes());
     hasher.update([0x1f]);
@@ -585,7 +657,11 @@ pub fn task_signature(
             .as_bytes(),
     );
     let digest = format!("{:x}", hasher.finalize());
-    digest[..16].to_owned()
+    TaskSignature {
+        hex: digest[..16].to_owned(),
+        scheme: TASK_SIGNATURE_SCHEME,
+        tool_names_sha256,
+    }
 }
 
 fn message_count_bucket(count: usize) -> &'static str {
@@ -605,13 +681,86 @@ fn log2_bucket(value: u64) -> u32 {
     }
 }
 
+/// What one attempt's model actually emitted — the evidence the shape label is
+/// computed from.
+///
+/// A completion consists of content text, reasoning content, or tool calls, and
+/// any one of the three alone is a non-empty response. This type exists so that
+/// every site computing [`shape_ok`] answers "did the model produce anything?"
+/// from the *output itself*, and so that the two ways of getting it wrong are
+/// unrepresentable at the call site:
+///
+/// * a response that is entirely `reasoning_content` (thinking models routinely
+///   return one) used to read as empty, because only `text` and `tool_calls`
+///   were consulted;
+/// * a live stream used to infer output from `usage.completion_tokens`, so a
+///   stream that emitted nothing while the upstream reported output tokens
+///   read as fine. A usage report is the provider's accounting, not a
+///   transcript, and it is exactly the signal a success estimator must not be
+///   trained on.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct EmittedOutput {
+    text: bool,
+    reasoning: bool,
+    tool_calls: bool,
+}
+
+impl EmittedOutput {
+    /// The emitted output of a buffered (non-streamed or synthetic-stream)
+    /// completion.
+    #[must_use]
+    pub fn from_response(response: &ChatResponse) -> Self {
+        let mut emitted = Self {
+            tool_calls: !response.tool_calls.is_empty(),
+            ..Self::default()
+        };
+        emitted.record_text(response.text.as_deref().unwrap_or_default());
+        emitted.record_reasoning(response.reasoning_content.as_deref().unwrap_or_default());
+        emitted
+    }
+
+    /// Fold one streamed content delta in. Empty deltas carry nothing and are
+    /// not output.
+    pub fn record_text(&mut self, delta: &str) {
+        self.text |= !delta.is_empty();
+    }
+
+    /// Fold one streamed reasoning delta in.
+    pub fn record_reasoning(&mut self, delta: &str) {
+        self.reasoning |= !delta.is_empty();
+    }
+
+    /// Fold one streamed tool call in. A tool call is output whatever its
+    /// arguments say; whether those arguments parse is the separate
+    /// `tool_args_all_json` half of the label.
+    pub fn record_tool_call(&mut self) {
+        self.tool_calls = true;
+    }
+
+    /// Whether the model produced anything at all.
+    #[must_use]
+    pub fn is_nonempty(self) -> bool {
+        self.text || self.reasoning || self.tool_calls
+    }
+
+    /// Whether any tool call was emitted — the input to the synthesized finish
+    /// reason, taken from the same evidence as the shape label.
+    #[must_use]
+    pub fn has_tool_calls(self) -> bool {
+        self.tool_calls
+    }
+}
+
 /// The implicit shape-validator label (migration 0004): output present and
 /// non-empty, every tool-call `arguments` parses as JSON, and the synthesized
 /// finish reason is not length-truncation. Label-only — it never changes
 /// routing, and it labels 100% of served traffic for the success estimator.
+///
+/// Takes [`EmittedOutput`] rather than a bare `bool` so no caller can hand it
+/// output-presence inferred from a provider usage report.
 #[must_use]
-pub fn shape_ok(output_nonempty: bool, tool_args_all_json: bool, finish_reason: &str) -> bool {
-    output_nonempty && tool_args_all_json && finish_reason != "length"
+pub fn shape_ok(emitted: EmittedOutput, tool_args_all_json: bool, finish_reason: &str) -> bool {
+    emitted.is_nonempty() && tool_args_all_json && finish_reason != "length"
 }
 
 /// Whether every tool call's `arguments` is syntactically valid JSON.
@@ -928,8 +1077,9 @@ mod tests {
         let first = task_signature("user-a", &tools, 3, 200, false, 4096);
         let again = task_signature("user-a", &tools, 3, 200, false, 4096);
         assert_eq!(first, again, "same inputs must hash identically");
-        assert_eq!(first.len(), 16);
-        assert!(first.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert_eq!(first.hex.len(), 16);
+        assert!(first.hex.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert_eq!(first.scheme, TASK_SIGNATURE_SCHEME);
     }
 
     #[test]
@@ -945,6 +1095,57 @@ mod tests {
             task_signature("user-a", &ordered, 1, 10, false, 4096),
             task_signature("user-b", &ordered, 1, 10, false, 4096),
             "a different user must land in a different segment"
+        );
+    }
+
+    /// The collision the `,`-joined encoding admitted: tool-name validation
+    /// only requires a non-empty name, so one tool actually named `a,b` hashed
+    /// exactly like two tools named `a` and `b`. Length-prefixing makes the
+    /// encoding injective, so the two are different segments.
+    #[test]
+    fn tool_names_with_a_separator_do_not_collide_with_two_tools() {
+        let one_comma_name = vec!["a,b".to_owned()];
+        let two_names = vec!["a".to_owned(), "b".to_owned()];
+        assert_ne!(
+            tool_names_digest(&one_comma_name),
+            tool_names_digest(&two_names),
+            "one tool named 'a,b' is not the same tool set as tools 'a' and 'b'"
+        );
+        assert_ne!(
+            task_signature("user-a", &one_comma_name, 1, 10, false, 4096),
+            task_signature("user-a", &two_names, 1, 10, false, 4096),
+            "a collidable tool encoding would merge two distinct segments"
+        );
+        // A concatenation that is ambiguous under ANY fixed separator: {"a",
+        // "b\u{1f}c"} versus {"a\u{1f}b", "c"} share every byte of a joined
+        // encoding using the field separator itself.
+        assert_ne!(
+            tool_names_digest(&["a".to_owned(), "b\u{1f}c".to_owned()]),
+            tool_names_digest(&["a\u{1f}b".to_owned(), "c".to_owned()]),
+            "the tool section must not be reinterpretable as a different multiset"
+        );
+    }
+
+    /// The re-keying claim migration 0004 made and only migration 0007 can
+    /// honour: the persisted digest is the exact tool input the key was built
+    /// from, not a lossy summary of it, so a settled row can be re-keyed
+    /// without the names.
+    #[test]
+    fn task_signature_carries_the_exact_tool_digest_it_was_built_from() {
+        let tools = vec!["shell".to_owned(), "read".to_owned()];
+        let signature = task_signature("user-a", &tools, 3, 200, false, 4096);
+        assert_eq!(signature.tool_names_sha256, tool_names_digest(&tools));
+        assert_eq!(signature.tool_names_sha256.len(), 64);
+        assert!(
+            signature
+                .tool_names_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        );
+        // Same multiset, different order: the digest is a property of the set.
+        assert_eq!(
+            signature.tool_names_sha256,
+            tool_names_digest(&["read".to_owned(), "shell".to_owned()])
         );
     }
 
@@ -975,16 +1176,84 @@ mod tests {
         assert_ne!(sig(256), sig(512), "the next power of two is a new bucket");
     }
 
+    fn emitted_text() -> EmittedOutput {
+        let mut emitted = EmittedOutput::default();
+        emitted.record_text("hello");
+        emitted
+    }
+
     #[test]
     fn shape_ok_requires_output_valid_args_and_no_truncation() {
-        assert!(shape_ok(true, true, "stop"));
-        assert!(shape_ok(true, true, "tool_calls"));
+        assert!(shape_ok(emitted_text(), true, "stop"));
+        assert!(shape_ok(emitted_text(), true, "tool_calls"));
         assert!(
-            !shape_ok(false, true, "stop"),
+            !shape_ok(EmittedOutput::default(), true, "stop"),
             "empty output fails the shape check"
         );
-        assert!(!shape_ok(true, false, "stop"), "unparseable tool args fail");
-        assert!(!shape_ok(true, true, "length"), "length truncation fails");
+        assert!(
+            !shape_ok(emitted_text(), false, "stop"),
+            "unparseable tool args fail"
+        );
+        assert!(
+            !shape_ok(emitted_text(), true, "length"),
+            "length truncation fails"
+        );
+    }
+
+    /// A thinking model can answer entirely in `reasoning_content`. That is a
+    /// non-empty response and must label as one — reading only `text` and
+    /// `tool_calls` labelled it a failure and would have taught the success
+    /// estimator that reasoning models fail.
+    #[test]
+    fn reasoning_only_output_is_not_empty() {
+        let mut emitted = EmittedOutput::default();
+        emitted.record_reasoning("thinking about it");
+        assert!(emitted.is_nonempty());
+        assert!(shape_ok(emitted, true, "stop"));
+
+        let response = ChatResponse {
+            text: None,
+            tool_calls: Vec::new(),
+            usage: None,
+            reasoning_content: Some("thinking about it".to_owned()),
+        };
+        assert!(
+            EmittedOutput::from_response(&response).is_nonempty(),
+            "a buffered response that is entirely reasoning is still output"
+        );
+    }
+
+    /// Every field is folded from an actual emission, so there is no path by
+    /// which a usage report alone can make output look present. Empty deltas
+    /// carry nothing and must not flip the flag either.
+    #[test]
+    fn emitted_output_only_counts_real_emissions() {
+        let mut emitted = EmittedOutput::default();
+        emitted.record_text("");
+        emitted.record_reasoning("");
+        assert!(
+            !emitted.is_nonempty(),
+            "empty deltas are not emitted output"
+        );
+        assert!(!emitted.has_tool_calls());
+        emitted.record_tool_call();
+        assert!(emitted.is_nonempty(), "a tool call is output on its own");
+        assert!(emitted.has_tool_calls());
+
+        let empty = ChatResponse {
+            text: Some(String::new()),
+            tool_calls: Vec::new(),
+            usage: Some(TokenUsage {
+                input_tokens: Some(10),
+                cached_input_tokens: None,
+                output_tokens: Some(500),
+            }),
+            reasoning_content: None,
+        };
+        assert!(
+            !EmittedOutput::from_response(&empty).is_nonempty(),
+            "500 reported output tokens do not make an empty response non-empty"
+        );
     }
 
     #[test]

@@ -21,10 +21,17 @@ use zerorouter::{
         RequestTelemetry, UsageAdmission, UsageRecord, UsageSession, begin_usage_session, migrate,
         quarantined_settlements, recover_owed_settlements,
     },
-    openai::OpenAiUsage,
+    openai::{OpenAiUsage, TASK_SIGNATURE_SCHEME, TaskSignature, tool_names_digest},
 };
 
-const TEST_SIGNATURE: &str = "0123456789abcdef";
+/// A fixed segment key for tests that only need the reservation to carry one.
+fn test_signature() -> TaskSignature {
+    TaskSignature {
+        hex: "0123456789abcdef".to_owned(),
+        scheme: TASK_SIGNATURE_SCHEME,
+        tool_names_sha256: tool_names_digest(&[]),
+    }
+}
 
 async fn connect() -> Option<PgPool> {
     let database_url = std::env::var("DATABASE_URL").ok()?;
@@ -261,7 +268,7 @@ async fn usage_settlement_debits_the_balance_exactly_once() {
         1_000,
         500,
         Decimal::from(2),
-        TEST_SIGNATURE.to_owned(),
+        test_signature(),
         true,
     )
     .await
@@ -330,7 +337,7 @@ async fn credit_admission_fails_closed_and_cannot_jointly_overdraw() {
             100,
             50,
             Decimal::from(2),
-            TEST_SIGNATURE.to_owned(),
+            test_signature(),
             true
         )
         .await
@@ -345,7 +352,7 @@ async fn credit_admission_fails_closed_and_cannot_jointly_overdraw() {
         100,
         50,
         Decimal::from(2),
-        TEST_SIGNATURE.to_owned(),
+        test_signature(),
         false,
     )
     .await
@@ -375,7 +382,7 @@ async fn credit_admission_fails_closed_and_cannot_jointly_overdraw() {
             100,
             50,
             Decimal::from(2),
-            TEST_SIGNATURE.to_owned(),
+            test_signature(),
             true
         ),
         begin_usage_session(
@@ -384,7 +391,7 @@ async fn credit_admission_fails_closed_and_cannot_jointly_overdraw() {
             100,
             50,
             Decimal::from(2),
-            TEST_SIGNATURE.to_owned(),
+            test_signature(),
             true
         ),
     );
@@ -489,7 +496,7 @@ async fn settlement_debit_is_clamped_to_the_reservation_and_cannot_overdraw() {
         1_000,
         500,
         Decimal::from(2),
-        TEST_SIGNATURE.to_owned(),
+        test_signature(),
         true,
     )
     .await
@@ -536,7 +543,7 @@ async fn cap_only_settlement_records_usage_without_touching_the_balance() {
         1_000,
         500,
         Decimal::from(2),
-        TEST_SIGNATURE.to_owned(),
+        test_signature(),
         false,
     )
     .await
@@ -707,7 +714,7 @@ async fn admit(pool: &PgPool, key: &AuthenticatedKey, require_credits: bool) -> 
         1_000,
         500,
         Decimal::from(2),
-        TEST_SIGNATURE.to_owned(),
+        test_signature(),
         require_credits,
     )
     .await
