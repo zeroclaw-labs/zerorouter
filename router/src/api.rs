@@ -401,9 +401,22 @@ async fn chat_completions(
     let catalog = load_tier_catalog(state.tier_config_path())
         .await
         .map_err(|_| ApiError::TierCatalogUnavailable)?;
-    let resolved = catalog
-        .resolve(&request.model)
-        .ok_or(ApiError::ModelNotFound)?;
+    let resolved = match catalog.resolve(&request.model) {
+        Some(resolved) => resolved,
+        // Absent from the servable catalog means one of two very different
+        // things. Either the id does not exist (the caller's mistake, 404), or
+        // it exists in a tier withheld for below-cost pricing — ZeroRouter's
+        // mistake, which the caller cannot fix and must not be told is a
+        // missing model.
+        None => {
+            return Err(catalog.unavailable_for(&request.model).map_or(
+                ApiError::ModelNotFound,
+                |withheld| ApiError::ModelUnavailable {
+                    tier: withheld.tier.clone(),
+                },
+            ));
+        }
+    };
     let max_output_tokens = *request.max_tokens.get_or_insert(BASELINE_MAX_TOKENS);
     let provider_route = services.provider_route(&resolved, max_output_tokens)?;
     let reservation_usage = request.reservation_usage(max_output_tokens);

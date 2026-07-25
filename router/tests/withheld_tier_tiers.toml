@@ -1,0 +1,44 @@
+schema_version = 1
+
+# Fixture catalog for the withheld-tier test in tests/request_path.rs. Two
+# tiers: `zero/test-solo` is priced exactly as in request_path_tiers.toml so
+# the settled amounts stay the same clean decimals, and `zero/test-below-cost`
+# carries a candidate that costs more than the tier sells on every dimension.
+#
+# Loading this file must succeed with `zero/test-solo` intact and
+# `zero/test-below-cost` withheld: an economic fault in one tier is a verdict
+# on that tier, never on the file.
+
+[tiers."zero/test-solo"]
+
+[tiers."zero/test-solo".rates]
+input_per_mtok = 3.00
+cached_input_per_mtok = 0.60
+output_per_mtok = 6.00
+
+[[tiers."zero/test-solo".candidates]]
+id = "deepinfra/solo"
+provider = "deepinfra"
+model = "upstream/solo"
+
+[tiers."zero/test-solo".candidates.rates]
+input_per_mtok = 1.00
+cached_input_per_mtok = 0.20
+output_per_mtok = 2.00
+
+[tiers."zero/test-below-cost"]
+
+[tiers."zero/test-below-cost".rates]
+input_per_mtok = 1.00
+cached_input_per_mtok = 0.20
+output_per_mtok = 2.00
+
+[[tiers."zero/test-below-cost".candidates]]
+id = "anthropic/dear"
+provider = "anthropic"
+model = "upstream/dear"
+
+[tiers."zero/test-below-cost".candidates.rates]
+input_per_mtok = 3.00
+cached_input_per_mtok = 0.60
+output_per_mtok = 6.00

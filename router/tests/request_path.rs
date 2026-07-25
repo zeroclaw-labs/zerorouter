@@ -147,10 +147,25 @@ async fn user_of(pool: &PgPool, api_key_id: Uuid) -> Uuid {
         .expect("owning user must query")
 }
 
+/// A catalog with one healthy tier and one tier priced below its own cost
+/// basis, for the withheld-tier test.
+fn withheld_tier_config_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/withheld_tier_tiers.toml")
+}
+
 /// A router whose candidates are served by `fakes` in tier order. Panics if a
 /// resolved route has more candidates than the test scripted, which would
 /// silently leave a real (credential-less) upstream in the walk.
 fn router(pool: PgPool, fakes: Vec<Arc<FakeModelProvider>>) -> RouterState {
+    router_with_catalog(pool, fakes, tier_config_path())
+}
+
+/// [`router`], reading a caller-chosen catalog.
+fn router_with_catalog(
+    pool: PgPool,
+    fakes: Vec<Arc<FakeModelProvider>>,
+    catalog: PathBuf,
+) -> RouterState {
     let route: InjectedRoute = Arc::new(move |resolved: &ResolvedRoute, _max_output_tokens| {
         assert_eq!(
             resolved.candidates.len(),
@@ -167,7 +182,7 @@ fn router(pool: PgPool, fakes: Vec<Arc<FakeModelProvider>>) -> RouterState {
                 .collect(),
         )
     });
-    RouterState::with_injected_route(tier_config_path(), pool, true, route)
+    RouterState::with_injected_route(catalog, pool, true, route)
 }
 
 fn completion_body(model: &str, stream: bool) -> Value {
@@ -322,6 +337,93 @@ async fn open_reservations(pool: &PgPool, api_key_id: Uuid) -> i64 {
         .fetch_one(pool)
         .await
         .expect("reservation count must query")
+}
+
+#[tokio::test]
+async fn a_withheld_tier_is_refused_while_a_healthy_tier_in_the_same_catalog_serves() {
+    // The whole point of scoping the margin verdict, proven on the real
+    // request path: `zero/test-below-cost` cannot cover its own candidate, so a
+    // request for it is refused as a misconfiguration — named, distinct from a
+    // missing model, and short of admission so nothing is reserved or billed —
+    // while `zero/test-solo`, sitting in the same file and served by the same
+    // process moments later, completes and settles exactly as it always did.
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let (api_key_id, key) = create_funded_key(&pool, "withheld").await;
+    let solo = FakeModelProvider::new(
+        "solo",
+        vec![FakeOutcome::chat("hello from solo", served_usage())],
+    );
+    let state = router_with_catalog(
+        pool.clone(),
+        vec![solo.clone()],
+        withheld_tier_config_path(),
+    );
+
+    let refused = app(state.clone())
+        .oneshot(completion_request(
+            &key,
+            &completion_body("zero/test-below-cost", false),
+        ))
+        .await
+        .expect("completion request should complete");
+    assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let refused_body = json_body(refused).await;
+    assert_eq!(refused_body["error"]["code"], "model_unavailable");
+    assert!(
+        refused_body["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("zero/test-below-cost"),
+        "{refused_body}"
+    );
+    // Refused before the walk and before admission: no upstream call, no
+    // reservation, no charge.
+    assert_eq!(solo.call_count(), 0);
+    assert_eq!(open_reservations(&pool, api_key_id).await, 0);
+    assert_eq!(
+        balance(&pool, user_of(&pool, api_key_id).await)
+            .await
+            .expect("balance must query"),
+        Decimal::from(50)
+    );
+
+    let served = app(state.clone())
+        .oneshot(completion_request(
+            &key,
+            &completion_body("zero/test-solo", false),
+        ))
+        .await
+        .expect("completion request should complete");
+    assert_eq!(served.status(), StatusCode::OK);
+    let served_body = json_body(served).await;
+    state.wait_for_background_tasks().await;
+    assert_eq!(
+        served_body["choices"][0]["message"]["content"],
+        "hello from solo"
+    );
+    assert_eq!(solo.call_count(), 1);
+
+    // One settled row, for the healthy tier only.
+    assert_eq!(
+        settled_event(&pool, api_key_id).await,
+        (
+            "deepinfra".to_owned(),
+            "upstream/solo".to_owned(),
+            1_000,
+            20,
+            served_sell_cost(),
+            200,
+        )
+    );
+    assert_eq!(
+        balance(&pool, user_of(&pool, api_key_id).await)
+            .await
+            .expect("balance must query"),
+        Decimal::from(50) - served_sell_cost()
+    );
+    assert_eq!(open_reservations(&pool, api_key_id).await, 0);
 }
 
 #[tokio::test]

@@ -103,8 +103,12 @@ output_per_mtok = 1.85
 # Sonnet 5 introductory pricing ends after 2026-08-31. Update this canonical
 # table before customer traffic continues at the standard rate. When the intro
 # basis lapses, both sonnet rows go above these sell rates and the invariant
-# above fails the catalog at startup — loud, not a silent margin leak, but the
-# whole API is down until the sell rates are raised. Raise them first.
+# above withholds this tier alone: zero/high-end disappears from /v1/models,
+# and every request for it — or for either sonnet row pinned directly — is
+# refused with `model_unavailable` naming the tier, until the sell rates are
+# raised. zero/low-cost and zero/balanced are unaffected and keep serving.
+# Loud and logged, not a silent margin leak, and not an API-wide outage — but
+# this tier earns nothing for as long as it is withheld. Raise the rates first.
 [tiers."zero/high-end".rates]
 input_per_mtok = 2.00
 cached_input_per_mtok = 0.20
