@@ -75,6 +75,10 @@ async fn serve() -> Result<()> {
         "ZeroRouter listening"
     );
     let state = RouterState::with_database(tier_config_path, pool.clone(), require_credits);
+    // The durable backstop for settlements that failed in-request: replays the
+    // intent persisted on the reservation row (migration 0006) so delivered
+    // inference cannot go unbilled because one transaction lost a connection.
+    state.spawn_settlement_recovery();
     let mut router = app(state.clone());
     if let Some(config) = web_config {
         let portal_dist = config.portal_dist_path.clone();

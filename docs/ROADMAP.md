@@ -74,13 +74,19 @@ The first security review's confirmed findings were fixed (see the
 `fix: remediate confirmed findings` commit). Three lower-severity items were
 deliberately deferred rather than fully closed, and are tracked here:
 
-- **Streaming settle-after-deliver window** — a non-streaming request settles
-  before any bytes reach the client, but a streaming request delivers tokens
-  first and settles after. If that final settlement transaction fails durably,
-  the delivered content is unbilled. The debit is idempotent and the failure
-  is logged; the durable fix is to settle expired reservations at their
-  reserved cost during the admission sweep (keyed by the unique `request_id`,
-  so a late-succeeding retry cannot double-charge) instead of releasing them.
+- **Streaming settle-after-deliver window** — CLOSED by migration
+  `0006_settlement_outbox.sql`. A streaming request delivers tokens first and
+  settles after, so a settlement transaction that failed durably lost the
+  charge outright — and the admission sweep then deleted the reservation at
+  expiry, leaving no trace at all. The settle payload is now written onto the
+  reservation row before the settle transaction runs, transient failures are
+  retried inside the request, an existing `usage_events.request_id` is read as
+  success rather than a duplicate-key error (which is what makes an ambiguous
+  COMMIT safe), and the background recovery sweep replays anything still owed.
+  An expired reservation that owes a settlement is quarantined for
+  reconciliation (`zerorouter admin owed-settlements`) instead of deleted.
+  Exactly-once is unchanged: money still moves only in the transaction that
+  consumed the reservation via `DELETE ... RETURNING`.
 - **Per-IP rate limiting on unauthenticated endpoints** — `/auth/device/code`,
   `/auth/login`, and `/webhooks/stripe` are bounded by a web-plane request-body
   limit and by terminal-row reclamation, but there is no per-IP request-rate

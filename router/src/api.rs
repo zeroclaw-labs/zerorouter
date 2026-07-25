@@ -33,8 +33,8 @@ use crate::{
     auth::{AuthenticatedKey, AuthenticationError, KeyAuthenticator},
     config::{ResolvedRoute, TierCandidate, load_tier_catalog},
     db::{
-        AttemptRecord, RequestTelemetry, UsageAdmission, UsageRecord, UsageSession,
-        begin_usage_session,
+        AttemptRecord, RequestTelemetry, SettlementRecovery, UsageAdmission, UsageRecord,
+        UsageSession, begin_usage_session, recover_owed_settlements,
     },
     error::{ApiError, streaming_error_json},
     openai::{
@@ -160,16 +160,94 @@ fn log_metering_gap(
     );
 }
 
+/// Whether a stream frame carries model output or is protocol scaffolding.
+///
+/// The distinction is a billing one. A customer who received only scaffolding
+/// received none of what they asked for, so scaffolding can never be the reason
+/// a request is charged.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Frame {
+    /// A content delta, a reasoning delta, or a tool-call delta: the thing the
+    /// customer asked for, and the only thing a charge may rest on.
+    ModelOutput,
+    /// The role primer (`{"role":"assistant","content":null}`), the finish
+    /// delta, the usage chunk, an error frame, the terminal `[DONE]`. Pure
+    /// protocol envelope carrying no model output. Keep-alives are scaffolding
+    /// too and never reach this enum at all — axum's `KeepAlive` layer writes
+    /// them below the channel, so the walk never sees them.
+    Scaffolding,
+}
+
 /// What the walk actually put on the wire for the candidate being settled.
 ///
-/// `client_output_sent` is the outer-walk flag (`stream_to_channel`): once any
-/// frame reaches the client it stays true for the rest of the request.
-#[derive(Clone, Copy)]
+/// `model_output_sent` is the outer-walk flag (`stream_to_channel`): once one
+/// [`Frame::ModelOutput`] frame is accepted it stays true for the rest of the
+/// request. It used to be set by *any* frame, which meant the role primer —
+/// emitted before the first delta and carrying nothing but
+/// `{"role":"assistant"}` — was enough to mark a request as delivered and,
+/// where the upstream had already reported usage, to bill it.
+///
+/// # What this flag can and cannot mean
+///
+/// A frame is counted when `Sender::send` into the SSE channel succeeds, which
+/// is **queued for the transport**, not **received by the client**. The
+/// channel is a 32-slot `tokio::mpsc` drained by `ReceiverStream` inside
+/// axum's `Sse` body, which hyper polls and writes to the socket. Nothing on
+/// that path reports back: a successful send means a slot was free, a
+/// successful hyper poll would mean the frame was handed to the socket, and
+/// even a completed socket write means the bytes are in a kernel buffer — not
+/// that a client read them. There is no ack at any layer this code can reach,
+/// so "delivered" is not observable here and this type does not pretend
+/// otherwise. What IS observable is the negative: once the client hangs up the
+/// receiver drops, `send` starts failing, and `sender.is_closed()` reports it —
+/// which is why every terminal consults `client_connected` as well.
+///
+/// The one signal strictly stronger than queueing — "the body stream yielded
+/// this frame to hyper" — is obtainable by instrumenting the stream, and is
+/// deliberately NOT used: the settle sites run concurrently with the body being
+/// polled, so reading a consumption counter at settle time would race the
+/// transport and under-bill correct deliveries. Making it non-racy means
+/// settling only after the body drains, i.e. moving settlement after the
+/// terminal `[DONE]` — a reordering of when a customer is charged that belongs
+/// in its own change.
+#[derive(Clone, Copy, Default)]
 struct StreamDelivery {
-    client_output_sent: bool,
+    model_output_sent: bool,
 }
 
 impl StreamDelivery {
+    /// Send one frame, recording it as a delivery only when it carries model
+    /// output. Returns whether the channel accepted the frame.
+    async fn send(&mut self, sender: &mpsc::Sender<Event>, data: String, frame: Frame) -> bool {
+        let accepted = send_data(sender, data).await;
+        self.model_output_sent |= accepted && frame == Frame::ModelOutput;
+        accepted
+    }
+
+    /// Emit the role primer once, if it has not been emitted yet.
+    ///
+    /// Scaffolding: it opens the assistant message and carries no output, so it
+    /// never marks the request as delivered.
+    async fn ensure_role(
+        &mut self,
+        sender: &mpsc::Sender<Event>,
+        metadata: &StreamMetadata,
+        already_sent: bool,
+    ) -> bool {
+        already_sent
+            || self
+                .send(
+                    sender,
+                    stream_delta_json(
+                        metadata,
+                        json!({ "role": "assistant", "content": null }),
+                        None,
+                    ),
+                    Frame::Scaffolding,
+                )
+                .await
+    }
+
     /// The single implementation of the streaming billing policy: **bill only
     /// metered actuals, never an estimate.** A charge requires both halves —
     /// output that actually reached the client, and a usage report from the
@@ -204,12 +282,21 @@ impl StreamDelivery {
     /// `request_attempts.served` is set only on the attempt whose output the
     /// customer received.
     fn settled_usage(self, usage: Option<OpenAiUsage>) -> OpenAiUsage {
-        if !self.client_output_sent {
+        if !self.model_output_sent {
             return OpenAiUsage::default();
         }
         usage.unwrap_or_default()
     }
 }
+
+/// Cadence of the background settlement-recovery sweep. Well above the
+/// `SETTLEMENT_RECOVERY_GRACE` an intent must age past before it is eligible,
+/// so a sweep never contends with a request still retrying in-band.
+const SETTLEMENT_RECOVERY_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Owed settlements one sweep pass replays. Bounded so a backlog is worked off
+/// over several passes instead of monopolising the pool in one.
+const SETTLEMENT_RECOVERY_BATCH: i64 = 64;
 
 const SSE_CHANNEL_CAPACITY: usize = 32;
 const SSE_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
@@ -315,6 +402,46 @@ impl RouterState {
         self.services
             .as_deref()
             .ok_or(ApiError::DatabaseUnavailable)
+    }
+
+    /// Start the background settlement-recovery sweep: the durable backstop
+    /// behind the bounded in-request settle retry (see
+    /// [`crate::db::recover_owed_settlements`]).
+    ///
+    /// Opt-in, and called only by `serve`. A test harness must not start it —
+    /// the loop exits only on shutdown, so
+    /// [`RouterState::wait_for_background_tasks`] would block forever on a
+    /// state that is never drained.
+    pub fn spawn_settlement_recovery(&self) {
+        let Some(services) = &self.services else {
+            return;
+        };
+        let pool = services.pool.clone();
+        let shutdown = services.runtime.shutdown.clone();
+        services.runtime.tasks.spawn(async move {
+            loop {
+                tokio::select! {
+                    biased;
+                    () = shutdown.cancelled() => return,
+                    () = tokio::time::sleep(SETTLEMENT_RECOVERY_INTERVAL) => {}
+                }
+                match recover_owed_settlements(&pool, SETTLEMENT_RECOVERY_BATCH).await {
+                    // Silence is the healthy state: nothing owed, nothing said.
+                    Ok(summary) if summary == SettlementRecovery::default() => {}
+                    Ok(summary) => tracing::warn!(
+                        settled = summary.settled,
+                        already_settled = summary.already_settled,
+                        failed = summary.failed,
+                        quarantined = summary.quarantined,
+                        "settlement recovery pass completed"
+                    ),
+                    Err(error) => tracing::error!(
+                        error = %error,
+                        "settlement recovery pass failed"
+                    ),
+                }
+            }
+        });
     }
 
     pub fn begin_shutdown(&self) {
@@ -745,7 +872,7 @@ async fn stream_to_channel(
     let mut last_candidate = None;
     let mut usage_session = Some(usage_session);
     let mut client_connected = true;
-    let mut client_output_sent = false;
+    let mut delivery = StreamDelivery::default();
     // The router-owned walk ledger: one row per candidate tried, drained into
     // the settle transaction at whichever terminal settles this request.
     let mut attempts: Vec<AttemptRecord> = Vec::new();
@@ -796,11 +923,11 @@ async fn stream_to_channel(
                 std::mem::take(&mut attempts),
                 started,
                 client_connected,
-                // `client_output_sent` is passed rather than assumed, but it is
+                // The delivery flag is passed rather than assumed, but it is
                 // necessarily false here: every terminal that can follow a
                 // delivery returns, so the only way the walk reaches another
                 // iteration is with nothing delivered.
-                StreamDelivery { client_output_sent },
+                delivery,
                 StreamInterruption::Timeout,
             )
             .await;
@@ -849,7 +976,7 @@ async fn stream_to_channel(
                         // writes anything for it is `complete_synthetic_stream`,
                         // which runs after `chat` returns and is not reached
                         // here, so nothing has been delivered for it.
-                        StreamDelivery { client_output_sent },
+                        delivery,
                         StreamInterruption::Shutdown,
                     )
                     .await;
@@ -870,6 +997,7 @@ async fn stream_to_channel(
                     complete_synthetic_stream(
                         &sender,
                         &mut usage_session,
+                        &mut delivery,
                         &metadata,
                         &resolved,
                         candidate,
@@ -922,7 +1050,7 @@ async fn stream_to_channel(
                         // The non-streaming call timed out, so
                         // `complete_synthetic_stream` never ran and nothing was
                         // written for this candidate.
-                        StreamDelivery { client_output_sent },
+                        delivery,
                         StreamInterruption::Timeout,
                     )
                     .await;
@@ -980,9 +1108,11 @@ async fn stream_to_channel(
                     if !client_connected {
                         continue;
                     }
-                    let role_was_sent = role_sent;
-                    role_sent = ensure_stream_role(&sender, &metadata, role_sent).await;
-                    client_output_sent |= !role_was_sent && role_sent;
+                    // The role primer is scaffolding: accepting it opens the
+                    // assistant message but delivers no model output, so it
+                    // cannot on its own make this request billable. Only the
+                    // delta below can.
+                    role_sent = delivery.ensure_role(&sender, &metadata, role_sent).await;
                     if !role_sent {
                         client_connected = false;
                         continue;
@@ -994,13 +1124,14 @@ async fn stream_to_channel(
                     if let Some(reasoning) = chunk.reasoning {
                         delta.insert("reasoning_content".to_owned(), Value::String(reasoning));
                     }
-                    let delivered = send_data(
-                        &sender,
-                        stream_delta_json(&metadata, Value::Object(delta), None),
-                    )
-                    .await;
-                    client_connected &= delivered;
-                    client_output_sent |= delivered;
+                    let accepted = delivery
+                        .send(
+                            &sender,
+                            stream_delta_json(&metadata, Value::Object(delta), None),
+                            Frame::ModelOutput,
+                        )
+                        .await;
+                    client_connected &= accepted;
                 }
                 Ok(StreamEvent::ToolCall(call)) => {
                     has_tool_calls = true;
@@ -1009,26 +1140,28 @@ async fn stream_to_channel(
                         tool_index = tool_index.saturating_add(1);
                         continue;
                     }
-                    let role_was_sent = role_sent;
-                    role_sent = ensure_stream_role(&sender, &metadata, role_sent).await;
-                    client_output_sent |= !role_was_sent && role_sent;
+                    role_sent = delivery.ensure_role(&sender, &metadata, role_sent).await;
                     if !role_sent {
                         client_connected = false;
                         tool_index = tool_index.saturating_add(1);
                         continue;
                     }
-                    let delivered = send_data(
-                        &sender,
-                        stream_delta_json(
-                            &metadata,
-                            stream_tool_call_delta(call, tool_index),
-                            None,
-                        ),
-                    )
-                    .await;
+                    // A tool-call delta IS model output — it is what a
+                    // tool-calling completion consists of — so it counts as a
+                    // delivery exactly as a content delta does.
+                    let accepted = delivery
+                        .send(
+                            &sender,
+                            stream_delta_json(
+                                &metadata,
+                                stream_tool_call_delta(call, tool_index),
+                                None,
+                            ),
+                            Frame::ModelOutput,
+                        )
+                        .await;
                     tool_index = tool_index.saturating_add(1);
-                    client_connected &= delivered;
-                    client_output_sent |= delivered;
+                    client_connected &= accepted;
                 }
                 Ok(StreamEvent::Usage(provider_usage)) => {
                     usage = OpenAiUsage::try_from_provider(Some(&provider_usage));
@@ -1067,9 +1200,9 @@ async fn stream_to_channel(
                 started,
                 client_connected,
                 // This candidate's stream was polled, so the delivery signal is
-                // real: whether any frame reached the client before the
-                // interruption.
-                StreamDelivery { client_output_sent },
+                // real: whether any model output was accepted for the client
+                // before the interruption.
+                delivery,
                 interruption,
             )
             .await;
@@ -1078,8 +1211,8 @@ async fn stream_to_channel(
 
         if completed {
             if client_connected {
-                let role_delivered = ensure_stream_role(&sender, &metadata, role_sent).await;
-                client_connected &= role_delivered;
+                let role_accepted = delivery.ensure_role(&sender, &metadata, role_sent).await;
+                client_connected &= role_accepted;
             }
             finish_successful_stream(
                 &sender,
@@ -1102,7 +1235,7 @@ async fn stream_to_channel(
                 },
                 // Only consulted when the upstream reported no usage, and then
                 // only to label whether the customer saw the unbilled output.
-                StreamDelivery { client_output_sent },
+                delivery,
                 started,
             )
             .await;
@@ -1110,17 +1243,17 @@ async fn stream_to_channel(
         }
 
         client_connected &= !sender.is_closed();
-        if client_output_sent || !client_connected {
+        if delivery.model_output_sent || !client_connected {
             let Some(session) = usage_session.take() else {
                 send_stream_error(&sender, &ApiError::MeteringUnavailable).await;
                 return;
             };
-            // Bill metered actuals only: the upstream's report when tokens
-            // reached the client, nothing otherwise. A stream that broke
+            // Bill metered actuals only: the upstream's report when model
+            // output reached the client, nothing otherwise. A stream that broke
             // mid-delivery having never reported usage is the common shape
             // here, and it settles at zero.
-            let settled_usage = StreamDelivery { client_output_sent }.settled_usage(usage);
-            if client_output_sent && usage.is_none() {
+            let settled_usage = delivery.settled_usage(usage);
+            if delivery.model_output_sent && usage.is_none() {
                 log_metering_gap(
                     &metadata,
                     &resolved,
@@ -1131,7 +1264,7 @@ async fn stream_to_channel(
             }
             // The customer received this candidate's partial output, so it is
             // the served attempt even though the stream broke.
-            let served = client_output_sent;
+            let served = delivery.model_output_sent;
             let attempt_usage = usage.or_else(|| estimated_stream_usage(estimated_output));
             attempts.push(build_attempt(
                 attempt_no,
@@ -1281,7 +1414,7 @@ async fn settle_stream_interruption(
     // partial delivery was never metered. A drained deploy (`Shutdown`) and an
     // upstream deadline (`Timeout`) both settle here.
     let settled_usage = delivery.settled_usage(usage);
-    if delivery.client_output_sent && usage.is_none() {
+    if delivery.model_output_sent && usage.is_none() {
         log_metering_gap(metadata, resolved, candidate, true, interruption.label());
     }
     let error = if let Some(session) = usage_session.take() {
@@ -1329,6 +1462,11 @@ async fn settle_stream_interruption(
 async fn complete_synthetic_stream(
     sender: &mpsc::Sender<Event>,
     usage_session: &mut Option<UsageSession>,
+    // Threaded from the walk so the frames replayed here are classified by the
+    // same rule as a live stream's. This site settles BEFORE it replays
+    // anything, so the flag it leaves behind is a record, not an input to the
+    // charge — restructuring that ordering is out of scope here.
+    delivery: &mut StreamDelivery,
     metadata: &StreamMetadata,
     resolved: &ResolvedRoute,
     candidate: &ProviderCandidate,
@@ -1437,37 +1575,43 @@ async fn complete_synthetic_stream(
         return;
     }
 
-    if !ensure_stream_role(sender, metadata, false).await {
+    if !delivery.ensure_role(sender, metadata, false).await {
         return;
     }
     if let Some(text) = response.text
-        && !send_data(
-            sender,
-            stream_delta_json(metadata, json!({ "content": text }), None),
-        )
-        .await
+        && !delivery
+            .send(
+                sender,
+                stream_delta_json(metadata, json!({ "content": text }), None),
+                Frame::ModelOutput,
+            )
+            .await
     {
         return;
     }
     if let Some(reasoning) = response.reasoning_content
-        && !send_data(
-            sender,
-            stream_delta_json(metadata, json!({ "reasoning_content": reasoning }), None),
-        )
-        .await
+        && !delivery
+            .send(
+                sender,
+                stream_delta_json(metadata, json!({ "reasoning_content": reasoning }), None),
+                Frame::ModelOutput,
+            )
+            .await
     {
         return;
     }
     for (index, call) in response.tool_calls.into_iter().enumerate() {
-        if !send_data(
-            sender,
-            stream_delta_json(
-                metadata,
-                stream_tool_call_delta(call, u32::try_from(index).unwrap_or(u32::MAX)),
-                None,
-            ),
-        )
-        .await
+        if !delivery
+            .send(
+                sender,
+                stream_delta_json(
+                    metadata,
+                    stream_tool_call_delta(call, u32::try_from(index).unwrap_or(u32::MAX)),
+                    None,
+                ),
+                Frame::ModelOutput,
+            )
+            .await
         {
             return;
         }
@@ -1516,7 +1660,7 @@ async fn finish_successful_stream(
             metadata,
             resolved,
             Some(candidate.definition()),
-            delivery.client_output_sent,
+            delivery.model_output_sent,
             "stream_final",
         );
         // Record the attempt with NULL token columns, `served` tracking whether
@@ -1527,7 +1671,7 @@ async fn finish_successful_stream(
             attempt_no,
             candidate.definition(),
             "ok",
-            delivery.client_output_sent,
+            delivery.model_output_sent,
             attempt_started,
             None,
             false,
@@ -1630,29 +1774,21 @@ async fn emit_stream_finish(
     );
 }
 
-async fn ensure_stream_role(
-    sender: &mpsc::Sender<Event>,
-    metadata: &StreamMetadata,
-    already_sent: bool,
-) -> bool {
-    already_sent
-        || send_data(
-            sender,
-            stream_delta_json(
-                metadata,
-                json!({ "role": "assistant", "content": null }),
-                None,
-            ),
-        )
-        .await
-}
-
 async fn send_stream_error(sender: &mpsc::Sender<Event>, error: &ApiError) {
     if send_data(sender, streaming_error_json(error)).await {
         let _ = send_data(sender, "[DONE]".to_owned()).await;
     }
 }
 
+/// Queue one SSE frame, bounded by [`SSE_SEND_TIMEOUT`]. Returns whether the
+/// channel accepted it — see [`StreamDelivery`] for why that is queueing rather
+/// than delivery.
+///
+/// Every remaining direct caller sends [`Frame::Scaffolding`] (the finish
+/// delta, the usage chunk, an error frame, `[DONE]`) after the request has
+/// already settled, so none of them can affect a charge. Anything sent while a
+/// settle is still ahead goes through [`StreamDelivery::send`], which is where
+/// the classification lives.
 async fn send_data(sender: &mpsc::Sender<Event>, data: String) -> bool {
     tokio::time::timeout(SSE_SEND_TIMEOUT, sender.send(Event::default().data(data)))
         .await
@@ -1763,10 +1899,72 @@ mod tests {
     use zeroclaw_providers::traits::TokenUsage;
 
     use super::*;
-    use crate::sqlx::{
-        postgres::{PgConnectOptions, PgPoolOptions},
-        query, query_as,
+    use crate::{
+        sqlx::{
+            postgres::{PgConnectOptions, PgPoolOptions},
+            query, query_as, query_scalar,
+        },
+        testing::{FakeModelProvider, FakeOutcome, FakeStreamStep},
     };
+
+    /// Only [`Frame::ModelOutput`] is a delivery. The role primer opens the
+    /// assistant message and carries nothing the customer asked for, so
+    /// accepting it must leave the request unbillable — it used to be enough on
+    /// its own to mark the request as delivered.
+    #[tokio::test]
+    async fn only_model_output_frames_count_as_delivery() {
+        let metadata =
+            StreamMetadata::new("chatcmpl-test".to_owned(), "zero/test".to_owned(), false);
+        let (sender, _receiver) = mpsc::channel(8);
+        let mut delivery = StreamDelivery::default();
+
+        assert!(
+            delivery.ensure_role(&sender, &metadata, false).await,
+            "the channel should accept the role primer"
+        );
+        assert!(
+            !delivery.model_output_sent,
+            "the role primer is scaffolding, not a delivery"
+        );
+
+        assert!(
+            delivery
+                .send(
+                    &sender,
+                    stream_delta_json(&metadata, json!({ "content": "hi" }), None),
+                    Frame::ModelOutput,
+                )
+                .await
+        );
+        assert!(
+            delivery.model_output_sent,
+            "a content delta is model output and is a delivery"
+        );
+    }
+
+    /// A frame the channel refuses is not a delivery either, whatever it
+    /// carried: the flag tracks frames the transport accepted, not frames the
+    /// walk produced.
+    #[tokio::test]
+    async fn a_refused_model_output_frame_is_not_a_delivery() {
+        let metadata =
+            StreamMetadata::new("chatcmpl-test".to_owned(), "zero/test".to_owned(), false);
+        let (sender, receiver) = mpsc::channel(8);
+        drop(receiver);
+        let mut delivery = StreamDelivery::default();
+
+        assert!(
+            !delivery
+                .send(
+                    &sender,
+                    stream_delta_json(&metadata, json!({ "content": "hi" }), None),
+                    Frame::ModelOutput,
+                )
+                .await,
+            "a closed channel refuses the frame"
+        );
+        assert!(!delivery.model_output_sent);
+    }
 
     #[test]
     fn bearer_parser_is_strict_and_case_insensitive() {
@@ -1848,16 +2046,28 @@ mod tests {
 
     /// A pool plus a funded key ready to admit a reservation, or `None` when
     /// no scratch database is configured.
+    ///
+    /// The pool is opened the way `tests/request_path.rs` opens its own: no
+    /// liveness ping and every connection dialled up front, so a test that
+    /// pauses the clock cannot have an acquire timer fire while the runtime is
+    /// parked on socket I/O.
     async fn walk_fixture() -> Option<(PgPool, AuthenticatedKey)> {
         let database_url = std::env::var("DATABASE_URL").ok()?;
         let pool = PgPoolOptions::new()
             .max_connections(2)
+            .test_before_acquire(false)
+            .acquire_timeout(Duration::from_secs(3_600))
             .connect_with(
                 PgConnectOptions::from_str(&database_url).expect("test database URL must parse"),
             )
             .await
             .expect("test database must connect");
         crate::db::migrate(&pool).await.expect("migration must run");
+        let mut warm = Vec::new();
+        for _ in 0..2 {
+            warm.push(pool.acquire().await.expect("pool connection must open"));
+        }
+        drop(warm);
 
         let user_id = Uuid::new_v4();
         let key = AuthenticatedKey {
@@ -2014,6 +2224,91 @@ mod tests {
         assert_eq!(attempt_count, Some(2));
         assert_eq!(candidate_id.as_deref(), Some(second.id.as_str()));
         assert_eq!(status, 200);
+    }
+
+    /// The role primer is the only frame the client ever accepts: the channel
+    /// holds exactly one and nothing drains it, so the content delta queued
+    /// behind the primer is refused and the customer receives no model output
+    /// at all. The upstream still reports usage before it breaks — and that
+    /// usage must not be billed, because the delivery that would justify
+    /// billing it never happened. Before the frame classification landed, the
+    /// accepted primer alone marked the request delivered and this settled at
+    /// the metered cost.
+    #[tokio::test]
+    async fn a_stream_whose_only_accepted_frame_is_the_role_primer_settles_at_zero() {
+        let Some((pool, key)) = walk_fixture().await else {
+            return;
+        };
+        let candidate = walk_candidate("primer-only");
+        let resolved = walk_route(vec![candidate.clone()]);
+        let request = walk_request();
+        let reservation_usage = request.reservation_usage(64);
+        let (session, request_id) = admit_walk(&pool, &key, &resolved, reservation_usage).await;
+        let metadata = StreamMetadata::new(session.request_id(), "zero/test".to_owned(), false);
+        let fake = FakeModelProvider::new(
+            "primer-only",
+            vec![FakeOutcome::Stream(vec![
+                FakeStreamStep::text("partial"),
+                FakeStreamStep::Usage(TokenUsage {
+                    input_tokens: Some(1_000),
+                    output_tokens: Some(20),
+                    cached_input_tokens: None,
+                }),
+                FakeStreamStep::Error("upstream exploded".to_owned()),
+            ])],
+        );
+
+        // One slot, never drained: the role primer fills it and nothing behind
+        // it can be accepted.
+        let (sender, receiver) = mpsc::channel(1);
+        // The refused delta waits out the 5s `SSE_SEND_TIMEOUT`; pausing the
+        // clock spends that instantly. `walk_fixture`'s pool is warm and
+        // timer-free on acquire, so the settle below is unaffected.
+        tokio::time::pause();
+        stream_to_channel(
+            sender,
+            CancellationToken::new(),
+            session,
+            metadata,
+            request,
+            resolved,
+            vec![ProviderCandidate::with_provider(candidate.clone(), fake)],
+            reservation_usage,
+        )
+        .await;
+        tokio::time::resume();
+        drop(receiver);
+
+        let (cost_usd, input_tokens, output_tokens, status) =
+            query_as::<_, (Decimal, i32, i32, i16)>(
+                r#"
+                SELECT cost_usd, input_tokens, output_tokens, status
+                FROM usage_events
+                WHERE request_id = $1
+                "#,
+            )
+            .bind(request_id)
+            .fetch_one(&pool)
+            .await
+            .expect("settled row must query");
+        assert_eq!(
+            cost_usd,
+            Decimal::ZERO,
+            "scaffolding is not a delivery, so the metered usage behind it is not billable"
+        );
+        assert_eq!((input_tokens, output_tokens), (0, 0));
+        assert_eq!(status, 499, "the client never got what it asked for");
+
+        let served =
+            query_scalar::<_, bool>("SELECT served FROM request_attempts WHERE request_id = $1")
+                .bind(request_id)
+                .fetch_one(&pool)
+                .await
+                .expect("attempt row must query");
+        assert!(
+            !served,
+            "an attempt whose output never reached the client is not the served one"
+        );
     }
 
     /// An interruption that delivered nothing settles at zero, but it still has

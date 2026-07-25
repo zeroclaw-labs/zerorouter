@@ -604,7 +604,7 @@ async fn migration_chain_applies_on_a_fresh_database() {
     let fresh_url = swap_database(&base, &fresh_db);
     // Nothing inside may panic: the DROP below is the only cleanup, so every
     // step reports through the Result and the assertions run after the drop.
-    let outcome: anyhow::Result<(bool, bool, bool, i64)> = async {
+    let outcome: anyhow::Result<(bool, bool, bool, bool, i64)> = async {
         let pool = PgPoolOptions::new()
             .max_connections(1)
             .connect_with(PgConnectOptions::from_str(&fresh_url)?)
@@ -625,11 +625,22 @@ async fn migration_chain_applies_on_a_fresh_database() {
         )
         .fetch_one(&pool)
         .await?;
+        let settlement_outbox_exists = query_scalar::<_, bool>(
+            "SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'usage_reservations' AND column_name = 'settlement_intent')",
+        )
+        .fetch_one(&pool)
+        .await?;
         let version = query_scalar::<_, i64>("SELECT MAX(version) FROM _sqlx_migrations")
             .fetch_one(&pool)
             .await?;
         pool.close().await;
-        Ok((attempts_exists, column_exists, intents_exists, version))
+        Ok((
+            attempts_exists,
+            column_exists,
+            intents_exists,
+            settlement_outbox_exists,
+            version,
+        ))
     }
     .await;
 
@@ -638,7 +649,7 @@ async fn migration_chain_applies_on_a_fresh_database() {
         .execute(&admin)
         .await;
 
-    let outcome = outcome.expect("the 0001->0005 chain must apply on a fresh database");
+    let outcome = outcome.expect("the 0001->0006 chain must apply on a fresh database");
     assert!(outcome.0, "request_attempts exists after the fresh chain");
     assert!(
         outcome.1,
@@ -648,7 +659,11 @@ async fn migration_chain_applies_on_a_fresh_database() {
         outcome.2,
         "the 0005 stripe_checkout_intents table exists after the chain"
     );
-    assert_eq!(outcome.3, 5, "the chain reaches migration version 5");
+    assert!(
+        outcome.3,
+        "the 0006 settlement-outbox columns exist after the chain"
+    );
+    assert_eq!(outcome.4, 6, "the chain reaches migration version 6");
 }
 
 /// Rewrite the database name in a Postgres URL, keeping any query string

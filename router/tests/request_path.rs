@@ -1061,6 +1061,80 @@ async fn streaming_error_after_delivered_bytes_bills_nothing() {
     );
 }
 
+/// The positive control for the delivery signal, at the terminal that consults
+/// it: real content reaches the client, the upstream reports usage, and the
+/// stream then breaks — so the metered usage IS billed. Its mirror image is
+/// `api.rs`'s `a_stream_whose_only_accepted_frame_is_the_role_primer_settles_at_zero`,
+/// where the same terminal settles at zero because the only frame the client
+/// accepted was scaffolding. Narrowing "delivered" to model output must not
+/// suppress a charge for output that genuinely arrived.
+#[tokio::test]
+async fn streaming_error_after_metered_content_bills_the_metered_usage() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let (api_key_id, key) = create_funded_key(&pool, "stream-metered-break").await;
+    let solo = FakeModelProvider::new(
+        "solo",
+        vec![FakeOutcome::Stream(vec![
+            FakeStreamStep::text("partial"),
+            FakeStreamStep::Usage(served_usage()),
+            FakeStreamStep::Error("upstream exploded".to_owned()),
+        ])],
+    );
+    let state = router(pool.clone(), vec![solo.clone()]);
+
+    let response = app(state.clone())
+        .oneshot(completion_request(
+            &key,
+            &completion_body("zero/test-solo", true),
+        ))
+        .await
+        .expect("stream request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    let chunks = sse_chunks(response).await;
+    state.wait_for_background_tasks().await;
+
+    assert_eq!(chunks[0]["choices"][0]["delta"]["role"], "assistant");
+    assert_eq!(chunks[1]["choices"][0]["delta"]["content"], "partial");
+    assert_eq!(
+        chunks
+            .last()
+            .expect("an error chunk should terminate the stream")["error"]["code"],
+        "upstream_unavailable"
+    );
+
+    assert_eq!(
+        settled_event(&pool, api_key_id).await,
+        (
+            "deepinfra".to_owned(),
+            "upstream/solo".to_owned(),
+            1_000,
+            20,
+            served_sell_cost(),
+            502,
+        )
+    );
+    assert_eq!(
+        balance(&pool, user_of(&pool, api_key_id).await)
+            .await
+            .expect("balance must query"),
+        Decimal::from(50) - served_sell_cost(),
+        "content that reached the client is billed at the metered actuals"
+    );
+    assert_eq!(
+        attempt_rows(&pool, api_key_id).await,
+        vec![(
+            1,
+            "deepinfra/solo".to_owned(),
+            "stream_error".to_owned(),
+            true
+        )],
+        "the candidate whose content the client received is the served one"
+    );
+    assert_eq!(open_reservations(&pool, api_key_id).await, 0);
+}
+
 /// See `non_streaming_timeout_releases_the_reservation_without_charge` for why
 /// the clock is paused, and paused only here.
 #[tokio::test]

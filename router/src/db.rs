@@ -3,6 +3,7 @@ use std::{borrow::Cow, env, str::FromStr, time::Duration};
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 // Named directly rather than through the `crate::sqlx` shim: the shim exists to
 // keep the sqlx-core/sqlx-postgres split out of call sites, and [`admit_key_mint`]
@@ -13,7 +14,7 @@ use zeroclaw_providers::pricing::ModelRates;
 
 use crate::{
     auth::AuthenticatedKey,
-    openai::{OpenAiUsage, usage_cost},
+    openai::{OpenAiUsage, PromptTokenDetails, usage_cost},
     sqlx::{
         self, PgPool,
         migrate::{Migration, MigrationType, Migrator},
@@ -146,6 +147,33 @@ pub struct UsageSession {
 const DATABASE_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
 const RESERVATION_TTL: Duration = Duration::from_secs(20 * 60);
 
+/// Settle transactions one request may run before it hands the durable intent
+/// to the recovery sweep. Bounded on purpose: the client is already waiting
+/// (streaming terminals settle before the error frame is written), so the
+/// in-request budget exists to ride out a lock-timeout or a dropped connection,
+/// not to outlast an outage. Everything longer than that is recovery's job.
+const SETTLEMENT_ATTEMPTS: u32 = 3;
+
+/// Backoff before the first in-request retry, tripled for the second. The whole
+/// budget is under 200 ms of added latency in the worst case.
+const SETTLEMENT_RETRY_BACKOFF: Duration = Duration::from_millis(50);
+
+/// How long a settlement intent must sit before [`recover_owed_settlements`]
+/// will replay it. Longer than the in-request retry budget by three orders of
+/// magnitude, so the sweep cannot race a request that is still trying — and
+/// even if it did, the settle is idempotent and the two serialize on the
+/// per-user advisory lock.
+const SETTLEMENT_RECOVERY_GRACE: Duration = Duration::from_secs(60);
+
+/// Total settle attempts, in-request and recovery together, before a
+/// reservation is quarantined for an operator instead of retried again.
+const MAX_SETTLE_ATTEMPTS: i32 = 8;
+
+/// Payload-format discriminant on [`SettlementIntent`]. A stored payload whose
+/// version this build does not know is quarantined, never guessed at: the
+/// alternative is deserializing an unknown shape into a wrong charge.
+const SETTLEMENT_INTENT_VERSION: u8 = 1;
+
 pub async fn database_pool_from_env() -> Result<PgPool> {
     let pool = if let Ok(database_url) = env::var("DATABASE_URL") {
         let mut options = PgConnectOptions::from_str(&database_url)
@@ -244,6 +272,13 @@ pub async fn migrate(pool: &PgPool) -> Result<()> {
                 )),
                 false,
             ),
+            Migration::new(
+                6,
+                Cow::Borrowed("settlement outbox"),
+                MigrationType::Simple,
+                Cow::Borrowed(include_str!("../migrations/0006_settlement_outbox.sql")),
+                false,
+            ),
         ]),
         ignore_missing: false,
         locking: true,
@@ -339,9 +374,32 @@ pub async fn begin_usage_session(
         .execute(&mut *transaction)
         .await?;
 
-    sqlx::query("DELETE FROM usage_reservations WHERE expires_at <= NOW()")
-        .execute(&mut *transaction)
-        .await?;
+    // Reclaim expired reservations, but only the ones that owe nothing. A row
+    // carrying a settlement intent is money the customer already received and
+    // ZeroRouter has not yet recorded; deleting it (which is what this sweep
+    // used to do unconditionally) erases the charge, the usage event, and every
+    // trace that either was owed. Those are quarantined instead — parked for
+    // reconciliation and readable through [`quarantined_settlements`].
+    //
+    // Quarantining rather than deleting cannot loosen any cap: every
+    // cap/credit aggregate below filters `expires_at > NOW()`, so a row that
+    // survives here is invisible to admission exactly as a deleted one was.
+    sqlx::query(
+        "DELETE FROM usage_reservations WHERE expires_at <= NOW() AND settlement_intent IS NULL",
+    )
+    .execute(&mut *transaction)
+    .await?;
+    sqlx::query(
+        r#"
+        UPDATE usage_reservations
+        SET quarantined_at = NOW()
+        WHERE expires_at <= NOW()
+          AND settlement_intent IS NOT NULL
+          AND quarantined_at IS NULL
+        "#,
+    )
+    .execute(&mut *transaction)
+    .await?;
 
     // Settled usage, aggregated across EVERY key the user owns (disabled ones
     // included — a disabled key's history is still the user's spend) and, in
@@ -551,69 +609,253 @@ impl UsageSession {
         format!("chatcmpl-{}", self.reservation_id.simple())
     }
 
-    pub async fn record(self, record: &UsageRecord) -> Result<(), sqlx::Error> {
-        let input_tokens = checked_token_count(record.usage.prompt_tokens, "prompt_tokens")?;
-        let cached_input_tokens =
-            checked_token_count(record.usage.cached_input_tokens(), "cached_input_tokens")?;
-        let output_tokens =
-            checked_token_count(record.usage.completion_tokens, "completion_tokens")?;
+    /// Settle this request.
+    ///
+    /// Two durable steps, in this order and never the other way round:
+    ///
+    /// 1. **Record the intent.** The whole settle payload is written onto the
+    ///    reservation row in its own autocommit statement, BEFORE any settle
+    ///    transaction runs. Until that commits, the only copy of what the
+    ///    customer owes lives in this process's memory; after it, a crash, a
+    ///    dropped connection or a rolled-back settle all leave a row that
+    ///    [`recover_owed_settlements`] can replay verbatim.
+    /// 2. **Settle, retrying transient failures.** [`settle_once`] is
+    ///    idempotent — see its documentation for why a retry can neither
+    ///    double-debit nor be defeated by a duplicate `request_id` — so the
+    ///    only question a retry has to answer is whether the failure was worth
+    ///    retrying inside the request at all. A permanent failure returns
+    ///    immediately and leaves the durable intent behind instead of burning
+    ///    the budget on a settle that cannot start working.
+    ///
+    /// Takes `&self`. The old signature consumed the session, so the single
+    /// settle attempt it ran was also the last one that could ever be made:
+    /// any failure after that point returned an error with the payload gone.
+    pub async fn record(&self, record: &UsageRecord) -> Result<(), sqlx::Error> {
+        let intent = SettlementIntent::new(self, record);
+        if let Err(error) = self.persist_intent(&intent).await {
+            // Not fatal on its own — the settle below may still succeed — but
+            // it means this request has lost its safety net, so it is reported
+            // at the same level as a lost charge.
+            tracing::error!(
+                request_id = %self.reservation_id,
+                error = %error,
+                "settlement intent could not be persisted; a failed settle for this request would not be recoverable"
+            );
+        }
+        settle_with_retry(&self.pool, self.reservation_id, self.api_key_id, &intent).await
+    }
 
-        let mut transaction = self.pool.begin().await?;
-        sqlx::query("SET LOCAL lock_timeout = '5s'")
-            .execute(&mut *transaction)
-            .await?;
-        // Same USER-keyed lock as admission so settlement serializes against
-        // concurrent admissions and balance reads for this user.
-        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1::TEXT, 0))")
-            .bind(self.user_id.to_string())
-            .execute(&mut *transaction)
-            .await?;
-
-        // Settle the reservation and recover what admission reserved in the
-        // same statement; a missing row means it was already settled or expired.
-        let reserved_cost_usd = sqlx::query_scalar::<_, Decimal>(
-            "DELETE FROM usage_reservations WHERE id = $1 AND api_key_id = $2 RETURNING reserved_cost_usd",
+    /// Write the settle payload onto the reservation row that carries it.
+    ///
+    /// Deliberately outside any transaction: an intent that rolls back
+    /// alongside the settle it exists to survive is not an intent. Zero rows
+    /// affected means the reservation is already gone; nothing is decided
+    /// here, because the settle attempt that follows is what distinguishes
+    /// "already settled" (success) from a genuinely lost reservation (error).
+    async fn persist_intent(&self, intent: &SettlementIntent) -> Result<(), sqlx::Error> {
+        let payload = serde_json::to_string(intent).map_err(|error| {
+            sqlx::Error::Protocol(format!("settlement intent is not serializable: {error}"))
+        })?;
+        sqlx::query(
+            r#"
+            UPDATE usage_reservations
+            SET settlement_intent = $3::JSONB, settlement_intent_at = NOW()
+            WHERE id = $1 AND api_key_id = $2
+            "#,
         )
         .bind(self.reservation_id)
         .bind(self.api_key_id)
-        .fetch_optional(&mut *transaction)
-        .await?
-        .ok_or_else(|| {
-            sqlx::Error::Protocol("usage reservation is missing or already settled".to_owned())
-        })?;
+        .bind(payload)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+}
 
-        // Telemetry derived at settle from the candidate's cost-basis rates and
-        // the buffered walk attempts (migration 0004). COGS is priced from the
-        // same usage the customer is billed on, so an unmetered row settled at
-        // the conservative estimate keeps a comparable basis instead of reading
-        // as pure margin.
-        let telemetry = &record.telemetry;
-        let cost_basis_usd = telemetry
-            .basis_rates
-            .map(|rates| usage_cost(rates, record.usage));
-        let attempts_cost_basis_usd = if record.attempts.is_empty() {
-            None
-        } else {
-            Some(
-                record
-                    .attempts
-                    .iter()
-                    .filter(|attempt| !attempt.served)
-                    .filter_map(|attempt| attempt.cost_basis_usd)
-                    .sum::<Decimal>(),
-            )
-        };
-        let finish_reason_source = telemetry.finish_reason.as_ref().map(|_| "synthetic");
-        let attempt_count = if record.attempts.is_empty() {
-            None
-        } else {
-            Some(i16::try_from(record.attempts.len()).unwrap_or(i16::MAX))
-        };
-        let sell_rates_json = rates_snapshot(&telemetry.sell_rates);
-        let basis_rates_json = telemetry.basis_rates.as_ref().map(rates_snapshot);
+/// Whether a settle transaction did the work or found it already done.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SettleOutcome {
+    Settled,
+    /// A previous attempt already committed this request's settled row. The
+    /// reservation (if one was still lying around) has been reclaimed.
+    AlreadySettled,
+}
 
-        sqlx::query(
-            r#"
+/// Run [`settle_once`] until it succeeds, the failure stops being transient, or
+/// the in-request budget runs out.
+///
+/// Every failure is stamped on the reservation row before it is retried or
+/// given up on, so `settle_attempts` and `last_settle_error` describe reality
+/// even if this process dies immediately afterwards.
+async fn settle_with_retry(
+    pool: &PgPool,
+    reservation_id: Uuid,
+    api_key_id: Uuid,
+    intent: &SettlementIntent,
+) -> Result<(), sqlx::Error> {
+    let mut backoff = SETTLEMENT_RETRY_BACKOFF;
+    let mut attempt = 1_u32;
+    loop {
+        match settle_once(pool, reservation_id, api_key_id, intent).await {
+            Ok(SettleOutcome::Settled) => return Ok(()),
+            Ok(SettleOutcome::AlreadySettled) => {
+                // The ambiguous-COMMIT case resolved in the customer's and
+                // ZeroRouter's favour: the money moved exactly once, and this
+                // attempt proved it rather than moving it again.
+                tracing::warn!(
+                    request_id = %reservation_id,
+                    attempt,
+                    "settlement was already committed by an earlier attempt"
+                );
+                return Ok(());
+            }
+            Err(error) => {
+                let transient = is_transient(&error);
+                let quarantined = record_settle_failure(pool, reservation_id, &error)
+                    .await
+                    .unwrap_or(None);
+                if !transient || attempt >= SETTLEMENT_ATTEMPTS {
+                    tracing::error!(
+                        request_id = %reservation_id,
+                        attempt,
+                        transient,
+                        quarantined = quarantined.unwrap_or(false),
+                        error = %error,
+                        "settlement failed; the durable intent is left for recovery"
+                    );
+                    return Err(error);
+                }
+                tracing::warn!(
+                    request_id = %reservation_id,
+                    attempt,
+                    error = %error,
+                    "settlement failed transiently; retrying"
+                );
+                tokio::time::sleep(backoff).await;
+                backoff = backoff.saturating_mul(3);
+                attempt += 1;
+            }
+        }
+    }
+}
+
+/// One settle transaction: consume the reservation, append the metering row and
+/// its walk ledger, and debit the prepaid balance — or discover that a previous
+/// attempt already did all three.
+///
+/// # Why a retry cannot double-charge
+///
+/// Exactly-once still comes from `DELETE FROM usage_reservations ... RETURNING`
+/// and nothing here weakens it. The debit runs in the same transaction as that
+/// DELETE and only when it returned a row, so:
+///
+/// * if an earlier attempt committed, the reservation row is gone — this
+///   attempt's DELETE returns nothing, the balance is never touched, and the
+///   presence of the settled `usage_events` row (whose `request_id` migration
+///   0001 made UNIQUE) turns the attempt into
+///   [`SettleOutcome::AlreadySettled`]. That is what makes an ambiguous COMMIT
+///   safe to retry: "did my COMMIT land?" is answered by the database rather
+///   than guessed at;
+/// * if an earlier attempt rolled back, the reservation row is back and this
+///   attempt is the first one to consume it;
+/// * two attempts can never both consume it, because the `DELETE` is atomic
+///   and both settles serialize on the same per-user advisory lock admission
+///   takes.
+///
+/// A duplicate-key error on the metering INSERT is therefore not a failure to
+/// report but a race that has already been decided — the customer has exactly
+/// one settled row — so it is reported as success and the orphaned reservation
+/// is reclaimed. `credit_ledger_request_unique` (0002) sits underneath all of
+/// this as an independent database-level refusal of a second `usage` debit for
+/// one request.
+async fn settle_once(
+    pool: &PgPool,
+    reservation_id: Uuid,
+    api_key_id: Uuid,
+    intent: &SettlementIntent,
+) -> Result<SettleOutcome, sqlx::Error> {
+    let record = intent.to_record()?;
+    let reserved_cost_snapshot = intent.reserved_cost_snapshot()?;
+    let input_tokens = checked_token_count(record.usage.prompt_tokens, "prompt_tokens")?;
+    let cached_input_tokens =
+        checked_token_count(record.usage.cached_input_tokens(), "cached_input_tokens")?;
+    let output_tokens = checked_token_count(record.usage.completion_tokens, "completion_tokens")?;
+
+    let mut transaction = pool.begin().await?;
+    sqlx::query("SET LOCAL lock_timeout = '5s'")
+        .execute(&mut *transaction)
+        .await?;
+    // Same USER-keyed lock as admission so settlement serializes against
+    // concurrent admissions and balance reads for this user.
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1::TEXT, 0))")
+        .bind(intent.user_id.to_string())
+        .execute(&mut *transaction)
+        .await?;
+
+    // Settle the reservation and recover what admission reserved in the
+    // same statement; a missing row means it was already settled or expired.
+    let reserved_cost_usd = sqlx::query_scalar::<_, Decimal>(
+        "DELETE FROM usage_reservations WHERE id = $1 AND api_key_id = $2 RETURNING reserved_cost_usd",
+    )
+    .bind(reservation_id)
+    .bind(api_key_id)
+    .fetch_optional(&mut *transaction)
+    .await?;
+    let Some(reserved_cost_usd) = reserved_cost_usd else {
+        // Nothing to consume. Ask the ledger which of the two reasons it is:
+        // a settled row means an earlier attempt won (success), no settled row
+        // means the reservation was lost without ever being billed (an error
+        // worth surfacing, and the case the intent-before-settle ordering
+        // exists to make impossible).
+        let already_settled =
+            sqlx::query_scalar::<_, i32>("SELECT 1 FROM usage_events WHERE request_id = $1")
+                .bind(reservation_id)
+                .fetch_optional(&mut *transaction)
+                .await?
+                .is_some();
+        transaction.rollback().await?;
+        return if already_settled {
+            Ok(SettleOutcome::AlreadySettled)
+        } else {
+            Err(sqlx::Error::Protocol(
+                "usage reservation is missing and no settled row exists for it".to_owned(),
+            ))
+        };
+    };
+
+    // Telemetry derived at settle from the candidate's cost-basis rates and
+    // the buffered walk attempts (migration 0004). COGS is priced from the
+    // same usage the customer is billed on, so an unmetered row settled at
+    // the conservative estimate keeps a comparable basis instead of reading
+    // as pure margin.
+    let record = &record;
+    let telemetry = &record.telemetry;
+    let cost_basis_usd = telemetry
+        .basis_rates
+        .map(|rates| usage_cost(rates, record.usage));
+    let attempts_cost_basis_usd = if record.attempts.is_empty() {
+        None
+    } else {
+        Some(
+            record
+                .attempts
+                .iter()
+                .filter(|attempt| !attempt.served)
+                .filter_map(|attempt| attempt.cost_basis_usd)
+                .sum::<Decimal>(),
+        )
+    };
+    let finish_reason_source = telemetry.finish_reason.as_ref().map(|_| "synthetic");
+    let attempt_count = if record.attempts.is_empty() {
+        None
+    } else {
+        Some(i16::try_from(record.attempts.len()).unwrap_or(i16::MAX))
+    };
+    let sell_rates_json = rates_snapshot(&telemetry.sell_rates);
+    let basis_rates_json = telemetry.basis_rates.as_ref().map(rates_snapshot);
+
+    let settled = sqlx::query(
+        r#"
             INSERT INTO usage_events (
                 request_id,
                 api_key_id,
@@ -651,59 +893,71 @@ impl UsageSession {
                 $22, $23, $24, $25, $26, $27, $28, $29
             )
             "#,
-        )
-        .bind(self.reservation_id)
-        .bind(self.api_key_id)
-        .bind(&record.tier)
-        .bind(&record.upstream_provider)
-        .bind(&record.upstream_model)
-        .bind(input_tokens)
-        .bind(cached_input_tokens.min(input_tokens))
-        .bind(output_tokens)
-        .bind(record.cost_usd)
-        .bind(record.latency_ms)
-        .bind(record.status)
-        .bind(telemetry.candidate_id.as_deref())
-        .bind(cost_basis_usd)
-        .bind(attempts_cost_basis_usd)
-        .bind(sell_rates_json)
-        .bind(basis_rates_json)
-        .bind(telemetry.finish_reason.as_deref())
-        .bind(finish_reason_source)
-        .bind(telemetry.requested_max_tokens)
-        .bind(telemetry.stream)
-        .bind(telemetry.prompt_bytes)
-        .bind(telemetry.message_count)
-        .bind(telemetry.tool_count)
-        .bind(&self.task_signature)
-        .bind(attempt_count)
-        .bind(telemetry.shape_ok)
-        .bind(self.reserved_output_tokens)
-        .bind(self.reserved_cost_usd)
-        .bind(ESTIMATOR_BASIS_COLD)
-        .execute(&mut *transaction)
-        .await?;
+    )
+    .bind(reservation_id)
+    .bind(api_key_id)
+    .bind(&record.tier)
+    .bind(&record.upstream_provider)
+    .bind(&record.upstream_model)
+    .bind(input_tokens)
+    .bind(cached_input_tokens.min(input_tokens))
+    .bind(output_tokens)
+    .bind(record.cost_usd)
+    .bind(record.latency_ms)
+    .bind(record.status)
+    .bind(telemetry.candidate_id.as_deref())
+    .bind(cost_basis_usd)
+    .bind(attempts_cost_basis_usd)
+    .bind(sell_rates_json)
+    .bind(basis_rates_json)
+    .bind(telemetry.finish_reason.as_deref())
+    .bind(finish_reason_source)
+    .bind(telemetry.requested_max_tokens)
+    .bind(telemetry.stream)
+    .bind(telemetry.prompt_bytes)
+    .bind(telemetry.message_count)
+    .bind(telemetry.tool_count)
+    .bind(&intent.task_signature)
+    .bind(attempt_count)
+    .bind(telemetry.shape_ok)
+    .bind(intent.reserved_output_tokens)
+    .bind(reserved_cost_snapshot)
+    .bind(ESTIMATOR_BASIS_COLD)
+    .execute(&mut *transaction)
+    .await;
+    if let Err(error) = settled {
+        if !is_unique_violation(&error) {
+            return Err(error);
+        }
+        // The settled row for this request already exists, so the customer has
+        // been billed exactly once and this attempt must not bill again. The
+        // rollback puts the reservation back (it is the same transaction that
+        // just consumed it), and reclaiming it is guarded on the settled row
+        // actually being there.
+        transaction.rollback().await?;
+        discard_settled_reservation(pool, reservation_id, api_key_id).await?;
+        return Ok(SettleOutcome::AlreadySettled);
+    }
 
-        // Attempts ride the settle transaction, inserted AFTER the event row so
-        // the FK to the UNIQUE usage_events.request_id holds; exactly-once is
-        // inherited from the reservation DELETE...RETURNING above.
-        for attempt in &record.attempts {
-            let (attempt_input, attempt_cached, attempt_output) = match attempt.usage {
-                Some(usage) => {
-                    let input = checked_token_count(usage.prompt_tokens, "attempt_input_tokens")?;
-                    let cached = checked_token_count(
-                        usage.cached_input_tokens(),
-                        "attempt_cached_input_tokens",
-                    )?
-                    .min(input);
-                    let output =
-                        checked_token_count(usage.completion_tokens, "attempt_output_tokens")?;
-                    (Some(input), Some(cached), Some(output))
-                }
-                None => (None, None, None),
-            };
-            sqlx::query(
-                r#"
+    // Attempts ride the settle transaction, inserted AFTER the event row so
+    // the FK to the UNIQUE usage_events.request_id holds; exactly-once is
+    // inherited from the reservation DELETE...RETURNING above.
+    for attempt in &record.attempts {
+        let (attempt_input, attempt_cached, attempt_output) = match attempt.usage {
+            Some(usage) => {
+                let input = checked_token_count(usage.prompt_tokens, "attempt_input_tokens")?;
+                let cached = checked_token_count(
+                    usage.cached_input_tokens(),
+                    "attempt_cached_input_tokens",
+                )?
+                .min(input);
+                let output = checked_token_count(usage.completion_tokens, "attempt_output_tokens")?;
+                (Some(input), Some(cached), Some(output))
+            }
+            None => (None, None, None),
+        };
+        sqlx::query(
+            r#"
                 INSERT INTO request_attempts (
                     request_id,
                     api_key_id,
@@ -726,57 +980,57 @@ impl UsageSession {
                 )
                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
                 "#,
-            )
-            .bind(self.reservation_id)
-            .bind(self.api_key_id)
-            .bind(self.user_id)
-            .bind(attempt.started_at)
-            .bind(attempt.attempt_no)
-            .bind(&attempt.candidate_id)
-            .bind(&attempt.upstream_provider)
-            .bind(&attempt.upstream_model)
-            .bind(&attempt.outcome)
-            .bind(attempt.served)
-            .bind(attempt.latency_ms)
-            .bind(attempt_input)
-            .bind(attempt_cached)
-            .bind(attempt_output)
-            .bind(attempt.tokens_estimated)
-            .bind(attempt.cost_basis_usd)
-            .bind(attempt.finish_reason.as_deref())
-            .bind(attempt.validator_kind.as_deref())
-            .execute(&mut *transaction)
-            .await?;
-        }
+        )
+        .bind(reservation_id)
+        .bind(api_key_id)
+        .bind(intent.user_id)
+        .bind(attempt.started_at)
+        .bind(attempt.attempt_no)
+        .bind(&attempt.candidate_id)
+        .bind(&attempt.upstream_provider)
+        .bind(&attempt.upstream_model)
+        .bind(&attempt.outcome)
+        .bind(attempt.served)
+        .bind(attempt.latency_ms)
+        .bind(attempt_input)
+        .bind(attempt_cached)
+        .bind(attempt_output)
+        .bind(attempt.tokens_estimated)
+        .bind(attempt.cost_basis_usd)
+        .bind(attempt.finish_reason.as_deref())
+        .bind(attempt.validator_kind.as_deref())
+        .execute(&mut *transaction)
+        .await?;
+    }
 
-        // Debit the prepaid balance in the same transaction that settles the
-        // reservation; the unique request_id and the settle-exactly-once
-        // reservation make the debit idempotent. The debit is clamped to what
-        // admission reserved (and thus verified against the balance), so actual
-        // usage exceeding the reserved output bound can never overdraw. The
-        // balance is only touched when credits gate admission — cap-only
-        // deployments record usage_events for metering without moving money.
-        // Zero-cost debits write no ledger row (the ledger forbids zero amounts).
-        if self.require_credits {
-            let debit = record.cost_usd.min(reserved_cost_usd);
-            if debit > Decimal::ZERO {
-                let balance_after = sqlx::query_scalar::<_, Decimal>(
-                    r#"
+    // Debit the prepaid balance in the same transaction that settles the
+    // reservation; the unique request_id and the settle-exactly-once
+    // reservation make the debit idempotent. The debit is clamped to what
+    // admission reserved (and thus verified against the balance), so actual
+    // usage exceeding the reserved output bound can never overdraw. The
+    // balance is only touched when credits gate admission — cap-only
+    // deployments record usage_events for metering without moving money.
+    // Zero-cost debits write no ledger row (the ledger forbids zero amounts).
+    if intent.require_credits {
+        let debit = record.cost_usd.min(reserved_cost_usd);
+        if debit > Decimal::ZERO {
+            let balance_after = sqlx::query_scalar::<_, Decimal>(
+                r#"
                     UPDATE users
                     SET credit_balance_usd = credit_balance_usd - $2
                     WHERE id = $1
                     RETURNING credit_balance_usd
                     "#,
-                )
-                .bind(self.user_id)
-                .bind(debit)
-                .fetch_optional(&mut *transaction)
-                .await?
-                .ok_or_else(|| {
-                    sqlx::Error::Protocol("usage settlement found no owning user".to_owned())
-                })?;
-                sqlx::query(
-                    r#"
+            )
+            .bind(intent.user_id)
+            .bind(debit)
+            .fetch_optional(&mut *transaction)
+            .await?
+            .ok_or_else(|| {
+                sqlx::Error::Protocol("usage settlement found no owning user".to_owned())
+            })?;
+            sqlx::query(
+                r#"
                     INSERT INTO credit_ledger (
                         user_id,
                         entry_type,
@@ -786,17 +1040,556 @@ impl UsageSession {
                     )
                     VALUES ($1, 'usage', $2, $3, $4)
                     "#,
+            )
+            .bind(intent.user_id)
+            .bind(-debit)
+            .bind(balance_after)
+            .bind(reservation_id)
+            .execute(&mut *transaction)
+            .await?;
+        }
+    }
+    transaction.commit().await?;
+    Ok(SettleOutcome::Settled)
+}
+
+/// Reclaim a reservation whose request is already settled.
+///
+/// The `EXISTS` guard is the whole point: this can only ever remove a
+/// reservation the ledger proves was settled, so a bug here cannot release an
+/// unbilled reservation.
+async fn discard_settled_reservation(
+    pool: &PgPool,
+    reservation_id: Uuid,
+    api_key_id: Uuid,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"
+        DELETE FROM usage_reservations
+        WHERE id = $1
+          AND api_key_id = $2
+          AND EXISTS (SELECT 1 FROM usage_events WHERE request_id = $1)
+        "#,
+    )
+    .bind(reservation_id)
+    .bind(api_key_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Stamp a failed settle on the reservation row and quarantine it once the
+/// budget is spent. Returns whether the row is now quarantined, or `None` when
+/// the reservation is already gone.
+///
+/// Best-effort by nature — it runs precisely when the database is misbehaving —
+/// so callers treat its own failure as "unknown" rather than propagating it.
+async fn record_settle_failure(
+    pool: &PgPool,
+    reservation_id: Uuid,
+    error: &sqlx::Error,
+) -> Result<Option<bool>, sqlx::Error> {
+    let detail: String = error.to_string().chars().take(500).collect();
+    sqlx::query_scalar::<_, bool>(
+        r#"
+        UPDATE usage_reservations
+        SET settle_attempts = settle_attempts + 1,
+            last_settle_error = $2,
+            quarantined_at = CASE
+                WHEN settlement_intent IS NULL THEN NULL
+                WHEN quarantined_at IS NOT NULL THEN quarantined_at
+                WHEN settle_attempts + 1 >= $3 THEN NOW()
+                ELSE NULL
+            END
+        WHERE id = $1
+        RETURNING quarantined_at IS NOT NULL
+        "#,
+    )
+    .bind(reservation_id)
+    .bind(detail)
+    .bind(MAX_SETTLE_ATTEMPTS)
+    .fetch_optional(pool)
+    .await
+}
+
+/// Take a reservation out of the automatic path with a stated reason.
+async fn quarantine_settlement(
+    pool: &PgPool,
+    reservation_id: Uuid,
+    reason: &str,
+) -> Result<(), sqlx::Error> {
+    let detail: String = reason.chars().take(500).collect();
+    sqlx::query(
+        r#"
+        UPDATE usage_reservations
+        SET quarantined_at = COALESCE(quarantined_at, NOW()),
+            last_settle_error = $2
+        WHERE id = $1 AND settlement_intent IS NOT NULL
+        "#,
+    )
+    .bind(reservation_id)
+    .bind(detail)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Whether a settle failure is worth retrying at all.
+///
+/// Fails closed: anything not positively recognised as transient is treated as
+/// permanent, which returns the request immediately and leaves the durable
+/// intent for an operator instead of spending the budget on an error that
+/// cannot clear. Conversion faults, CHECK violations and trigger rejections all
+/// land here, and they should — retrying them only delays the customer.
+fn is_transient(error: &sqlx::Error) -> bool {
+    match error {
+        // The pool could not hand out a connection in time, or the connection
+        // died under the statement. Both clear on their own.
+        sqlx::Error::PoolTimedOut | sqlx::Error::PoolClosed | sqlx::Error::Io(_) => true,
+        // SQLSTATEs that describe a condition of the moment rather than of the
+        // statement: serialization_failure / deadlock_detected (40001, 40P01),
+        // lock_not_available from the 5s `SET LOCAL lock_timeout` waiting on
+        // the per-user advisory lock (55P03), query_canceled and the shutdown
+        // family (57014, 57P01-57P03), resource exhaustion (53200, 53300), and
+        // the whole class-08 connection-exception family.
+        sqlx::Error::Database(database) => database.code().is_some_and(|code| {
+            matches!(
+                code.as_ref(),
+                "40001"
+                    | "40P01"
+                    | "55P03"
+                    | "57014"
+                    | "57P01"
+                    | "57P02"
+                    | "57P03"
+                    | "53300"
+                    | "53200"
+            ) || code.starts_with("08")
+        }),
+        _ => false,
+    }
+}
+
+fn is_unique_violation(error: &sqlx::Error) -> bool {
+    matches!(error, sqlx::Error::Database(database) if database.is_unique_violation())
+}
+
+/// What one [`recover_owed_settlements`] pass did.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
+pub struct SettlementRecovery {
+    /// Owed settlements this pass turned into a settled row and a debit.
+    pub settled: u64,
+    /// Owed settlements whose request turned out to be settled already — the
+    /// ambiguous-COMMIT case. The orphaned reservation is now reclaimed.
+    pub already_settled: u64,
+    /// Owed settlements that failed again and are still queued.
+    pub failed: u64,
+    /// Owed settlements handed to an operator instead of being retried again.
+    pub quarantined: u64,
+}
+
+/// Replay settlements that were recorded as owed and never committed.
+///
+/// This is the durable backstop behind the bounded in-request retry: whatever
+/// killed the original settle — a crashed process, an outage longer than a
+/// request, a connection that died at COMMIT — the payload is still on the
+/// reservation row and this replays it through the same [`settle_once`] the
+/// request path uses. Because it is the same code and the same stored payload,
+/// a recovered settle charges exactly what the original would have charged and
+/// can never charge more.
+///
+/// Only intents older than [`SETTLEMENT_RECOVERY_GRACE`] are considered, so
+/// this cannot collide with a request still working through its own retries;
+/// and even a collision would be harmless, since both paths serialize on the
+/// per-user advisory lock and the loser sees `AlreadySettled`.
+pub async fn recover_owed_settlements(
+    pool: &PgPool,
+    limit: i64,
+) -> Result<SettlementRecovery, sqlx::Error> {
+    let grace_seconds = i64::try_from(SETTLEMENT_RECOVERY_GRACE.as_secs()).unwrap_or(i64::MAX);
+    let owed = sqlx::query_as::<_, (Uuid, Uuid, String)>(
+        r#"
+        SELECT id, api_key_id, settlement_intent::TEXT
+        FROM usage_reservations
+        WHERE settlement_intent IS NOT NULL
+          AND quarantined_at IS NULL
+          AND settlement_intent_at <= NOW() - ($2 * INTERVAL '1 second')
+        ORDER BY settlement_intent_at
+        LIMIT $1
+        "#,
+    )
+    .bind(limit.max(0))
+    .bind(grace_seconds)
+    .fetch_all(pool)
+    .await?;
+
+    let mut summary = SettlementRecovery::default();
+    for (reservation_id, api_key_id, payload) in owed {
+        let intent = match serde_json::from_str::<SettlementIntent>(&payload) {
+            Ok(intent) if intent.version == SETTLEMENT_INTENT_VERSION => intent,
+            Ok(intent) => {
+                // A payload written by a build that knew a different shape.
+                // Guessing at it would guess at a charge.
+                quarantine_settlement(
+                    pool,
+                    reservation_id,
+                    &format!("unsupported settlement payload version {}", intent.version),
                 )
-                .bind(self.user_id)
-                .bind(-debit)
-                .bind(balance_after)
-                .bind(self.reservation_id)
-                .execute(&mut *transaction)
                 .await?;
+                summary.quarantined += 1;
+                continue;
+            }
+            Err(error) => {
+                quarantine_settlement(
+                    pool,
+                    reservation_id,
+                    &format!("settlement payload is unreadable: {error}"),
+                )
+                .await?;
+                summary.quarantined += 1;
+                continue;
+            }
+        };
+        match settle_once(pool, reservation_id, api_key_id, &intent).await {
+            Ok(SettleOutcome::Settled) => {
+                tracing::info!(
+                    request_id = %reservation_id,
+                    "owed settlement recovered"
+                );
+                summary.settled += 1;
+            }
+            Ok(SettleOutcome::AlreadySettled) => summary.already_settled += 1,
+            Err(error) => {
+                let quarantined = record_settle_failure(pool, reservation_id, &error)
+                    .await
+                    .unwrap_or(None)
+                    .unwrap_or(false);
+                if quarantined {
+                    tracing::error!(
+                        request_id = %reservation_id,
+                        error = %error,
+                        "owed settlement quarantined for reconciliation"
+                    );
+                    summary.quarantined += 1;
+                } else {
+                    summary.failed += 1;
+                }
             }
         }
-        transaction.commit().await
     }
+    Ok(summary)
+}
+
+/// A settlement that could not be recorded automatically and is waiting on an
+/// operator. Read by `zerorouter admin owed-settlements`.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct QuarantinedSettlement {
+    /// Equal to the `usage_events.request_id` this settlement would have
+    /// written, so the ledger and the quarantine share one key.
+    pub request_id: Uuid,
+    pub api_key_id: Uuid,
+    pub quarantined_at: DateTime<Utc>,
+    pub settle_attempts: i32,
+    /// The admission-verified ceiling; the recovered debit can never exceed it.
+    pub reserved_cost_usd: Decimal,
+    /// What the stored payload says the customer owes, when it is readable.
+    pub owed_cost_usd: Option<Decimal>,
+    pub last_settle_error: Option<String>,
+}
+
+/// Every settlement currently parked for reconciliation, oldest first.
+pub async fn quarantined_settlements(
+    pool: &PgPool,
+    limit: i64,
+) -> Result<Vec<QuarantinedSettlement>, sqlx::Error> {
+    let rows = sqlx::query_as::<
+        _,
+        (
+            Uuid,
+            Uuid,
+            DateTime<Utc>,
+            i32,
+            Decimal,
+            Option<Decimal>,
+            Option<String>,
+        ),
+    >(
+        r#"
+        SELECT
+            id,
+            api_key_id,
+            quarantined_at,
+            settle_attempts,
+            reserved_cost_usd,
+            -- Pattern-guarded so an unreadable payload cannot fail the whole
+            -- reconciliation query; the row still has to be listed.
+            CASE
+                WHEN settlement_intent->>'cost_usd' ~ '^[0-9]+(\.[0-9]+)?$'
+                    THEN (settlement_intent->>'cost_usd')::NUMERIC
+            END,
+            last_settle_error
+        FROM usage_reservations
+        WHERE quarantined_at IS NOT NULL
+        ORDER BY quarantined_at
+        LIMIT $1
+        "#,
+    )
+    .bind(limit.max(0))
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(
+            |(
+                request_id,
+                api_key_id,
+                quarantined_at,
+                settle_attempts,
+                reserved_cost_usd,
+                owed_cost_usd,
+                last_settle_error,
+            )| QuarantinedSettlement {
+                request_id,
+                api_key_id,
+                quarantined_at,
+                settle_attempts,
+                reserved_cost_usd,
+                owed_cost_usd,
+                last_settle_error,
+            },
+        )
+        .collect())
+}
+
+/// The durable settle payload: everything a settle transaction needs, in a form
+/// that outlives the process that built it.
+///
+/// Money is carried as exact decimal STRINGS, never JSON numbers. A JSON number
+/// round-trips through a float, and this payload is replayed to move a balance;
+/// a string reproduces the `Decimal` exactly and stays readable in `psql`.
+/// Everything else here is the same metadata already written to `usage_events`
+/// and `request_attempts` — no prompt content — so persisting it changes
+/// nothing about what ZeroRouter retains.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct SettlementIntent {
+    version: u8,
+    user_id: Uuid,
+    require_credits: bool,
+    task_signature: String,
+    reserved_output_tokens: i32,
+    /// The reservation's admission-verified cost ceiling, snapshotted onto the
+    /// settled row. The clamp itself still reads the live value returned by the
+    /// settle `DELETE ... RETURNING`, never this copy.
+    reserved_cost_usd: String,
+    tier: String,
+    upstream_provider: String,
+    upstream_model: String,
+    usage: UsagePayload,
+    cost_usd: String,
+    latency_ms: i32,
+    status: i16,
+    telemetry: TelemetryPayload,
+    attempts: Vec<AttemptPayload>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+struct UsagePayload {
+    prompt_tokens: u64,
+    cached_input_tokens: u64,
+    completion_tokens: u64,
+    total_tokens: u64,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+struct RatesPayload {
+    input_per_mtok: Option<f64>,
+    cached_input_per_mtok: Option<f64>,
+    output_per_mtok: Option<f64>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct TelemetryPayload {
+    requested_max_tokens: i32,
+    stream: bool,
+    prompt_bytes: i64,
+    message_count: i32,
+    tool_count: i32,
+    candidate_id: Option<String>,
+    basis_rates: Option<RatesPayload>,
+    sell_rates: RatesPayload,
+    finish_reason: Option<String>,
+    shape_ok: Option<bool>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct AttemptPayload {
+    attempt_no: i16,
+    started_at: DateTime<Utc>,
+    candidate_id: String,
+    upstream_provider: String,
+    upstream_model: String,
+    outcome: String,
+    served: bool,
+    latency_ms: i32,
+    usage: Option<UsagePayload>,
+    tokens_estimated: bool,
+    cost_basis_usd: Option<String>,
+    finish_reason: Option<String>,
+    validator_kind: Option<String>,
+}
+
+impl SettlementIntent {
+    fn new(session: &UsageSession, record: &UsageRecord) -> Self {
+        Self {
+            version: SETTLEMENT_INTENT_VERSION,
+            user_id: session.user_id,
+            require_credits: session.require_credits,
+            task_signature: session.task_signature.clone(),
+            reserved_output_tokens: session.reserved_output_tokens,
+            reserved_cost_usd: session.reserved_cost_usd.to_string(),
+            tier: record.tier.clone(),
+            upstream_provider: record.upstream_provider.clone(),
+            upstream_model: record.upstream_model.clone(),
+            usage: UsagePayload::new(record.usage),
+            cost_usd: record.cost_usd.to_string(),
+            latency_ms: record.latency_ms,
+            status: record.status,
+            telemetry: TelemetryPayload {
+                requested_max_tokens: record.telemetry.requested_max_tokens,
+                stream: record.telemetry.stream,
+                prompt_bytes: record.telemetry.prompt_bytes,
+                message_count: record.telemetry.message_count,
+                tool_count: record.telemetry.tool_count,
+                candidate_id: record.telemetry.candidate_id.clone(),
+                basis_rates: record.telemetry.basis_rates.map(RatesPayload::new),
+                sell_rates: RatesPayload::new(record.telemetry.sell_rates),
+                finish_reason: record.telemetry.finish_reason.clone(),
+                shape_ok: record.telemetry.shape_ok,
+            },
+            attempts: record
+                .attempts
+                .iter()
+                .map(|attempt| AttemptPayload {
+                    attempt_no: attempt.attempt_no,
+                    started_at: attempt.started_at,
+                    candidate_id: attempt.candidate_id.clone(),
+                    upstream_provider: attempt.upstream_provider.clone(),
+                    upstream_model: attempt.upstream_model.clone(),
+                    outcome: attempt.outcome.clone(),
+                    served: attempt.served,
+                    latency_ms: attempt.latency_ms,
+                    usage: attempt.usage.map(UsagePayload::new),
+                    tokens_estimated: attempt.tokens_estimated,
+                    cost_basis_usd: attempt.cost_basis_usd.map(|cost| cost.to_string()),
+                    finish_reason: attempt.finish_reason.clone(),
+                    validator_kind: attempt.validator_kind.clone(),
+                })
+                .collect(),
+        }
+    }
+
+    /// Rebuild the in-memory record the settle SQL binds from. A decimal that
+    /// will not parse is a permanent failure, not a retryable one: it means the
+    /// payload is corrupt, and the row belongs in quarantine rather than in a
+    /// retry loop.
+    fn to_record(&self) -> Result<UsageRecord, sqlx::Error> {
+        let mut attempts = Vec::with_capacity(self.attempts.len());
+        for attempt in &self.attempts {
+            attempts.push(AttemptRecord {
+                attempt_no: attempt.attempt_no,
+                started_at: attempt.started_at,
+                candidate_id: attempt.candidate_id.clone(),
+                upstream_provider: attempt.upstream_provider.clone(),
+                upstream_model: attempt.upstream_model.clone(),
+                outcome: attempt.outcome.clone(),
+                served: attempt.served,
+                latency_ms: attempt.latency_ms,
+                usage: attempt.usage.map(UsagePayload::to_usage),
+                tokens_estimated: attempt.tokens_estimated,
+                cost_basis_usd: attempt
+                    .cost_basis_usd
+                    .as_deref()
+                    .map(|cost| settlement_decimal(cost, "attempt cost_basis_usd"))
+                    .transpose()?,
+                finish_reason: attempt.finish_reason.clone(),
+                validator_kind: attempt.validator_kind.clone(),
+            });
+        }
+        Ok(UsageRecord {
+            tier: self.tier.clone(),
+            upstream_provider: self.upstream_provider.clone(),
+            upstream_model: self.upstream_model.clone(),
+            usage: self.usage.to_usage(),
+            cost_usd: settlement_decimal(&self.cost_usd, "cost_usd")?,
+            latency_ms: self.latency_ms,
+            status: self.status,
+            telemetry: RequestTelemetry {
+                requested_max_tokens: self.telemetry.requested_max_tokens,
+                stream: self.telemetry.stream,
+                prompt_bytes: self.telemetry.prompt_bytes,
+                message_count: self.telemetry.message_count,
+                tool_count: self.telemetry.tool_count,
+                candidate_id: self.telemetry.candidate_id.clone(),
+                basis_rates: self.telemetry.basis_rates.map(RatesPayload::to_rates),
+                sell_rates: self.telemetry.sell_rates.to_rates(),
+                finish_reason: self.telemetry.finish_reason.clone(),
+                shape_ok: self.telemetry.shape_ok,
+            },
+            attempts,
+        })
+    }
+
+    fn reserved_cost_snapshot(&self) -> Result<Decimal, sqlx::Error> {
+        settlement_decimal(&self.reserved_cost_usd, "reserved_cost_usd")
+    }
+}
+
+impl UsagePayload {
+    fn new(usage: OpenAiUsage) -> Self {
+        Self {
+            prompt_tokens: usage.prompt_tokens,
+            cached_input_tokens: usage.cached_input_tokens(),
+            completion_tokens: usage.completion_tokens,
+            total_tokens: usage.total_tokens,
+        }
+    }
+
+    fn to_usage(self) -> OpenAiUsage {
+        OpenAiUsage {
+            prompt_tokens: self.prompt_tokens,
+            completion_tokens: self.completion_tokens,
+            total_tokens: self.total_tokens,
+            prompt_tokens_details: (self.cached_input_tokens > 0).then_some(PromptTokenDetails {
+                cached_tokens: self.cached_input_tokens,
+            }),
+        }
+    }
+}
+
+impl RatesPayload {
+    fn new(rates: ModelRates) -> Self {
+        Self {
+            input_per_mtok: rates.input_per_mtok,
+            cached_input_per_mtok: rates.cached_input_per_mtok,
+            output_per_mtok: rates.output_per_mtok,
+        }
+    }
+
+    fn to_rates(self) -> ModelRates {
+        ModelRates {
+            input_per_mtok: self.input_per_mtok,
+            cached_input_per_mtok: self.cached_input_per_mtok,
+            output_per_mtok: self.output_per_mtok,
+        }
+    }
+}
+
+fn settlement_decimal(value: &str, field: &'static str) -> Result<Decimal, sqlx::Error> {
+    Decimal::from_str(value).map_err(|_| {
+        sqlx::Error::Protocol(format!(
+            "settlement payload field {field} is not a decimal number"
+        ))
+    })
 }
 
 /// Whether one spend ceiling still admits `additional` on top of what is
