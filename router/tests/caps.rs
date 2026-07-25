@@ -146,6 +146,12 @@ fn usage_record(cost_usd: Decimal) -> UsageRecord {
 }
 
 /// Admit a reservation in cap-only mode (no credits required).
+///
+/// Cap-only is passed explicitly here because it is no longer the default:
+/// `ZEROROUTER_REQUIRE_CREDITS` defaults to `true`, and cap-only is reached
+/// only by opting out (`router/src/web.rs`). These tests want the caps alone
+/// under test, which is exactly the deployment shape that opt-out produces —
+/// and exactly why the caps below have to hold on their own.
 async fn admit(
     pool: &PgPool,
     key: &AuthenticatedKey,

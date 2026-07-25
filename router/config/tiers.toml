@@ -2,6 +2,15 @@ schema_version = 1
 
 # This file is the sole source of truth for the public catalog, fallback order,
 # upstream model IDs, and metering rates. Prices were verified on 2026-07-11.
+#
+# Pricing invariant, enforced at load time by `validate_tier_catalog`
+# (`src/config.rs`): no candidate's cost basis may exceed its owning tier's
+# sell rate on any dimension. Each tier's flagship candidate is priced *at* the
+# tier sell rate (0% markup) and margin comes from routing inside the tier to
+# cheaper candidates, so basis == sell is the intended flagship shape and stays
+# legal; only a strictly greater basis is rejected, because such a candidate
+# loses money on every request it serves. A candidate that a tier cannot cover
+# belongs in a tier whose sell rates are at or above its basis, not here.
 
 [tiers."zero/low-cost"]
 
@@ -78,16 +87,6 @@ input_per_mtok = 1.30
 cached_input_per_mtok = 0.10
 output_per_mtok = 2.60
 
-[[tiers."zero/balanced".candidates]]
-id = "anthropic/claude-haiku-4-5"
-provider = "anthropic"
-model = "claude-haiku-4-5-20251001"
-
-[tiers."zero/balanced".candidates.rates]
-input_per_mtok = 1.00
-cached_input_per_mtok = 0.10
-output_per_mtok = 5.00
-
 # Bedrock-only private-beta fallback. This is priced at the canonical Bedrock
 # us-east-1 on-demand rate while the tier keeps its existing sell rate.
 [[tiers."zero/balanced".candidates]]
@@ -102,7 +101,10 @@ output_per_mtok = 1.85
 [tiers."zero/high-end"]
 
 # Sonnet 5 introductory pricing ends after 2026-08-31. Update this canonical
-# table before customer traffic continues at the standard rate.
+# table before customer traffic continues at the standard rate. When the intro
+# basis lapses, both sonnet rows go above these sell rates and the invariant
+# above fails the catalog at startup — loud, not a silent margin leak, but the
+# whole API is down until the sell rates are raised. Raise them first.
 [tiers."zero/high-end".rates]
 input_per_mtok = 2.00
 cached_input_per_mtok = 0.20
@@ -128,23 +130,3 @@ model = "us.anthropic.claude-sonnet-5"
 input_per_mtok = 2.00
 cached_input_per_mtok = 0.20
 output_per_mtok = 10.00
-
-[[tiers."zero/high-end".candidates]]
-id = "anthropic/claude-opus-4-8"
-provider = "anthropic"
-model = "claude-opus-4-8"
-
-[tiers."zero/high-end".candidates.rates]
-input_per_mtok = 5.00
-cached_input_per_mtok = 0.50
-output_per_mtok = 25.00
-
-[[tiers."zero/high-end".candidates]]
-id = "bedrock/us.anthropic.claude-opus-4-8"
-provider = "bedrock"
-model = "us.anthropic.claude-opus-4-8"
-
-[tiers."zero/high-end".candidates.rates]
-input_per_mtok = 5.00
-cached_input_per_mtok = 0.50
-output_per_mtok = 25.00

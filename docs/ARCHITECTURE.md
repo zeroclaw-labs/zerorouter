@@ -61,7 +61,8 @@ Prepaid credits denominated in USD (`rust_decimal`, Postgres `NUMERIC`).
   the balance with a `usage` ledger entry keyed by the unique `request_id`.
   A double settle fails; a crash between insert and debit rolls both back.
 - **Admission**: B0's per-key monthly spend cap and token-velocity cap are
-  kept; when `ZEROROUTER_REQUIRE_CREDITS=true` admission additionally
+  kept; when `ZEROROUTER_REQUIRE_CREDITS=true` — **the default**, including
+  when the variable is unset or blank — admission additionally
   requires `balance − active user reservations ≥ reserved cost` inside the
   same advisory-locked transaction. The lock key is the **user id** (not the
   key id) so concurrent requests across a user's keys cannot jointly
@@ -101,7 +102,12 @@ The startup contract is: misconfiguration aborts, absence disables.
 
 - missing DB env → abort; `DB_*` path forces `verify-full` TLS.
 - partially configured OIDC/Stripe/web groups → abort.
-- unknown `ZEROROUTER_REQUIRE_CREDITS` value → abort.
+- unknown `ZEROROUTER_REQUIRE_CREDITS` value → abort; unset or blank →
+  credits required (the safe side), with cap-only reachable only by an
+  explicit `false`/`0`.
+- a tier candidate whose cost basis exceeds its owning tier's sell rate on
+  any dimension → abort (`validate_tier_catalog`). The catalog is re-parsed
+  per request, so a below-cost table is a full-API 503, not a slow leak.
 - auth/database errors during a request → 401/503, never allow.
 - unmetered success (usage missing) → the reservation settles at its
   conservative bound; the request errors with `metering_unavailable`.

@@ -81,7 +81,8 @@ async fn models_are_materialized_from_tiers_toml() {
         .expect("models response should contain a data array");
 
     assert_eq!(json["object"], "list");
-    assert_eq!(data.len(), 15);
+    // 3 tier ids + 9 concrete candidates (4 low-cost, 3 balanced, 2 high-end).
+    assert_eq!(data.len(), 12);
     assert!(data.iter().all(|model| model["object"] == "model"));
     assert!(data.iter().any(|model| model["id"] == "zero/balanced"));
     assert!(
@@ -230,15 +231,78 @@ async fn bundled_tier_catalog_has_expected_virtual_models() {
         .collect::<Vec<_>>();
     assert_eq!(
         bedrock_profiles,
-        [
-            (
-                "bedrock/us.anthropic.claude-sonnet-5",
-                "us.anthropic.claude-sonnet-5"
-            ),
-            (
-                "bedrock/us.anthropic.claude-opus-4-8",
-                "us.anthropic.claude-opus-4-8"
-            ),
-        ]
+        [(
+            "bedrock/us.anthropic.claude-sonnet-5",
+            "us.anthropic.claude-sonnet-5"
+        )]
     );
+}
+
+#[tokio::test]
+async fn no_shipped_candidate_costs_more_than_its_tier_sells() {
+    // The margin-leak regression guard, re-derived from the table rather than
+    // delegated to the loader: three candidates once sat above their tier's
+    // sell rate (opus in zero/high-end on all three dimensions, haiku in
+    // zero/balanced on output alone) and lost money on every request they
+    // served. `load_tier_catalog` now refuses such a table outright, so this
+    // test failing at the assert rather than the load would mean the rule
+    // itself regressed.
+    let catalog = load_tier_catalog(&tier_config_path())
+        .await
+        .expect("bundled tier catalog must load and validate");
+
+    for (tier_id, tier) in &catalog.tiers {
+        for candidate in &tier.candidates {
+            for (dimension, basis, sell) in [
+                (
+                    "input_per_mtok",
+                    candidate.rates.input_per_mtok,
+                    tier.rates.input_per_mtok,
+                ),
+                (
+                    "output_per_mtok",
+                    candidate.rates.output_per_mtok,
+                    tier.rates.output_per_mtok,
+                ),
+                (
+                    "cached_input_per_mtok",
+                    candidate.rates.cached_input_per_mtok,
+                    tier.rates.cached_input_per_mtok,
+                ),
+            ] {
+                let (Some(basis), Some(sell)) = (basis, sell) else {
+                    continue;
+                };
+                assert!(
+                    basis <= sell,
+                    "{} in {tier_id} has a {dimension} basis of {basis} above the tier sell rate {sell}",
+                    candidate.id
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn every_shipped_tier_keeps_two_candidates_across_two_providers() {
+    // Availability floor for the removal above: a tier with one rung, or two
+    // rungs behind a single provider credential, has no fallback when that
+    // upstream is down.
+    let catalog = load_tier_catalog(&tier_config_path())
+        .await
+        .expect("bundled tier catalog must load");
+
+    for (tier_id, tier) in &catalog.tiers {
+        let providers = tier
+            .candidates
+            .iter()
+            .map(|candidate| candidate.provider.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(
+            tier.candidates.len() >= 2 && providers.len() >= 2,
+            "{tier_id} has {} candidate(s) across {} provider(s)",
+            tier.candidates.len(),
+            providers.len()
+        );
+    }
 }

@@ -199,12 +199,12 @@ request strictness is):
 "zerorouter": {
   "priority": "success",
   "attempts": [ {"candidate": "deepinfra/deepseek-ai/DeepSeek-V4-Pro", "outcome": "validation_failed", "latency_ms": 812},
-                {"candidate": "anthropic/claude-haiku-4-5", "outcome": "ok", "latency_ms": 1490} ],
+                {"candidate": "fireworks/accounts/fireworks/models/deepseek-v4-pro", "outcome": "ok", "latency_ms": 1490} ],
   "validated": true,                     // null when no validator was declared
   "estimate": { "output_tokens_p50": 210, "output_tokens_p90": 640,
                 "basis": "cold" },       // 'cold' | 'learned' | (later) 'quote' — guidance, never a quote
   "limited": "escalation_budget",        // present only when policy degraded the walk (per-user budget, Engine §)
-  "savings": { "reference_model": "anthropic/claude-opus-4-8",
+  "savings": { "reference_model": "anthropic/claude-sonnet-5",
                "reference_cost_usd": "0.0412", "billed_cost_usd": "0.0104",
                "saved_usd": "0.0308",
                "basis": "measured" }     // 'measured' | 'rate_only' — see Billing §3; only when the key declares a reference
@@ -405,12 +405,21 @@ means the reservation caps only the *customer's* money; ZR's walk COGS needs
 
 **Margin eligibility — the escalation set vs the availability chain.** A
 candidate is a **negative-margin rung** when its cost basis exceeds its
-owning tier's sell rate on any required dimension. Verified today that means:
-`anthropic/claude-opus-4-8` and `bedrock/us.anthropic.claude-opus-4-8`
-(basis 5.00/0.50/25.00 vs high-end sell 2.00/0.20/10.00,
-`tiers.toml:137-150` vs `:106-109`) and — less obviously —
+owning tier's sell rate on any required dimension. When this design was
+written the shipped table carried three: `anthropic/claude-opus-4-8` and
+`bedrock/us.anthropic.claude-opus-4-8` (basis 5.00/0.50/25.00 vs high-end
+sell 2.00/0.20/10.00) and — less obviously —
 `anthropic/claude-haiku-4-5` in zero/balanced (output basis 5.00 vs sell
-3.48, `tiers.toml:86-89` vs `:56-59`). The eligibility rule, applied in
+3.48).
+
+**All three have since been removed from `tiers.toml`, and the class is now
+closed at startup**: `validate_tier_catalog` (`config.rs`) rejects any
+catalog containing a candidate whose basis exceeds its owning tier's sell
+rate on any dimension, so a negative-margin rung can no longer be added by
+editing the table. The eligibility machinery below is therefore a no-op
+against today's table and is retained as the rule that keeps it that way if
+the invariant is ever relaxed — and as the reasoning that decides what a
+future tier is allowed to contain. The eligibility rule, applied in
 every mode:
 
 - The **availability chain** (a rung failed with a transport/upstream error
@@ -642,10 +651,11 @@ Three rules make the ladder margin-safe by construction:
    systematically bind. The flip side is honest too — you cannot enter the
    auto ladder without top-rung headroom in balance and caps.
 3. **The ladder's escalation set contains only margin-eligible rungs** (the
-   global rule, Selection policy §): with today's table the auto ladder
-   escalates up to the sonnet-class rungs and never into opus or haiku's
-   negative-output-margin rung — those remain availability fallback inside
-   their own explicitly-requested tiers only. And `zero/auto` ships only at
+   global rule, Selection policy §): with today's table every rung is
+   margin-eligible — the negative-margin ones were removed and the catalog
+   validator now refuses to load a table that reintroduces one — so the auto
+   ladder escalates up to the sonnet-class rungs with nothing to exclude.
+   The rule still binds any future tier. And `zero/auto` ships only at
    Stage 6, **after** the flat orchestration fee is live (Stage 5a), so the
    ladder is never a fee-less COGS faucet.
 
@@ -746,10 +756,13 @@ Gross margin per request is one expression:
 the same function with cost-basis rates; the rate table (`config.rs:29-36`)
 has been parsed and validated all along. The served attempt's COGS lands on
 `usage_events.cost_basis_usd`, losing attempts sum into
-`attempts_cost_basis_usd` — making both invisibly negative-margin candidates
-(opus: basis 5.00/0.50/25.00 vs high-end sell 2.00/0.20/10.00,
-`tiers.toml:137-150` vs `:106-109`; haiku output: basis 5.00 vs balanced
-sell 3.48, `:86-89` vs `:56-59`) monitored numbers from Stage 1. Unreported
+`attempts_cost_basis_usd` — making per-request gross margin a monitored
+number from Stage 1. The three invisibly negative-margin candidates that
+motivated this (opus at basis 5.00/0.50/25.00 vs high-end sell
+2.00/0.20/10.00; haiku output at basis 5.00 vs balanced sell 3.48) have been
+removed from the table and the class is now rejected at catalog load, so
+what this measures is residual walk COGS rather than per-rung losses.
+Unreported
 usage stores NULL tokens (or the `token_count` lower bound with
 `tokens_estimated = true`). Bedrock rows carry a known caveat — no
 cached-token reporting at the pin while cachePoints are inserted (map §3.9)
@@ -845,7 +858,7 @@ is real again.)
 | Stage | Map # | Contents | Customer-visible? |
 |---|---|---|---|
 | 0 | 1, 2 | Prereqs, parallel: advance the ZC pin (builder rewrite `providers.rs:369-445`, `.timeout_secs(900)`; decide B0's fate); OpenRouter-shaped string pricing on `/v1/models` (`openai.rs:355-361`, `api.rs:147-152`) | pricing only |
-| 1 | 3 | **Migration 0004** + telemetry at all 13 persist sites + user-scoped task signature + synthesized `finish_reason`(+`_source`) + `shape_ok` labeling + attempts rows from the already-router-owned streaming walk (`api.rs:459-764`). Zero behavior change, zero wire change; the margin dashboard (opus and haiku negative-margin aggregates) and the data flywheel start here | no |
+| 1 | 3 | **Migration 0004** + telemetry at all 13 persist sites + user-scoped task signature + synthesized `finish_reason`(+`_source`) + `shape_ok` labeling + attempts rows from the already-router-owned streaming walk (`api.rs:459-764`). Zero behavior change, zero wire change; the margin dashboard (per-request gross margin and walk-COGS aggregates; the opus/haiku negative-margin rungs it was originally scoped to watch are gone from the table and now rejected at catalog load) and the data flywheel start here | no |
 | 2 | 4 | **Unroll the non-streaming walk** into the router-owned loop; attempts rows everywhere; `ProviderHealth` (observe-only for a bake week, then demotion); attribution hack deleted. Canary: happy-path byte-diff on `balanced` **plus** the fault-injection retry/ladder test (invariance claim is no-failure-path only) | no |
 | 3a | 6 | **The knob, visibility-only**: `zerorouter` request object + `:suffix` (resolve-first) + catalog colon-collision validation + per-key default threaded through auth/mints + `PATCH /api/keys/{id}` + the `zerorouter` response block (non-streaming + usage-chunk streaming). Ordering = identity or health-only; no estimator dependency; reservations byte-bound | yes |
 | 3b | 6, 7a | **Estimator read path**: `EstimatorState` cache + background refresher + percentile SQL + n≥50/staleness gates; flip cost-mode ordering to estimator-backed (cold-fallback); `estimate` block appears. Reservations still byte-bound — **visibility before financial exposure** | yes |
@@ -887,9 +900,10 @@ is real again.)
    ~100% first-rung pass rate moves the key to the flat fee). An
    unsatisfiable validator can no longer farm negative-margin attempts at
    all: validation failure **cannot** escalate into a rung whose basis
-   exceeds its tier sell (opus, bedrock-opus, haiku-output — Selection
-   policy §), those rungs remaining availability-fallback only, exactly
-   today's outage semantics. What remains farmable is neutral-margin walk
+   exceeds its tier sell (Selection policy §), and as of the table cleanup
+   no such rung exists to reach — the three that did (opus, bedrock-opus,
+   haiku-output) were removed and the catalog validator now rejects any
+   replacement at startup. What remains farmable is neutral-margin walk
    COGS, bounded by `MAX_ATTEMPTS`, the κ×reserved walk-COGS budget, and the
    per-user escalation budget — and priced by the orchestration fee that
    ships **with** the loop, not two stages later. The per-user
@@ -979,13 +993,16 @@ is real again.)
     settle-time attempt rows are *not* the velocity-enforcement mechanism
     (dispatch-time buckets are — Engine §), only its audit trail.
 14. **Clock risk** (map §4): Sonnet-5 intro sell pricing expires 2026-08-31
-    (`tiers.toml:104-105`); the rate-snapshot columns make the flip
+    (`tiers.toml`); the rate-snapshot columns make the flip
     auditable, and the margin-eligibility set is recomputed from the live
-    table — but note the consequence: if the high-end sell rate is not
-    raised when the intro basis ends, the sonnet rungs themselves could turn
-    negative-margin and drop out of every escalation set, leaving high-end
-    validation failures with no escalation target (best-effort returns).
-    The tier table needs an owner before that date.
+    table — but note the consequence, now sharper than when this was
+    written: the high-end sonnet rows sit at basis **==** sell, so the
+    moment the intro basis lapses without a matching sell-rate raise they
+    violate the catalog invariant and `validate_tier_catalog` **refuses to
+    load the table**. Because the catalog is re-parsed per request, that is
+    a full-API 503, not a quiet drop out of the escalation set. Loud beats
+    bleeding, but it is an outage: the tier table needs an owner and a
+    raised sell rate landed *before* that date.
 
 ## Deliberate v1 exclusions
 

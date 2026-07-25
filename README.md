@@ -113,10 +113,20 @@ fail-closed inventory in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 | `DEEPINFRA_API_KEY` | no | — | enables `deepinfra/*` candidates |
 | `FIREWORKS_API_KEY` | no | — | enables `fireworks/*` candidates |
 | `TOGETHER_API_KEY` | no | — | enables `together/*` candidates |
-| `ZEROROUTER_REQUIRE_CREDITS` | no | `false` | `true`/`1` or `false`/`0`; anything else aborts. When true, admission requires prepaid balance ≥ the reserved cost |
+| `ZEROROUTER_REQUIRE_CREDITS` | no | `true` | `true`/`1` or `false`/`0`; anything else aborts, and unset or blank means `true`. When true, admission requires prepaid balance ≥ the reserved cost. `false` opts into cap-only (see below) |
 
 \* exactly one database path must be fully configured: either `DATABASE_URL`,
 or all six `DB_*` variables.
+
+**`ZEROROUTER_REQUIRE_CREDITS` defaults to `true`** (it previously defaulted
+to `false`). Credits are the only ceiling backed by money: with enforcement
+off, the per-key and derived per-user spend/velocity caps on `api_keys` are
+the sole limit on what a user can consume, and those caps are self-service —
+the portal lets a user raise a key's own `spend_cap_usd`. A deployment that
+never set the variable was therefore running with no enforced ceiling, so the
+unconfigured case now lands on the safe side. Cap-only is still supported:
+set `ZEROROUTER_REQUIRE_CREDITS=false` (or `0`) to opt in explicitly, which
+logs a startup warning naming what that gives up.
 
 ### Web plane
 

@@ -92,6 +92,17 @@ pub enum TierConfigError {
     UnsupportedProvider { tier: String, provider: String },
     #[error("duplicate concrete model id {0}")]
     DuplicateModelId(String),
+    #[error(
+        "candidate {candidate} in tier {tier} costs more than the tier sells: \
+         {dimension} cost basis {basis} exceeds tier sell rate {sell}"
+    )]
+    NegativeMargin {
+        tier: String,
+        candidate: String,
+        dimension: &'static str,
+        basis: f64,
+        sell: f64,
+    },
 }
 
 impl TierCatalog {
@@ -217,6 +228,64 @@ fn validate_tier_catalog(catalog: &TierCatalog) -> Result<(), TierConfigError> {
                 return Err(TierConfigError::DuplicateModelId(candidate.id.clone()));
             }
             validate_rates(tier_id, candidate.rates)?;
+            validate_candidate_margin(tier_id, definition.rates, candidate)?;
+        }
+    }
+    Ok(())
+}
+
+/// Reject a candidate that costs more than its owning tier sells for.
+///
+/// The tier tables encode a deliberate pricing model: a tier's flagship
+/// candidate is priced *at* the tier sell rate (0% markup) and margin comes
+/// from routing inside the tier to cheaper candidates. Every candidate bills
+/// at `sell_rates` regardless of which one serves (see [`TierCatalog::resolve`]
+/// and [`TierCatalog::model_listing`]), so a candidate whose basis exceeds the
+/// tier rate on any dimension loses money on *every* request it serves — a
+/// silent margin leak that no amount of downstream routing policy can repair.
+/// Catching it here turns that leak into a startup failure.
+///
+/// Two edges the rule must respect:
+///
+/// - `basis == sell` is **legal**. That is the intended flagship shape, so
+///   only a strictly greater basis is a violation.
+/// - A dimension either side leaves unset is skipped, not read as zero. The
+///   bedrock rows omit `cached_input_per_mtok` because Bedrock does not report
+///   cached tokens at all; an absent basis is "unknown here", and treating it
+///   as free (or as a violation) would both be wrong.
+fn validate_candidate_margin(
+    tier: &str,
+    sell_rates: ModelRates,
+    candidate: &TierCandidate,
+) -> Result<(), TierConfigError> {
+    for (dimension, basis, sell) in [
+        (
+            "input_per_mtok",
+            candidate.rates.input_per_mtok,
+            sell_rates.input_per_mtok,
+        ),
+        (
+            "output_per_mtok",
+            candidate.rates.output_per_mtok,
+            sell_rates.output_per_mtok,
+        ),
+        (
+            "cached_input_per_mtok",
+            candidate.rates.cached_input_per_mtok,
+            sell_rates.cached_input_per_mtok,
+        ),
+    ] {
+        let (Some(basis), Some(sell)) = (basis, sell) else {
+            continue;
+        };
+        if basis > sell {
+            return Err(TierConfigError::NegativeMargin {
+                tier: tier.to_owned(),
+                candidate: candidate.id.clone(),
+                dimension,
+                basis,
+                sell,
+            });
         }
     }
     Ok(())
@@ -312,6 +381,98 @@ output_per_mtok = 2
             concrete.sell_rates, tier.sell_rates,
             "a pinned candidate must bill at the tier sell rate"
         );
+    }
+
+    /// A one-tier, one-candidate catalog with the given `[rates]` bodies.
+    fn catalog_with(sell: &str, basis: &str) -> TierCatalog {
+        toml::from_str(&format!(
+            r#"
+schema_version = 1
+[tiers."zero/test"]
+[tiers."zero/test".rates]
+{sell}
+[[tiers."zero/test".candidates]]
+id = "provider/model"
+provider = "fireworks"
+model = "upstream-model"
+[tiers."zero/test".candidates.rates]
+{basis}
+"#
+        ))
+        .expect("catalog should parse")
+    }
+
+    #[test]
+    fn a_candidate_priced_above_its_tier_is_rejected_on_every_dimension() {
+        // The three rungs the shipped table used to carry, reduced to their
+        // shapes. Every candidate in a tier bills at the one tier sell rate,
+        // so a basis above it on *any* dimension loses money on every request
+        // that candidate serves — and the error has to say which dimension and
+        // both numbers, or the operator cannot fix the table from the log line.
+        for (label, sell, basis, message) in [
+            (
+                // Opus in zero/high-end: dearer on input.
+                "input",
+                "input_per_mtok = 2.00\noutput_per_mtok = 10.00\ncached_input_per_mtok = 0.20",
+                "input_per_mtok = 5.00\noutput_per_mtok = 10.00\ncached_input_per_mtok = 0.20",
+                "input_per_mtok cost basis 5 exceeds tier sell rate 2",
+            ),
+            (
+                // Haiku in zero/balanced: *cheaper* on input, dearer on output.
+                // The dimension that leaks is not always the headline rate.
+                "output",
+                "input_per_mtok = 1.74\noutput_per_mtok = 3.48\ncached_input_per_mtok = 0.14",
+                "input_per_mtok = 1.00\noutput_per_mtok = 5.00\ncached_input_per_mtok = 0.10",
+                "output_per_mtok cost basis 5 exceeds tier sell rate 3.48",
+            ),
+            (
+                "cached input",
+                "input_per_mtok = 2.00\noutput_per_mtok = 10.00\ncached_input_per_mtok = 0.20",
+                "input_per_mtok = 2.00\noutput_per_mtok = 10.00\ncached_input_per_mtok = 0.50",
+                "cached_input_per_mtok cost basis 0.5 exceeds tier sell rate 0.2",
+            ),
+        ] {
+            let catalog = catalog_with(sell, basis);
+            let error = validate_tier_catalog(&catalog)
+                .expect_err(&format!("a below-cost {label} basis must be rejected"));
+            assert!(
+                matches!(error, TierConfigError::NegativeMargin { .. }),
+                "{label}: unexpected error {error:?}"
+            );
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "candidate provider/model in tier zero/test costs more than the tier sells: \
+                     {message}"
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn a_basis_equal_to_the_tier_sell_rate_is_legal() {
+        // The pricing model itself: the flagship candidate sits *at* the sell
+        // rate (0% markup) and margin comes from routing to cheaper candidates
+        // in the same tier. Rejecting equality would reject every tier we ship.
+        let catalog = catalog_with(
+            "input_per_mtok = 2.00\noutput_per_mtok = 10.00\ncached_input_per_mtok = 0.20",
+            "input_per_mtok = 2.00\noutput_per_mtok = 10.00\ncached_input_per_mtok = 0.20",
+        );
+        validate_tier_catalog(&catalog).expect("a 0%-markup flagship must stay legal");
+    }
+
+    #[test]
+    fn an_absent_cached_basis_is_not_a_margin_violation() {
+        // The bedrock shape: no `cached_input_per_mtok` on the candidate, and
+        // an input basis well above the tier's *cached* sell rate. An unset
+        // dimension is unknown, not free and not a violation — reading it as
+        // the input rate would fail a table that is fine.
+        let catalog = catalog_with(
+            "input_per_mtok = 0.30\noutput_per_mtok = 1.20\ncached_input_per_mtok = 0.06",
+            "input_per_mtok = 0.30\noutput_per_mtok = 1.20",
+        );
+        validate_tier_catalog(&catalog)
+            .expect("a candidate that declares no cached rate must still validate");
     }
 
     #[test]

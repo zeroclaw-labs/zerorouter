@@ -49,11 +49,6 @@ use zerorouter::{
 /// reservation clamp (which `tests/billing.rs` already pins).
 const MAX_TOKENS: u32 = 4_096;
 
-/// The reservation `zero/test-pair` and `zero/test-solo` admit for
-/// [`completion_body`]: 64 + len("user") + len("hello") prompt-byte bound plus
-/// [`MAX_TOKENS`] of output.
-const RESERVED_PROMPT_TOKENS: i32 = 73;
-
 /// Pooled connections each test opens up front. Two is enough for a request
 /// that admits, walks, and settles in sequence while the test reads back rows.
 const POOL_CONNECTIONS: u32 = 2;
@@ -72,24 +67,11 @@ fn served_sell_cost() -> Decimal {
     decimal("0.00312")
 }
 
-/// `73 * $3.00/Mtok + 4096 * $6.00/Mtok`: what the reservation bound costs the
-/// customer. No settle site bills this any more; it is kept as the ceiling the
-/// streaming terminals are asserted to stay under.
-fn reservation_sell_cost() -> Decimal {
-    decimal("0.024795")
-}
-
-/// The per-chunk `token_count` lower bound a seven-character delta reports,
-/// which is the whole output side a stream that broke before any usage report
-/// can honestly claim.
+/// The per-chunk `token_count` lower bound a seven-character delta reports.
+/// Never billed to a customer — the settle policy is metered actuals only — but
+/// still written to the attempt ledger, where it prices ZeroRouter's own COGS
+/// for an attempt the upstream abandoned without a usage report.
 const ESTIMATED_OUTPUT_TOKENS: i32 = 2;
-
-/// `73 * $3.00/Mtok + 2 * $6.00/Mtok`: the conservative estimate billed when
-/// bytes reached the client but the upstream never metered them — the admitted
-/// prompt bound plus [`ESTIMATED_OUTPUT_TOKENS`].
-fn estimated_sell_cost() -> Decimal {
-    decimal("0.000231")
-}
 
 fn decimal(value: &str) -> Decimal {
     Decimal::from_str(value).expect("test decimal must parse")
@@ -307,6 +289,31 @@ async fn attempt_rows(pool: &PgPool, api_key_id: Uuid) -> Vec<(i16, String, Stri
     .fetch_all(pool)
     .await
     .expect("attempt rows must query")
+}
+
+/// The after-the-fact metering-gap detector documented on
+/// `StreamDelivery::settled_usage`, run verbatim: requests where an attempt was
+/// served yet the settled row carries no tokens, i.e. output the customer
+/// received that ZeroRouter could not bill. Needs no column beyond migration
+/// 0004 — a genuine usage report can never be all-zero
+/// (`OpenAiUsage::try_from_provider` rejects that), so zero tokens on a served
+/// request means "never metered".
+async fn unbilled_served_requests(pool: &PgPool, api_key_id: Uuid) -> i64 {
+    query_scalar::<_, i64>(
+        r#"
+        SELECT COUNT(*)
+        FROM usage_events e
+        JOIN request_attempts a USING (request_id)
+        WHERE e.api_key_id = $1
+          AND a.served
+          AND e.input_tokens = 0
+          AND e.output_tokens = 0
+        "#,
+    )
+    .bind(api_key_id)
+    .fetch_one(pool)
+    .await
+    .expect("metering-gap count must query")
 }
 
 async fn open_reservations(pool: &PgPool, api_key_id: Uuid) -> i64 {
@@ -661,16 +668,25 @@ async fn streaming_happy_path_emits_deltas_then_usage_and_settles_the_metered_ro
     assert_eq!(call.model, "upstream/solo");
     assert!(call.streaming);
 
+    // Metered-actuals-only cuts both ways: when the upstream DOES report usage
+    // the billed row is exactly that report, token for token, and the balance
+    // moves by exactly its sell-rate cost. Nothing about the unmetered policy
+    // touches the normal path.
     assert_eq!(
         settled_event(&pool, api_key_id).await,
         (
             "deepinfra".to_owned(),
             "upstream/solo".to_owned(),
-            1_000,
-            20,
+            i32::try_from(served_usage().input_tokens.expect("metered input")).expect("fits"),
+            i32::try_from(served_usage().output_tokens.expect("metered output")).expect("fits"),
             served_sell_cost(),
             200,
         )
+    );
+    assert_eq!(
+        unbilled_served_requests(&pool, api_key_id).await,
+        0,
+        "a metered request is not a metering gap"
     );
     let (candidate_id, cost_basis_usd, attempt_count, finish_reason) =
         settled_provenance(&pool, api_key_id).await;
@@ -749,12 +765,12 @@ async fn streaming_candidate_failing_before_any_bytes_fails_over_to_the_next() {
     );
 }
 
-/// The highest-frequency unmetered settle there is. An OpenAI-compatible
-/// upstream omits the usage chunk unless the caller opted into it, so for such
-/// a provider "the stream succeeded and reported no usage" is the ordinary
-/// case, not a failure mode — and it must not bill the whole output bound.
+/// The highest-frequency unmetered settle there is: several provider families
+/// never surface streaming usage at all, so "the stream succeeded and reported
+/// no usage" is an ordinary case, not a failure mode. Billing policy is metered
+/// actuals only, so ZeroRouter serves this one for free rather than guess.
 #[tokio::test]
-async fn streaming_success_without_upstream_usage_bills_the_conservative_estimate() {
+async fn streaming_success_without_upstream_usage_bills_nothing() {
     let Some(pool) = connect().await else {
         return;
     };
@@ -792,46 +808,65 @@ async fn streaming_success_without_upstream_usage_bills_the_conservative_estimat
         "metering_unavailable"
     );
 
-    // The billed row is the prompt bound plus the observed output floor. Before
-    // this settle honored the governing rule it charged `reservation_sell_cost`
-    // — the full 4096-token output bound — for a two-token completion, on what
-    // is the normal path for any upstream that does not volunteer usage.
+    // Nothing was metered, so nothing is billed. Both halves of the estimate
+    // this used to charge were heuristics — a byte-length prompt bound and a
+    // `len()/4` output floor — and pricing per-token rates against either is a
+    // guess at a customer's bill. The settled row carries zero tokens and zero
+    // cost; the reservation is released, not spent.
     assert_eq!(
         settled_event(&pool, api_key_id).await,
         (
             "deepinfra".to_owned(),
             "upstream/solo".to_owned(),
-            RESERVED_PROMPT_TOKENS,
-            ESTIMATED_OUTPUT_TOKENS,
-            estimated_sell_cost(),
+            0,
+            0,
+            Decimal::ZERO,
             502,
         )
-    );
-    assert!(
-        estimated_sell_cost() < reservation_sell_cost(),
-        "the estimate must stay under the reservation bound it replaced"
     );
     assert_eq!(
         balance(&pool, user_of(&pool, api_key_id).await)
             .await
             .expect("balance must query"),
-        Decimal::from(50) - estimated_sell_cost()
+        Decimal::from(50),
+        "an unmetered delivery must not move the balance"
     );
     assert_eq!(open_reservations(&pool, api_key_id).await, 0);
 
-    // Pre-existing and untouched here: the unmetered branch settles without
-    // pushing an attempt row for the candidate that served, so this request
-    // carries no walk ledger. A telemetry gap, not an overcharge.
+    // The gap is countable after the fact: the served attempt is now recorded
+    // (it was not before, leaving this request with no walk ledger at all) with
+    // NULL token columns, and joined against the zero-token settled row it is
+    // exactly one unbilled served request.
     let (_, cost_basis_usd, attempt_count, _) = settled_provenance(&pool, api_key_id).await;
-    assert_eq!(attempt_count, None);
-    assert!(attempt_rows(&pool, api_key_id).await.is_empty());
-    // COGS is priced on the same usage the customer is billed:
-    // 73 * $1.00/Mtok + 2 * $2.00/Mtok.
-    assert_eq!(cost_basis_usd, Some(decimal("0.000077")));
+    assert_eq!(attempt_count, Some(1));
+    assert_eq!(
+        attempt_rows(&pool, api_key_id).await,
+        vec![(1, "deepinfra/solo".to_owned(), "ok".to_owned(), true)],
+        "the candidate whose output the client received is still the served one"
+    );
+    let attempt_tokens = query_as::<_, (Option<i32>, Option<i32>, bool)>(
+        r#"
+        SELECT input_tokens, output_tokens, tokens_estimated
+        FROM request_attempts
+        WHERE api_key_id = $1
+        "#,
+    )
+    .bind(api_key_id)
+    .fetch_one(&pool)
+    .await
+    .expect("attempt row must query");
+    assert_eq!(
+        attempt_tokens,
+        (None, None, false),
+        "no tokens were measured, so none are claimed on the attempt either"
+    );
+    assert_eq!(unbilled_served_requests(&pool, api_key_id).await, 1);
+    // COGS is priced on the same usage the customer is billed: none.
+    assert_eq!(cost_basis_usd, Some(Decimal::ZERO));
 }
 
 #[tokio::test]
-async fn streaming_error_after_delivered_bytes_bills_the_conservative_estimate() {
+async fn streaming_error_after_delivered_bytes_bills_nothing() {
     let Some(pool) = connect().await else {
         return;
     };
@@ -866,30 +901,26 @@ async fn streaming_error_after_delivered_bytes_bills_the_conservative_estimate()
         "upstream_unavailable"
     );
 
-    // Tokens reached the client and the upstream never metered them, so the
-    // settle bills the conservative estimate: the prompt bound admission
-    // computed (the input was definitely consumed) plus the per-chunk output
-    // lower bound the stream itself reported — not the 4096-token reservation
-    // bound this used to charge for seven characters.
+    // Tokens reached the client and the upstream never metered them, so nothing
+    // is billed. The per-chunk `token_count` floor the stream reported is not a
+    // measurement — it is `len()/4`, zero on adapters that never opt in — and
+    // the reservation's prompt side is a byte-length bound, so neither may
+    // price a customer's row.
     assert_eq!(
         settled_event(&pool, api_key_id).await,
         (
             "deepinfra".to_owned(),
             "upstream/solo".to_owned(),
-            RESERVED_PROMPT_TOKENS,
-            ESTIMATED_OUTPUT_TOKENS,
-            estimated_sell_cost(),
+            0,
+            0,
+            Decimal::ZERO,
             502,
         )
     );
-    assert!(
-        estimated_sell_cost() < reservation_sell_cost(),
-        "the estimate must stay under the reservation bound it replaced"
-    );
-    // The billed row and the attempt row now reconcile: the same 2 output
-    // tokens, priced at the sell rate on the billed row and at the candidate's
-    // own cost basis on the attempt row, with the billed row additionally
-    // carrying the input side an attempt row deliberately omits.
+    assert_eq!(unbilled_served_requests(&pool, api_key_id).await, 1);
+    // The estimate survives on the attempt row and only there: it prices
+    // ZeroRouter's own COGS for the delivery it just absorbed, flagged
+    // `tokens_estimated` so it can never be mistaken for a metered actual.
     let attempt_usage = query_as::<_, (Option<i32>, bool, Option<Decimal>)>(
         r#"
         SELECT output_tokens, tokens_estimated, cost_basis_usd
@@ -923,7 +954,8 @@ async fn streaming_error_after_delivered_bytes_bills_the_conservative_estimate()
         balance(&pool, user_of(&pool, api_key_id).await)
             .await
             .expect("balance must query"),
-        Decimal::from(50) - estimated_sell_cost()
+        Decimal::from(50),
+        "an unmetered delivery must not move the balance"
     );
 }
 
@@ -1058,6 +1090,73 @@ async fn synthetic_stream_serves_a_candidate_that_cannot_stream() {
         attempt_rows(&pool, api_key_id).await,
         vec![(1, "deepinfra/solo".to_owned(), "ok".to_owned(), true)]
     );
+}
+
+/// The buffered sibling of the streaming gap. A non-streaming candidate returns
+/// a complete response with no usage on it: the router has the whole answer in
+/// hand, which is why this settle used to be argued as a special case and left
+/// at the reservation bound. Under metered-actuals-only there is no special
+/// case — nothing was measured, so nothing is billed.
+#[tokio::test]
+async fn synthetic_stream_without_upstream_usage_bills_nothing() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let (api_key_id, key) = create_funded_key(&pool, "synthetic-unmetered").await;
+    let solo = FakeModelProvider::without_streaming(
+        "solo",
+        vec![FakeOutcome::Chat {
+            text: Some("whole answer".to_owned()),
+            tool_calls: Vec::new(),
+            usage: None,
+        }],
+    );
+    let state = router(pool.clone(), vec![solo.clone()]);
+
+    let response = app(state.clone())
+        .oneshot(completion_request(
+            &key,
+            &completion_body("zero/test-solo", true),
+        ))
+        .await
+        .expect("stream request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    let chunks = sse_chunks(response).await;
+    state.wait_for_background_tasks().await;
+
+    // This branch aborts instead of replaying the buffered answer, so the
+    // customer receives nothing at all — which made billing the 4096-token
+    // reservation bound here the starkest overcharge of the set.
+    assert_eq!(chunks.len(), 1);
+    assert_eq!(chunks[0]["error"]["code"], "metering_unavailable");
+
+    assert_eq!(
+        settled_event(&pool, api_key_id).await,
+        (
+            "deepinfra".to_owned(),
+            "upstream/solo".to_owned(),
+            0,
+            0,
+            Decimal::ZERO,
+            502,
+        )
+    );
+    assert_eq!(
+        balance(&pool, user_of(&pool, api_key_id).await)
+            .await
+            .expect("balance must query"),
+        Decimal::from(50),
+        "an unmetered response must not move the balance"
+    );
+    assert_eq!(open_reservations(&pool, api_key_id).await, 0);
+    // The attempt is recorded so the gap is countable, but `served` is false:
+    // nothing was replayed to the client. That is the difference between a
+    // metering gap ZeroRouter ate and one where the customer got the output.
+    assert_eq!(
+        attempt_rows(&pool, api_key_id).await,
+        vec![(1, "deepinfra/solo".to_owned(), "ok".to_owned(), false)]
+    );
+    assert_eq!(unbilled_served_requests(&pool, api_key_id).await, 0);
 }
 
 #[tokio::test]
