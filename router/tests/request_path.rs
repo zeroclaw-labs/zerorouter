@@ -2845,3 +2845,135 @@ async fn non_streaming_shutdown_during_a_backoff_releases_the_reservation_withou
     );
     assert_eq!(open_reservations(&pool, api_key_id).await, 0);
 }
+
+/// Cross-request state: none exists today. A rung that answered 429 on one
+/// request is dispatched again by the very next request through the same
+/// router, because the walk's only memory of the rate limit dies with the
+/// request that observed it.
+///
+/// Stage 2b (`ProviderHealth`, design "Provider-health state") deliberately
+/// changes this: a 429 sets a 60-second cooldown keyed by
+/// `(provider, upstream_model)`, and the next walk records `health_skipped`
+/// for the cooling rung instead of dispatching to it. When that lands, this
+/// assertion flips with it — until then it pins the pre-health baseline the
+/// change will be measured against.
+#[tokio::test]
+async fn non_streaming_a_rate_limited_rung_is_walked_again_by_the_next_request() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let (first_key_id, first_key) = create_funded_key(&pool, "no-memory-sync-1").await;
+    let (second_key_id, second_key) = create_funded_key(&pool, "no-memory-sync-2").await;
+    let primary = FakeModelProvider::new(
+        "primary",
+        vec![
+            FakeOutcome::RateLimited,
+            FakeOutcome::chat("hello from primary", served_usage()),
+        ],
+    );
+    let secondary = FakeModelProvider::new(
+        "secondary",
+        vec![FakeOutcome::chat("hello from secondary", served_usage())],
+    );
+    let state = router(pool.clone(), vec![primary.clone(), secondary.clone()]);
+
+    let response = app(state.clone())
+        .oneshot(completion_request(
+            &first_key,
+            &completion_body("zero/test-pair", false),
+        ))
+        .await
+        .expect("first completion request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(header(&response, "x-zerorouter-provider"), "together");
+
+    // The second request walks the same tier through the same router process.
+    let response = app(state.clone())
+        .oneshot(completion_request(
+            &second_key,
+            &completion_body("zero/test-pair", false),
+        ))
+        .await
+        .expect("second completion request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        header(&response, "x-zerorouter-provider"),
+        "fireworks",
+        "the 429 left no in-process trace, so the walk starts at the top again"
+    );
+    state.wait_for_background_tasks().await;
+
+    assert_eq!(
+        primary.call_count(),
+        2,
+        "one dispatch per request: no cross-request memory of the 429"
+    );
+    assert_eq!(secondary.call_count(), 1);
+    assert_eq!(
+        attempt_rows(&pool, second_key_id).await,
+        [(1, "fireworks/primary".to_owned(), "ok".to_owned(), true)],
+        "the second walk dispatches the rung the first walk saw rate-limited"
+    );
+    assert_eq!(open_reservations(&pool, first_key_id).await, 0);
+    assert_eq!(open_reservations(&pool, second_key_id).await, 0);
+}
+
+/// The streaming twin of the test above, because Stage 2b's health state must
+/// land on both walks together or not at all: a 429-shaped stream failure on
+/// one request leaves no in-process trace either, so the next request's walk
+/// dispatches the same rung again.
+#[tokio::test]
+async fn streaming_a_rate_limited_rung_is_walked_again_by_the_next_request() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let (first_key_id, first_key) = create_funded_key(&pool, "no-memory-stream-1").await;
+    let (second_key_id, second_key) = create_funded_key(&pool, "no-memory-stream-2").await;
+    let served_stream = || {
+        FakeOutcome::Stream(vec![
+            FakeStreamStep::text("served"),
+            FakeStreamStep::Usage(served_usage()),
+            FakeStreamStep::Final,
+        ])
+    };
+    let primary = FakeModelProvider::new("primary", vec![FakeOutcome::RateLimited, served_stream()]);
+    let secondary = FakeModelProvider::new("secondary", vec![served_stream()]);
+    let state = router(pool.clone(), vec![primary.clone(), secondary.clone()]);
+
+    let response = app(state.clone())
+        .oneshot(completion_request(
+            &first_key,
+            &completion_body("zero/test-pair", true),
+        ))
+        .await
+        .expect("first stream request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    let chunks = sse_chunks(response).await;
+    assert_eq!(chunks[1]["choices"][0]["delta"]["content"], "served");
+
+    let response = app(state.clone())
+        .oneshot(completion_request(
+            &second_key,
+            &completion_body("zero/test-pair", true),
+        ))
+        .await
+        .expect("second stream request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    let chunks = sse_chunks(response).await;
+    assert_eq!(chunks[1]["choices"][0]["delta"]["content"], "served");
+    state.wait_for_background_tasks().await;
+
+    assert_eq!(
+        primary.call_count(),
+        2,
+        "one dispatch per request: no cross-request memory of the 429"
+    );
+    assert_eq!(secondary.call_count(), 1);
+    assert_eq!(
+        attempt_rows(&pool, second_key_id).await,
+        [(1, "fireworks/primary".to_owned(), "ok".to_owned(), true)],
+        "the second walk dispatches the rung the first walk saw rate-limited"
+    );
+    assert_eq!(open_reservations(&pool, first_key_id).await, 0);
+    assert_eq!(open_reservations(&pool, second_key_id).await, 0);
+}
