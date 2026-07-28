@@ -1450,11 +1450,18 @@ async fn stream_to_channel(
                     .await;
                     return;
                 }
-                Ok(Err(_)) => {
+                Ok(Err(err)) => {
+                    // The buffered walk's classifier, for the LABEL only — the
+                    // control flow stays one dispatch then move on. Migration
+                    // 0004 documents `outcome` as what feeds the health
+                    // cooldown, so a 429 recorded as a generic upstream error
+                    // would hide this rung's state from the thing that has to
+                    // notice it. `false`: this walk has no truncation repair,
+                    // so no truncation has ever been spent.
                     attempts.push(build_attempt(
                         attempt_no,
                         candidate.definition(),
-                        "upstream_error",
+                        retry::classify(&err, false).outcome(),
                         false,
                         attempt_started,
                         AttemptTokens::unknown(),
@@ -1514,6 +1521,11 @@ async fn stream_to_channel(
         // price and label this attempt if it is abandoned or served.
         let mut estimated_output = 0_u64;
         let mut tool_args_ok = true;
+        // Whether the stream died on a 429-shaped error, read off the failure
+        // text by the same check the buffered walk applies to a chat error.
+        // Label-only: a broken stream falls through to the next candidate
+        // whatever its text said.
+        let mut stream_rate_limited = false;
         // What this candidate actually put out, folded from the deltas
         // themselves. The shape label used to be derived from
         // `usage.completion_tokens`, which is the provider's accounting rather
@@ -1623,7 +1635,10 @@ async fn stream_to_channel(
                 }
                 Ok(StreamEvent::PreExecutedToolCall { .. })
                 | Ok(StreamEvent::PreExecutedToolResult { .. }) => {}
-                Err(_) => break,
+                Err(error) => {
+                    stream_rate_limited = retry::is_rate_limited(&anyhow::Error::new(error));
+                    break;
+                }
             }
         }
 
@@ -1733,10 +1748,18 @@ async fn stream_to_channel(
             // the served attempt even though the stream broke.
             let served = delivery.model_output_sent;
             let tokens = attempt_tokens(usage, estimated_output);
+            // A 429 that delivered nothing is labelled as the rate limit it
+            // was. Once model output has flowed the story of this attempt is
+            // the broken delivery, whatever text the failure carried.
+            let outcome = if stream_rate_limited && !delivery.model_output_sent {
+                "rate_limited"
+            } else {
+                "stream_error"
+            };
             attempts.push(build_attempt(
                 attempt_no,
                 candidate.definition(),
-                "stream_error",
+                outcome,
                 served,
                 attempt_started,
                 tokens,
@@ -1772,11 +1795,16 @@ async fn stream_to_channel(
         }
 
         // Nothing delivered and the stream ended without completing: record a
-        // non-served failure and fall through to the next candidate.
+        // non-served failure — as the 429 it was when the failure text says so
+        // — and fall through to the next candidate.
         attempts.push(build_attempt(
             attempt_no,
             candidate.definition(),
-            "stream_error",
+            if stream_rate_limited {
+                "rate_limited"
+            } else {
+                "stream_error"
+            },
             false,
             attempt_started,
             attempt_tokens(usage, estimated_output),

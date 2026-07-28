@@ -2977,3 +2977,104 @@ async fn streaming_a_rate_limited_rung_is_walked_again_by_the_next_request() {
     assert_eq!(open_reservations(&pool, first_key_id).await, 0);
     assert_eq!(open_reservations(&pool, second_key_id).await, 0);
 }
+
+/// A 429-shaped stream failure is recorded as the rate limit it was, not as a
+/// generic broken stream. Migration 0004 documents `outcome` as what feeds the
+/// health cooldown, and the streaming walk is one of the two paths that has to
+/// feed it — a `stream_error` label here would leave a rate-limited rung
+/// invisible to health while the buffered walk could see it.
+#[tokio::test]
+async fn streaming_a_rate_limited_stream_failure_is_labelled_as_the_429_it_was() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let (api_key_id, key) = create_funded_key(&pool, "stream-429-label").await;
+    let primary = FakeModelProvider::new("primary", vec![FakeOutcome::RateLimited]);
+    let secondary = FakeModelProvider::new(
+        "secondary",
+        vec![FakeOutcome::Stream(vec![
+            FakeStreamStep::text("served"),
+            FakeStreamStep::Usage(served_usage()),
+            FakeStreamStep::Final,
+        ])],
+    );
+    let state = router(pool.clone(), vec![primary.clone(), secondary.clone()]);
+
+    let response = app(state.clone())
+        .oneshot(completion_request(
+            &key,
+            &completion_body("zero/test-pair", true),
+        ))
+        .await
+        .expect("stream request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    let chunks = sse_chunks(response).await;
+    state.wait_for_background_tasks().await;
+
+    assert_eq!(chunks[1]["choices"][0]["delta"]["content"], "served");
+    assert_eq!(primary.call_count(), 1, "a stream 429 is still not retried");
+    assert_eq!(secondary.call_count(), 1);
+    assert_eq!(
+        attempt_rows(&pool, api_key_id).await,
+        vec![
+            (
+                1,
+                "fireworks/primary".to_owned(),
+                "rate_limited".to_owned(),
+                false
+            ),
+            (2, "together/secondary".to_owned(), "ok".to_owned(), true),
+        ]
+    );
+    assert_eq!(open_reservations(&pool, api_key_id).await, 0);
+}
+
+/// The synthetic-stream sibling: a candidate that cannot stream fails its
+/// buffered call with a 429, and the row says so. The label comes from the
+/// same classifier the buffered walk dispatches on; only the label is taken —
+/// the walk still moves on after one call rather than retrying.
+#[tokio::test]
+async fn synthetic_stream_a_rate_limited_chat_failure_is_labelled_as_the_429_it_was() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let (api_key_id, key) = create_funded_key(&pool, "synthetic-429-label").await;
+    let primary = FakeModelProvider::without_streaming("primary", vec![FakeOutcome::RateLimited]);
+    let secondary = FakeModelProvider::new(
+        "secondary",
+        vec![FakeOutcome::Stream(vec![
+            FakeStreamStep::text("served"),
+            FakeStreamStep::Usage(served_usage()),
+            FakeStreamStep::Final,
+        ])],
+    );
+    let state = router(pool.clone(), vec![primary.clone(), secondary.clone()]);
+
+    let response = app(state.clone())
+        .oneshot(completion_request(
+            &key,
+            &completion_body("zero/test-pair", true),
+        ))
+        .await
+        .expect("stream request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    let chunks = sse_chunks(response).await;
+    state.wait_for_background_tasks().await;
+
+    assert_eq!(chunks[1]["choices"][0]["delta"]["content"], "served");
+    assert_eq!(primary.call_count(), 1);
+    assert_eq!(secondary.call_count(), 1);
+    assert_eq!(
+        attempt_rows(&pool, api_key_id).await,
+        vec![
+            (
+                1,
+                "fireworks/primary".to_owned(),
+                "rate_limited".to_owned(),
+                false
+            ),
+            (2, "together/secondary".to_owned(), "ok".to_owned(), true),
+        ]
+    );
+    assert_eq!(open_reservations(&pool, api_key_id).await, 0);
+}
