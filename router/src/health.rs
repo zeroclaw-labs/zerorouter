@@ -133,10 +133,13 @@ impl ProviderHealth {
         }
     }
 
-    /// Whether the walk should demote this candidate — record `health_skipped`
-    /// and move on — instead of dispatching to it. Advisory: the walk's own
-    /// guard keeps a skip from ever leaving a request with nothing to
-    /// dispatch.
+    /// Whether this candidate is demoted. Two consumers, one verdict:
+    /// `api::order_candidates` sinks a demoted rung to the back of the route
+    /// (demotion's first line since stage 3a), and the walk records
+    /// `health_skipped` and moves on when it still reaches one (the
+    /// backstop). Advisory either way: ordering never removes a rung, and
+    /// the walk's own guard keeps a skip from ever leaving a request with
+    /// nothing to dispatch.
     #[must_use]
     pub fn should_skip(&self, candidate: &TierCandidate) -> bool {
         let now = Instant::now();

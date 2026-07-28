@@ -622,7 +622,8 @@ async fn chat_completions(
         .or(authenticated.default_priority)
         .unwrap_or(Priority::Balanced);
     let max_output_tokens = *request.max_tokens.get_or_insert(BASELINE_MAX_TOKENS);
-    let provider_route = services.provider_route(&resolved, max_output_tokens)?;
+    let mut provider_route = services.provider_route(&resolved, max_output_tokens)?;
+    order_candidates(priority, provider_route.candidates_mut(), &services.health);
     let reservation_usage = request.reservation_usage(max_output_tokens);
     let reserved_tokens =
         i64::try_from(reservation_usage.total_tokens).map_err(|_| ApiError::InvalidRequest)?;
@@ -709,6 +710,40 @@ fn model_unresolvable(catalog: &TierCatalog, requested_model: &str) -> ApiError 
         })
 }
 
+/// Selection policy (design doc: Engine "Selection policy"), applied to the
+/// built route before either walk starts.
+///
+/// Stage 3a ships the knob visibility-only: there is no estimator yet, so
+/// every mode's base ordering is the identity — the tiers.toml order, which
+/// is the human-curated quality prior. The `priority` arms exist so the
+/// cost- and success-mode orderings (stage 3b) land in this function's body
+/// without touching its callers.
+///
+/// Health demotion applies last, in every mode: demoted rungs sink to the
+/// back — preserving table order within each group — and never disappear.
+/// Sinking replaces the recorded skip as demotion's first line (stage 2b
+/// shipped the skip while ordering belonged to this stage); the walk-time
+/// `should_skip` check remains as the backstop for a rung that cools between
+/// this ordering and the walk reaching it, and its never-below-one-candidate
+/// floor is unchanged. An all-demoted route partitions to itself, so this
+/// can never manufacture an empty route.
+fn order_candidates(
+    priority: Priority,
+    candidates: &mut Vec<ProviderCandidate>,
+    health: &ProviderHealth,
+) {
+    match priority {
+        // 3a: no estimator, so cost, balanced, and success all keep the
+        // identity base order. The arms split when 3b's estimator arrives.
+        Priority::Cost | Priority::Balanced | Priority::Success => {}
+    }
+    let (healthy, demoted): (Vec<_>, Vec<_>) = candidates
+        .drain(..)
+        .partition(|candidate| !health.should_skip(candidate.definition()));
+    candidates.extend(healthy);
+    candidates.extend(demoted);
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn non_streaming_response(
     runtime: RuntimeControl,
@@ -776,12 +811,16 @@ async fn run_non_streaming(
     let mut attempts = WalkLedger::new(health.clone());
 
     'walk: for (position, candidate) in candidates.iter().enumerate() {
-        // Cross-request health demotion (stage 2b): a rung cooling after a
-        // 429, or error-heavy on its EWMA, is recorded and skipped rather
-        // than dispatched. The guard is the design's never-below-one-
-        // candidate floor — a skip is taken only while this walk has already
-        // dispatched somewhere or still has somewhere left to go — so health
-        // can cost a walk a rung but never cost it the whole walk, and a
+        // The walk-time health backstop. Since stage 3a, demotion's first
+        // line is `order_candidates` sinking a cooling or error-heavy rung
+        // to the back of the route, so a demoted rung is normally never
+        // reached; this check catches the rung that cools BETWEEN that
+        // ordering and the walk arriving here (a concurrent request's 429),
+        // and the rungs an all-demoted or all-failing walk still visits.
+        // The guard is the design's never-below-one-candidate floor — a
+        // skip is taken only while this walk has already dispatched
+        // somewhere or still has somewhere left to go — so health can cost
+        // a walk a rung but never cost it the whole walk, and a
         // single-candidate route rides out a cooldown exactly as it rides
         // out the 429 itself.
         if health.should_skip(candidate.definition())
@@ -1452,12 +1491,14 @@ async fn stream_to_channel(
             }
             return;
         }
-        // Cross-request health demotion (stage 2b), the same rule at the same
-        // place as the buffered walk: a cooling or error-heavy rung is
-        // recorded and skipped, guarded by the never-below-one-candidate
-        // floor so a walk can lose a rung to health but never lose its only
-        // dispatch. Checked before the deadline because a skip consumes no
-        // walk time — admissibility first, ceilings second.
+        // The walk-time health backstop, the same rule at the same place as
+        // the buffered walk (demotion's first line is `order_candidates`
+        // sinking demoted rungs — see the buffered walk's twin comment):
+        // a rung found cooling or error-heavy on arrival is recorded and
+        // skipped, guarded by the never-below-one-candidate floor so a walk
+        // can lose a rung to health but never lose its only dispatch.
+        // Checked before the deadline because a skip consumes no walk time
+        // — admissibility first, ceilings second.
         if health.should_skip(candidate.definition())
             && (last_candidate.is_some() || position + 1 < candidates.len())
         {

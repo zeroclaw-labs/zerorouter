@@ -2888,15 +2888,18 @@ async fn non_streaming_shutdown_during_a_backoff_releases_the_reservation_withou
     assert_eq!(open_reservations(&pool, api_key_id).await, 0);
 }
 
-/// Cross-request health (stage 2b, design "Provider-health state"): a 429
-/// sets a 60-second cooldown keyed `(provider, upstream_model)`, so the very
-/// next request through the same router records `health_skipped` for the
-/// cooling rung — a real walk position in the ledger, never a silent
-/// reorder — and dispatches straight to the next rung. Until stage 2b this
-/// test pinned the opposite baseline: the walk kept no state between
-/// requests and dispatched the 429'd rung again.
+/// Cross-request health (stage 2b, design "Provider-health state"; ordering
+/// since stage 3a): a 429 sets a 60-second cooldown keyed
+/// `(provider, upstream_model)`, and the very next request through the same
+/// router sinks the cooling rung to the back of its route
+/// (`order_candidates`), walking straight to the healthy rung. The walk
+/// ledger records the walk that happened — one served position, no skip row,
+/// because the demoted rung was never a position of this walk. Stage 2b
+/// pinned the interim shape (a recorded `health_skipped` at position 1);
+/// before 2b, the walk kept no state at all and dispatched the 429'd rung
+/// again.
 #[tokio::test]
-async fn non_streaming_a_rate_limited_rung_is_skipped_by_the_next_request() {
+async fn non_streaming_a_rate_limited_rung_sinks_behind_the_healthy_rung_for_the_next_request() {
     let Some(pool) = connect().await else {
         return;
     };
@@ -2943,27 +2946,19 @@ async fn non_streaming_a_rate_limited_rung_is_skipped_by_the_next_request() {
     assert_eq!(secondary.call_count(), 2);
     assert_eq!(
         attempt_rows(&pool, second_key_id).await,
-        [
-            (
-                1,
-                "fireworks/primary".to_owned(),
-                "health_skipped".to_owned(),
-                false
-            ),
-            (2, "together/secondary".to_owned(), "ok".to_owned(), true),
-        ],
-        "the skip is a recorded walk position, not a silent reorder"
+        [(1, "together/secondary".to_owned(), "ok".to_owned(), true)],
+        "the demoted rung sank out of the walk entirely: one position, served"
     );
     assert_eq!(open_reservations(&pool, first_key_id).await, 0);
     assert_eq!(open_reservations(&pool, second_key_id).await, 0);
 }
 
-/// The streaming twin of the test above, because stage 2b's health state
-/// lands on both walks together or not at all: a 429-shaped stream failure
-/// cools the rung for the streaming walk exactly as a buffered 429 does, and
-/// the next request's walk records `health_skipped` instead of dispatching.
+/// The streaming twin of the test above, because health lands on both walks
+/// together or not at all: a 429-shaped stream failure cools the rung for
+/// the streaming walk exactly as a buffered 429 does, and the next request's
+/// route is reordered before the streaming walk starts.
 #[tokio::test]
-async fn streaming_a_rate_limited_rung_is_skipped_by_the_next_request() {
+async fn streaming_a_rate_limited_rung_sinks_behind_the_healthy_rung_for_the_next_request() {
     let Some(pool) = connect().await else {
         return;
     };
@@ -3011,16 +3006,8 @@ async fn streaming_a_rate_limited_rung_is_skipped_by_the_next_request() {
     assert_eq!(secondary.call_count(), 2);
     assert_eq!(
         attempt_rows(&pool, second_key_id).await,
-        [
-            (
-                1,
-                "fireworks/primary".to_owned(),
-                "health_skipped".to_owned(),
-                false
-            ),
-            (2, "together/secondary".to_owned(), "ok".to_owned(), true),
-        ],
-        "the skip is a recorded walk position, not a silent reorder"
+        [(1, "together/secondary".to_owned(), "ok".to_owned(), true)],
+        "the demoted rung sank out of the walk entirely: one position, served"
     );
     assert_eq!(open_reservations(&pool, first_key_id).await, 0);
     assert_eq!(open_reservations(&pool, second_key_id).await, 0);
@@ -3129,9 +3116,9 @@ async fn synthetic_stream_a_rate_limited_chat_failure_is_labelled_as_the_429_it_
 
 /// The EWMA half of demotion: three availability failures on one request push
 /// the rung's error EWMA past 0.5 (0.3 → 0.51 → 0.657), so the next request
-/// skips it without a 429 ever having been involved.
+/// sinks it behind the healthy rung without a 429 ever having been involved.
 #[tokio::test]
-async fn non_streaming_an_error_heavy_rung_is_skipped_by_the_next_request() {
+async fn non_streaming_an_error_heavy_rung_sinks_behind_the_healthy_rung_for_the_next_request() {
     let Some(pool) = connect().await else {
         return;
     };
@@ -3183,15 +3170,7 @@ async fn non_streaming_an_error_heavy_rung_is_skipped_by_the_next_request() {
     assert_eq!(secondary.call_count(), 2);
     assert_eq!(
         attempt_rows(&pool, second_key_id).await,
-        [
-            (
-                1,
-                "fireworks/primary".to_owned(),
-                "health_skipped".to_owned(),
-                false
-            ),
-            (2, "together/secondary".to_owned(), "ok".to_owned(), true),
-        ]
+        [(1, "together/secondary".to_owned(), "ok".to_owned(), true)]
     );
     assert_eq!(open_reservations(&pool, first_key_id).await, 0);
     assert_eq!(open_reservations(&pool, second_key_id).await, 0);
@@ -3310,8 +3289,7 @@ async fn non_streaming_a_walk_of_cooling_rungs_still_dispatches_the_last() {
 
 /// Health is keyed `(provider, upstream_model)`, not by provider alone: a
 /// demoted rung must not drag its provider-mate down with it. Both twin
-/// candidates name `together`; only the model that actually failed is
-/// skipped.
+/// candidates name `together`; only the model that actually failed sinks.
 #[tokio::test]
 async fn non_streaming_a_demoted_rung_does_not_demote_its_provider_mate() {
     let Some(pool) = connect().await else {
@@ -3363,15 +3341,7 @@ async fn non_streaming_a_demoted_rung_does_not_demote_its_provider_mate() {
     assert_eq!(twin_b.call_count(), 2);
     assert_eq!(
         attempt_rows(&pool, second_key_id).await,
-        [
-            (
-                1,
-                "together/twin-a".to_owned(),
-                "health_skipped".to_owned(),
-                false
-            ),
-            (2, "together/twin-b".to_owned(), "ok".to_owned(), true),
-        ],
+        [(1, "together/twin-b".to_owned(), "ok".to_owned(), true)],
         "the verdict follows the upstream model, not the provider name"
     );
     assert_eq!(open_reservations(&pool, first_key_id).await, 0);
