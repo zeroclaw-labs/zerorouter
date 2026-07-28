@@ -1,0 +1,37 @@
+schema_version = 1
+
+# Fixture catalog for the "two candidates on one upstream provider" test in
+# tests/request_path.rs. Both candidates name `together`, so anything the walk
+# keyed by PROVIDER rather than by CANDIDATE would leak from the first rung to
+# the second: a shared retry budget, a shared rate-limit cooldown, a shared
+# health verdict. Each candidate must get its own full budget.
+#
+# Rates mirror tests/request_path_tiers.toml's pair tier so the settled
+# decimals stay the same clean numbers.
+
+[tiers."zero/test-twin"]
+
+[tiers."zero/test-twin".rates]
+input_per_mtok = 3.00
+cached_input_per_mtok = 0.60
+output_per_mtok = 6.00
+
+[[tiers."zero/test-twin".candidates]]
+id = "together/twin-a"
+provider = "together"
+model = "upstream/twin-a"
+
+[tiers."zero/test-twin".candidates.rates]
+input_per_mtok = 1.00
+cached_input_per_mtok = 0.20
+output_per_mtok = 2.00
+
+[[tiers."zero/test-twin".candidates]]
+id = "together/twin-b"
+provider = "together"
+model = "upstream/twin-b"
+
+[tiers."zero/test-twin".candidates.rates]
+input_per_mtok = 1.50
+cached_input_per_mtok = 0.30
+output_per_mtok = 3.00

@@ -154,6 +154,25 @@ fn withheld_tier_config_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/withheld_tier_tiers.toml")
 }
 
+/// A catalog whose two candidates name the SAME upstream provider, so anything
+/// the walk keyed by provider rather than by candidate would leak between them.
+fn twin_tier_config_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/two_on_one_provider_tiers.toml")
+}
+
+/// A completion the emptiness check reads as blank: no text, no tool calls, no
+/// reasoning. It still carries a usage report, so a blank turn the walk chooses
+/// to RETURN settles as an ordinary metered 200 rather than falling into the
+/// unmetered-gap branch — which is what makes the re-roll a money question.
+fn blank_completion() -> FakeOutcome {
+    FakeOutcome::Chat {
+        text: Some(String::new()),
+        tool_calls: Vec::new(),
+        usage: Some(served_usage()),
+        reasoning_content: None,
+    }
+}
+
 /// A router whose candidates are served by `fakes` in tier order. Panics if a
 /// resolved route has more candidates than the test scripted, which would
 /// silently leave a real (credential-less) upstream in the walk.
@@ -596,6 +615,7 @@ async fn non_streaming_failover_retries_the_first_candidate_twice_then_bills_the
     .await
     .expect("attempts COGS must query");
     assert_eq!(attempts_cogs, None);
+    assert_eq!(open_reservations(&pool, api_key_id).await, 0);
 }
 
 #[tokio::test]
@@ -627,6 +647,7 @@ async fn non_streaming_rate_limited_candidate_moves_on_without_burning_retries()
     assert_eq!(secondary.call_count(), 1);
     let (candidate_id, _, _, _) = settled_provenance(&pool, api_key_id).await;
     assert_eq!(candidate_id.as_deref(), Some("together/secondary"));
+    assert_eq!(open_reservations(&pool, api_key_id).await, 0);
 }
 
 #[tokio::test]
@@ -728,6 +749,7 @@ async fn non_streaming_timeout_releases_the_reservation_without_charge() {
             .expect("balance must query"),
         Decimal::from(50)
     );
+    assert_eq!(open_reservations(&pool, api_key_id).await, 0);
 }
 
 #[tokio::test]
@@ -1445,7 +1467,7 @@ async fn a_reasoning_only_answer_labels_as_output_on_every_path() {
             served_usage(),
         )],
     );
-    let state = router(pool.clone(), vec![buffered]);
+    let state = router(pool.clone(), vec![buffered.clone()]);
     let response = app(state.clone())
         .oneshot(completion_request(
             &buffered_key,
@@ -1459,6 +1481,11 @@ async fn a_reasoning_only_answer_labels_as_output_on_every_path() {
     assert_eq!(
         body["choices"][0]["message"]["reasoning_content"],
         "thinking it over"
+    );
+    assert_eq!(
+        buffered.call_count(),
+        1,
+        "reasoning is output, so the emptiness check must not re-roll this turn"
     );
     assert_eq!(
         settled_shape_ok(&pool, buffered_key_id).await,
@@ -1625,4 +1652,610 @@ async fn a_settled_row_carries_the_signature_provenance_a_rekey_needs() {
         Some(tool_names_digest(&["read".to_owned(), "shell".to_owned()])),
         "the digest is the exact tool input the key was hashed from, order-independent"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Non-streaming walk semantics.
+//
+// Everything below pins behavior that the delegated walk had but that no test
+// observed: the retry budget's shape, the classifier's verdicts, the
+// empty-completion re-roll, context-window truncation, the shared deadline, and
+// reservation release on every terminal. They were written against the
+// delegated implementation and must keep passing verbatim once the router owns
+// the loop — that invariance is the whole evidence that the unroll preserved
+// behavior, so do not relax one to make a refactor fit.
+// ---------------------------------------------------------------------------
+
+/// A blank turn is re-rolled inside the candidate's OWN retry budget: the walk
+/// does not treat it as a candidate failure and does not fall through.
+#[tokio::test]
+async fn non_streaming_empty_completion_is_rerolled_within_the_candidate_budget() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let (api_key_id, key) = create_funded_key(&pool, "empty-reroll").await;
+    let primary = FakeModelProvider::new(
+        "primary",
+        vec![
+            blank_completion(),
+            blank_completion(),
+            FakeOutcome::chat("hello on the third try", served_usage()),
+        ],
+    );
+    let secondary = FakeModelProvider::new("secondary", Vec::new());
+    let state = router(pool.clone(), vec![primary.clone(), secondary.clone()]);
+
+    let response = app(state.clone())
+        .oneshot(completion_request(
+            &key,
+            &completion_body("zero/test-pair", false),
+        ))
+        .await
+        .expect("completion request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    state.wait_for_background_tasks().await;
+
+    assert_eq!(
+        primary.call_count(),
+        3,
+        "two blank turns are re-rolled against the same candidate"
+    );
+    assert_eq!(
+        secondary.call_count(),
+        0,
+        "a blank completion is not a candidate failure"
+    );
+    assert_eq!(
+        body["choices"][0]["message"]["content"],
+        "hello on the third try"
+    );
+    let (candidate_id, _, _, _) = settled_provenance(&pool, api_key_id).await;
+    assert_eq!(candidate_id.as_deref(), Some("fireworks/primary"));
+    assert_eq!(settled_shape_ok(&pool, api_key_id).await, Some(true));
+    assert_eq!(open_reservations(&pool, api_key_id).await, 0);
+}
+
+/// The re-roll is bounded by the same budget as an error retry, so the THIRD
+/// blank turn is returned to the customer and billed. Dropping the re-roll
+/// would turn the first blank into this outcome — which is why the re-roll is a
+/// billing behavior, not a resilience nicety.
+#[tokio::test]
+async fn non_streaming_empty_completion_on_the_final_attempt_is_returned_as_a_blank_turn() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let (api_key_id, key) = create_funded_key(&pool, "empty-final").await;
+    let primary = FakeModelProvider::new(
+        "primary",
+        vec![blank_completion(), blank_completion(), blank_completion()],
+    );
+    let secondary = FakeModelProvider::new(
+        "secondary",
+        vec![FakeOutcome::chat("hello from secondary", served_usage())],
+    );
+    let state = router(pool.clone(), vec![primary.clone(), secondary.clone()]);
+
+    let response = app(state.clone())
+        .oneshot(completion_request(
+            &key,
+            &completion_body("zero/test-pair", false),
+        ))
+        .await
+        .expect("completion request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    state.wait_for_background_tasks().await;
+
+    assert_eq!(primary.call_count(), 3);
+    assert_eq!(
+        secondary.call_count(),
+        0,
+        "the budget is spent re-rolling, never failed over"
+    );
+    assert_eq!(body["choices"][0]["message"]["content"], "");
+    let (_, _, _, _, cost_usd, status) = settled_event(&pool, api_key_id).await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        cost_usd,
+        served_sell_cost(),
+        "a blank turn returned on the final attempt is a billed turn"
+    );
+    let (candidate_id, cost_basis_usd, _, _) = settled_provenance(&pool, api_key_id).await;
+    assert_eq!(candidate_id.as_deref(), Some("fireworks/primary"));
+    assert_eq!(cost_basis_usd, Some(decimal("0.00104")));
+    assert_eq!(
+        settled_shape_ok(&pool, api_key_id).await,
+        Some(false),
+        "the shape label is what tells the estimator this turn was blank"
+    );
+    assert_eq!(open_reservations(&pool, api_key_id).await, 0);
+}
+
+/// Emptiness is a three-way test. A completion carrying only tool calls is a
+/// complete answer and must not be re-rolled.
+#[tokio::test]
+async fn non_streaming_tool_calls_only_completion_is_not_empty() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let (api_key_id, key) = create_funded_key(&pool, "toolonly").await;
+    let solo = FakeModelProvider::new(
+        "solo",
+        vec![FakeOutcome::Chat {
+            text: None,
+            tool_calls: vec![ToolCall {
+                id: "call_1".to_owned(),
+                name: "shell".to_owned(),
+                arguments: r#"{"command":"pwd"}"#.to_owned(),
+                extra_content: None,
+            }],
+            usage: Some(served_usage()),
+            reasoning_content: None,
+        }],
+    );
+    let state = router(pool.clone(), vec![solo.clone()]);
+
+    let response = app(state.clone())
+        .oneshot(completion_request(
+            &key,
+            &completion_body("zero/test-solo", false),
+        ))
+        .await
+        .expect("completion request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    state.wait_for_background_tasks().await;
+
+    assert_eq!(solo.call_count(), 1, "tool calls are output, not emptiness");
+    assert_eq!(
+        body["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
+        "shell"
+    );
+    assert_eq!(body["choices"][0]["finish_reason"], "tool_calls");
+    assert_eq!(settled_shape_ok(&pool, api_key_id).await, Some(true));
+}
+
+/// A candidate whose error carries a 4xx status token is abandoned after a
+/// single call: no backoff is spent and no retry is burnt on a condition that
+/// cannot resolve.
+#[tokio::test]
+async fn non_streaming_non_retryable_error_moves_on_without_burning_retries() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let (api_key_id, key) = create_funded_key(&pool, "nonretryable").await;
+    let primary = FakeModelProvider::new("primary", vec![FakeOutcome::Failure("401 Unauthorized")]);
+    let secondary = FakeModelProvider::new(
+        "secondary",
+        vec![FakeOutcome::chat("hello from secondary", served_usage())],
+    );
+    let state = router(pool.clone(), vec![primary.clone(), secondary.clone()]);
+
+    let response = app(state.clone())
+        .oneshot(completion_request(
+            &key,
+            &completion_body("zero/test-pair", false),
+        ))
+        .await
+        .expect("completion request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    state.wait_for_background_tasks().await;
+
+    assert_eq!(primary.call_count(), 1, "a 4xx is not retried");
+    assert_eq!(secondary.call_count(), 1);
+    let (candidate_id, _, _, _) = settled_provenance(&pool, api_key_id).await;
+    assert_eq!(candidate_id.as_deref(), Some("together/secondary"));
+    assert_eq!(open_reservations(&pool, api_key_id).await, 0);
+}
+
+/// The 429 short-circuit is gated on there being somewhere else to go. On a
+/// one-candidate route a rate limit is retried like any other transient
+/// failure, spending the whole budget.
+#[tokio::test]
+async fn non_streaming_rate_limit_on_a_single_candidate_route_burns_the_full_budget() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let (api_key_id, key) = create_funded_key(&pool, "solo-429").await;
+    let solo = FakeModelProvider::new(
+        "solo",
+        vec![
+            FakeOutcome::RateLimited,
+            FakeOutcome::RateLimited,
+            FakeOutcome::RateLimited,
+        ],
+    );
+    let state = router(pool.clone(), vec![solo.clone()]);
+
+    let response = app(state.clone())
+        .oneshot(completion_request(
+            &key,
+            &completion_body("zero/test-solo", false),
+        ))
+        .await
+        .expect("completion request should complete");
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let body = json_body(response).await;
+    state.wait_for_background_tasks().await;
+    assert_eq!(body["error"]["code"], "upstream_unavailable");
+
+    assert_eq!(
+        solo.call_count(),
+        3,
+        "with nowhere to fail over to, a 429 is retried"
+    );
+    assert_eq!(open_reservations(&pool, api_key_id).await, 0);
+}
+
+/// The retry budget is per candidate, not per walk: a candidate abandoned after
+/// one call does not shorten the next candidate's budget.
+#[tokio::test]
+async fn non_streaming_the_second_candidate_gets_its_own_retry_budget() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let (api_key_id, key) = create_funded_key(&pool, "own-budget").await;
+    let primary = FakeModelProvider::new("primary", vec![FakeOutcome::Failure("401 Unauthorized")]);
+    let secondary = FakeModelProvider::new(
+        "secondary",
+        vec![
+            FakeOutcome::Transport,
+            FakeOutcome::Transport,
+            FakeOutcome::Transport,
+        ],
+    );
+    let state = router(pool.clone(), vec![primary.clone(), secondary.clone()]);
+
+    let response = app(state.clone())
+        .oneshot(completion_request(
+            &key,
+            &completion_body("zero/test-pair", false),
+        ))
+        .await
+        .expect("completion request should complete");
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    state.wait_for_background_tasks().await;
+
+    assert_eq!(primary.call_count(), 1);
+    assert_eq!(
+        secondary.call_count(),
+        3,
+        "the second candidate starts from a full budget"
+    );
+    assert_eq!(open_reservations(&pool, api_key_id).await, 0);
+}
+
+/// Two candidates on the SAME upstream provider are still two candidates. The
+/// budget, and any transient penalty, is keyed by candidate — a provider-keyed
+/// one would let the first rung's failures shorten the second's.
+#[tokio::test]
+async fn non_streaming_two_candidates_on_one_provider_each_get_a_full_budget() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let (api_key_id, key) = create_funded_key(&pool, "twin").await;
+    let twin_a = FakeModelProvider::new(
+        "twin-a",
+        vec![
+            FakeOutcome::Transport,
+            FakeOutcome::Transport,
+            FakeOutcome::Transport,
+        ],
+    );
+    let twin_b = FakeModelProvider::new(
+        "twin-b",
+        vec![FakeOutcome::chat("hello from twin b", served_usage())],
+    );
+    let state = router_with_catalog(
+        pool.clone(),
+        vec![twin_a.clone(), twin_b.clone()],
+        twin_tier_config_path(),
+    );
+
+    let response = app(state.clone())
+        .oneshot(completion_request(
+            &key,
+            &completion_body("zero/test-twin", false),
+        ))
+        .await
+        .expect("completion request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    state.wait_for_background_tasks().await;
+
+    assert_eq!(twin_a.call_count(), 3);
+    assert_eq!(twin_b.call_count(), 1);
+    let (candidate_id, _, _, _) = settled_provenance(&pool, api_key_id).await;
+    assert_eq!(candidate_id.as_deref(), Some("together/twin-b"));
+    assert_eq!(open_reservations(&pool, api_key_id).await, 0);
+}
+
+/// Retries are spaced, not spun. The schedule is 500ms then 1000ms with no
+/// sleep after the final attempt, so three calls cost at least 1.5s.
+///
+/// A LOWER bound only: the walk clock is `std::time::Instant`, which
+/// `tokio::time::pause` does not mock, so any park on socket I/O auto-advances
+/// the mocked clock to the next armed timer. Equality here would be a flake.
+#[tokio::test]
+async fn non_streaming_backoff_is_spent_between_retries() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let (api_key_id, key) = create_funded_key(&pool, "backoff").await;
+    let primary = FakeModelProvider::new(
+        "primary",
+        vec![
+            FakeOutcome::Transport,
+            FakeOutcome::Transport,
+            FakeOutcome::Transport,
+        ],
+    );
+    let secondary = FakeModelProvider::new(
+        "secondary",
+        vec![FakeOutcome::chat("hello from secondary", served_usage())],
+    );
+    let state = router(pool.clone(), vec![primary.clone(), secondary.clone()]);
+    tokio::time::pause();
+    let started = tokio::time::Instant::now();
+
+    let response = app(state.clone())
+        .oneshot(completion_request(
+            &key,
+            &completion_body("zero/test-pair", false),
+        ))
+        .await
+        .expect("completion request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    state.wait_for_background_tasks().await;
+
+    assert_eq!(primary.call_count(), 3);
+    assert!(
+        started.elapsed() >= Duration::from_millis(1_500),
+        "500ms + 1000ms of backoff must be spent, saw {:?}",
+        started.elapsed()
+    );
+    assert_eq!(open_reservations(&pool, api_key_id).await, 0);
+}
+
+/// A context-window rejection is recovered in place: the oldest half of the
+/// non-system history is dropped and the SAME candidate is called again with
+/// the shortened prompt.
+#[tokio::test]
+async fn non_streaming_context_window_error_truncates_and_retries() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let (api_key_id, key) = create_funded_key(&pool, "ctxtruncate").await;
+    let primary = FakeModelProvider::new(
+        "primary",
+        vec![
+            FakeOutcome::Failure("maximum context length exceeded"),
+            FakeOutcome::chat("hello from a shorter prompt", served_usage()),
+        ],
+    );
+    let secondary = FakeModelProvider::new("secondary", Vec::new());
+    let state = router(pool.clone(), vec![primary.clone(), secondary.clone()]);
+
+    let mut body = completion_body("zero/test-pair", false);
+    body["messages"] = json!([
+        { "role": "user", "content": "one" },
+        { "role": "assistant", "content": "two" },
+        { "role": "user", "content": "three" },
+    ]);
+    let response = app(state.clone())
+        .oneshot(completion_request(&key, &body))
+        .await
+        .expect("completion request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    state.wait_for_background_tasks().await;
+
+    let calls = primary.calls();
+    assert_eq!(calls.len(), 2, "truncation consumes an attempt");
+    assert_eq!(calls[0].message_count, 3);
+    assert_eq!(
+        calls[1].message_count, 2,
+        "the oldest half of the non-system history is dropped"
+    );
+    assert_eq!(secondary.call_count(), 0);
+    let (candidate_id, _, _, _) = settled_provenance(&pool, api_key_id).await;
+    assert_eq!(candidate_id.as_deref(), Some("fireworks/primary"));
+    assert_eq!(open_reservations(&pool, api_key_id).await, 0);
+}
+
+/// A context-window rejection with nothing left to drop aborts the WHOLE walk.
+/// It does not fall through to a candidate with a larger context window —
+/// making it do so would be a resilience change with no baseline to measure.
+#[tokio::test]
+async fn non_streaming_irreducible_context_window_aborts_the_whole_walk() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let (api_key_id, key) = create_funded_key(&pool, "ctxirreducible").await;
+    let primary =
+        FakeModelProvider::new("primary", vec![FakeOutcome::Failure("prompt is too long")]);
+    let secondary = FakeModelProvider::new(
+        "secondary",
+        vec![FakeOutcome::chat("never reached", served_usage())],
+    );
+    let state = router(pool.clone(), vec![primary.clone(), secondary.clone()]);
+
+    let response = app(state.clone())
+        .oneshot(completion_request(
+            &key,
+            &completion_body("zero/test-pair", false),
+        ))
+        .await
+        .expect("completion request should complete");
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let body = json_body(response).await;
+    state.wait_for_background_tasks().await;
+    assert_eq!(body["error"]["code"], "upstream_unavailable");
+
+    assert_eq!(primary.call_count(), 1, "there is nothing to truncate");
+    assert_eq!(
+        secondary.call_count(),
+        0,
+        "an irreducible prompt ends the walk rather than moving on"
+    );
+    assert_eq!(
+        balance(&pool, user_of(&pool, api_key_id).await)
+            .await
+            .expect("balance must query"),
+        Decimal::from(50)
+    );
+    assert_eq!(open_reservations(&pool, api_key_id).await, 0);
+}
+
+/// The upstream deadline is a property of the REQUEST, not of a candidate: it
+/// ends the walk where it stands instead of counting as this candidate's
+/// failure and handing the next candidate a fresh budget.
+#[tokio::test]
+async fn non_streaming_deadline_ends_the_walk_instead_of_falling_through() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let (api_key_id, key) = create_funded_key(&pool, "deadline-walk").await;
+    let primary = FakeModelProvider::new(
+        "primary",
+        vec![FakeOutcome::Stall(Duration::from_secs(20 * 60))],
+    );
+    let secondary = FakeModelProvider::new(
+        "secondary",
+        vec![FakeOutcome::chat("never reached", served_usage())],
+    );
+    let state = router(pool.clone(), vec![primary.clone(), secondary.clone()]);
+    tokio::time::pause();
+
+    let response = app(state.clone())
+        .oneshot(completion_request(
+            &key,
+            &completion_body("zero/test-pair", false),
+        ))
+        .await
+        .expect("completion request should complete");
+    assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+    let body = json_body(response).await;
+    state.wait_for_background_tasks().await;
+    assert_eq!(body["error"]["code"], "upstream_timeout");
+
+    assert_eq!(primary.call_count(), 1);
+    assert_eq!(
+        secondary.call_count(),
+        0,
+        "the deadline is the request's, so there is no budget left to hand on"
+    );
+    let (_, _, input_tokens, output_tokens, cost_usd, status) =
+        settled_event(&pool, api_key_id).await;
+    assert_eq!(
+        (input_tokens, output_tokens, cost_usd, status),
+        (0, 0, Decimal::ZERO, 504)
+    );
+    assert_eq!(
+        balance(&pool, user_of(&pool, api_key_id).await)
+            .await
+            .expect("balance must query"),
+        Decimal::from(50)
+    );
+    assert_eq!(open_reservations(&pool, api_key_id).await, 0);
+}
+
+/// A drained deploy releases the reservation without a charge: nothing reached
+/// the customer, so nothing is billed, and the reservation must not be left for
+/// the TTL sweep.
+#[tokio::test]
+async fn non_streaming_shutdown_releases_the_reservation_without_charge() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let (api_key_id, key) = create_funded_key(&pool, "shutdown-sync").await;
+    let solo = FakeModelProvider::new("solo", vec![FakeOutcome::Stall(Duration::from_secs(60))]);
+    let state = router(pool.clone(), vec![solo.clone()]);
+
+    let request = completion_request(&key, &completion_body("zero/test-solo", false));
+    let inflight = tokio::spawn(app(state.clone()).oneshot(request));
+    // Cancel only once a candidate is genuinely in flight, so the test pins the
+    // mid-dispatch terminal rather than racing the walk's first line.
+    while solo.call_count() == 0 {
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    state.begin_shutdown();
+
+    let response = inflight
+        .await
+        .expect("request task should not panic")
+        .expect("completion request should complete");
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = json_body(response).await;
+    state.wait_for_background_tasks().await;
+    assert_eq!(body["error"]["code"], "server_shutting_down");
+
+    assert_eq!(
+        settled_event(&pool, api_key_id).await,
+        (
+            "fallback-chain".to_owned(),
+            "zero/test-solo".to_owned(),
+            0,
+            0,
+            Decimal::ZERO,
+            503,
+        )
+    );
+    assert_eq!(
+        balance(&pool, user_of(&pool, api_key_id).await)
+            .await
+            .expect("balance must query"),
+        Decimal::from(50)
+    );
+    assert_eq!(open_reservations(&pool, api_key_id).await, 0);
+}
+
+/// A retry that eventually succeeds is still the FIRST candidate's success.
+/// Attribution is what prices the request's COGS, so a walk that mislabelled a
+/// retried primary as a fallback would settle the wrong cost basis — 0.00156
+/// instead of 0.00104 here.
+#[tokio::test]
+async fn non_streaming_attribution_survives_a_retry_on_the_primary() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let (api_key_id, key) = create_funded_key(&pool, "retry-attrib").await;
+    let primary = FakeModelProvider::new(
+        "primary",
+        vec![
+            FakeOutcome::Transport,
+            FakeOutcome::Transport,
+            FakeOutcome::chat("hello on the third try", served_usage()),
+        ],
+    );
+    let secondary = FakeModelProvider::new("secondary", Vec::new());
+    let state = router(pool.clone(), vec![primary.clone(), secondary.clone()]);
+
+    let response = app(state.clone())
+        .oneshot(completion_request(
+            &key,
+            &completion_body("zero/test-pair", false),
+        ))
+        .await
+        .expect("completion request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(header(&response, "x-zerorouter-provider"), "fireworks");
+    assert_eq!(header(&response, "x-zerorouter-model"), "upstream/primary");
+    state.wait_for_background_tasks().await;
+
+    assert_eq!(primary.call_count(), 3);
+    assert_eq!(secondary.call_count(), 0);
+    let (upstream_provider, upstream_model, _, _, cost_usd, status) =
+        settled_event(&pool, api_key_id).await;
+    assert_eq!(upstream_provider, "fireworks");
+    assert_eq!(upstream_model, "upstream/primary");
+    assert_eq!(cost_usd, served_sell_cost());
+    assert_eq!(status, 200);
+    let (candidate_id, cost_basis_usd, _, _) = settled_provenance(&pool, api_key_id).await;
+    assert_eq!(candidate_id.as_deref(), Some("fireworks/primary"));
+    assert_eq!(
+        cost_basis_usd,
+        Some(decimal("0.00104")),
+        "the retried primary's own basis, not the secondary's"
+    );
+    assert_eq!(open_reservations(&pool, api_key_id).await, 0);
 }

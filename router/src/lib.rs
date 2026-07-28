@@ -11,6 +11,7 @@ pub mod oidc;
 pub mod openai;
 pub mod portal;
 pub mod providers;
+pub mod retry;
 pub mod session;
 mod sqlx;
 pub mod stripe;

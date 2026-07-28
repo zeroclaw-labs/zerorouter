@@ -28,12 +28,12 @@ use zeroclaw_providers::traits::{
 };
 
 /// Failure text a [`FakeOutcome::Transport`] reports. Deliberately free of HTTP
-/// status digits so ZeroClaw's classifier (`reliable.rs::is_non_retryable`)
-/// reads it as retryable and the candidate burns its whole retry budget.
+/// status digits so the classifier (`crate::retry::is_non_retryable`) reads it
+/// as retryable and the candidate burns its whole retry budget.
 pub const TRANSPORT_FAILURE: &str = "connection reset by peer";
 
-/// Failure text a [`FakeOutcome::RateLimited`] reports, shaped so ZeroClaw's
-/// classifier (`reliable.rs::is_rate_limited`) reads it as a transient 429.
+/// Failure text a [`FakeOutcome::RateLimited`] reports, shaped so the
+/// classifier (`crate::retry::is_rate_limited`) reads it as a transient 429.
 pub const RATE_LIMIT_FAILURE: &str = "429 Too Many Requests";
 
 /// One scripted upstream outcome. A fake pops these in order, so a single
@@ -54,6 +54,11 @@ pub enum FakeOutcome {
     Transport,
     /// A 429-shaped failure that the retry loop treats as rate-limited.
     RateLimited,
+    /// A failure reporting caller-chosen text, so a test can script the exact
+    /// string the classifier reads — a 4xx status token, an auth phrase, a
+    /// context-window phrase. The classifier only ever sees `err.to_string()`
+    /// (`crate::retry`), so the text IS the upstream condition.
+    Failure(&'static str),
     /// Never answers: sleeps for `Duration` and then reports a failure, so a
     /// caller-imposed deadline elapses first.
     Stall(Duration),
@@ -204,7 +209,9 @@ impl FakeModelProvider {
 
     /// A script mismatch is a test bug, not an upstream condition. Report it
     /// with a 4xx marker so the retry loop treats it as non-retryable and the
-    /// failing test does not also pay the backoff.
+    /// failing test does not also pay the backoff. The marker works through the
+    /// digit scan in `crate::retry::is_non_retryable`, which reads `400` out of
+    /// the message text.
     fn misuse(&self, detail: &str) -> String {
         format!("400 fake upstream {}: {detail}", self.alias)
     }
@@ -255,6 +262,7 @@ impl ModelProvider for FakeModelProvider {
             }),
             Some(FakeOutcome::Transport) => Err(anyhow::anyhow!(TRANSPORT_FAILURE)),
             Some(FakeOutcome::RateLimited) => Err(anyhow::anyhow!(RATE_LIMIT_FAILURE)),
+            Some(FakeOutcome::Failure(detail)) => Err(anyhow::anyhow!(detail)),
             Some(FakeOutcome::Stall(duration)) => {
                 tokio::time::sleep(duration).await;
                 Err(anyhow::anyhow!(TRANSPORT_FAILURE))
@@ -279,6 +287,9 @@ impl ModelProvider for FakeModelProvider {
             }
             Some(FakeOutcome::RateLimited) => {
                 vec![FakeStreamStep::Error(RATE_LIMIT_FAILURE.to_owned())]
+            }
+            Some(FakeOutcome::Failure(detail)) => {
+                vec![FakeStreamStep::Error(detail.to_owned())]
             }
             Some(FakeOutcome::Chat { .. }) => {
                 vec![FakeStreamStep::Error(self.misuse("scripted non-streaming"))]
