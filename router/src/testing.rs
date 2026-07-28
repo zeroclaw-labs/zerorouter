@@ -140,6 +140,9 @@ pub struct FakeModelProvider {
     supports_streaming: bool,
     script: Mutex<VecDeque<FakeOutcome>>,
     calls: Mutex<Vec<FakeCall>>,
+    /// When each call arrived, on the runtime clock rather than the wall clock,
+    /// so a paused test can read the retry schedule the walk actually spent.
+    call_times: Mutex<Vec<tokio::time::Instant>>,
 }
 
 impl FakeModelProvider {
@@ -162,6 +165,7 @@ impl FakeModelProvider {
             supports_streaming,
             script: Mutex::new(VecDeque::from(script)),
             calls: Mutex::new(Vec::new()),
+            call_times: Mutex::new(Vec::new()),
         })
     }
 
@@ -183,6 +187,26 @@ impl FakeModelProvider {
             .len()
     }
 
+    /// The wait between consecutive calls to this fake — the retry schedule as
+    /// the upstream experienced it.
+    ///
+    /// Read this rather than the request's total elapsed time: a paused runtime
+    /// auto-advances the mocked clock to the next armed timer whenever it parks
+    /// on socket I/O, so a request's end-to-end duration sweeps up every timer
+    /// armed during its database round trips and says nothing about backoff.
+    /// Nothing is armed BETWEEN two upstream calls, so these gaps are exact.
+    #[must_use]
+    pub fn call_gaps(&self) -> Vec<Duration> {
+        let times = self
+            .call_times
+            .lock()
+            .expect("fake call clock must not be poisoned");
+        times
+            .windows(2)
+            .map(|pair| pair[1].duration_since(pair[0]))
+            .collect()
+    }
+
     /// Record one call and take the next scripted outcome.
     fn take(
         &self,
@@ -191,6 +215,10 @@ impl FakeModelProvider {
         temperature: Option<f64>,
         streaming: bool,
     ) -> Option<FakeOutcome> {
+        self.call_times
+            .lock()
+            .expect("fake call clock must not be poisoned")
+            .push(tokio::time::Instant::now());
         self.calls
             .lock()
             .expect("fake call log must not be poisoned")

@@ -695,11 +695,13 @@ async fn run_non_streaming(
     // available is a resilience change with no baseline to measure it against.
     let mut effective_messages = request.provider_messages();
     let mut context_truncated = false;
-    // The walk ledger. Built here so `attempt_no` already counts real
-    // dispatches, but deliberately NOT yet drained into the settle sites: this
-    // commit replaces who dispatches and must change nothing a settled row can
-    // observe, so every terminal still writes an empty ledger and still names
-    // the `fallback-chain` sentinel.
+    // The last candidate this walk dispatched to, which is what a terminal
+    // names instead of the `fallback-chain` sentinel. The sentinel means "no
+    // candidate had been selected", and after the unroll that is only true
+    // before the first dispatch — where `None` still says it.
+    let mut last_candidate: Option<&TierCandidate> = None;
+    // The router-owned walk ledger: one row per dispatched upstream call,
+    // drained into whichever terminal settles this request.
     let mut attempts: Vec<AttemptRecord> = Vec::new();
 
     'walk: for candidate in &candidates {
@@ -715,9 +717,9 @@ async fn run_non_streaming(
                     usage_session,
                     &request_id,
                     &resolved,
-                    None,
+                    last_candidate,
                     features,
-                    Vec::new(),
+                    std::mem::take(&mut attempts),
                     started,
                     WalkTerminal::Timeout,
                 )
@@ -751,14 +753,15 @@ async fn run_non_streaming(
                             None,
                             None,
                         ));
+                        last_candidate = Some(candidate.definition());
                     }
                     return Err(settle_walk_terminal(
                         usage_session,
                         &request_id,
                         &resolved,
-                        None,
+                        last_candidate,
                         features,
-                        Vec::new(),
+                        std::mem::take(&mut attempts),
                         started,
                         WalkTerminal::Shutdown,
                     )
@@ -773,6 +776,7 @@ async fn run_non_streaming(
                     .await
                 } => result,
             };
+            last_candidate = Some(candidate.definition());
 
             let err = match result {
                 Err(_elapsed) => {
@@ -791,9 +795,9 @@ async fn run_non_streaming(
                         usage_session,
                         &request_id,
                         &resolved,
-                        None,
+                        last_candidate,
                         features,
-                        Vec::new(),
+                        std::mem::take(&mut attempts),
                         started,
                         WalkTerminal::Timeout,
                     )
@@ -828,9 +832,9 @@ async fn run_non_streaming(
                                 usage_session,
                                 &request_id,
                                 &resolved,
-                                None,
+                                last_candidate,
                                 features,
-                                Vec::new(),
+                                std::mem::take(&mut attempts),
                                 started,
                                 WalkTerminal::Shutdown,
                             )
@@ -847,7 +851,7 @@ async fn run_non_streaming(
                         response,
                         max_tokens,
                         features,
-                        Vec::new(),
+                        attempts,
                         attempt_no,
                         attempt_started,
                         started,
@@ -914,9 +918,9 @@ async fn run_non_streaming(
                         usage_session,
                         &request_id,
                         &resolved,
-                        None,
+                        last_candidate,
                         features,
-                        Vec::new(),
+                        std::mem::take(&mut attempts),
                         started,
                         WalkTerminal::Shutdown,
                     )
@@ -934,9 +938,9 @@ async fn run_non_streaming(
         usage_session,
         &request_id,
         &resolved,
-        None,
+        last_candidate,
         features,
-        Vec::new(),
+        attempts,
         started,
         WalkTerminal::Exhausted,
     )
@@ -1121,7 +1125,7 @@ async fn serve_completion(
             features,
             None,
             None,
-            Vec::new(),
+            attempts,
             started,
             502,
         )
@@ -1166,7 +1170,7 @@ async fn serve_completion(
         features,
         Some(synthesized_finish),
         Some(shape_label),
-        Vec::new(),
+        attempts,
         started,
         200,
     )

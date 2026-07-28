@@ -7,13 +7,12 @@
 //! feature). The catalog is `tests/request_path_tiers.toml`, so these
 //! assertions pin router behavior rather than the production candidate list.
 //!
-//! These tests document what the code does TODAY, ahead of the failover-loop
-//! rewrite. Where current behavior is known-wrong but not yet fixable here the
-//! actual behavior is still asserted, with a comment saying so — do not "fix"
-//! the code to make one of these pass; change the assertion deliberately when
-//! the behavior changes. One such assertion is left: the non-streaming walk
-//! keeps no attempt ledger, which is blocked on unrolling that walk (see
-//! `non_streaming_failover_retries_the_first_candidate_twice_then_bills_the_second`).
+//! These tests document what the code does, not what it ought to do. Where
+//! current behavior is known-wrong but not yet fixable here the actual behavior
+//! is still asserted, with a comment saying so — do not "fix" the code to make
+//! one of these pass; change the assertion deliberately when the behavior
+//! changes. Both walks now record a `request_attempts` ledger, so the
+//! known-gap assertion that used to live here is gone.
 //!
 //! Gated on `DATABASE_URL` like `tests/billing.rs`: when unset each test
 //! returns early (skips) instead of failing.
@@ -76,6 +75,19 @@ const ESTIMATED_OUTPUT_TOKENS: i32 = 2;
 
 fn decimal(value: &str) -> Decimal {
     Decimal::from_str(value).expect("test decimal must parse")
+}
+
+/// The waits between a fake's consecutive calls, in whole tens of milliseconds.
+///
+/// Tokio's timer rounds a deadline up to the next millisecond tick, so a 500ms
+/// sleep lands at 501ms on the mocked clock. The retry schedule's steps are
+/// hundreds of milliseconds apart, so a tens-of-ms reading is exact for what is
+/// being asserted and immune to that tick.
+fn backoff_steps_ms(fake: &FakeModelProvider) -> Vec<u64> {
+    fake.call_gaps()
+        .into_iter()
+        .map(|gap| u64::try_from(gap.as_millis() / 10 * 10).unwrap_or(u64::MAX))
+        .collect()
 }
 
 fn tier_config_path() -> PathBuf {
@@ -326,6 +338,43 @@ async fn attempt_rows(pool: &PgPool, api_key_id: Uuid) -> Vec<(i16, String, Stri
     .expect("attempt rows must query")
 }
 
+/// Which check rejected each attempt, in walk order. `None` on every row a
+/// check was not the reason for.
+async fn attempt_validator_kinds(pool: &PgPool, api_key_id: Uuid) -> Vec<Option<String>> {
+    query_scalar::<_, Option<String>>(
+        r#"
+        SELECT validator_kind
+        FROM request_attempts
+        WHERE api_key_id = $1
+        ORDER BY attempt_no
+        "#,
+    )
+    .bind(api_key_id)
+    .fetch_all(pool)
+    .await
+    .expect("validator kinds must query")
+}
+
+/// `(attempts_cost_basis_usd, attempts_cost_basis_complete)` — what the losing
+/// attempts burnt, and whether that number is the whole story.
+///
+/// Both are NULL only when no walk was recorded at all. A request whose single
+/// attempt served has no losing attempts, which is a genuine zero rather than
+/// an unknown, and reads `Some(0)` + `Some(true)`.
+async fn attempts_cogs(pool: &PgPool, api_key_id: Uuid) -> (Option<Decimal>, Option<bool>) {
+    query_as(
+        r#"
+        SELECT attempts_cost_basis_usd, attempts_cost_basis_complete
+        FROM usage_events
+        WHERE api_key_id = $1
+        "#,
+    )
+    .bind(api_key_id)
+    .fetch_one(pool)
+    .await
+    .expect("attempts COGS must query")
+}
+
 /// The after-the-fact metering-gap detector documented on
 /// `StreamDelivery::settled_usage`, run verbatim: requests where an attempt was
 /// served yet the settled row carries no tokens, i.e. output the customer
@@ -521,10 +570,18 @@ async fn non_streaming_first_candidate_serves_and_settles_its_metered_usage() {
     // COGS at the candidate's own cost basis: 1000 * $1.00 + 20 * $2.00 per Mtok.
     assert_eq!(cost_basis_usd, Some(decimal("0.00104")));
     assert_eq!(finish_reason.as_deref(), Some("stop"));
-    // The non-streaming walk keeps no attempt ledger; only the streaming walk
-    // records `request_attempts` rows today.
-    assert_eq!(attempt_count, None);
-    assert!(attempt_rows(&pool, api_key_id).await.is_empty());
+    // One dispatch, recorded as the served attempt.
+    assert_eq!(attempt_count, Some(1));
+    assert_eq!(
+        attempt_rows(&pool, api_key_id).await,
+        [(1, "fireworks/primary".to_owned(), "ok".to_owned(), true)]
+    );
+    // No losing attempts is a genuine zero, not an unknown — the served
+    // attempt's COGS is counted once, on `cost_basis_usd` above.
+    assert_eq!(
+        attempts_cogs(&pool, api_key_id).await,
+        (Some(Decimal::ZERO), Some(true))
+    );
 
     assert_eq!(
         balance(&pool, user_of(&pool, api_key_id).await)
@@ -594,27 +651,42 @@ async fn non_streaming_failover_retries_the_first_candidate_twice_then_bills_the
     // COGS moves to the second candidate's basis: 1000 * $1.50 + 20 * $3.00.
     assert_eq!(cost_basis_usd, Some(decimal("0.00156")));
 
-    // CONFIRMED GAP, blocked on the walk rewrite (api.rs `run_non_streaming`):
-    // the three burnt calls on the first candidate leave no trace, because the
-    // non-streaming walk is delegated to zeroclaw's `ReliableModelProvider` and
-    // the only per-request outcome it surfaces is `ProviderFallbackInfo`
-    // (requested/actual provider + model, recorded on success only). Losing
-    // attempts exist there solely as a `Vec<String>` of log lines folded into
-    // the error on total failure, so no honest ledger row can be reconstructed
-    // without unrolling the walk into the router the way the streaming path
-    // already does. NULL is the correct value until then: migration 0004
-    // documents `attempts_cost_basis_usd` as NULL until the router-owned walk
-    // records attempts, and writing a placeholder here would claim the burnt
-    // calls cost nothing.
-    assert!(attempt_rows(&pool, api_key_id).await.is_empty());
-    let attempts_cogs = query_scalar::<_, Option<Decimal>>(
-        "SELECT attempts_cost_basis_usd FROM usage_events WHERE api_key_id = $1",
-    )
-    .bind(api_key_id)
-    .fetch_one(&pool)
-    .await
-    .expect("attempts COGS must query");
-    assert_eq!(attempts_cogs, None);
+    // The three burnt calls on the first candidate are now on the record. They
+    // used to leave no trace at all: the walk was delegated, and the only
+    // per-request outcome it surfaced was which candidate had served.
+    assert_eq!(
+        attempt_rows(&pool, api_key_id).await,
+        [
+            (
+                1,
+                "fireworks/primary".to_owned(),
+                "upstream_error".to_owned(),
+                false
+            ),
+            (
+                2,
+                "fireworks/primary".to_owned(),
+                "upstream_error".to_owned(),
+                false
+            ),
+            (
+                3,
+                "fireworks/primary".to_owned(),
+                "upstream_error".to_owned(),
+                false
+            ),
+            (4, "together/secondary".to_owned(), "ok".to_owned(), true),
+        ],
+        "one row per dispatched upstream call, ordinals continuing across candidates"
+    );
+    // Zero AND incomplete, which is the honest reading: three calls were
+    // burnt and none of them reported what it consumed. Not NULL — NULL now
+    // means only "no walk recorded" — and not a total, which a bare zero
+    // would claim.
+    assert_eq!(
+        attempts_cogs(&pool, api_key_id).await,
+        (Some(Decimal::ZERO), Some(false))
+    );
     assert_eq!(open_reservations(&pool, api_key_id).await, 0);
 }
 
@@ -647,6 +719,21 @@ async fn non_streaming_rate_limited_candidate_moves_on_without_burning_retries()
     assert_eq!(secondary.call_count(), 1);
     let (candidate_id, _, _, _) = settled_provenance(&pool, api_key_id).await;
     assert_eq!(candidate_id.as_deref(), Some("together/secondary"));
+    // The abandoned 429 is on the record, labelled as the rate limit it was
+    // rather than as a generic upstream error — the distinction a health
+    // estimator needs and the delegated walk never surfaced.
+    assert_eq!(
+        attempt_rows(&pool, api_key_id).await,
+        [
+            (
+                1,
+                "fireworks/primary".to_owned(),
+                "rate_limited".to_owned(),
+                false
+            ),
+            (2, "together/secondary".to_owned(), "ok".to_owned(), true),
+        ]
+    );
     assert_eq!(open_reservations(&pool, api_key_id).await, 0);
 }
 
@@ -674,22 +761,46 @@ async fn non_streaming_every_candidate_failing_releases_the_reservation_without_
 
     assert_eq!(primary.call_count(), 1);
     assert_eq!(secondary.call_count(), 1);
-    // No tokens were delivered, so the reservation is released with a
-    // zero-cost sentinel row rather than a charge.
+    // No tokens were delivered, so the reservation is released at zero cost.
+    // The row names the last candidate the walk actually reached: the
+    // `fallback-chain` sentinel means "no candidate had been selected", and
+    // after the unroll that is only true before the first dispatch.
     assert_eq!(
         settled_event(&pool, api_key_id).await,
         (
-            "fallback-chain".to_owned(),
-            "zero/test-pair".to_owned(),
+            "together".to_owned(),
+            "upstream/secondary".to_owned(),
             0,
             0,
             Decimal::ZERO,
             502,
         )
     );
-    let (candidate_id, cost_basis_usd, _, _) = settled_provenance(&pool, api_key_id).await;
-    assert_eq!(candidate_id, None, "no candidate was selected");
-    assert_eq!(cost_basis_usd, None);
+    let (candidate_id, cost_basis_usd, attempt_count, _) =
+        settled_provenance(&pool, api_key_id).await;
+    assert_eq!(candidate_id.as_deref(), Some("together/secondary"));
+    // Zero tokens at a real candidate's basis prices to zero, so margin is
+    // `0 - 0 - attempts_cost_basis_usd` — arithmetically the burnt COGS,
+    // where it used to be `0 - NULL - NULL`.
+    assert_eq!(cost_basis_usd, Some(Decimal::ZERO));
+    assert_eq!(attempt_count, Some(2));
+    assert_eq!(
+        attempt_rows(&pool, api_key_id).await,
+        [
+            (
+                1,
+                "fireworks/primary".to_owned(),
+                "rate_limited".to_owned(),
+                false
+            ),
+            (
+                2,
+                "together/secondary".to_owned(),
+                "rate_limited".to_owned(),
+                false
+            ),
+        ]
+    );
     assert_eq!(
         balance(&pool, user_of(&pool, api_key_id).await)
             .await
@@ -731,17 +842,23 @@ async fn non_streaming_timeout_releases_the_reservation_without_charge() {
 
     // The non-streaming deadline releases the reservation at zero cost, and so
     // does its streaming sibling — see
-    // `streaming_timeout_releases_the_reservation_without_charge`.
+    // `streaming_timeout_releases_the_reservation_without_charge`. The row now
+    // names the candidate that was in flight when the deadline hit; the
+    // delegated walk destroyed that with the dropped future.
     assert_eq!(
         settled_event(&pool, api_key_id).await,
         (
-            "fallback-chain".to_owned(),
-            "zero/test-solo".to_owned(),
+            "deepinfra".to_owned(),
+            "upstream/solo".to_owned(),
             0,
             0,
             Decimal::ZERO,
             504,
         )
+    );
+    assert_eq!(
+        attempt_rows(&pool, api_key_id).await,
+        [(1, "deepinfra/solo".to_owned(), "timeout".to_owned(), false)]
     );
     assert_eq!(
         balance(&pool, user_of(&pool, api_key_id).await)
@@ -1713,6 +1830,44 @@ async fn non_streaming_empty_completion_is_rerolled_within_the_candidate_budget(
     let (candidate_id, _, _, _) = settled_provenance(&pool, api_key_id).await;
     assert_eq!(candidate_id.as_deref(), Some("fireworks/primary"));
     assert_eq!(settled_shape_ok(&pool, api_key_id).await, Some(true));
+    // A re-rolled blank turn is `validation_failed`, not `upstream_error`: the
+    // HTTP call succeeded and the RESPONSE was rejected. `validator_kind`
+    // records which check did the rejecting, so a later declared validator's
+    // failures stay distinguishable from this one.
+    assert_eq!(
+        attempt_rows(&pool, api_key_id).await,
+        [
+            (
+                1,
+                "fireworks/primary".to_owned(),
+                "validation_failed".to_owned(),
+                false
+            ),
+            (
+                2,
+                "fireworks/primary".to_owned(),
+                "validation_failed".to_owned(),
+                false
+            ),
+            (3, "fireworks/primary".to_owned(), "ok".to_owned(), true),
+        ]
+    );
+    assert_eq!(
+        attempt_validator_kinds(&pool, api_key_id).await,
+        [
+            Some("empty_completion".to_owned()),
+            Some("empty_completion".to_owned()),
+            None,
+        ]
+    );
+    // The two discarded responses reported usage, so the walk knows exactly
+    // what re-rolling cost: 2 x $0.00104 of burnt COGS that was previously
+    // dropped on the floor. It never reaches `cost_usd` — this is ZeroRouter's
+    // spend, not the customer's bill.
+    assert_eq!(
+        attempts_cogs(&pool, api_key_id).await,
+        (Some(decimal("0.00208")), Some(true))
+    );
     assert_eq!(open_reservations(&pool, api_key_id).await, 0);
 }
 
@@ -1768,6 +1923,26 @@ async fn non_streaming_empty_completion_on_the_final_attempt_is_returned_as_a_bl
         settled_shape_ok(&pool, api_key_id).await,
         Some(false),
         "the shape label is what tells the estimator this turn was blank"
+    );
+    // The blank turn that IS returned is `ok` and served — the re-roll budget
+    // ran out, not the response's validity.
+    assert_eq!(
+        attempt_rows(&pool, api_key_id).await,
+        [
+            (
+                1,
+                "fireworks/primary".to_owned(),
+                "validation_failed".to_owned(),
+                false
+            ),
+            (
+                2,
+                "fireworks/primary".to_owned(),
+                "validation_failed".to_owned(),
+                false
+            ),
+            (3, "fireworks/primary".to_owned(), "ok".to_owned(), true),
+        ]
     );
     assert_eq!(open_reservations(&pool, api_key_id).await, 0);
 }
@@ -2192,13 +2367,20 @@ async fn non_streaming_shutdown_releases_the_reservation_without_charge() {
     assert_eq!(
         settled_event(&pool, api_key_id).await,
         (
-            "fallback-chain".to_owned(),
-            "zero/test-solo".to_owned(),
+            "deepinfra".to_owned(),
+            "upstream/solo".to_owned(),
             0,
             0,
             Decimal::ZERO,
             503,
         )
+    );
+    // A call was in flight when the drain began, so it burnt an upstream
+    // request and is recorded as aborted. Cancelled before dispatch, there
+    // would be no row and the sentinel would still be the honest answer.
+    assert_eq!(
+        attempt_rows(&pool, api_key_id).await,
+        [(1, "deepinfra/solo".to_owned(), "aborted".to_owned(), false)]
     );
     assert_eq!(
         balance(&pool, user_of(&pool, api_key_id).await)
@@ -2322,8 +2504,145 @@ async fn non_streaming_success_without_upstream_usage_bills_nothing() {
         "nothing metered, nothing billed"
     );
     assert_eq!(open_reservations(&pool, api_key_id).await, 0);
+    // The call is on the record as `ok` — it completed — but NOT served: the
+    // body was discarded. That is what keeps the gap detector below silent
+    // while `log_metering_gap` fires, and it is the whole reason `served`
+    // tracks possession rather than completion.
+    assert_eq!(
+        attempt_rows(&pool, api_key_id).await,
+        [(1, "deepinfra/solo".to_owned(), "ok".to_owned(), false)]
+    );
     // The gap detector stays silent: nothing reached the customer, so no
     // attempt on this request is `served` and the zero-token row is not a
     // delivery ZeroRouter failed to bill.
     assert_eq!(unbilled_served_requests(&pool, api_key_id).await, 0);
+}
+
+/// Each candidate starts its backoff schedule over. A walk that carried the
+/// interval across candidates would have the last rung waiting eight times as
+/// long as the first for no reason the upstream ever gave it: 500ms then 1000ms
+/// per candidate here, not 500/1000 followed by 2000/4000.
+#[tokio::test]
+async fn non_streaming_each_candidate_starts_its_backoff_schedule_over() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let (api_key_id, key) = create_funded_key(&pool, "backoff-reset").await;
+    let primary = FakeModelProvider::new(
+        "primary",
+        vec![
+            FakeOutcome::Transport,
+            FakeOutcome::Transport,
+            FakeOutcome::Transport,
+        ],
+    );
+    let secondary = FakeModelProvider::new(
+        "secondary",
+        vec![
+            FakeOutcome::Transport,
+            FakeOutcome::Transport,
+            FakeOutcome::Transport,
+        ],
+    );
+    let state = router(pool.clone(), vec![primary.clone(), secondary.clone()]);
+    tokio::time::pause();
+
+    let response = app(state.clone())
+        .oneshot(completion_request(
+            &key,
+            &completion_body("zero/test-pair", false),
+        ))
+        .await
+        .expect("completion request should complete");
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    state.wait_for_background_tasks().await;
+
+    assert_eq!(primary.call_count(), 3);
+    assert_eq!(secondary.call_count(), 3);
+    assert_eq!(backoff_steps_ms(&primary), [500, 1_000]);
+    assert_eq!(
+        backoff_steps_ms(&secondary),
+        [500, 1_000],
+        "a schedule carried across candidates would wait 2s then 4s here"
+    );
+    assert_eq!(open_reservations(&pool, api_key_id).await, 0);
+}
+
+/// A drained router must not be held open by a backoff it is only waiting out
+/// to be polite to an upstream. Here the upstream asks for twenty seconds and
+/// the walk honors it — `Retry-After` lengthens the wait, capped at thirty
+/// seconds — so a shutdown that did not race the sleep would keep this request,
+/// its reservation, and the drain itself waiting the full twenty.
+#[tokio::test]
+async fn non_streaming_shutdown_during_a_backoff_releases_the_reservation_without_charge() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let (api_key_id, key) = create_funded_key(&pool, "shutdown-backoff").await;
+    let solo = FakeModelProvider::new(
+        "solo",
+        vec![
+            FakeOutcome::Failure("429 Too Many Requests; Retry-After: 20"),
+            FakeOutcome::Failure("429 Too Many Requests; Retry-After: 20"),
+            FakeOutcome::Failure("429 Too Many Requests; Retry-After: 20"),
+        ],
+    );
+    let state = router(pool.clone(), vec![solo.clone()]);
+
+    let request = completion_request(&key, &completion_body("zero/test-solo", false));
+    let inflight = tokio::spawn(app(state.clone()).oneshot(request));
+    while solo.call_count() == 0 {
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    // Real time, deliberately: what this pins is how long a drain waits, and
+    // the outcome is identical either way — a sleep that ran to completion
+    // would meet the shutdown at the next dispatch instead and settle exactly
+    // the same row, twenty seconds later. Latency IS the property here.
+    let drained_at = std::time::Instant::now();
+    state.begin_shutdown();
+
+    let response = inflight
+        .await
+        .expect("request task should not panic")
+        .expect("completion request should complete");
+    let drain_took = drained_at.elapsed();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = json_body(response).await;
+    state.wait_for_background_tasks().await;
+    assert_eq!(body["error"]["code"], "server_shutting_down");
+
+    assert!(
+        drain_took < Duration::from_secs(5),
+        "a backoff that ignored shutdown would hold the drain for the upstream's \
+         full twenty seconds; this took {drain_took:?}"
+    );
+    assert_eq!(
+        solo.call_count(),
+        1,
+        "the walk stops in the backoff rather than finishing it"
+    );
+    // No `aborted` row: nothing was in flight, so no upstream call was burnt by
+    // the drain. The 429 that started the backoff is on the record.
+    assert_eq!(
+        attempt_rows(&pool, api_key_id).await,
+        [(
+            1,
+            "deepinfra/solo".to_owned(),
+            "rate_limited".to_owned(),
+            false
+        )]
+    );
+    let (_, _, input_tokens, output_tokens, cost_usd, status) =
+        settled_event(&pool, api_key_id).await;
+    assert_eq!(
+        (input_tokens, output_tokens, cost_usd, status),
+        (0, 0, Decimal::ZERO, 503)
+    );
+    assert_eq!(
+        balance(&pool, user_of(&pool, api_key_id).await)
+            .await
+            .expect("balance must query"),
+        Decimal::from(50)
+    );
+    assert_eq!(open_reservations(&pool, api_key_id).await, 0);
 }
