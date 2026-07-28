@@ -2405,6 +2405,18 @@ async fn the_walk_never_logs_an_upstream_error_body() {
     // what stops the detail.
     let subscriber = logging::subscriber("trace", captured.clone());
     let _guard = tracing::dispatcher::set_default(&tracing::Dispatch::new(subscriber));
+    // Repair the callsite interest cache before driving the walk. While
+    // exactly one `Dispatch` is registered — and the one above is the only one
+    // in this binary — tracing-core resolves a newly registered callsite's
+    // interest against *the registering thread's* default subscriber instead
+    // of against the registered dispatch. Ours is thread-local to this test,
+    // so a callsite first hit on another test's thread caches `never`, and a
+    // `never` callsite is skipped by the macro before this thread's subscriber
+    // is ever consulted. That reads here as "the walk logged nothing", failing
+    // the positive controls below on a walk that logged correctly.
+    // `Dispatch::new` above already repaired every callsite registered before
+    // it; this rebuild, run from this thread, covers the ones after.
+    tracing::callsite::rebuild_interest_cache();
 
     let response = app(state.clone())
         .oneshot(completion_request(
