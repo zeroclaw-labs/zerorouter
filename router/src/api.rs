@@ -157,7 +157,7 @@ fn attempt_tokens(usage: Option<OpenAiUsage>, estimated_output: u64) -> AttemptT
 /// event is countable after the fact without a new column — see
 /// [`StreamDelivery::settled_usage`] for the ledger query.
 fn log_metering_gap(
-    metadata: &StreamMetadata,
+    request_id: &str,
     resolved: &ResolvedRoute,
     candidate: Option<&TierCandidate>,
     output_delivered: bool,
@@ -174,7 +174,7 @@ fn log_metering_gap(
         },
     );
     tracing::error!(
-        request_id = metadata.request_id,
+        request_id,
         requested_model = resolved.requested_model,
         candidate_id,
         upstream_provider,
@@ -761,13 +761,36 @@ async fn run_non_streaming(
     };
 
     let Some(usage) = OpenAiUsage::try_from_provider(selected.response.usage.as_ref()) else {
+        // The buffered twin of `complete_synthetic_stream`'s gap, settled by
+        // the same rule: no metered usage, no bill.
+        //
+        // This site used to settle at `reservation_usage` — a BYTE-length
+        // input bound plus the whole 4096-token output bound — for a response
+        // the customer never receives, since the branch discards the body and
+        // answers 503 `metering_unavailable`. On the fixture tier that billed
+        // $0.024795 against a real completion's $0.00312: roughly eight times
+        // the price of the answer, charged for no answer at all. It was the
+        // last non-metered charge left in the crate, and its structural
+        // sibling four hundred lines below already settled zero.
+        //
+        // Loud, because an unbilled delivery is lost revenue and a silent one
+        // is a revenue hole that grows unnoticed — and countable afterwards
+        // without a new column, by the join documented on
+        // `StreamDelivery::settled_usage`.
+        log_metering_gap(
+            &request_id,
+            &resolved,
+            Some(selected.candidate),
+            false,
+            "non_streaming",
+        );
         persist_usage(
             usage_session,
             &resolved.requested_model,
             &selected.candidate.provider,
             &selected.candidate.model,
             Some(selected.candidate),
-            reservation_usage,
+            OpenAiUsage::default(),
             resolved.sell_rates,
             features,
             None,
@@ -1309,7 +1332,7 @@ async fn stream_to_channel(
             let settled_usage = delivery.settled_usage(usage);
             if delivery.model_output_sent && usage.is_none() {
                 log_metering_gap(
-                    &metadata,
+                    &metadata.request_id,
                     &resolved,
                     Some(candidate.definition()),
                     true,
@@ -1469,7 +1492,13 @@ async fn settle_stream_interruption(
     // upstream deadline (`Timeout`) both settle here.
     let settled_usage = delivery.settled_usage(usage);
     if delivery.model_output_sent && usage.is_none() {
-        log_metering_gap(metadata, resolved, candidate, true, interruption.label());
+        log_metering_gap(
+            &metadata.request_id,
+            resolved,
+            candidate,
+            true,
+            interruption.label(),
+        );
     }
     let error = if let Some(session) = usage_session.take() {
         match persist_usage(
@@ -1547,7 +1576,7 @@ async fn complete_synthetic_stream(
         // customer never even receives (this branch aborts with
         // `metering_unavailable` instead of replaying it).
         log_metering_gap(
-            metadata,
+            &metadata.request_id,
             resolved,
             Some(candidate.definition()),
             false,
@@ -1710,7 +1739,7 @@ async fn finish_successful_stream(
         // the customer keeps the output and ZeroRouter absorbs the provider
         // cost, which is the deliberate price of never guessing at a bill.
         log_metering_gap(
-            metadata,
+            &metadata.request_id,
             resolved,
             Some(candidate.definition()),
             delivery.model_output_sent,

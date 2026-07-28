@@ -2259,3 +2259,71 @@ async fn non_streaming_attribution_survives_a_retry_on_the_primary() {
     );
     assert_eq!(open_reservations(&pool, api_key_id).await, 0);
 }
+
+/// An upstream that answers but reports no usage is the one shape where the
+/// buffered path used to bill an ESTIMATE: a byte-length input bound plus the
+/// whole requested output bound, for a completion this branch then throws away.
+/// On this fixture tier that was $0.024795 against a real completion's
+/// $0.00312 — eight times the price of the answer, for no answer.
+///
+/// The policy is metered actuals only, on every path. The exact twin of
+/// `synthetic_stream_without_upstream_usage_bills_nothing`.
+#[tokio::test]
+async fn non_streaming_success_without_upstream_usage_bills_nothing() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let (api_key_id, key) = create_funded_key(&pool, "unmetered-sync").await;
+    let solo = FakeModelProvider::new(
+        "solo",
+        vec![FakeOutcome::Chat {
+            text: Some("an answer nobody is charged for".to_owned()),
+            tool_calls: Vec::new(),
+            usage: None,
+            reasoning_content: None,
+        }],
+    );
+    let state = router(pool.clone(), vec![solo.clone()]);
+
+    let response = app(state.clone())
+        .oneshot(completion_request(
+            &key,
+            &completion_body("zero/test-solo", false),
+        ))
+        .await
+        .expect("completion request should complete");
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = json_body(response).await;
+    state.wait_for_background_tasks().await;
+    assert_eq!(body["error"]["code"], "metering_unavailable");
+    assert!(
+        !body.to_string().contains("an answer nobody is charged for"),
+        "the unmetered completion is discarded, not returned: {body}"
+    );
+
+    assert_eq!(solo.call_count(), 1);
+    assert_eq!(
+        settled_event(&pool, api_key_id).await,
+        (
+            "deepinfra".to_owned(),
+            "upstream/solo".to_owned(),
+            0,
+            0,
+            Decimal::ZERO,
+            502,
+        ),
+        "an unmetered turn settles at zero, naming the candidate that produced it"
+    );
+    assert_eq!(
+        balance(&pool, user_of(&pool, api_key_id).await)
+            .await
+            .expect("balance must query"),
+        Decimal::from(50),
+        "nothing metered, nothing billed"
+    );
+    assert_eq!(open_reservations(&pool, api_key_id).await, 0);
+    // The gap detector stays silent: nothing reached the customer, so no
+    // attempt on this request is `served` and the zero-token row is not a
+    // delivery ZeroRouter failed to bill.
+    assert_eq!(unbilled_served_requests(&pool, api_key_id).await, 0);
+}
