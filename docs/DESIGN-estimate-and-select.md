@@ -131,6 +131,38 @@ values → 400 (`priority_conflict`): a conflict is a client bug; be loud.
 order, byte-bound reservation, unchanged responses. Backward compatibility is
 the identity function, and it is testable byte-for-byte.
 
+> **Shipped in Stage 3a** (`priority.rs`, `openai.rs`, `api.rs`, `auth.rs`,
+> `config.rs`, `portal.rs`, `admin.rs`). Points where this section was terse
+> are now decided, recorded so they are re-decided rather than re-derived:
+>
+> - **The typed object carries `priority` alone in 3a.** `validator` and
+>   `budget_usd` are not fields yet; `deny_unknown_fields` makes them — and
+>   any typo — a loud 400 until the stage that defines them, rather than
+>   silently accepted no-ops. An empty `"zerorouter": {}` is legal,
+>   forward-compatible, and does not engage the knob.
+> - **The stripped name is the name.** After suffix stripping, every surface
+>   reads the resolved model: `usage_events.tier` (as specified),
+>   the response `model` field, and stream-chunk `model` — the suffix is a
+>   carrier, not part of the model's identity.
+> - **A suffix on an unresolvable base falls through untouched** to the same
+>   404/withheld answer the base alone would get; an empty base (`":cost"`)
+>   is not a carrier.
+> - **The resolved priority is written on every settled row** at every
+>   terminal of both walks; NULL is reserved for rows that predate the knob —
+>   including a settlement intent persisted before the deploy and replayed
+>   after it (`TelemetryPayload.priority` is `#[serde(default)]`), which
+>   settles NULL rather than guessing `balanced`.
+> - **The per-key default rides `AuthenticatedKey`** out of the authenticate
+>   SELECT under its existing 30-second cache — a changed default has
+>   exactly the staleness contract of a disablement, as designed. The
+>   device-claim mint leaves it NULL.
+> - **`PATCH /api/keys/{id}` is presence-semantics**: the body field is a
+>   double `Option` — absent leaves the key unchanged (`{}` is a no-op
+>   answering the current summary), explicit `null` clears to balanced, a
+>   keyword sets. Strict namespace like the request object; other tenants'
+>   keys 404; disabled keys stay patchable (the flag governs dispatch, not
+>   ownership).
+
 ### Validators
 
 **Zero-config default: the implicit shape check.** Every request — with or
@@ -224,6 +256,25 @@ walk resolves (`streaming_response` returns at `api.rs:397-437` with only
 tolerate an extra top-level field; clients without `include_usage` read
 attempts and savings from the portal usage endpoint. Honest, and a strict
 improvement over invisible.
+
+> **Shipped in Stage 3a**, with the visibility rule this section implied
+> made explicit: the block is attached **only when the request engaged the
+> knob** through some carrier (typed object, suffix, or key default). A
+> request that never mentioned the knob keeps a byte-identical legacy body —
+> the testable backward-compatibility anchor — while its resolved `balanced`
+> is still persisted. The 3a block is `priority` + `attempts` + `validated`
+> (null exactly as defined: no validator was declared); `estimate`,
+> `limited`, and `savings` are **absent until their stages ship them**, so
+> each field's appearance is itself the capability signal. The attempts
+> array is built from the same walk ledger the settle transaction drains,
+> immediately before it drains, so the customer-visible story and the
+> `request_attempts` rows cannot diverge; skips are included. The
+> `x-zerorouter-attempts` header is additive and rides every served buffered
+> response, engaged or not; both stream serve paths (live and synthetic)
+> attach the block to the usage chunk. The portal-usage-endpoint read path
+> for header-less streaming clients is **not** in 3a — it ships with a later
+> portal pass.
+
 
 ### Error semantics
 
@@ -463,6 +514,24 @@ reachable only via missing credentials; `EmptyRoute` (`providers.rs:321-323`)
 is the empty-input guard that catalog validation (`EmptyTier`,
 `config.rs:170-174`) already makes unreachable — health demotion reorders and
 never removes, so it can never manufacture either.
+
+> **Shipped in Stage 3a** at the designated seam, with two decisions
+> recorded. First, 3a's ordering is exactly the rollout row's bound: every
+> mode's base order is the identity (no estimator exists to order by), and
+> health demotion — sink to the back, table order preserved within each
+> group — is the only permutation; the mode arms exist so 3b's cost/success
+> orderings change `order_candidates`' body, not its callers. Second, the
+> permutation is applied to the **built route** (`ProviderRoute::
+> candidates_mut`) rather than to `resolved.candidates` before
+> `ProviderRoute::new`: each rung's definition and its constructed transport
+> move together, so a reorder cannot pair one candidate's definition with
+> another's client — semantically identical (`ProviderRoute` preserves
+> order), mechanically safer. Demotion's first line is now the ordering; the
+> stage-2b walk-time skip remains as the backstop for a rung that cools
+> between ordering and the walk reaching it, keeping its recorded
+> `health_skipped` rows and its never-below-one-candidate floor. An
+> all-demoted route partitions to itself, so ordering never manufactures an
+> empty route.
 
 ### Provider-health state
 
