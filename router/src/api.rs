@@ -337,9 +337,9 @@ const SSE_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 const UPSTREAM_REQUEST_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
 /// Retries one candidate gets after its first call, so three upstream calls per
-/// candidate and never a fourth. Reproduces the delegated walk's
-/// `PROVIDER_RETRIES` exactly; changing it changes what every failing request
-/// costs in provider spend.
+/// candidate and never a fourth. Reproduces the delegated walk's retry budget
+/// exactly; changing it changes what every failing request costs in provider
+/// spend.
 const CANDIDATE_RETRIES: u32 = 2;
 
 /// First wait between a candidate's attempts, doubled per retry and capped by

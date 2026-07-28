@@ -598,11 +598,11 @@ async fn non_streaming_failover_retries_the_first_candidate_twice_then_bills_the
         return;
     };
     let (api_key_id, key) = create_funded_key(&pool, "failover").await;
-    // Today's `ReliableModelProvider` is built with 2 retries and a 500ms base
-    // backoff (providers.rs `PROVIDER_RETRIES` / `PROVIDER_BACKOFF_MS`), so a
-    // retryable failure costs 3 upstream calls and ~1.5s before the walk moves
-    // on. Scripting exactly 3 failures pins that budget: a 4th call would fall
-    // off the script and fail the request instead of failing over.
+    // The walk allows `CANDIDATE_RETRIES` retries on a 500ms base backoff
+    // (api.rs), so a retryable failure costs 3 upstream calls and ~1.5s before
+    // the walk moves on. Scripting exactly 3 failures pins that budget: a 4th
+    // call would fall off the script and fail the request instead of failing
+    // over.
     let primary = FakeModelProvider::new(
         "primary",
         vec![

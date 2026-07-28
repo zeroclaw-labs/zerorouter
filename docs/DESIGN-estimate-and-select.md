@@ -476,6 +476,30 @@ a 429 sets a 60s cooldown; success decays the EWMA; demote when
 state is exactly today's behavior). Persisted/shared health is explicitly
 deferred.
 
+> **Deferred out of Stage 2 (shipped).** No `ProviderHealth` type, registry,
+> demotion, or `'health_skipped'` row exists yet, for three reasons in the
+> order that decided it. The streaming walk has no health state either, so
+> adding one only to the buffered walk would open the exact cross-path
+> divergence Stage 2 existed to close. Observe-only is already delivered, as
+> data rather than as an in-process EWMA: `request_attempts` plus
+> `request_attempts_candidate_ts_idx` is a queryable, durable,
+> restart-surviving record of every attempt outcome and latency, which is a
+> strictly better bake-week instrument than a registry that is lost on
+> restart. And Stage 2's whole reviewability claim was "every pre-existing
+> assertion still holds", which new mutable cross-request state would have
+> made unauditable.
+>
+> The seam is one line each, and both sites exist in the shipped loop:
+> `health.observe(candidate, outcome)` at the single `attempts.push(...)`
+> funnel, and `health.should_skip(candidate)` at the top of the candidate
+> loop, pushing a `'health_skipped'` row and continuing. Neither is written.
+>
+> The 429-cooldown map did not need replacing to be removed. Under ZeroRouter's
+> wiring its key was the candidate id, each candidate was visited once per
+> walk, and the map lived exactly one request — so no entry it wrote could ever
+> be read back. Its only observable effect, the move-on-instead-of-wait break,
+> is reproduced directly. Cross-request cooldown arrives with health.
+
 ### The escalation loop
 
 **Non-streaming: unroll `ReliableModelProvider`** (map §5.4 — one change,
@@ -511,14 +535,28 @@ settle served-or-best; attempts rows ride the settle transaction
 ```
 
 This deletes the `scope_provider_fallback` / `take_last_provider_fallback`
-attribution hack (`providers.rs:243-264`) and the `ReliableModelProvider`
-construction (`providers.rs:383-388`); per-attempt retries drop from 2×500ms
-(`providers.rs:26-27`) to one — the ladder replaces blind retry. It lands the
+attribution hack and the `ReliableModelProvider` construction. It lands the
 attempts ledger, direct winner attribution, the validator hook, and health
 instrumentation simultaneously, and is the first concrete step of the
-thin-trait option, taken on its own merits. Existing attribution tests
-(`providers.rs:627-658`) are replaced by loop-level tests asserting the same
-observable.
+thin-trait option, taken on its own merits. Existing attribution tests are
+replaced by loop-level tests asserting the same observable.
+
+> **Revised in Stage 2 (shipped): the retry cut was rejected.** Per-attempt
+> retries stay at 2×500ms rather than dropping to one. Cutting them would have
+> been a behavior change smuggled into a change whose entire warrant was that
+> it changed no behavior — and an expensive one to review, since the retry
+> budget is what a failing request costs in provider spend, and no test
+> measured that budget before Stage 2 added one. There is no ladder to replace
+> blind retry until Stage 5a ships one, so the cut would have traded
+> availability for nothing in the interim. Revisit it with the ladder, where a
+> retry and an escalation can be weighed against each other.
+>
+> Two further behaviors were reproduced rather than revised, both because
+> dropping them would have moved money: the empty-completion re-roll (a blank
+> turn returned instead of re-rolled settles as a billed 200), and
+> context-window truncation including its abort of the whole walk. Whether an
+> empty completion should escalate rather than re-roll is a Stage-5a question,
+> not an availability one.
 
 **The invariance claim, stated honestly:** the unroll is
 **response-invariant on the no-failure path** — same candidate, same
@@ -859,7 +897,7 @@ is real again.)
 |---|---|---|---|
 | 0 | 1, 2 | Prereqs, parallel: advance the ZC pin (builder rewrite `providers.rs:369-445`, `.timeout_secs(900)`; decide B0's fate); OpenRouter-shaped string pricing on `/v1/models` (`openai.rs:355-361`, `api.rs:147-152`) | pricing only |
 | 1 | 3 | **Migration 0004** + telemetry at all 13 persist sites + user-scoped task signature + synthesized `finish_reason`(+`_source`) + `shape_ok` labeling + attempts rows from the already-router-owned streaming walk (`api.rs:459-764`). Zero behavior change, zero wire change; the margin dashboard (per-request gross margin and walk-COGS aggregates; the opus/haiku negative-margin rungs it was originally scoped to watch are gone from the table and now rejected at catalog load) and the data flywheel start here | no |
-| 2 | 4 | **Unroll the non-streaming walk** into the router-owned loop; attempts rows everywhere; `ProviderHealth` (observe-only for a bake week, then demotion); attribution hack deleted. Canary: happy-path byte-diff on `balanced` **plus** the fault-injection retry/ladder test (invariance claim is no-failure-path only) | no |
+| 2 | 4 | **Unroll the non-streaming walk** into the router-owned loop; attempts rows everywhere; attribution hack deleted. `ProviderHealth` deferred to 2b — observation is delivered as `request_attempts` data instead, which is durable and restart-surviving where an in-process EWMA is not. Landed as four commits: characterization tests first, the unmetered-success overcharge on its own, the unroll with every pre-existing assertion unchanged, then the ledger and provenance | no |
 | 3a | 6 | **The knob, visibility-only**: `zerorouter` request object + `:suffix` (resolve-first) + catalog colon-collision validation + per-key default threaded through auth/mints + `PATCH /api/keys/{id}` + the `zerorouter` response block (non-streaming + usage-chunk streaming). Ordering = identity or health-only; no estimator dependency; reservations byte-bound | yes |
 | 3b | 6, 7a | **Estimator read path**: `EstimatorState` cache + background refresher + percentile SQL + n≥50/staleness gates; flip cost-mode ordering to estimator-backed (cold-fallback); `estimate` block appears. Reservations still byte-bound — **visibility before financial exposure** | yes |
 | 4 | 7a | Estimator-informed **reservations** for eligible segments (floor at 0.25×requested_max; p99/p50 tail gate; escalation-capable requests stay byte-bound); provenance + `reserved_cost_usd` stamped; **dollar-denominated clamp-loss monitoring and per-segment/per-user auto-revert**. Reclaims velocity/credit headroom (`db.rs:216-273`) | throughput |
