@@ -75,6 +75,12 @@ impl RequestFeatures {
 /// Build one `request_attempts` row from an in-walk candidate outcome. Cost
 /// basis is the candidate's own cost-basis rate applied to whatever tokens are
 /// known (a per-chunk `token_count` output floor for abandoned attempts).
+///
+/// `validator_kind` names the check that rejected this attempt, on the rows
+/// where one did. It is `None` everywhere a check was not the reason the
+/// attempt ended — a transport failure, a timeout, a completion that was simply
+/// served — and free-form by design (migration 0004), because the set of checks
+/// grows over time while rows are immutable.
 #[allow(clippy::too_many_arguments)]
 fn build_attempt(
     attempt_no: usize,
@@ -85,6 +91,7 @@ fn build_attempt(
     tokens: AttemptTokens,
     tokens_estimated: bool,
     finish_reason: Option<&str>,
+    validator_kind: Option<&'static str>,
 ) -> AttemptRecord {
     let latency_ms = i32::try_from(attempt_started.elapsed().as_millis()).unwrap_or(i32::MAX);
     let started_at = Utc::now() - chrono::Duration::milliseconds(i64::from(latency_ms));
@@ -108,7 +115,7 @@ fn build_attempt(
         tokens_estimated,
         cost_basis_usd,
         finish_reason: finish_reason.map(str::to_owned),
-        validator_kind: None,
+        validator_kind: validator_kind.map(str::to_owned),
     }
 }
 
@@ -1007,6 +1014,7 @@ async fn stream_to_channel(
                             AttemptTokens::unknown(),
                             false,
                             None,
+                            None,
                         ));
                         Some(candidate.definition())
                     } else {
@@ -1073,6 +1081,7 @@ async fn stream_to_channel(
                         AttemptTokens::unknown(),
                         false,
                         None,
+                        None,
                     ));
                     continue;
                 }
@@ -1085,6 +1094,7 @@ async fn stream_to_channel(
                         attempt_started,
                         AttemptTokens::unknown(),
                         false,
+                        None,
                         None,
                     ));
                     settle_stream_interruption(
@@ -1264,6 +1274,7 @@ async fn stream_to_channel(
                 tokens,
                 usage.is_none() && tokens != AttemptTokens::unknown(),
                 None,
+                None,
             ));
             settle_stream_interruption(
                 &sender,
@@ -1352,6 +1363,7 @@ async fn stream_to_channel(
                 tokens,
                 usage.is_none() && tokens != AttemptTokens::unknown(),
                 None,
+                None,
             ));
             let metering = persist_usage(
                 session,
@@ -1390,6 +1402,7 @@ async fn stream_to_channel(
             attempt_started,
             attempt_tokens(usage, estimated_output),
             usage.is_none() && estimated_output > 0,
+            None,
             None,
         ));
     }
@@ -1593,6 +1606,7 @@ async fn complete_synthetic_stream(
             AttemptTokens::unknown(),
             false,
             None,
+            None,
         ));
         let _ = persist_usage(
             session,
@@ -1634,6 +1648,7 @@ async fn complete_synthetic_stream(
         AttemptTokens::measured(usage),
         false,
         Some(synthesized_finish),
+        None,
     ));
     if persist_usage(
         session,
@@ -1758,6 +1773,7 @@ async fn finish_successful_stream(
             AttemptTokens::unknown(),
             false,
             None,
+            None,
         ));
         let _ = persist_usage(
             session,
@@ -1793,6 +1809,7 @@ async fn finish_successful_stream(
         AttemptTokens::measured(usage),
         false,
         Some(synthesized_finish),
+        None,
     ));
     if persist_usage(
         session,
