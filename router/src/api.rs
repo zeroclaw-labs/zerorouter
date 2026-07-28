@@ -34,9 +34,11 @@ use crate::{
     config::{ResolvedRoute, TierCandidate, TierCatalog, load_tier_catalog},
     db::{
         AttemptRecord, AttemptTokens, RequestTelemetry, SettlementRecovery, UsageAdmission,
-        UsageRecord, UsageSession, begin_usage_session, recover_owed_settlements,
+        UsageRecord, UsageSession, begin_usage_session, output_token_percentiles,
+        recover_owed_settlements,
     },
     error::{ApiError, streaming_error_json},
+    estimator::{EstimatorState, REFRESH_BATCH, REFRESH_INTERVAL},
     health::{ProviderHealth, WalkLedger},
     openai::{
         ChatCompletionRequest, ChatCompletionResponse, EmittedOutput, ModelList, OpenAiUsage,
@@ -429,6 +431,11 @@ struct RouterServices {
     /// Cross-request rung health (stage 2b). Lives exactly as long as the
     /// services — in-process and lost on restart, deliberately.
     health: ProviderHealth,
+    /// The cost estimator's cell cache (stage 3b), on the same contract:
+    /// in-process, lost on restart, and restart-cold is exactly today's
+    /// behavior. Requests only read it; the background refresher
+    /// ([`RouterState::spawn_estimator_refresher`]) is its only writer.
+    estimator: EstimatorState,
     #[cfg(feature = "testing")]
     injected_route: Option<InjectedRoute>,
 }
@@ -472,6 +479,7 @@ impl RouterState {
                 runtime: RuntimeControl::new(),
                 require_credits,
                 health: ProviderHealth::default(),
+                estimator: EstimatorState::default(),
                 #[cfg(feature = "testing")]
                 injected_route: None,
             })),
@@ -497,6 +505,7 @@ impl RouterState {
                 runtime: RuntimeControl::new(),
                 require_credits,
                 health: ProviderHealth::default(),
+                estimator: EstimatorState::default(),
                 injected_route: Some(route),
             })),
         }
@@ -553,6 +562,51 @@ impl RouterState {
         });
     }
 
+    /// Start the background estimator refresher: every
+    /// [`REFRESH_INTERVAL`], drain the cells requests enqueued and run their
+    /// percentile scans off the request path.
+    ///
+    /// Opt-in and called only by `serve`, for the same reason as
+    /// [`RouterState::spawn_settlement_recovery`]: the loop exits only on
+    /// shutdown, so a test harness that started it could never drain
+    /// [`RouterState::wait_for_background_tasks`]. Tests drive the identical
+    /// batch synchronously through [`RouterState::refresh_estimator_once`].
+    pub fn spawn_estimator_refresher(&self) {
+        let Some(services) = &self.services else {
+            return;
+        };
+        let services = Arc::clone(services);
+        let shutdown = services.runtime.shutdown.clone();
+        services.runtime.tasks.clone().spawn(async move {
+            loop {
+                tokio::select! {
+                    biased;
+                    () = shutdown.cancelled() => return,
+                    () = tokio::time::sleep(REFRESH_INTERVAL) => {}
+                }
+                refresh_estimator_batch(&services.pool, &services.estimator).await;
+            }
+        });
+    }
+
+    /// Run one refresher batch synchronously — the testing seam for the loop
+    /// [`RouterState::spawn_estimator_refresher`] runs in production.
+    #[cfg(feature = "testing")]
+    pub async fn refresh_estimator_once(&self) {
+        if let Some(services) = &self.services {
+            refresh_estimator_batch(&services.pool, &services.estimator).await;
+        }
+    }
+
+    /// Backdate every cached estimator cell, so a test can cross the
+    /// staleness TTL without touching the runtime clock.
+    #[cfg(feature = "testing")]
+    pub fn age_estimator_cells(&self, by: Duration) {
+        if let Some(services) = &self.services {
+            services.estimator.age_cells(by);
+        }
+    }
+
     pub fn begin_shutdown(&self) {
         if let Some(services) = &self.services {
             services.runtime.shutdown.cancel();
@@ -582,6 +636,30 @@ impl RouterServices {
         }
         ProviderRoute::new(resolved.candidates.clone(), max_output_tokens)
             .map_err(|_| ApiError::NoProviderAvailable)
+    }
+}
+
+/// One refresher pass: drain the pending cells and run each percentile scan.
+/// A failed scan re-enqueues its cell so the next pass retries it — without
+/// this, a cell that failed once would stay cold until its TTL re-offered
+/// it. Shared verbatim by the production loop and the testing seam, so tests
+/// exercise the code that ships.
+async fn refresh_estimator_batch(pool: &PgPool, estimator: &EstimatorState) {
+    for key in estimator.drain_pending(REFRESH_BATCH) {
+        match output_token_percentiles(pool, &key.signature, key.scheme, key.candidate.as_deref())
+            .await
+        {
+            Ok(measured) => estimator.apply(key, measured),
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    signature = key.signature,
+                    candidate = key.candidate.as_deref().unwrap_or("<signature>"),
+                    "estimator cell refresh failed; cell re-queued"
+                );
+                estimator.enqueue(key);
+            }
+        }
     }
 }
 
