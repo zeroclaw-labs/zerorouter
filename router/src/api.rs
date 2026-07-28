@@ -38,7 +38,7 @@ use crate::{
         recover_owed_settlements,
     },
     error::{ApiError, streaming_error_json},
-    estimator::{EstimatorState, REFRESH_BATCH, REFRESH_INTERVAL},
+    estimator::{CellKey, CellRead, EstimatorState, REFRESH_BATCH, REFRESH_INTERVAL},
     health::{ProviderHealth, WalkLedger},
     openai::{
         ChatCompletionRequest, ChatCompletionResponse, EmittedOutput, ModelList, OpenAiUsage,
@@ -750,23 +750,12 @@ async fn chat_completions(
             .or(authenticated.default_priority),
     );
     let max_output_tokens = *request.max_tokens.get_or_insert(BASELINE_MAX_TOKENS);
-    let mut provider_route = services.provider_route(&resolved, max_output_tokens)?;
-    order_candidates(
-        priority.resolved,
-        provider_route.candidates_mut(),
-        &services.health,
-    );
     let reservation_usage = request.reservation_usage(max_output_tokens);
-    let reserved_tokens =
-        i64::try_from(reservation_usage.total_tokens).map_err(|_| ApiError::InvalidRequest)?;
-    // Fail closed before admission: a tier whose sell rates cannot be priced
-    // cannot size a reservation, and a request that cannot be metered must not
-    // be dispatched. The catalog validated these rates at load, so this is a
-    // backstop rather than a live path.
-    let reserved_cost =
-        usage_cost(resolved.sell_rates, reservation_usage).ok_or(ApiError::MeteringUnavailable)?;
     // The user-scoped segmentation key (design: Engine "Task signature"),
-    // computed beside the reservation over the same request-shape fields.
+    // computed over the same request-shape fields the reservation measures.
+    // Moved ahead of route construction in stage 3b because selection now
+    // reads the segment's estimator cells; the computation is pure, so only
+    // the order changed.
     let tool_names: Vec<String> = request
         .tools
         .iter()
@@ -780,6 +769,33 @@ async fn chat_completions(
         request.stream,
         max_output_tokens,
     );
+    // One cache read per request for the candidate-agnostic cell. Every
+    // request — engaged or not — offers its segment to the refresher through
+    // this lookup's miss path: the flywheel warms on all traffic, which is
+    // what Stage 4's reservation sizing will want already spinning.
+    let signature_cell = services
+        .estimator
+        .lookup(&CellKey::for_signature(&signature));
+    let mut provider_route = services.provider_route(&resolved, max_output_tokens)?;
+    order_candidates(
+        priority.resolved,
+        provider_route.candidates_mut(),
+        &CostContext {
+            estimator: &services.estimator,
+            signature: &signature,
+            signature_cell,
+            input_bytes: reservation_usage.prompt_tokens,
+        },
+        &services.health,
+    );
+    let reserved_tokens =
+        i64::try_from(reservation_usage.total_tokens).map_err(|_| ApiError::InvalidRequest)?;
+    // Fail closed before admission: a tier whose sell rates cannot be priced
+    // cannot size a reservation, and a request that cannot be metered must not
+    // be dispatched. The catalog validated these rates at load, so this is a
+    // backstop rather than a live path.
+    let reserved_cost =
+        usage_cost(resolved.sell_rates, reservation_usage).ok_or(ApiError::MeteringUnavailable)?;
     let usage_session = admit_usage(
         &services.pool,
         &authenticated,
@@ -845,11 +861,12 @@ fn model_unresolvable(catalog: &TierCatalog, requested_model: &str) -> ApiError 
 /// Selection policy (design doc: Engine "Selection policy"), applied to the
 /// built route before either walk starts.
 ///
-/// Stage 3a ships the knob visibility-only: there is no estimator yet, so
-/// every mode's base ordering is the identity — the tiers.toml order, which
-/// is the human-curated quality prior. The `priority` arms exist so the
-/// cost- and success-mode orderings (stage 3b) land in this function's body
-/// without touching its callers.
+/// Since stage 3b, `cost` orders ascending by expected cost basis —
+/// estimator-backed, with a whole-route fall-through to the identity while
+/// the segment is cold (`order_by_expected_cost`). `balanced` stays the
+/// identity — the tiers.toml order, the human-curated prior and the frozen
+/// control group. `success` stays the identity until its estimator and
+/// escalation machinery arrive in stage 5a.
 ///
 /// Health demotion applies last, in every mode: demoted rungs sink to the
 /// back — preserving table order within each group — and never disappear.
@@ -862,18 +879,103 @@ fn model_unresolvable(catalog: &TierCatalog, requested_model: &str) -> ApiError 
 fn order_candidates(
     priority: Priority,
     candidates: &mut Vec<ProviderCandidate>,
+    estimates: &CostContext<'_>,
     health: &ProviderHealth,
 ) {
     match priority {
-        // 3a: no estimator, so cost, balanced, and success all keep the
-        // identity base order. The arms split when 3b's estimator arrives.
-        Priority::Cost | Priority::Balanced | Priority::Success => {}
+        // Since 3b, cost orders by expected cost basis (cold-fallback:
+        // identity). balanced: identity by definition, the frozen control
+        // group. success: identity until its machinery arrives in 5a.
+        Priority::Cost => order_by_expected_cost(candidates, estimates),
+        Priority::Balanced | Priority::Success => {}
     }
     let (healthy, demoted): (Vec<_>, Vec<_>) = candidates
         .drain(..)
         .partition(|candidate| !health.should_skip(candidate.definition()));
     candidates.extend(healthy);
     candidates.extend(demoted);
+}
+
+/// The request-scoped inputs cost-mode ordering reads (design doc: Engine
+/// "Selection policy" and "Cost estimator"). All cache; the request path
+/// never touches the database for an estimate.
+struct CostContext<'a> {
+    estimator: &'a EstimatorState,
+    signature: &'a TaskSignature,
+    /// The candidate-agnostic cell, read once per request in
+    /// `chat_completions` (it also feeds the response `estimate` block).
+    signature_cell: CellRead,
+    /// The byte-bound input measure — the same number admission reserves
+    /// against, reused as the input side of expected cost.
+    input_bytes: u64,
+}
+
+/// Cost mode's base ordering: ascending expected cost basis, stable, so
+/// candidates the estimator prices identically keep their table order.
+///
+/// Each candidate's expected output is its own warm selection cell's p50
+/// when one exists, else the segment's candidate-agnostic p50 — the shared
+/// fallback that breaks the cold-start circle where a candidate that never
+/// serves never warms and so never gets ordered past. With the shared
+/// fallback every candidate prices at the same expected output and the
+/// ordering degenerates to rate order, which is exactly the right cold-ish
+/// answer. Only when the segment itself is cold (no candidate-agnostic cell
+/// either) does the whole route fall through to the identity — the design's
+/// cold-fallback, and bit-for-bit today's behavior.
+///
+/// f64 per-mtok arithmetic prices an ORDERING, never a bill: within a tier
+/// every candidate bills at the same tier sell rate (sell-price invariance),
+/// so this chooses ZeroRouter's COGS and the customer's odds, never the
+/// customer's price. Billing math stays in `Decimal` (`usage_cost`).
+fn order_by_expected_cost(candidates: &mut Vec<ProviderCandidate>, estimates: &CostContext<'_>) {
+    let shared_fallback = match estimates.signature_cell {
+        CellRead::Warm(percentiles) => Some(percentiles.p50),
+        CellRead::Cold => None,
+    };
+    let expected: Vec<Option<f64>> = candidates
+        .iter()
+        .map(|candidate| {
+            let definition = candidate.definition();
+            let cell = estimates
+                .estimator
+                .lookup(&CellKey::for_candidate(estimates.signature, &definition.id));
+            let expected_output = match cell {
+                CellRead::Warm(percentiles) => percentiles.p50,
+                CellRead::Cold => shared_fallback?,
+            };
+            Some(expected_cost_basis(
+                definition.rates,
+                estimates.input_bytes,
+                expected_output,
+            ))
+        })
+        .collect();
+    if expected.iter().any(Option::is_none) {
+        // Cold fallback: some rung has no estimate from any grain, so the
+        // route keeps the table order rather than sorting on partial data.
+        return;
+    }
+    let mut priced: Vec<(f64, ProviderCandidate)> = expected
+        .into_iter()
+        .map(|cost| cost.unwrap_or(f64::INFINITY))
+        .zip(candidates.drain(..))
+        .collect();
+    priced.sort_by(|left, right| left.0.total_cmp(&right.0));
+    candidates.extend(priced.into_iter().map(|(_, candidate)| candidate));
+}
+
+/// Expected COST BASIS of dispatching one candidate: the byte-bound input at
+/// the candidate's input rate plus the estimated output at its output rate.
+/// A candidate whose rate table cannot price a dimension prices at infinity
+/// and sorts last — defensive only; catalog validation refuses such tables.
+fn expected_cost_basis(rates: ModelRates, input_bytes: u64, expected_output_tokens: f64) -> f64 {
+    // Precision loss on the u64 → f64 cast is irrelevant at ordering
+    // magnitudes (bytes are far below 2^52).
+    #[allow(clippy::cast_precision_loss)]
+    let input_bytes = input_bytes as f64;
+    let input_rate = rates.input_per_mtok.unwrap_or(f64::INFINITY);
+    let output_rate = rates.output_per_mtok.unwrap_or(f64::INFINITY);
+    input_bytes * input_rate / 1_000_000.0 + expected_output_tokens * output_rate / 1_000_000.0
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -3873,3 +3873,222 @@ async fn synthetic_stream_carries_the_block_on_the_usage_chunk() {
         Some("success".to_owned())
     );
 }
+
+// ---------------------------------------------------------------------------
+// Stage 3b: the estimator read path. Cost mode orders by expected cost basis
+// once its segment warms; balanced stays the frozen control group; everything
+// stays cache-only on the request path (tests drive the refresher through
+// the synchronous testing seam).
+// ---------------------------------------------------------------------------
+
+/// Seed one settled row into a segment's trailing window, shaped for the
+/// estimator scan. `candidate_id` stays NULL: the candidate-agnostic cell is
+/// the shared fallback under test, and rows without a candidate are exactly
+/// what cannot leak into a per-candidate cell.
+async fn seed_segment_row(pool: &PgPool, api_key_id: Uuid, signature: &str, output_tokens: i32) {
+    query(
+        r#"
+        INSERT INTO usage_events (
+            request_id, api_key_id, tier, upstream_provider, upstream_model,
+            input_tokens, cached_input_tokens, output_tokens, cost_usd,
+            latency_ms, status, task_signature, task_signature_scheme
+        )
+        VALUES ($1, $2, 'zero/test-pricier-first', 'fireworks', 'upstream/seed',
+                100, 0, $3, 0.001, 10, 200, $4, $5)
+        "#,
+    )
+    .bind(Uuid::new_v4())
+    .bind(api_key_id)
+    .bind(output_tokens)
+    .bind(signature)
+    .bind(TASK_SIGNATURE_SCHEME)
+    .execute(pool)
+    .await
+    .expect("segment seed row must insert");
+}
+
+/// The segment key the serve path stamped on this key's settled rows — the
+/// exact signature a same-shaped request will look up, without the test
+/// re-deriving the hash.
+async fn settled_signature(pool: &PgPool, api_key_id: Uuid) -> String {
+    query_scalar::<_, String>(
+        "SELECT task_signature FROM usage_events WHERE api_key_id = $1 LIMIT 1",
+    )
+    .bind(api_key_id)
+    .fetch_one(pool)
+    .await
+    .expect("settled signature must query")
+}
+
+/// The 3b flip end to end: a cold segment keeps today's table order, a warm
+/// segment reorders cost mode by expected cost basis — cheapest rates first,
+/// because the candidate-agnostic p50 is every rung's shared expected output
+/// — and balanced traffic on the same warm segment still walks the table
+/// order. The frozen control group stays frozen.
+#[tokio::test]
+async fn cost_mode_reorders_by_expected_cost_once_the_segment_warms() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let (api_key_id, key) = create_funded_key(&pool, "estimator-cost-flip").await;
+    let pricier = FakeModelProvider::new(
+        "pricier",
+        vec![
+            FakeOutcome::chat("hello from pricier", served_usage()),
+            FakeOutcome::chat("hello from pricier", served_usage()),
+        ],
+    );
+    let cheaper = FakeModelProvider::new(
+        "cheaper",
+        vec![FakeOutcome::chat("hello from cheaper", served_usage())],
+    );
+    let state = router(pool.clone(), vec![pricier.clone(), cheaper.clone()]);
+
+    // Cold segment: cost mode falls through to the table order, so the
+    // pricier-but-first rung serves — bit-for-bit today's behavior.
+    let response = app(state.clone())
+        .oneshot(completion_request(
+            &key,
+            &completion_body("zero/test-pricier-first:cost", false),
+        ))
+        .await
+        .expect("cold cost request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(header(&response, "x-zerorouter-provider"), "fireworks");
+    state.wait_for_background_tasks().await;
+
+    // Warm the segment: enough settled rows to clear the n >= 50 gate, then
+    // one refresher batch — the synchronous twin of the production loop.
+    let signature = settled_signature(&pool, api_key_id).await;
+    for _ in 0..60 {
+        seed_segment_row(&pool, api_key_id, &signature, 200).await;
+    }
+    state.refresh_estimator_once().await;
+
+    // Warm segment, cost mode: both rungs price at the shared p50, so the
+    // ordering is rate order and the cheaper rung now serves.
+    let response = app(state.clone())
+        .oneshot(completion_request(
+            &key,
+            &completion_body("zero/test-pricier-first:cost", false),
+        ))
+        .await
+        .expect("warm cost request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        header(&response, "x-zerorouter-provider"),
+        "together",
+        "a warm segment orders cost mode cheapest-first"
+    );
+
+    // Same warm segment, balanced: identity, exactly as before the flip.
+    let response = app(state.clone())
+        .oneshot(completion_request(
+            &key,
+            &completion_body("zero/test-pricier-first", false),
+        ))
+        .await
+        .expect("balanced request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        header(&response, "x-zerorouter-provider"),
+        "fireworks",
+        "balanced stays the frozen control group"
+    );
+    state.wait_for_background_tasks().await;
+
+    assert_eq!(pricier.call_count(), 2);
+    assert_eq!(cheaper.call_count(), 1);
+}
+
+/// Staleness closes the loop the other way: a warm cell past its TTL answers
+/// cold again, so cost mode falls back to the table order until the
+/// refresher re-measures the segment.
+#[tokio::test]
+async fn a_stale_segment_falls_back_to_table_order_until_remeasured() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let (api_key_id, key) = create_funded_key(&pool, "estimator-stale").await;
+    let pricier = FakeModelProvider::new(
+        "pricier",
+        vec![
+            FakeOutcome::chat("hello from pricier", served_usage()),
+            FakeOutcome::chat("hello from pricier", served_usage()),
+        ],
+    );
+    let cheaper = FakeModelProvider::new(
+        "cheaper",
+        vec![
+            FakeOutcome::chat("hello from cheaper", served_usage()),
+            FakeOutcome::chat("hello from cheaper", served_usage()),
+        ],
+    );
+    let state = router(pool.clone(), vec![pricier.clone(), cheaper.clone()]);
+
+    // Warm the segment through a first request (which also enqueues the
+    // cells), then confirm the reorder is in force.
+    let response = app(state.clone())
+        .oneshot(completion_request(
+            &key,
+            &completion_body("zero/test-pricier-first:cost", false),
+        ))
+        .await
+        .expect("first request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    state.wait_for_background_tasks().await;
+    let signature = settled_signature(&pool, api_key_id).await;
+    for _ in 0..60 {
+        seed_segment_row(&pool, api_key_id, &signature, 200).await;
+    }
+    state.refresh_estimator_once().await;
+
+    let response = app(state.clone())
+        .oneshot(completion_request(
+            &key,
+            &completion_body("zero/test-pricier-first:cost", false),
+        ))
+        .await
+        .expect("warm request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(header(&response, "x-zerorouter-provider"), "together");
+
+    // Cross the TTL without touching the clock: the cells stale out, the
+    // next cost request keeps table order, and the lookup re-enqueued the
+    // segment for the next refresher pass.
+    state.age_estimator_cells(Duration::from_secs(6 * 60));
+    let response = app(state.clone())
+        .oneshot(completion_request(
+            &key,
+            &completion_body("zero/test-pricier-first:cost", false),
+        ))
+        .await
+        .expect("stale request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        header(&response, "x-zerorouter-provider"),
+        "fireworks",
+        "a stale segment is a cold segment"
+    );
+    // One refresher pass re-measures exactly what the stale lookups
+    // enqueued, and the reorder returns — the full cold → warm → stale →
+    // re-warmed cycle on one router.
+    state.refresh_estimator_once().await;
+    let response = app(state.clone())
+        .oneshot(completion_request(
+            &key,
+            &completion_body("zero/test-pricier-first:cost", false),
+        ))
+        .await
+        .expect("re-warmed request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        header(&response, "x-zerorouter-provider"),
+        "together",
+        "a re-measured segment reorders again"
+    );
+    state.wait_for_background_tasks().await;
+
+    assert_eq!(pricier.call_count(), 2);
+    assert_eq!(cheaper.call_count(), 2);
+}
