@@ -12,7 +12,7 @@ use zerorouter::{
     },
     db::{
         AttemptRecord, AttemptTokens, RequestTelemetry, UsageAdmission, UsageRecord, UsageSession,
-        begin_usage_session, migrate,
+        begin_usage_session, migrate, output_token_percentiles,
     },
     openai::{OpenAiUsage, TASK_SIGNATURE_SCHEME, TaskSignature, tool_names_digest, usage_cost},
     priority::Priority,
@@ -881,5 +881,151 @@ fn swap_database_keeps_connection_parameters() {
             "zr_migchain_1"
         ),
         "postgres://zr@db.example.invalid/zr_migchain_1?sslmode=require"
+    );
+}
+
+/// One settled row shaped for the estimator scan, inserted directly — the
+/// scan's input contract is the table, not the serve path.
+#[allow(clippy::too_many_arguments)]
+async fn seed_settled_output(
+    pool: &PgPool,
+    api_key_id: Uuid,
+    signature: &str,
+    scheme: Option<i16>,
+    candidate: Option<&str>,
+    output_tokens: i32,
+    status: i16,
+) {
+    query(
+        r#"
+        INSERT INTO usage_events (
+            request_id, api_key_id, tier, upstream_provider, upstream_model,
+            input_tokens, cached_input_tokens, output_tokens, cost_usd,
+            latency_ms, status, task_signature, task_signature_scheme,
+            candidate_id
+        )
+        VALUES ($1, $2, 'zero/estimator-test', 'fireworks', 'upstream/est',
+                100, 0, $3, 0.001, 10, $4, $5, $6, $7)
+        "#,
+    )
+    .bind(Uuid::new_v4())
+    .bind(api_key_id)
+    .bind(output_tokens)
+    .bind(status)
+    .bind(signature)
+    .bind(scheme)
+    .bind(candidate)
+    .execute(pool)
+    .await
+    .expect("estimator seed row must insert");
+}
+
+/// The estimator's percentile scan reads exactly its cell: the signature at
+/// the current scheme, optionally one candidate, status-200 rows only —
+/// with pre-0007 NULL-scheme rows invisible to it.
+#[tokio::test]
+async fn output_percentiles_scan_measures_only_the_cell_it_is_asked_about() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let key = seed_key(&pool).await;
+    let signature = "aabb001122334455";
+
+    // Candidate A: 101 settled rows with outputs 0..=100, so the quantile
+    // index lands on whole ranks and p50/p90/p99 are exact.
+    for output in 0..=100 {
+        seed_settled_output(
+            &pool,
+            key.id,
+            signature,
+            Some(TASK_SIGNATURE_SCHEME),
+            Some("fireworks/est-a"),
+            output,
+            200,
+        )
+        .await;
+    }
+    // Candidate B: 10 rows at 1000 — visible to its own cell and to the
+    // per-signature cell, never to A's.
+    for _ in 0..10 {
+        seed_settled_output(
+            &pool,
+            key.id,
+            signature,
+            Some(TASK_SIGNATURE_SCHEME),
+            Some("together/est-b"),
+            1_000,
+            200,
+        )
+        .await;
+    }
+    // Noise the scan must not see: pre-0007 rows (NULL scheme) and non-200
+    // settles.
+    for _ in 0..7 {
+        seed_settled_output(
+            &pool,
+            key.id,
+            signature,
+            None,
+            Some("fireworks/est-a"),
+            5_000,
+            200,
+        )
+        .await;
+        seed_settled_output(
+            &pool,
+            key.id,
+            signature,
+            Some(TASK_SIGNATURE_SCHEME),
+            Some("fireworks/est-a"),
+            7_777,
+            502,
+        )
+        .await;
+    }
+
+    let cell_a = output_token_percentiles(
+        &pool,
+        signature,
+        TASK_SIGNATURE_SCHEME,
+        Some("fireworks/est-a"),
+    )
+    .await
+    .expect("scan must run")
+    .expect("candidate A has rows");
+    assert_eq!(cell_a.rows, 101);
+    assert!((cell_a.p50 - 50.0).abs() < 1e-9, "p50 = {}", cell_a.p50);
+    assert!((cell_a.p90 - 90.0).abs() < 1e-9, "p90 = {}", cell_a.p90);
+    assert!((cell_a.p99 - 99.0).abs() < 1e-9, "p99 = {}", cell_a.p99);
+    assert!(cell_a.is_warm());
+
+    let cell_b = output_token_percentiles(
+        &pool,
+        signature,
+        TASK_SIGNATURE_SCHEME,
+        Some("together/est-b"),
+    )
+    .await
+    .expect("scan must run")
+    .expect("candidate B has rows");
+    assert_eq!(cell_b.rows, 10);
+    assert!((cell_b.p50 - 1_000.0).abs() < 1e-9);
+    assert!(!cell_b.is_warm(), "10 rows is under the warm gate");
+
+    let whole_signature = output_token_percentiles(&pool, signature, TASK_SIGNATURE_SCHEME, None)
+        .await
+        .expect("scan must run")
+        .expect("the signature has rows");
+    assert_eq!(
+        whole_signature.rows, 111,
+        "the candidate-agnostic cell sees both candidates and none of the noise"
+    );
+
+    assert!(
+        output_token_percentiles(&pool, "ffff000011112222", TASK_SIGNATURE_SCHEME, None)
+            .await
+            .expect("scan must run")
+            .is_none(),
+        "an unmeasured signature answers None, not zeros"
     );
 }

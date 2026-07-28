@@ -14,6 +14,7 @@ use zeroclaw_providers::pricing::ModelRates;
 
 use crate::{
     auth::AuthenticatedKey,
+    estimator::OutputPercentiles,
     openai::{OpenAiUsage, PromptTokenDetails, TaskSignature, usage_cost},
     priority::Priority,
     sqlx::{
@@ -22,6 +23,63 @@ use crate::{
         postgres::{PgConnectOptions, PgPoolOptions, PgSslMode},
     },
 };
+
+/// The estimator's output-percentile scan (design doc: "Cost estimator";
+/// rollout Stage 3b): one SQL aggregate over settled rows — never ML, and
+/// never run on the request path (only the background refresher calls this).
+///
+/// `candidate_id: None` is the candidate-agnostic per-signature cell.
+/// `task_signature_scheme` is a hard filter because signature values are not
+/// comparable across schemes (migration 0007); pre-0007 rows carry a NULL
+/// scheme and are deliberately invisible to a current-scheme cell.
+///
+/// Only `status = 200` rows train the estimator: a settled non-200 row's
+/// output count reflects a failure shape, not what a completion of this
+/// segment costs. Served by `usage_events_signature_candidate_idx`
+/// (migration 0004; partial over non-NULL signatures).
+///
+/// Returns `None` when the window holds no rows at all.
+pub async fn output_token_percentiles(
+    pool: &PgPool,
+    task_signature: &str,
+    task_signature_scheme: i16,
+    candidate_id: Option<&str>,
+) -> Result<Option<OutputPercentiles>, sqlx::Error> {
+    let row = sqlx::query_as::<_, (Option<Vec<f64>>, i64)>(
+        r#"
+        SELECT
+            percentile_cont(ARRAY[0.5, 0.9, 0.99])
+                WITHIN GROUP (ORDER BY output_tokens::FLOAT8),
+            COUNT(*)
+        FROM usage_events
+        WHERE task_signature = $1
+          AND task_signature_scheme = $2
+          AND ($3::TEXT IS NULL OR candidate_id = $3)
+          AND status = 200
+          AND ts >= NOW() - INTERVAL '14 days'
+        "#,
+    )
+    .bind(task_signature)
+    .bind(task_signature_scheme)
+    .bind(candidate_id)
+    .fetch_one(pool)
+    .await?;
+    let (percentiles, rows) = row;
+    let Some(percentiles) = percentiles else {
+        return Ok(None);
+    };
+    let [p50, p90, p99] = percentiles[..] else {
+        // Three fractions in, three quantiles out; anything else is a broken
+        // aggregate and reads as no measurement rather than a wrong one.
+        return Ok(None);
+    };
+    Ok(Some(OutputPercentiles {
+        p50,
+        p90,
+        p99,
+        rows,
+    }))
+}
 
 /// The permanent Stage-1 reservation sizing basis: byte bound + max_tokens.
 /// Learned/quote sizings arrive in later rollout stages (migration 0004
