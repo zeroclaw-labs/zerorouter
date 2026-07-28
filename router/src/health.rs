@@ -88,8 +88,7 @@ struct RungHealth {
 
 impl RungHealth {
     fn demoted(self, now: Instant) -> bool {
-        self.error_ewma > DEMOTION_THRESHOLD
-            || self.cooldown_until.is_some_and(|until| now < until)
+        self.error_ewma > DEMOTION_THRESHOLD || self.cooldown_until.is_some_and(|until| now < until)
     }
 }
 
@@ -190,6 +189,15 @@ impl WalkLedger {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.rows.is_empty()
+    }
+
+    /// The rows recorded so far, in walk order — read by the response-block
+    /// builder (`api::zerorouter_block`); draining stays with
+    /// [`WalkLedger::take_rows`]/[`WalkLedger::into_rows`], so a peek cannot
+    /// detach a row from its settle transaction.
+    #[must_use]
+    pub fn rows(&self) -> &[AttemptRecord] {
+        &self.rows
     }
 
     /// Drain the rows for a settle site, leaving the ledger empty but usable —

@@ -40,8 +40,9 @@ use crate::{
     health::{ProviderHealth, WalkLedger},
     openai::{
         ChatCompletionRequest, ChatCompletionResponse, EmittedOutput, ModelList, OpenAiUsage,
-        StreamMetadata, TaskSignature, finish_reason, shape_ok, stream_delta_json,
-        stream_tool_call_delta, stream_usage_json, task_signature, tool_args_all_json, usage_cost,
+        StreamMetadata, TaskSignature, ZeroRouterAttempt, ZeroRouterResponseMetadata,
+        finish_reason, shape_ok, stream_delta_json, stream_tool_call_delta, stream_usage_json,
+        task_signature, tool_args_all_json, usage_cost,
     },
     priority::Priority,
     providers::{ProviderCandidate, ProviderRoute},
@@ -63,13 +64,18 @@ struct RequestFeatures {
     // resolved before admission from typed field > model suffix > per-key
     // default > balanced, and written on the settled row at every terminal.
     priority: Priority,
+    // Whether any carrier actually engaged the knob. Response-block
+    // visibility only (`zerorouter_block`), never persisted: a request that
+    // never mentioned the knob keeps its byte-identical legacy response
+    // while still recording its resolved `balanced`.
+    knob_engaged: bool,
 }
 
 impl RequestFeatures {
     fn from_request(
         request: &ChatCompletionRequest,
         reservation_usage: OpenAiUsage,
-        priority: Priority,
+        priority: PriorityResolution,
     ) -> Self {
         Self {
             requested_max_tokens: request
@@ -79,9 +85,52 @@ impl RequestFeatures {
             prompt_bytes: i64::try_from(reservation_usage.prompt_tokens).unwrap_or(i64::MAX),
             message_count: i32::try_from(request.messages.len()).unwrap_or(i32::MAX),
             tool_count: i32::try_from(request.tools.len()).unwrap_or(i32::MAX),
-            priority,
+            priority: priority.resolved,
+            knob_engaged: priority.engaged,
         }
     }
+}
+
+/// The outcome of resolving the priority knob for one request (design doc:
+/// "Precedence and conflicts"): which priority governs, and whether any
+/// carrier actually set it.
+#[derive(Clone, Copy)]
+struct PriorityResolution {
+    resolved: Priority,
+    engaged: bool,
+}
+
+impl PriorityResolution {
+    fn new(engaged: Option<Priority>) -> Self {
+        Self {
+            resolved: engaged.unwrap_or(Priority::Balanced),
+            engaged: engaged.is_some(),
+        }
+    }
+}
+
+/// The `zerorouter` response block for a served completion, built from the
+/// same walk ledger the settle transaction drains — the customer-visible
+/// attempts array and the persisted `request_attempts` rows are one story by
+/// construction. `None` while the knob was never engaged, which is what
+/// keeps legacy responses byte-stable.
+fn zerorouter_block(
+    features: RequestFeatures,
+    attempts: &WalkLedger,
+) -> Option<ZeroRouterResponseMetadata> {
+    features.knob_engaged.then(|| ZeroRouterResponseMetadata {
+        priority: features.priority,
+        attempts: attempts
+            .rows()
+            .iter()
+            .map(|row| ZeroRouterAttempt {
+                candidate: row.candidate_id.clone(),
+                outcome: row.outcome.clone(),
+                latency_ms: row.latency_ms,
+            })
+            .collect(),
+        validated: None,
+    })
 }
 
 /// Build one `request_attempts` row from an in-walk candidate outcome. Cost
@@ -617,13 +666,18 @@ async fn chat_completions(
     {
         return Err(ApiError::PriorityConflict);
     }
-    let priority = typed_priority
-        .or(suffix_priority)
-        .or(authenticated.default_priority)
-        .unwrap_or(Priority::Balanced);
+    let priority = PriorityResolution::new(
+        typed_priority
+            .or(suffix_priority)
+            .or(authenticated.default_priority),
+    );
     let max_output_tokens = *request.max_tokens.get_or_insert(BASELINE_MAX_TOKENS);
     let mut provider_route = services.provider_route(&resolved, max_output_tokens)?;
-    order_candidates(priority, provider_route.candidates_mut(), &services.health);
+    order_candidates(
+        priority.resolved,
+        provider_route.candidates_mut(),
+        &services.health,
+    );
     let reservation_usage = request.reservation_usage(max_output_tokens);
     let reserved_tokens =
         i64::try_from(reservation_usage.total_tokens).map_err(|_| ApiError::InvalidRequest)?;
@@ -753,7 +807,7 @@ async fn non_streaming_response(
     resolved: ResolvedRoute,
     provider_route: ProviderRoute,
     reservation_usage: OpenAiUsage,
-    priority: Priority,
+    priority: PriorityResolution,
 ) -> Result<Response, ApiError> {
     runtime
         .tasks
@@ -780,7 +834,7 @@ async fn run_non_streaming(
     resolved: ResolvedRoute,
     provider_route: ProviderRoute,
     reservation_usage: OpenAiUsage,
-    priority: Priority,
+    priority: PriorityResolution,
 ) -> Result<Response, ApiError> {
     let request_id = usage_session.request_id();
     let features = RequestFeatures::from_request(&request, reservation_usage, priority);
@@ -1337,6 +1391,10 @@ async fn serve_completion(
         Some(synthesized_finish),
         None,
     ));
+    // Read from the ledger before the settle drains it, so the block and the
+    // persisted rows cannot diverge.
+    let walk_positions = attempts.len();
+    let zerorouter = zerorouter_block(features, &attempts);
     persist_usage(
         usage_session,
         &resolved.requested_model,
@@ -1370,6 +1428,7 @@ async fn serve_completion(
         response,
         usage,
         max_tokens,
+        zerorouter,
     );
     let mut completion = Json(completion).into_response();
     insert_header(&mut completion, "x-request-id", &request_id);
@@ -1379,6 +1438,11 @@ async fn serve_completion(
         &candidate.provider,
     );
     insert_header(&mut completion, "x-zerorouter-model", &candidate.model);
+    insert_header(
+        &mut completion,
+        "x-zerorouter-attempts",
+        &walk_positions.to_string(),
+    );
     Ok(completion)
 }
 
@@ -1391,7 +1455,7 @@ fn streaming_response(
     resolved: ResolvedRoute,
     provider_route: ProviderRoute,
     reservation_usage: OpenAiUsage,
-    priority: Priority,
+    priority: PriorityResolution,
 ) -> Result<Response, ApiError> {
     let metadata = StreamMetadata::new(
         usage_session.request_id(),
@@ -1440,7 +1504,7 @@ async fn stream_to_channel(
     resolved: ResolvedRoute,
     candidates: Vec<ProviderCandidate>,
     reservation_usage: OpenAiUsage,
-    priority: Priority,
+    priority: PriorityResolution,
 ) {
     let messages = request.provider_messages();
     let tools = request.provider_tools();
@@ -2224,6 +2288,9 @@ async fn complete_synthetic_stream(
         Some(synthesized_finish),
         None,
     ));
+    // Read before the settle drains the ledger — same rule as the buffered
+    // serve site.
+    let zerorouter = zerorouter_block(features, &attempts);
     if persist_usage(
         session,
         &resolved.requested_model,
@@ -2294,6 +2361,7 @@ async fn complete_synthetic_stream(
         candidate,
         usage,
         finish_reason(has_tool_calls, usage, max_tokens),
+        zerorouter,
     )
     .await;
 }
@@ -2385,6 +2453,9 @@ async fn finish_successful_stream(
         Some(synthesized_finish),
         None,
     ));
+    // Read before the settle drains the ledger — same rule as the buffered
+    // serve site.
+    let zerorouter = zerorouter_block(features, &attempts);
     if persist_usage(
         session,
         &resolved.requested_model,
@@ -2414,10 +2485,12 @@ async fn finish_successful_stream(
         candidate,
         usage,
         synthesized_finish,
+        zerorouter,
     )
     .await;
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn emit_stream_finish(
     sender: &mpsc::Sender<Event>,
     metadata: &StreamMetadata,
@@ -2425,6 +2498,7 @@ async fn emit_stream_finish(
     candidate: &ProviderCandidate,
     usage: OpenAiUsage,
     finish_reason: &'static str,
+    zerorouter: Option<ZeroRouterResponseMetadata>,
 ) {
     if !send_data(
         sender,
@@ -2434,7 +2508,13 @@ async fn emit_stream_finish(
     {
         return;
     }
-    if metadata.include_usage && !send_data(sender, stream_usage_json(metadata, usage)).await {
+    if metadata.include_usage
+        && !send_data(
+            sender,
+            stream_usage_json(metadata, usage, zerorouter.as_ref()),
+        )
+        .await
+    {
         return;
     }
     let _ = send_data(sender, "[DONE]".to_owned()).await;
@@ -2875,7 +2955,7 @@ mod tests {
                 ProviderCandidate::against_local_upstream(second.clone(), &ok_url),
             ],
             reservation_usage,
-            Priority::Balanced,
+            PriorityResolution::new(None),
         )
         .await;
         assert!(
@@ -2961,7 +3041,7 @@ mod tests {
             resolved,
             vec![ProviderCandidate::with_provider(candidate.clone(), fake)],
             reservation_usage,
-            Priority::Balanced,
+            PriorityResolution::new(None),
         )
         .await;
         tokio::time::resume();
@@ -3062,7 +3142,7 @@ mod tests {
             resolved,
             vec![ProviderCandidate::with_provider(candidate.clone(), fake)],
             reservation_usage,
-            Priority::Balanced,
+            PriorityResolution::new(None),
         )
         .await;
         assert!(
@@ -3156,7 +3236,7 @@ mod tests {
                 &ok_url,
             )],
             reservation_usage,
-            Priority::Balanced,
+            PriorityResolution::new(None),
         )
         .await;
         client.await.expect("client task should join");

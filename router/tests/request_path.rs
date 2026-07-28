@@ -3218,7 +3218,11 @@ async fn non_streaming_a_cooling_solo_rung_is_still_dispatched() {
     assert_eq!(response.status(), StatusCode::OK);
     state.wait_for_background_tasks().await;
 
-    assert_eq!(solo.call_count(), 4, "the cooldown does not starve a solo route");
+    assert_eq!(
+        solo.call_count(),
+        4,
+        "the cooldown does not starve a solo route"
+    );
     assert_eq!(
         attempt_rows(&pool, second_key_id).await,
         [(1, "deepinfra/solo".to_owned(), "ok".to_owned(), true)],
@@ -3401,7 +3405,11 @@ async fn streaming_a_cooling_solo_rung_is_still_dispatched() {
     assert_eq!(chunks[1]["choices"][0]["delta"]["content"], "served");
     state.wait_for_background_tasks().await;
 
-    assert_eq!(solo.call_count(), 2, "the cooldown does not starve a solo route");
+    assert_eq!(
+        solo.call_count(),
+        2,
+        "the cooldown does not starve a solo route"
+    );
     assert_eq!(
         attempt_rows(&pool, second_key_id).await,
         [(1, "deepinfra/solo".to_owned(), "ok".to_owned(), true)],
@@ -3441,7 +3449,19 @@ async fn a_request_without_the_knob_records_balanced() {
         .await
         .expect("completion request should complete");
     assert_eq!(response.status(), StatusCode::OK);
+    // The attempts header is additive and rides every served response; the
+    // BODY of a knob-less request stays byte-identical, which is the
+    // backward-compatibility anchor — no `zerorouter` key at all, not a null.
+    assert_eq!(header(&response, "x-zerorouter-attempts"), "1");
+    let body = json_body(response).await;
     state.wait_for_background_tasks().await;
+    assert!(
+        !body
+            .as_object()
+            .expect("body is an object")
+            .contains_key("zerorouter"),
+        "a request that never engaged the knob keeps the legacy response shape: {body}"
+    );
 
     assert_eq!(
         settled_priority(&pool, api_key_id).await,
@@ -3473,10 +3493,22 @@ async fn a_priority_suffix_is_stripped_carried_and_recorded() {
         .await
         .expect("completion request should complete");
     assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(header(&response, "x-zerorouter-attempts"), "1");
     let body = json_body(response).await;
     state.wait_for_background_tasks().await;
 
     assert_eq!(body["model"], "zero/test-solo");
+    // Engaging the knob through any carrier attaches the response block:
+    // resolved priority, the walk story, and the (null until validators
+    // exist) declared-validator verdict.
+    assert_eq!(body["zerorouter"]["priority"], "cost");
+    assert_eq!(
+        body["zerorouter"]["attempts"][0]["candidate"],
+        "deepinfra/solo"
+    );
+    assert_eq!(body["zerorouter"]["attempts"][0]["outcome"], "ok");
+    assert!(body["zerorouter"]["attempts"][0]["latency_ms"].is_i64());
+    assert!(body["zerorouter"]["validated"].is_null());
     assert_eq!(
         settled_priority(&pool, api_key_id).await,
         Some("cost".to_owned())
@@ -3678,22 +3710,26 @@ async fn a_suffix_never_invents_a_model() {
 }
 
 /// The streaming twin of the suffix test: the resolved priority reaches the
-/// settled row through the streaming walk's terminals too, and the stream's
-/// chunks carry the stripped model name.
+/// settled row through the streaming walk's terminals too, the stream's
+/// chunks carry the stripped model name, and — because SSE headers left
+/// before the walk resolved — the response block rides the final usage chunk
+/// for exactly the clients that opted into usage. A knob-less stream's usage
+/// chunk stays byte-identical.
 #[tokio::test]
-async fn streaming_records_the_resolved_priority() {
+async fn streaming_carries_the_block_on_the_usage_chunk_and_records_the_priority() {
     let Some(pool) = connect().await else {
         return;
     };
     let (api_key_id, key) = create_funded_key(&pool, "knob-stream").await;
-    let solo = FakeModelProvider::new(
-        "solo",
-        vec![FakeOutcome::Stream(vec![
+    let (bare_key_id, bare_key) = create_funded_key(&pool, "knob-stream-bare").await;
+    let served_stream = || {
+        FakeOutcome::Stream(vec![
             FakeStreamStep::text("served"),
             FakeStreamStep::Usage(served_usage()),
             FakeStreamStep::Final,
-        ])],
-    );
+        ])
+    };
+    let solo = FakeModelProvider::new("solo", vec![served_stream(), served_stream()]);
     let state = router(pool.clone(), vec![solo.clone()]);
 
     let response = app(state.clone())
@@ -3707,6 +3743,34 @@ async fn streaming_records_the_resolved_priority() {
     let chunks = sse_chunks(response).await;
     assert_eq!(chunks[1]["choices"][0]["delta"]["content"], "served");
     assert_eq!(chunks[1]["model"], "zero/test-solo");
+    let usage_chunk = chunks.last().expect("stream ends with the usage chunk");
+    assert_eq!(usage_chunk["usage"]["prompt_tokens"], 1_000);
+    assert_eq!(usage_chunk["zerorouter"]["priority"], "cost");
+    assert_eq!(
+        usage_chunk["zerorouter"]["attempts"][0]["candidate"],
+        "deepinfra/solo"
+    );
+    assert_eq!(usage_chunk["zerorouter"]["attempts"][0]["outcome"], "ok");
+    assert!(usage_chunk["zerorouter"]["validated"].is_null());
+
+    let response = app(state.clone())
+        .oneshot(completion_request(
+            &bare_key,
+            &completion_body("zero/test-solo", true),
+        ))
+        .await
+        .expect("bare stream request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    let chunks = sse_chunks(response).await;
+    let usage_chunk = chunks.last().expect("stream ends with the usage chunk");
+    assert_eq!(usage_chunk["usage"]["prompt_tokens"], 1_000);
+    assert!(
+        !usage_chunk
+            .as_object()
+            .expect("usage chunk is an object")
+            .contains_key("zerorouter"),
+        "a knob-less stream keeps its legacy usage chunk: {usage_chunk}"
+    );
     state.wait_for_background_tasks().await;
 
     assert_eq!(
@@ -3714,4 +3778,98 @@ async fn streaming_records_the_resolved_priority() {
         Some("cost".to_owned())
     );
     assert_eq!(settled_tier(&pool, api_key_id).await, "zero/test-solo");
+    assert_eq!(
+        settled_priority(&pool, bare_key_id).await,
+        Some("balanced".to_owned())
+    );
+}
+
+/// The walk story in the block is the whole walk, skips and failures
+/// included: a rate-limited first rung appears beside the serving rung, and
+/// the attempts header counts both — the customer-visible mirror of the
+/// `request_attempts` rows the same walk settled.
+#[tokio::test]
+async fn the_response_block_tells_the_whole_walk_story() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let (api_key_id, key) = create_funded_key(&pool, "knob-walk-story").await;
+    let primary = FakeModelProvider::new("primary", vec![FakeOutcome::RateLimited]);
+    let secondary = FakeModelProvider::new(
+        "secondary",
+        vec![FakeOutcome::chat("hello from secondary", served_usage())],
+    );
+    let state = router(pool.clone(), vec![primary.clone(), secondary.clone()]);
+
+    let mut body = completion_body("zero/test-pair", false);
+    body["zerorouter"] = json!({ "priority": "balanced" });
+    let response = app(state.clone())
+        .oneshot(completion_request(&key, &body))
+        .await
+        .expect("completion request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(header(&response, "x-zerorouter-attempts"), "2");
+    let body = json_body(response).await;
+    state.wait_for_background_tasks().await;
+
+    assert_eq!(body["zerorouter"]["priority"], "balanced");
+    let attempts = body["zerorouter"]["attempts"]
+        .as_array()
+        .expect("attempts is an array");
+    assert_eq!(attempts.len(), 2);
+    assert_eq!(attempts[0]["candidate"], "fireworks/primary");
+    assert_eq!(attempts[0]["outcome"], "rate_limited");
+    assert_eq!(attempts[1]["candidate"], "together/secondary");
+    assert_eq!(attempts[1]["outcome"], "ok");
+    assert_eq!(
+        attempt_rows(&pool, api_key_id).await,
+        [
+            (
+                1,
+                "fireworks/primary".to_owned(),
+                "rate_limited".to_owned(),
+                false
+            ),
+            (2, "together/secondary".to_owned(), "ok".to_owned(), true),
+        ],
+        "the block and the ledger are the same story"
+    );
+}
+
+/// The synthetic-stream serve path — a non-streaming candidate replayed as
+/// SSE — attaches the same block to its usage chunk as a live stream does.
+#[tokio::test]
+async fn synthetic_stream_carries_the_block_on_the_usage_chunk() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let (api_key_id, key) = create_funded_key(&pool, "knob-synthetic").await;
+    let solo = FakeModelProvider::without_streaming(
+        "solo",
+        vec![FakeOutcome::chat("whole answer", served_usage())],
+    );
+    let state = router(pool.clone(), vec![solo.clone()]);
+
+    let response = app(state.clone())
+        .oneshot(completion_request(
+            &key,
+            &completion_body("zero/test-solo:success", true),
+        ))
+        .await
+        .expect("stream request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    let chunks = sse_chunks(response).await;
+    state.wait_for_background_tasks().await;
+
+    let usage_chunk = chunks.last().expect("stream ends with the usage chunk");
+    assert_eq!(usage_chunk["usage"]["prompt_tokens"], 1_000);
+    assert_eq!(usage_chunk["zerorouter"]["priority"], "success");
+    assert_eq!(
+        usage_chunk["zerorouter"]["attempts"][0]["candidate"],
+        "deepinfra/solo"
+    );
+    assert_eq!(
+        settled_priority(&pool, api_key_id).await,
+        Some("success".to_owned())
+    );
 }

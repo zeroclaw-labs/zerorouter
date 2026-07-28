@@ -1745,7 +1745,10 @@ impl SettlementIntent {
                 sell_rates: RatesPayload::new(record.telemetry.sell_rates),
                 finish_reason: record.telemetry.finish_reason.clone(),
                 shape_ok: record.telemetry.shape_ok,
-                priority: record.telemetry.priority.map(|priority| priority.as_str().to_owned()),
+                priority: record
+                    .telemetry
+                    .priority
+                    .map(|priority| priority.as_str().to_owned()),
             },
             attempts: record
                 .attempts

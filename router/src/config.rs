@@ -1068,8 +1068,7 @@ output_per_mtok = 2
 "#,
         )
         .expect("catalog should parse");
-        validate_tier_catalog(&catalog)
-            .expect("a non-colliding colon id should validate");
+        validate_tier_catalog(&catalog).expect("a non-colliding colon id should validate");
         assert!(
             catalog.resolve("arn:aws:bedrock:us-east-1").is_some(),
             "the colon id must stay resolvable"
