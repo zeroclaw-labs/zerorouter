@@ -109,11 +109,18 @@ time, so the plaintext exists only in the claiming response.
 - **Provider request/response bodies** — application logs carry
   request/model/provider/token metadata only. Chat messages, tool payloads,
   and completions are never logged.
-- **Upstream error bodies** — the pinned provider dependency includes
-  sanitized upstream response fragments in its own log events, so
-  `router/src/main.rs` force-appends `zeroclaw_log_event=off,zeroclaw_providers=off`
-  to whatever `RUST_LOG` requests. Operators cannot re-enable those targets
-  through the environment.
+- **Upstream error bodies** — an upstream 4xx body is provider-controlled text
+  that routinely echoes the request that provoked it, and the pinned provider
+  dependency includes sanitized fragments of it in its own log events. Those
+  events, and the router's own per-attempt failure detail from the candidate
+  walk, are emitted under targets listed in
+  `logging::RETENTION_PROTECTED_TARGETS` and denied by a filter layer *beneath*
+  the operator's. Because `tracing` composes global filters by conjunction, no
+  `RUST_LOG` value — including a field-qualified directive, which outranks a
+  bare `target=off` on specificity — can re-enable them. Router code that
+  formats a provider body belongs under `logging::UPSTREAM_DETAIL_TARGET`;
+  anything logged under an unlisted target reaches the sink, which is why the
+  boundary is a list to extend rather than a claim to trust.
 - **Secrets in debug output** — `StripeSettings` scrubs its secret fields in
   its `Debug` impl (`router/src/web.rs`).
 

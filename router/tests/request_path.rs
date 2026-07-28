@@ -17,7 +17,13 @@
 //! Gated on `DATABASE_URL` like `tests/billing.rs`: when unset each test
 //! returns early (skips) instead of failing.
 
-use std::{path::PathBuf, str::FromStr, sync::Arc, time::Duration};
+use std::{
+    io::Write,
+    path::PathBuf,
+    str::FromStr,
+    sync::{Arc, Mutex, PoisonError},
+    time::Duration,
+};
 
 use axum::{
     body::Body,
@@ -29,6 +35,7 @@ use serde_json::{Value, json};
 use sqlx_core::{query::query, query_as::query_as, query_scalar::query_scalar};
 use sqlx_postgres::{PgConnectOptions, PgPool, PgPoolOptions};
 use tower::ServiceExt;
+use tracing_subscriber::fmt::MakeWriter;
 use uuid::Uuid;
 use zeroclaw_providers::traits::{TokenUsage, ToolCall};
 use zerorouter::{
@@ -39,6 +46,7 @@ use zerorouter::{
     billing::{balance, grant_promo},
     config::ResolvedRoute,
     db::migrate,
+    logging,
     openai::{TASK_SIGNATURE_SCHEME, tool_names_digest},
     providers::{ProviderCandidate, ProviderRoute},
     testing::{FakeModelProvider, FakeOutcome, FakeStreamStep},
@@ -2234,6 +2242,197 @@ async fn non_streaming_context_window_error_truncates_and_retries() {
     assert_eq!(secondary.call_count(), 0);
     let (candidate_id, _, _, _) = settled_provenance(&pool, api_key_id).await;
     assert_eq!(candidate_id.as_deref(), Some("fireworks/primary"));
+    assert_eq!(open_reservations(&pool, api_key_id).await, 0);
+}
+
+/// One error can be BOTH: a TPM rejection reading
+/// `429 Too Many Requests: token limit exceeded` matches the context-window
+/// hints (`token limit exceeded`) and the rate-limit check (`429` + `limit`) at
+/// once. The walk owes it one truncation and then owes it nothing.
+///
+/// The second occurrence must be read as the live 429 it is and move on, not as
+/// a context window the walk has already tried to repair. Reading it as the
+/// latter costs a 500ms wait and a THIRD dispatch to a rung the upstream has
+/// refused twice — pure COGS, on every candidate, invisible in the response.
+///
+/// The ledger is the second half of the same point: both abandoned attempts are
+/// labelled `rate_limited`, because migration 0004 documents that column as
+/// what feeds the health cooldown and a 429 the router happened to have a
+/// repair for is still a 429.
+#[tokio::test]
+async fn non_streaming_a_rate_limited_context_window_truncates_once_then_moves_on() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let (api_key_id, key) = create_funded_key(&pool, "ctx429").await;
+    let primary = FakeModelProvider::new(
+        "primary",
+        vec![
+            FakeOutcome::Failure("429 Too Many Requests: token limit exceeded"),
+            FakeOutcome::Failure("429 Too Many Requests: token limit exceeded"),
+            FakeOutcome::chat("a third call nobody should pay for", served_usage()),
+        ],
+    );
+    let secondary = FakeModelProvider::new(
+        "secondary",
+        vec![FakeOutcome::chat("hello from secondary", served_usage())],
+    );
+    let state = router(pool.clone(), vec![primary.clone(), secondary.clone()]);
+
+    let mut body = completion_body("zero/test-pair", false);
+    body["messages"] = json!([
+        { "role": "user", "content": "one" },
+        { "role": "assistant", "content": "two" },
+        { "role": "user", "content": "three" },
+    ]);
+    let response = app(state.clone())
+        .oneshot(completion_request(&key, &body))
+        .await
+        .expect("completion request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    state.wait_for_background_tasks().await;
+
+    let calls = primary.calls();
+    assert_eq!(
+        calls.len(),
+        2,
+        "the repair is owed once; the second refusal is a 429 and ends the rung"
+    );
+    assert_eq!(calls[0].message_count, 3);
+    assert_eq!(
+        calls[1].message_count, 2,
+        "the one truncation still happens — the class is not degraded early"
+    );
+    assert_eq!(secondary.call_count(), 1);
+    let (candidate_id, _, _, _) = settled_provenance(&pool, api_key_id).await;
+    assert_eq!(candidate_id.as_deref(), Some("together/secondary"));
+    assert_eq!(
+        attempt_rows(&pool, api_key_id).await,
+        [
+            (
+                1,
+                "fireworks/primary".to_owned(),
+                "rate_limited".to_owned(),
+                false
+            ),
+            (
+                2,
+                "fireworks/primary".to_owned(),
+                "rate_limited".to_owned(),
+                false
+            ),
+            (3, "together/secondary".to_owned(), "ok".to_owned(), true),
+        ]
+    );
+    assert_eq!(open_reservations(&pool, api_key_id).await, 0);
+}
+
+/// A log sink a test can read back, shaped like the one `logging::subscriber`
+/// writes JSON into.
+#[derive(Clone, Default)]
+struct CapturedLog(Arc<Mutex<Vec<u8>>>);
+
+impl CapturedLog {
+    fn contents(&self) -> String {
+        let bytes = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+}
+
+impl Write for CapturedLog {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'writer> MakeWriter<'writer> for CapturedLog {
+    type Writer = Self;
+
+    fn make_writer(&'writer self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+/// The retention contract, asserted against the REAL walk rather than a
+/// synthetic event: no part of an upstream error body reaches the log sink.
+///
+/// `logging.rs` pins the boundary and `logging::UPSTREAM_DETAIL_TARGET` names
+/// the one target allowed to carry provider text, but neither can see whether
+/// the walk actually uses it. This drives a failing candidate through the real
+/// handler with the real subscriber installed and reads the sink back, so
+/// moving the `detail` field onto the metadata event — the regression this
+/// replaces, which shipped a sanitized 500 characters of provider body under
+/// `zerorouter::api` at the default `info` level — fails here.
+///
+/// The upstream text is scripted to contain a prompt fragment, because that is
+/// what a real 4xx body echoes: the provider bails with `response.text()`
+/// verbatim, and `sanitize_api_error` scrubs seven credential prefixes and
+/// nothing else.
+///
+/// The subscriber is installed as this THREAD's default, not the process's:
+/// `#[tokio::test]` builds a current-thread runtime, so the spawned walk is
+/// polled on this same thread and inherits it, while the rest of the suite —
+/// running on other threads — neither sees it nor writes into this buffer. The
+/// two positive controls below are what prove the capture is live; without them
+/// a subscriber that captured nothing at all would pass.
+#[tokio::test]
+async fn the_walk_never_logs_an_upstream_error_body() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let (api_key_id, key) = create_funded_key(&pool, "logretention").await;
+    // Shaped like a provider 4xx: a status line, then the request echoed back.
+    let upstream_body = "400 Bad Request: {\"error\":{\"message\":\"invalid role\",\
+                         \"input\":\"SECRET-PROMPT-TEXT\"}}";
+    let primary = FakeModelProvider::new("primary", vec![FakeOutcome::Failure(upstream_body)]);
+    let secondary = FakeModelProvider::new(
+        "secondary",
+        vec![FakeOutcome::chat("hello from secondary", served_usage())],
+    );
+    let state = router(pool.clone(), vec![primary.clone(), secondary.clone()]);
+
+    let captured = CapturedLog::default();
+    // The production filter (`main.rs` defaults to `info`), widened to `trace`
+    // so nothing is suppressed by level and only the retention layer can be
+    // what stops the detail.
+    let subscriber = logging::subscriber("trace", captured.clone());
+    let _guard = tracing::dispatcher::set_default(&tracing::Dispatch::new(subscriber));
+
+    let response = app(state.clone())
+        .oneshot(completion_request(
+            &key,
+            &completion_body("zero/test-pair", false),
+        ))
+        .await
+        .expect("completion request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    state.wait_for_background_tasks().await;
+
+    let logged = captured.contents();
+    assert!(
+        logged.contains("upstream candidate attempt failed"),
+        "the walk's metadata event must reach the sink: {logged}"
+    );
+    assert!(
+        logged.contains("fireworks/primary"),
+        "which candidate failed is metadata and must survive: {logged}"
+    );
+    assert!(
+        !logged.contains("SECRET-PROMPT-TEXT"),
+        "an upstream body fragment reached the log sink: {logged}"
+    );
+    assert!(
+        !logged.contains("invalid role"),
+        "an upstream body fragment reached the log sink: {logged}"
+    );
     assert_eq!(open_reservations(&pool, api_key_id).await, 0);
 }
 

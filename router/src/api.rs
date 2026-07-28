@@ -865,7 +865,16 @@ async fn run_non_streaming(
             // then abandon-on-non-retryable, then move-on-rather-than-wait for
             // a live 429, then wait. Reordering any pair changes how many
             // upstream calls a failing request costs.
-            let class = retry::classify(&err);
+            //
+            // The classifier is told whether this walk has already spent its
+            // one truncation, because the pinned walk gated its whole
+            // context-window branch on the same flag (`reliable.rs:1735`) and
+            // fell through to the general classifier on a second occurrence. A
+            // 429 whose text also names a token limit is the case that pays for
+            // it: read as `ContextWindow` twice it would land in the backoff
+            // below instead of moving on, buying a third upstream call on a
+            // rung the provider has already refused.
+            let class = retry::classify(&err, context_truncated);
             attempts.push(build_attempt(
                 attempt_no,
                 candidate.definition(),
@@ -877,9 +886,10 @@ async fn run_non_streaming(
                 None,
                 None,
             ));
-            // The ledger has no free-text error column, so the detail the
-            // delegated walk folded into an aggregate string — and then
-            // discarded unread — is emitted per attempt here instead.
+            // Metadata only: which candidate failed, how, and on which attempt.
+            // The upstream's own words are deliberately NOT on this event —
+            // `zerorouter::api` is outside the retention boundary, so anything
+            // here reaches the operator's sink.
             tracing::warn!(
                 request_id,
                 requested_model = resolved.requested_model,
@@ -888,11 +898,45 @@ async fn run_non_streaming(
                 upstream_model = candidate.definition().model,
                 attempt = attempt_no,
                 outcome = class.outcome(),
-                detail = retry::compact_error_detail(&err),
                 "upstream candidate attempt failed"
             );
+            // The upstream's response text, under the one target that may carry
+            // it. `compact_error_detail` returns up to 500 characters of the
+            // provider's raw HTTP body — `sanitize_api_error` scrubs seven
+            // credential prefixes and nothing else, and a 4xx body routinely
+            // echoes the request that provoked it — while ZeroRouter's
+            // retention contract permits request metadata only
+            // (`docs/SECURITY.md`).
+            //
+            // So this callsite sits INSIDE the retention boundary
+            // (`logging::RETENTION_PROTECTED_TARGETS`), which drops it before
+            // any sink and which no `RUST_LOG` value can reopen. It costs
+            // nothing to keep: `tracing` decides a callsite is enabled before it
+            // builds the value set, so under the router's subscriber this never
+            // runs the `compact_error_detail` call at all
+            // (`logging::a_denied_target_never_evaluates_its_fields`).
+            //
+            // It is written rather than deleted so that the single place
+            // upstream text is formatted is governed by the boundary rather
+            // than by a reviewer remembering the rule: a deployment that wants
+            // bodies has to move the boundary, once and visibly, instead of
+            // adding a field to the event above.
+            tracing::warn!(
+                target: crate::logging::UPSTREAM_DETAIL_TARGET,
+                request_id,
+                candidate_id = candidate.definition().id,
+                attempt = attempt_no,
+                detail = retry::compact_error_detail(&err),
+                "upstream candidate attempt detail"
+            );
 
-            if class == retry::FailureClass::ContextWindow && !context_truncated {
+            // A `ContextWindow` here implies the walk has NOT yet truncated —
+            // `classify` was told the flag, and returns the class only while the
+            // repair is still available. Every path out of this block leaves the
+            // attempt loop, which is what keeps the two checks below unreachable
+            // for this class and lets `is_rate_limited` stay a pure control-flow
+            // predicate (`retry::FailureClass::is_rate_limited`).
+            if matches!(class, retry::FailureClass::ContextWindow { .. }) {
                 if retry::truncate_for_context(&mut effective_messages) > 0 {
                     context_truncated = true;
                     // Consumes an attempt, deliberately.

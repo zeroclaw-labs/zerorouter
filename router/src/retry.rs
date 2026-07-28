@@ -16,22 +16,39 @@
 //! | `is_context_window_exceeded` | `reliable.rs:278` | **imported** (`pub`) |
 //! | `is_rate_limited` | `reliable.rs:297` | copied |
 //! | `is_non_retryable_rate_limit` | `reliable.rs:308` | copied |
-//! | `parse_retry_after_ms` | `reliable.rs:350` | copied |
+//! | `parse_retry_after_ms` | `reliable.rs:350` | copied, **diverged** |
 //! | `is_empty_completion` | `reliable.rs:685` | copied |
 //! | `truncate_for_context` | `reliable.rs:634` | copied |
 //! | `compute_backoff` | `reliable.rs:854` | copied |
 //!
 //! A copy is a fork the day the pin moves, so the copies are byte-faithful to
-//! the cited lines and the tests below are a table over their observable
-//! verdicts rather than a smoke test. **When the `zeroclaw-providers` pin
+//! the cited lines except where the table says otherwise, and the tests below
+//! are a table over their observable verdicts rather than a smoke test. Exactly
+//! one row diverges today, and it is called out below so the divergence has to
+//! be re-decided rather than silently re-imported. **When the `zeroclaw-providers` pin
 //! moves, diff those eight functions and re-run this module's tests before
 //! anything else** — a silent classifier drift changes how many times a
 //! customer's request is dispatched upstream, which is a COGS change nobody
 //! would see in a diff.
 //!
-//! Nothing here is a policy decision. Every value and every branch reproduces
-//! what the delegated walk already did; the walk that consumes them lives in
-//! [`crate::api`].
+//! # The one row that is not byte-faithful
+//!
+//! [`parse_retry_after_ms`] fixes a panic the pinned original still carries: it
+//! finds a byte offset in a lowercased copy of the message and slices the
+//! ORIGINAL with it, which is out of bounds or mid-codepoint whenever
+//! lowercasing changed the byte length. The text is an upstream response body,
+//! so the input is not ours to constrain, and the blast radius differs by host:
+//! in ZeroClaw the panic fails one agent turn, here it unwinds a spawned walk
+//! and strands a reservation with no ledger row. **Do not re-import this one
+//! when the pin moves** unless the upstream has fixed it too — see the function
+//! for the exact divergence and
+//! `retry_after_survives_non_ascii_upstream_text` for the inputs that pin it.
+//!
+//! No BRANCH here is a policy decision: every value the walk dispatches on
+//! reproduces what the delegated walk already did, and the walk that consumes
+//! them lives in [`crate::api`]. [`FailureClass::outcome`] is the exception by
+//! construction — the delegated walk kept no ledger, so its label has no pinned
+//! counterpart to be faithful to and answers to migration 0004 instead.
 
 use std::time::Duration;
 
@@ -68,7 +85,15 @@ pub enum FailureClass {
     NonRetryable,
     /// The prompt does not fit. Uniquely recoverable in place, by shortening
     /// the prompt rather than by waiting or by moving on.
-    ContextWindow,
+    ///
+    /// `rate_limited` carries what the upstream ALSO said. A TPM rejection
+    /// reading `429 Too Many Requests: token limit exceeded` matches both hint
+    /// lists — `token limit exceeded` is a context-window hint
+    /// (`reliable.rs:283-292`) and `429` + `limit` is a rate-limit one — and
+    /// truncating is the right response to it either way. Only the ledger
+    /// LABEL depends on the bit, which is why it rides here instead of
+    /// changing the class: see [`Self::outcome`].
+    ContextWindow { rate_limited: bool },
 }
 
 impl FailureClass {
@@ -79,9 +104,18 @@ impl FailureClass {
         matches!(self, Self::NonRetryable | Self::RateLimitedNonRetryable)
     }
 
-    /// Whether the upstream said 429, in either flavour. Gates the
-    /// move-on-instead-of-waiting short circuit (`reliable.rs:1814`) and picks
-    /// the ledger outcome.
+    /// Whether the walk should abandon this candidate rather than wait out a
+    /// 429. Gates the move-on-instead-of-waiting short circuit
+    /// (`reliable.rs:1814`).
+    ///
+    /// Deliberately FALSE for a rate-limited [`Self::ContextWindow`]. That
+    /// class's response is the in-place repair, not moving on, and the pinned
+    /// walk only ever reached its 429 short circuit on a SECOND occurrence
+    /// (`reliable.rs:1735` gates the whole context branch on
+    /// `!context_truncated`) — by which point [`classify`] no longer returns
+    /// `ContextWindow` at all. Keeping this predicate about control flow alone
+    /// means no reordering of the walk can turn a repairable prompt into an
+    /// abandoned candidate. The ledger reads the 429 separately, below.
     #[must_use]
     pub fn is_rate_limited(self) -> bool {
         matches!(self, Self::RateLimited | Self::RateLimitedNonRetryable)
@@ -91,12 +125,27 @@ impl FailureClass {
     /// Every value is admitted by `request_attempts_outcome_is_known`
     /// (migration 0004) — an unknown string would abort the settle
     /// transaction, i.e. lose a settlement.
+    ///
+    /// This reads the 429 bit rather than [`Self::is_rate_limited`], so a
+    /// context-window rejection the upstream delivered AS a 429 is recorded as
+    /// the 429 it was. Migration 0004 documents this column as what feeds the
+    /// health cooldown; labelling a real rate limit `upstream_error` because
+    /// the router happened to have a repair for it hides the rung's state from
+    /// the thing that has to notice it.
+    ///
+    /// Matched exhaustively on purpose: a new class must decide its label here
+    /// rather than inherit one from a wildcard.
     #[must_use]
     pub fn outcome(self) -> &'static str {
-        if self.is_rate_limited() {
-            "rate_limited"
-        } else {
-            "upstream_error"
+        match self {
+            Self::RateLimited
+            | Self::RateLimitedNonRetryable
+            | Self::ContextWindow { rate_limited: true } => "rate_limited",
+            Self::Retryable
+            | Self::NonRetryable
+            | Self::ContextWindow {
+                rate_limited: false,
+            } => "upstream_error",
         }
     }
 }
@@ -108,17 +157,37 @@ impl FailureClass {
 /// and a business 429 is folded into "non-retryable" before the plain
 /// rate-limit short circuit is consulted.
 ///
-/// A [`FailureClass::ContextWindow`] returned after the prompt has ALREADY been
-/// truncated once degrades to [`FailureClass::Retryable`], which is what the
-/// delegated walk did by falling through to its general classifier — see
-/// `context_window_errors_are_retryable_once_the_prompt_is_already_truncated`
-/// for the proof that the general classifier reads it that way.
+/// `context_truncated` says whether this walk has already spent its one
+/// truncation, and it gates the context-window check exactly as
+/// `reliable.rs:1735` gated the whole branch. On a second occurrence the pinned
+/// walk fell through to the general classifier it computes at
+/// `reliable.rs:1791-1793`, i.e. it classified the error by everything it is
+/// APART from being a context-window error — so this does too.
+///
+/// That distinction is not cosmetic. A TPM rejection reading
+/// `429 Too Many Requests: token limit exceeded` is simultaneously
+/// context-window-shaped and rate-limit-shaped. Returning
+/// [`FailureClass::ContextWindow`] for it a second time would drop it past the
+/// abandon-on-non-retryable check and past the move-on-for-a-live-429 check
+/// into another backoff and another billable upstream call, on a candidate the
+/// upstream has already refused twice.
+///
+/// For the plain case the flag changes nothing, which is what makes it
+/// faithful rather than a policy choice: `is_non_retryable` short-circuits to
+/// false for any context-window error (`reliable.rs:176-179`), so a second
+/// `maximum context length exceeded` still classifies
+/// [`FailureClass::Retryable`] and still burns the candidate's whole retry
+/// budget — see
+/// `context_window_errors_are_retryable_once_the_prompt_is_already_truncated`.
 #[must_use]
-pub fn classify(err: &anyhow::Error) -> FailureClass {
-    if is_context_window_exceeded(err) {
-        return FailureClass::ContextWindow;
-    }
+pub fn classify(err: &anyhow::Error, context_truncated: bool) -> FailureClass {
+    // Hoisted only so the context-window arm can carry it; it decides nothing
+    // here. The context check is still the first thing that DECIDES, which is
+    // the ordering `reliable.rs:1735 → 1791-1793` fixes.
     let rate_limited = is_rate_limited(err);
+    if !context_truncated && is_context_window_exceeded(err) {
+        return FailureClass::ContextWindow { rate_limited };
+    }
     let non_retryable = is_non_retryable(err) || is_non_retryable_rate_limit(err);
     match (non_retryable, rate_limited) {
         (true, true) => FailureClass::RateLimitedNonRetryable,
@@ -186,11 +255,31 @@ pub fn is_non_retryable_rate_limit(err: &anyhow::Error) -> bool {
 }
 
 /// Extract a `Retry-After` value in milliseconds from an error message. Copied
-/// verbatim from `reliable.rs:350-380`.
+/// from `reliable.rs:350-380` with one deliberate divergence.
+///
+/// # The divergence
+///
+/// The pinned original searches `msg.to_lowercase()` for the prefix and then
+/// slices the ORIGINAL `msg` at the offset it found. `to_lowercase` is not
+/// length-preserving — U+0130 is two bytes and lowercases to three, U+212A is
+/// three bytes and lowercases to one — so that offset is not an index into
+/// `msg`, and the slice lands mid-codepoint or past the end. Both panic.
+///
+/// The error text here is the upstream's HTTP response body verbatim
+/// (`compatible.rs:2682-2685`), and `sanitize_api_error` scrubs credential
+/// prefixes without normalising case or stripping non-ASCII — so the input is
+/// upstream-controlled and need not be ASCII. In ZeroClaw a panic here fails
+/// one agent turn; here it unwinds a spawned walk past
+/// `UsageSession::record`, which leaves a reservation counting against the
+/// user's caps with no ledger row and no settlement intent to replay.
+///
+/// So this reads the payload out of `lower` rather than out of `msg`. The
+/// payload is ASCII digits and `.`, which `to_lowercase` does not alter, so
+/// every input the original parsed still parses to the same value — the
+/// divergence is confined to the inputs that used to abort.
 #[must_use]
 pub fn parse_retry_after_ms(err: &anyhow::Error) -> Option<u64> {
-    let msg = err.to_string();
-    let lower = msg.to_lowercase();
+    let lower = err.to_string().to_lowercase();
 
     for prefix in &[
         "retry-after:",
@@ -199,7 +288,10 @@ pub fn parse_retry_after_ms(err: &anyhow::Error) -> Option<u64> {
         "retry_after ",
     ] {
         if let Some(pos) = lower.find(prefix) {
-            let after = &msg[pos + prefix.len()..];
+            // Same buffer the offset came from. `pos + prefix.len()` is a char
+            // boundary in `lower` because the prefix is ASCII and matched
+            // there; it is nothing in particular in `msg`.
+            let after = &lower[pos + prefix.len()..];
             let num_str: String = after
                 .trim()
                 .chars()
@@ -386,13 +478,80 @@ mod tests {
             // The one class with an in-place repair.
             (
                 "maximum context length exceeded",
-                FailureClass::ContextWindow,
+                FailureClass::ContextWindow {
+                    rate_limited: false,
+                },
             ),
-            ("prompt is too long", FailureClass::ContextWindow),
+            (
+                "prompt is too long",
+                FailureClass::ContextWindow {
+                    rate_limited: false,
+                },
+            ),
+            // Both at once: `token limit exceeded` is a context-window hint
+            // and `429` + `limit` is a rate-limit one. The repair still wins
+            // the first time — but the 429 rides along so the ledger can say
+            // what the upstream actually said.
+            (
+                "429 Too Many Requests: token limit exceeded",
+                FailureClass::ContextWindow { rate_limited: true },
+            ),
         ];
 
         for (detail, expected) in table {
-            assert_eq!(classify(&error(detail)), expected, "classifying {detail:?}");
+            assert_eq!(
+                classify(&error(detail), false),
+                expected,
+                "classifying {detail:?}"
+            );
+        }
+    }
+
+    /// The second occurrence is classified by everything the error is APART
+    /// from being a context-window error, because the walk has no second
+    /// repair to offer it (`reliable.rs:1735`).
+    ///
+    /// The 429-shaped row is the one that costs money: read as
+    /// `ContextWindow` it would fall past both short circuits into a backoff
+    /// and a third dispatch, where the pinned walk broke to the next candidate
+    /// after two. The plain rows prove the flag is not a licence to give up
+    /// early — they still burn the full budget.
+    #[test]
+    fn classifier_degrades_once_the_prompt_is_already_truncated() {
+        let table = [
+            (
+                "429 Too Many Requests: token limit exceeded",
+                FailureClass::RateLimited,
+            ),
+            ("maximum context length exceeded", FailureClass::Retryable),
+            ("prompt is too long", FailureClass::Retryable),
+            // A business 429 that is also context-shaped is still unpayable.
+            (
+                "429 rate limit: insufficient quota, prompt is too long",
+                FailureClass::RateLimitedNonRetryable,
+            ),
+        ];
+
+        for (detail, expected) in table {
+            assert_eq!(
+                classify(&error(detail), true),
+                expected,
+                "classifying {detail:?} after truncation"
+            );
+        }
+
+        // Nothing else moves: the flag gates the context check and only that.
+        for detail in [
+            "connection reset by peer",
+            "401 Unauthorized",
+            "429 Too Many Requests",
+            "503 Service Unavailable",
+        ] {
+            assert_eq!(
+                classify(&error(detail), true),
+                classify(&error(detail), false),
+                "{detail:?} must not depend on the truncation flag"
+            );
         }
     }
 
@@ -405,20 +564,50 @@ mod tests {
         assert!(FailureClass::RateLimitedNonRetryable.is_non_retryable());
         assert!(!FailureClass::RateLimited.is_non_retryable());
         assert!(!FailureClass::Retryable.is_non_retryable());
-        assert!(!FailureClass::ContextWindow.is_non_retryable());
+        assert!(
+            !FailureClass::ContextWindow {
+                rate_limited: false
+            }
+            .is_non_retryable()
+        );
 
         assert!(FailureClass::RateLimited.is_rate_limited());
         assert!(FailureClass::RateLimitedNonRetryable.is_rate_limited());
         assert!(!FailureClass::NonRetryable.is_rate_limited());
+        // The 429 bit on a repairable prompt is a LABEL, not a branch: a walk
+        // that read it as one would abandon a candidate whose prompt it could
+        // still have shortened. Both flavours must answer no.
+        assert!(
+            !FailureClass::ContextWindow { rate_limited: true }.is_rate_limited(),
+            "a rate-limited context window must not divert the walk"
+        );
+        assert!(
+            !FailureClass::ContextWindow {
+                rate_limited: false
+            }
+            .is_rate_limited()
+        );
 
         // Only these two outcome strings can reach the walk ledger from a
         // failed attempt, and both are in migration 0004's CHECK.
         assert_eq!(FailureClass::Retryable.outcome(), "upstream_error");
         assert_eq!(FailureClass::NonRetryable.outcome(), "upstream_error");
-        assert_eq!(FailureClass::ContextWindow.outcome(), "upstream_error");
+        assert_eq!(
+            FailureClass::ContextWindow {
+                rate_limited: false
+            }
+            .outcome(),
+            "upstream_error"
+        );
         assert_eq!(FailureClass::RateLimited.outcome(), "rate_limited");
         assert_eq!(
             FailureClass::RateLimitedNonRetryable.outcome(),
+            "rate_limited"
+        );
+        // The ledger says what the upstream said, even where the walk's
+        // response was the truncation rather than a cooldown.
+        assert_eq!(
+            FailureClass::ContextWindow { rate_limited: true }.outcome(),
             "rate_limited"
         );
     }
@@ -484,6 +673,41 @@ mod tests {
             parse_retry_after_ms(&error("retry-after: soon")),
             None,
             "an unparseable value is no value"
+        );
+    }
+
+    /// The error text is the upstream's HTTP response body verbatim
+    /// (`compatible.rs:2682-2685` bails with `response.text()`, and
+    /// `sanitize_api_error` scrubs seven credential prefixes without touching
+    /// case or non-ASCII), so it is attacker-influenced and need not be ASCII.
+    ///
+    /// `to_lowercase` is not length-preserving — U+0130 is two bytes and
+    /// lowercases to three, U+212A is three bytes and lowercases to one — so an
+    /// offset found in the lowercased copy is not an index into the original.
+    /// Scanning one buffer and slicing the other panicked the walk, and the
+    /// walk is a spawned task: the panic unwinds past
+    /// `UsageSession::record`, leaving the reservation open against the user's
+    /// caps until the TTL sweep deletes it, with no `usage_events` row, no
+    /// `request_attempts` row, and no settlement intent for recovery to replay.
+    #[test]
+    fn retry_after_survives_non_ascii_upstream_text() {
+        // 22 bytes; 26 once lowercased. The old code sliced `msg` at 25.
+        assert_eq!(
+            parse_retry_after_ms(&error("\u{130}\u{130}\u{130}\u{130} retry_after 1")),
+            Some(1_000),
+            "a multi-byte-expanding prefix must not move the payload"
+        );
+        // The other direction: U+212A shrinks, so the offset lands early and
+        // used to split a codepoint or silently read the wrong bytes.
+        assert_eq!(
+            parse_retry_after_ms(&error("429 K\u{212A} model\u{e9}x retry-after: 5")),
+            Some(5_000),
+            "a shrinking prefix must not discard a valid Retry-After"
+        );
+        // The whole point of parsing it: a wait the walk actually takes.
+        assert_eq!(
+            compute_backoff(500, &error("\u{130}\u{130}\u{130}\u{130} retry_after 1")),
+            1_000
         );
     }
 

@@ -81,9 +81,23 @@ impl RequestTelemetry {
     /// COGS would appear on neither side of
     /// `cost_usd - cost_basis_usd - attempts_cost_basis_usd`.
     ///
-    /// With no served attempt — every non-streaming settle, and the streaming
-    /// terminals that delivered nothing — this falls back to pricing the
-    /// settled usage, which is what those paths have always done.
+    /// With no served attempt this falls back to pricing the settled usage,
+    /// which is what those paths have always done. That set shrank when the
+    /// non-streaming walk was unrolled into the router: the buffered success
+    /// path now records a served attempt of its own, so it reads
+    /// `served.cost_basis_usd` like the streaming path does. What is left on
+    /// the fallback is the terminals that recorded no served attempt — the
+    /// three `api::WalkTerminal` settles, the non-streaming metering-gap branch
+    /// (`served = false`, because the body is discarded and the customer gets a
+    /// 503), and the streaming terminals that delivered nothing.
+    ///
+    /// No money moved when that set shrank, and it is worth saying why rather
+    /// than leaving it to be re-derived: `AttemptTokens::measured(usage)
+    /// .priceable()` reconstructs exactly the prompt/cached/completion figures
+    /// the fallback would have priced, and both arms price them at the same
+    /// `candidate.rates`. The two arms agree by construction on that path;
+    /// `non_streaming_attribution_survives_a_retry_on_the_primary` pins the
+    /// value.
     fn cost_basis(&self, record: &UsageRecord) -> Option<Decimal> {
         record
             .attempts
@@ -227,6 +241,19 @@ impl AttemptRecord {
 /// attempts exist but none of them lost (a single-attempt request that served),
 /// the sum is a genuine zero and `complete` is TRUE: there were no losing
 /// attempts, which is a different statement from not knowing what they cost.
+///
+/// # A reading boundary in the data, not in the code
+///
+/// A first-try non-streaming success used to record no attempts at all and so
+/// settled `(NULL, NULL)` — "unknown". Since the walk was unrolled into the
+/// router it records its served attempt, so the same request shape now settles
+/// `(0, TRUE)` — "there were no losing attempts", which is migration 0007's
+/// intended reading (`0007_ledger_honesty.sql:44-52`) and the one the streaming
+/// path already wrote. Nothing about the request changed; what changed is that
+/// the ledger can now tell the two apart. Anyone comparing
+/// `attempts_cost_basis_usd` across that commit is comparing a NULL that meant
+/// "no rows" with a zero that means "no losses", and must not read the change
+/// as COGS appearing or disappearing.
 struct AttemptCogs {
     total: Option<Decimal>,
     complete: Option<bool>,

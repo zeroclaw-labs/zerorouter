@@ -39,12 +39,32 @@
 //! is why [`RETENTION_PROTECTED_TARGETS`] is the thing to extend when the pinned
 //! dependency grows a new body-bearing target, and why the list matches whole
 //! target path segments rather than bare string prefixes.
+//!
+//! That gap is not hypothetical, and it has been closed once already. Unrolling
+//! the non-streaming candidate walk into the router put the provider's raw error
+//! body in reach of ZeroRouter's OWN code, and the walk logged a sanitized 500
+//! characters of it under `zerorouter::api` — a target this list does not name,
+//! at the default `info` level. Router code that touches upstream text now emits
+//! it under [`UPSTREAM_DETAIL_TARGET`], which the list does name. **Anything
+//! that formats a provider body belongs under that target, whoever wrote it.**
 
 use tracing::Subscriber;
 use tracing_subscriber::{
     EnvFilter, filter::filter_fn, fmt::MakeWriter, layer::SubscriberExt, registry,
     util::SubscriberInitExt,
 };
+
+/// The router's own target for events carrying upstream response text.
+///
+/// The router-owned candidate walk sees the provider's raw HTTP error body and
+/// has one diagnostic use for it (`api::run_non_streaming`, the per-attempt
+/// failure detail). That text may not reach the sink, so its callsite is given
+/// a target inside the boundary rather than left on `zerorouter::api` — the
+/// boundary, not a reviewer, is then what stops it. Nothing logged under this
+/// target is emitted today; it exists so the rule is structural and so a
+/// deployment with a different retention posture has exactly one place to
+/// change.
+pub const UPSTREAM_DETAIL_TARGET: &str = "zerorouter::upstream_body";
 
 /// Targets whose events may carry provider request or response bodies.
 ///
@@ -53,7 +73,16 @@ use tracing_subscriber::{
 /// `zeroclaw_providers::openai`). A bare string prefix would be wrong in both
 /// directions — it would sweep in an unrelated `zeroclaw_providers_metrics` and
 /// still say nothing useful about intent.
-pub const RETENTION_PROTECTED_TARGETS: &[&str] = &["zeroclaw_log_event", "zeroclaw_providers"];
+///
+/// Note that the list is not only about the pinned dependency:
+/// [`UPSTREAM_DETAIL_TARGET`] is first-party. Upstream text became reachable
+/// from ZeroRouter's own code the moment the walk was unrolled into it, and a
+/// boundary that named only the dependency's targets would have missed it.
+pub const RETENTION_PROTECTED_TARGETS: &[&str] = &[
+    "zeroclaw_log_event",
+    "zeroclaw_providers",
+    UPSTREAM_DETAIL_TARGET,
+];
 
 /// Whether `target` sits inside the retention boundary and must never be logged.
 #[must_use]
@@ -101,7 +130,10 @@ pub fn init(requested_filter: &str) {
 mod tests {
     use std::{
         io::Write,
-        sync::{Arc, Mutex, PoisonError},
+        sync::{
+            Arc, Mutex, PoisonError,
+            atomic::{AtomicUsize, Ordering},
+        },
     };
 
     use super::*;
@@ -144,11 +176,62 @@ mod tests {
         assert!(is_retention_protected("zeroclaw_providers"));
         assert!(is_retention_protected("zeroclaw_providers::openai"));
         assert!(is_retention_protected("zeroclaw_providers::openai::stream"));
+        // First-party, and the reason the list is not only about the pin.
+        assert!(is_retention_protected(UPSTREAM_DETAIL_TARGET));
         // A bare string prefix would sweep these in; a path-segment match must
         // not, or the boundary silently grows past what it documents.
         assert!(!is_retention_protected("zeroclaw_providers_metrics"));
         assert!(!is_retention_protected("zerorouter::api"));
+        assert!(!is_retention_protected("zerorouter::upstream_bodyguard"));
         assert!(!is_retention_protected(""));
+    }
+
+    /// The router's own walk formats upstream response bodies
+    /// (`api::run_non_streaming` → `retry::compact_error_detail`, up to 500
+    /// characters of the provider's raw HTTP body). Emitted under
+    /// `zerorouter::api` it reached the sink at the default `info` level, which
+    /// is what `docs/SECURITY.md` promises never happens. Under
+    /// [`UPSTREAM_DETAIL_TARGET`] it must be as unreachable as the pinned
+    /// dependency's own events, including under an operator filter written to
+    /// ask for it by name and by field.
+    ///
+    /// The second assertion is the positive control: the metadata half of the
+    /// same walk event must still arrive, or a regression that suppresses
+    /// everything would pass this test.
+    #[test]
+    fn the_walks_upstream_body_cannot_reach_the_sink() {
+        let captured = CapturedLog::default();
+        let adversarial = "info,zerorouter=trace,zerorouter::upstream_body=trace,\
+                           zerorouter::upstream_body[{detail}]=trace";
+
+        tracing::subscriber::with_default(subscriber(adversarial, captured.clone()), || {
+            tracing::warn!(
+                target: UPSTREAM_DETAIL_TARGET,
+                request_id = "req-1",
+                candidate_id = "fireworks/primary",
+                attempt = 1,
+                detail = "provider API error (400): invalid request: PROVIDER-BODY",
+                "upstream candidate attempt detail"
+            );
+            tracing::warn!(
+                target: "zerorouter::api",
+                request_id = "req-1",
+                candidate_id = "fireworks/primary",
+                attempt = 1,
+                outcome = "upstream_error",
+                "upstream candidate attempt failed"
+            );
+        });
+
+        let logged = captured.contents();
+        assert!(
+            !logged.contains("PROVIDER-BODY"),
+            "the walk's upstream detail reached the sink: {logged}"
+        );
+        assert!(
+            logged.contains("upstream candidate attempt failed"),
+            "the metadata half of the walk event must still be logged: {logged}"
+        );
     }
 
     /// The defect itself: an operator filter crafted to outrank a target-only
@@ -180,6 +263,55 @@ mod tests {
         assert!(
             logged.contains("req-1"),
             "the operator's filter must still admit everything outside the boundary: {logged}"
+        );
+    }
+
+    /// Keeping a permanently-denied callsite costs nothing, which is what makes
+    /// it reasonable for the walk to format upstream text at one.
+    ///
+    /// `tracing` decides whether a callsite is enabled BEFORE it builds the
+    /// value set, so a denied target never runs its field expressions — the
+    /// `compact_error_detail` call in `api::run_non_streaming` is not made on a
+    /// failing attempt. The `zerorouter::api` half is the positive control: it
+    /// proves the counter moves when the callsite IS admitted, so a broken
+    /// probe cannot pass this.
+    #[test]
+    fn a_denied_target_never_evaluates_its_fields() {
+        static FORMATTED: AtomicUsize = AtomicUsize::new(0);
+
+        fn upstream_body() -> String {
+            FORMATTED.fetch_add(1, Ordering::SeqCst);
+            "PROVIDER-BODY".to_owned()
+        }
+
+        let captured = CapturedLog::default();
+        tracing::subscriber::with_default(subscriber("trace", captured.clone()), || {
+            tracing::warn!(
+                target: UPSTREAM_DETAIL_TARGET,
+                detail = upstream_body(),
+                "upstream candidate attempt detail"
+            );
+            assert_eq!(
+                FORMATTED.load(Ordering::SeqCst),
+                0,
+                "a denied callsite must not even format its fields"
+            );
+
+            tracing::warn!(
+                target: "zerorouter::api",
+                detail = upstream_body(),
+                "outside the boundary"
+            );
+            assert_eq!(
+                FORMATTED.load(Ordering::SeqCst),
+                1,
+                "an admitted callsite must still format them"
+            );
+        });
+
+        assert!(
+            captured.contents().contains("PROVIDER-BODY"),
+            "the control event must have reached the sink"
         );
     }
 
