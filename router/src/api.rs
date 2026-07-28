@@ -31,7 +31,7 @@ use zeroclaw_providers::{
 
 use crate::{
     auth::{AuthenticatedKey, AuthenticationError, KeyAuthenticator},
-    config::{ResolvedRoute, TierCandidate, load_tier_catalog},
+    config::{ResolvedRoute, TierCandidate, TierCatalog, load_tier_catalog},
     db::{
         AttemptRecord, AttemptTokens, RequestTelemetry, SettlementRecovery, UsageAdmission,
         UsageRecord, UsageSession, begin_usage_session, recover_owed_settlements,
@@ -43,6 +43,7 @@ use crate::{
         StreamMetadata, TaskSignature, finish_reason, shape_ok, stream_delta_json,
         stream_tool_call_delta, stream_usage_json, task_signature, tool_args_all_json, usage_cost,
     },
+    priority::Priority,
     providers::{ProviderCandidate, ProviderRoute},
     retry,
     sqlx::PgPool,
@@ -58,10 +59,18 @@ struct RequestFeatures {
     prompt_bytes: i64,
     message_count: i32,
     tool_count: i32,
+    // The resolved priority knob for this request (rollout Stage 3a) —
+    // resolved before admission from typed field > model suffix > per-key
+    // default > balanced, and written on the settled row at every terminal.
+    priority: Priority,
 }
 
 impl RequestFeatures {
-    fn from_request(request: &ChatCompletionRequest, reservation_usage: OpenAiUsage) -> Self {
+    fn from_request(
+        request: &ChatCompletionRequest,
+        reservation_usage: OpenAiUsage,
+        priority: Priority,
+    ) -> Self {
         Self {
             requested_max_tokens: request
                 .max_tokens
@@ -70,6 +79,7 @@ impl RequestFeatures {
             prompt_bytes: i64::try_from(reservation_usage.prompt_tokens).unwrap_or(i64::MAX),
             message_count: i32::try_from(request.messages.len()).unwrap_or(i32::MAX),
             tool_count: i32::try_from(request.tools.len()).unwrap_or(i32::MAX),
+            priority,
         }
     }
 }
@@ -578,22 +588,39 @@ async fn chat_completions(
     let catalog = load_tier_catalog(state.tier_config_path())
         .await
         .map_err(|_| ApiError::TierCatalogUnavailable)?;
-    let resolved = match catalog.resolve(&request.model) {
-        Some(resolved) => resolved,
-        // Absent from the servable catalog means one of two very different
-        // things. Either the id does not exist (the caller's mistake, 404), or
-        // it exists in a tier withheld for below-cost pricing — ZeroRouter's
-        // mistake, which the caller cannot fix and must not be told is a
-        // missing model.
-        None => {
-            return Err(catalog.unavailable_for(&request.model).map_or(
-                ApiError::ModelNotFound,
-                |withheld| ApiError::ModelUnavailable {
-                    tier: withheld.tier.clone(),
-                },
-            ));
-        }
+    // The model-suffix priority carrier (design doc: "Model-suffix carrier"),
+    // resolve-first: the untouched model string is tried before anything is
+    // stripped, so a hypothetical id ending in a priority keyword — catalog
+    // validation refuses to load one — would still resolve as itself. Only
+    // when that fails, and the segment after the last ':' is exactly a
+    // priority keyword, is the suffix stripped and the remainder resolved;
+    // anything else falls through to the same not-found answer as before.
+    // Everything downstream — `usage_events.tier`, the response `model`
+    // field, stream metadata — reads the resolved (stripped) name.
+    let (resolved, suffix_priority) = match catalog.resolve(&request.model) {
+        Some(resolved) => (resolved, None),
+        None => match split_priority_suffix(&request.model) {
+            Some((base, priority)) => match catalog.resolve(base) {
+                Some(resolved) => (resolved, Some(priority)),
+                None => return Err(model_unresolvable(&catalog, base)),
+            },
+            None => return Err(model_unresolvable(&catalog, &request.model)),
+        },
     };
+    // Precedence: typed `zerorouter.priority` > model suffix > per-key
+    // default > balanced. Typed and suffix present with different values is
+    // a client bug and refused loudly (`priority_conflict`), before anything
+    // is reserved.
+    let typed_priority = request.zerorouter.and_then(|options| options.priority);
+    if let (Some(typed), Some(suffix)) = (typed_priority, suffix_priority)
+        && typed != suffix
+    {
+        return Err(ApiError::PriorityConflict);
+    }
+    let priority = typed_priority
+        .or(suffix_priority)
+        .or(authenticated.default_priority)
+        .unwrap_or(Priority::Balanced);
     let max_output_tokens = *request.max_tokens.get_or_insert(BASELINE_MAX_TOKENS);
     let provider_route = services.provider_route(&resolved, max_output_tokens)?;
     let reservation_usage = request.reservation_usage(max_output_tokens);
@@ -642,6 +669,7 @@ async fn chat_completions(
             resolved,
             provider_route,
             reservation_usage,
+            priority,
         )
     } else {
         non_streaming_response(
@@ -652,11 +680,36 @@ async fn chat_completions(
             resolved,
             provider_route,
             reservation_usage,
+            priority,
         )
         .await
     }
 }
 
+/// The model-suffix carrier's split: `Some((base, priority))` when the last
+/// `:`-delimited segment is exactly a priority keyword and a base remains.
+/// Never consulted while the untouched string resolves (resolve-first).
+fn split_priority_suffix(model: &str) -> Option<(&str, Priority)> {
+    let (base, keyword) = model.rsplit_once(':')?;
+    let priority = Priority::from_keyword(keyword)?;
+    (!base.is_empty()).then_some((base, priority))
+}
+
+/// Absent from the servable catalog means one of two very different things.
+/// Either the id does not exist (the caller's mistake, 404), or it exists in
+/// a tier withheld for below-cost pricing — ZeroRouter's mistake, which the
+/// caller cannot fix and must not be told is a missing model.
+fn model_unresolvable(catalog: &TierCatalog, requested_model: &str) -> ApiError {
+    catalog
+        .unavailable_for(requested_model)
+        .map_or(ApiError::ModelNotFound, |withheld| {
+            ApiError::ModelUnavailable {
+                tier: withheld.tier.clone(),
+            }
+        })
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn non_streaming_response(
     runtime: RuntimeControl,
     health: ProviderHealth,
@@ -665,6 +718,7 @@ async fn non_streaming_response(
     resolved: ResolvedRoute,
     provider_route: ProviderRoute,
     reservation_usage: OpenAiUsage,
+    priority: Priority,
 ) -> Result<Response, ApiError> {
     runtime
         .tasks
@@ -676,6 +730,7 @@ async fn non_streaming_response(
             resolved,
             provider_route,
             reservation_usage,
+            priority,
         ))
         .await
         .map_err(|_| ApiError::UpstreamUnavailable)?
@@ -690,9 +745,10 @@ async fn run_non_streaming(
     resolved: ResolvedRoute,
     provider_route: ProviderRoute,
     reservation_usage: OpenAiUsage,
+    priority: Priority,
 ) -> Result<Response, ApiError> {
     let request_id = usage_session.request_id();
-    let features = RequestFeatures::from_request(&request, reservation_usage);
+    let features = RequestFeatures::from_request(&request, reservation_usage, priority);
     let tools = request.provider_tools();
     let max_tokens = request.max_tokens;
     // One clock for the whole walk, exactly as the streaming walk keeps one:
@@ -1296,6 +1352,7 @@ fn streaming_response(
     resolved: ResolvedRoute,
     provider_route: ProviderRoute,
     reservation_usage: OpenAiUsage,
+    priority: Priority,
 ) -> Result<Response, ApiError> {
     let metadata = StreamMetadata::new(
         usage_session.request_id(),
@@ -1316,6 +1373,7 @@ fn streaming_response(
             resolved,
             provider_route.into_candidates(),
             reservation_usage,
+            priority,
         )
         .await;
     });
@@ -1343,11 +1401,12 @@ async fn stream_to_channel(
     resolved: ResolvedRoute,
     candidates: Vec<ProviderCandidate>,
     reservation_usage: OpenAiUsage,
+    priority: Priority,
 ) {
     let messages = request.provider_messages();
     let tools = request.provider_tools();
     let max_tokens = request.max_tokens;
-    let features = RequestFeatures::from_request(&request, reservation_usage);
+    let features = RequestFeatures::from_request(&request, reservation_usage, priority);
     let started = Instant::now();
     let mut last_candidate = None;
     let mut usage_session = Some(usage_session);
@@ -2435,6 +2494,7 @@ async fn persist_usage(
         sell_rates,
         finish_reason: finish_reason.map(str::to_owned),
         shape_ok: shape_label,
+        priority: Some(features.priority),
     };
     usage_session
         .record(&UsageRecord {
@@ -2655,6 +2715,7 @@ mod tests {
         let key = AuthenticatedKey {
             id: Uuid::new_v4(),
             user_id,
+            default_priority: None,
         };
         query("INSERT INTO users (id, email) VALUES ($1, $2)")
             .bind(user_id)
@@ -2773,6 +2834,7 @@ mod tests {
                 ProviderCandidate::against_local_upstream(second.clone(), &ok_url),
             ],
             reservation_usage,
+            Priority::Balanced,
         )
         .await;
         assert!(
@@ -2858,6 +2920,7 @@ mod tests {
             resolved,
             vec![ProviderCandidate::with_provider(candidate.clone(), fake)],
             reservation_usage,
+            Priority::Balanced,
         )
         .await;
         tokio::time::resume();
@@ -2958,6 +3021,7 @@ mod tests {
             resolved,
             vec![ProviderCandidate::with_provider(candidate.clone(), fake)],
             reservation_usage,
+            Priority::Balanced,
         )
         .await;
         assert!(
@@ -3051,6 +3115,7 @@ mod tests {
                 &ok_url,
             )],
             reservation_usage,
+            Priority::Balanced,
         )
         .await;
         client.await.expect("client task should join");

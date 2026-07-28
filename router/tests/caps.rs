@@ -35,6 +35,7 @@ use zerorouter::{
     device,
     openai::{OpenAiUsage, TASK_SIGNATURE_SCHEME, TaskSignature, tool_names_digest},
     portal,
+    priority::Priority,
     session::{CSRF_HEADER, SESSION_COOKIE, create_session},
     web::{WebConfig, WebCtx},
 };
@@ -98,6 +99,7 @@ async fn create_key(
     AuthenticatedKey {
         id: key_id,
         user_id,
+        default_priority: None,
     }
 }
 
@@ -147,6 +149,7 @@ fn usage_record(cost_usd: Decimal) -> UsageRecord {
             },
             finish_reason: None,
             shape_ok: None,
+            priority: Some(Priority::Balanced),
         },
         attempts: Vec::new(),
     }

@@ -10,6 +10,11 @@ use serde::Serialize;
 #[derive(Debug)]
 pub enum ApiError {
     InvalidRequest,
+    /// The typed `zerorouter.priority` and the model-suffix carrier are both
+    /// present and disagree. A conflict is a client bug and is refused loudly
+    /// rather than resolved by precedence (design doc: "Precedence and
+    /// conflicts").
+    PriorityConflict,
     CacheControlUnsupported,
     PayloadTooLarge,
     UnsupportedRequestFields,
@@ -66,6 +71,15 @@ impl ApiError {
                 "invalid_request_error",
                 None,
                 "invalid_request",
+            ),
+            Self::PriorityConflict => (
+                StatusCode::BAD_REQUEST,
+                Cow::Borrowed(
+                    "zerorouter.priority and the model-name priority suffix disagree; send one, or the same value in both.",
+                ),
+                "invalid_request_error",
+                Some("zerorouter.priority"),
+                "priority_conflict",
             ),
             Self::CacheControlUnsupported => (
                 StatusCode::BAD_REQUEST,

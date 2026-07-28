@@ -11,6 +11,8 @@ use zeroclaw_providers::{
     traits::{ChatMessage, ChatResponse, TokenUsage, ToolCall},
 };
 
+use crate::priority::Priority;
+
 #[derive(Clone, Deserialize)]
 pub struct ChatCompletionRequest {
     pub model: String,
@@ -23,8 +25,30 @@ pub struct ChatCompletionRequest {
     pub tools: Vec<OpenAiTool>,
     pub tool_choice: Option<Value>,
     pub stream_options: Option<StreamOptionsRequest>,
+    // Typed and named BEFORE the flatten, so serde consumes the key and it
+    // never lands in `extra` — the one namespaced field ZeroRouter owns on an
+    // otherwise OpenAI-shaped request (design doc: "The priority knob").
+    pub zerorouter: Option<ZeroRouterRequestOptions>,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
+}
+
+/// ZeroRouter's own request namespace, strictly validated where the
+/// OpenAI-compat surface is strictly rejected: `deny_unknown_fields` makes a
+/// typo like `"priorty"` a loud 400 through the same deserialization error
+/// any malformed body takes, without touching
+/// [`ChatCompletionRequest::contains_unsupported_extensions`]. Before this
+/// field existed, a request carrying `zerorouter` landed in `extra` and was
+/// 400-rejected as an unsupported field — so the typed object cannot change
+/// the meaning of any request that worked before it.
+///
+/// Stage 3a carries `priority` alone. `validator` and `budget_usd` are
+/// stage-5a fields; until then `deny_unknown_fields` keeps them loud 400s
+/// rather than silently accepted no-ops.
+#[derive(Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ZeroRouterRequestOptions {
+    pub priority: Option<Priority>,
 }
 
 #[derive(Clone, Deserialize)]
@@ -1169,6 +1193,37 @@ mod tests {
         .expect("request should parse");
 
         assert!(request.contains_unsupported_extensions());
+    }
+
+    #[test]
+    fn the_zerorouter_object_is_typed_not_an_unsupported_extension() {
+        // Before the knob, a top-level `zerorouter` key landed in `extra` and
+        // was 400-rejected as unsupported — so typing it cannot change any
+        // request that worked. Typed, it must no longer read as an extension,
+        // and its contents are strictly validated.
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "zero/balanced",
+            "messages": [{"role": "user", "content": "hello"}],
+            "zerorouter": {"priority": "cost"}
+        }))
+        .expect("request should parse");
+        assert!(!request.contains_unsupported_extensions());
+        assert!(request.extra.is_empty());
+        assert_eq!(
+            request.zerorouter.and_then(|options| options.priority),
+            Some(Priority::Cost)
+        );
+
+        // deny_unknown_fields: a typo inside ZeroRouter's own namespace is a
+        // deserialization failure, not a silently dropped field.
+        assert!(
+            serde_json::from_value::<ChatCompletionRequest>(json!({
+                "model": "zero/balanced",
+                "messages": [{"role": "user", "content": "hello"}],
+                "zerorouter": {"priorty": "cost"}
+            }))
+            .is_err()
+        );
     }
 
     #[test]

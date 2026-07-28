@@ -15,6 +15,7 @@ use zeroclaw_providers::pricing::ModelRates;
 use crate::{
     auth::AuthenticatedKey,
     openai::{OpenAiUsage, PromptTokenDetails, TaskSignature, usage_cost},
+    priority::Priority,
     sqlx::{
         self, PgPool,
         migrate::{Migration, MigrationType, Migrator},
@@ -67,6 +68,11 @@ pub struct RequestTelemetry {
     // Synthesized outcome labels; `None` where no completion was produced.
     pub finish_reason: Option<String>,
     pub shape_ok: Option<bool>,
+    // The resolved priority knob (rollout Stage 3a). `None` only when
+    // replaying a settlement intent persisted before the knob shipped —
+    // exactly migration 0004's "NULL = row predates the knob". The live path
+    // always resolves one, `balanced` being the default.
+    pub priority: Option<Priority>,
 }
 
 impl RequestTelemetry {
@@ -1115,12 +1121,13 @@ async fn settle_once(
                 estimator_basis,
                 attempts_cost_basis_complete,
                 task_signature_scheme,
-                tool_names_sha256
+                tool_names_sha256,
+                priority
             )
             VALUES (
                 $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
                 $12, $13, $14, $15::JSONB, $16::JSONB, $17, $18, $19, $20, $21,
-                $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32
+                $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33
             )
             "#,
     )
@@ -1160,6 +1167,7 @@ async fn settle_once(
     // a key this build did not compute would mislabel the segment.
     .bind(intent.task_signature_scheme)
     .bind(intent.tool_names_sha256.as_deref())
+    .bind(telemetry.priority.map(Priority::as_str))
     .execute(&mut *transaction)
     .await;
     if let Err(error) = settled {
@@ -1672,6 +1680,11 @@ struct TelemetryPayload {
     sell_rates: RatesPayload,
     finish_reason: Option<String>,
     shape_ok: Option<bool>,
+    /// `#[serde(default)]` keeps pre-knob intents replayable; they settle
+    /// with a NULL priority, which is the ledger's word for "predates the
+    /// knob", never a guessed `balanced`.
+    #[serde(default)]
+    priority: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1732,6 +1745,7 @@ impl SettlementIntent {
                 sell_rates: RatesPayload::new(record.telemetry.sell_rates),
                 finish_reason: record.telemetry.finish_reason.clone(),
                 shape_ok: record.telemetry.shape_ok,
+                priority: record.telemetry.priority.map(|priority| priority.as_str().to_owned()),
             },
             attempts: record
                 .attempts
@@ -1809,6 +1823,11 @@ impl SettlementIntent {
                 sell_rates: self.telemetry.sell_rates.to_rates(),
                 finish_reason: self.telemetry.finish_reason.clone(),
                 shape_ok: self.telemetry.shape_ok,
+                priority: self
+                    .telemetry
+                    .priority
+                    .as_deref()
+                    .and_then(Priority::from_keyword),
             },
             attempts,
         })
