@@ -3509,6 +3509,17 @@ async fn a_priority_suffix_is_stripped_carried_and_recorded() {
     assert_eq!(body["zerorouter"]["attempts"][0]["outcome"], "ok");
     assert!(body["zerorouter"]["attempts"][0]["latency_ms"].is_i64());
     assert!(body["zerorouter"]["validated"].is_null());
+    // Stage 3b: an unmeasured segment's estimate is the cold byte-bound
+    // answer — the request's own max_tokens, labeled as such.
+    assert_eq!(body["zerorouter"]["estimate"]["basis"], "cold");
+    assert_eq!(
+        body["zerorouter"]["estimate"]["output_tokens_p50"],
+        MAX_TOKENS
+    );
+    assert_eq!(
+        body["zerorouter"]["estimate"]["output_tokens_p90"],
+        MAX_TOKENS
+    );
     assert_eq!(
         settled_priority(&pool, api_key_id).await,
         Some("cost".to_owned())
@@ -3752,6 +3763,11 @@ async fn streaming_carries_the_block_on_the_usage_chunk_and_records_the_priority
     );
     assert_eq!(usage_chunk["zerorouter"]["attempts"][0]["outcome"], "ok");
     assert!(usage_chunk["zerorouter"]["validated"].is_null());
+    assert_eq!(usage_chunk["zerorouter"]["estimate"]["basis"], "cold");
+    assert_eq!(
+        usage_chunk["zerorouter"]["estimate"]["output_tokens_p50"],
+        MAX_TOKENS
+    );
 
     let response = app(state.clone())
         .oneshot(completion_request(
@@ -3980,6 +3996,12 @@ async fn cost_mode_reorders_by_expected_cost_once_the_segment_warms() {
         "together",
         "a warm segment orders cost mode cheapest-first"
     );
+    let body = json_body(response).await;
+    assert_eq!(
+        body["zerorouter"]["estimate"]["basis"], "learned",
+        "a warm segment's estimate is the measured one"
+    );
+    assert_eq!(body["zerorouter"]["estimate"]["output_tokens_p50"], 200);
 
     // Same warm segment, balanced: identity, exactly as before the flip.
     let response = app(state.clone())

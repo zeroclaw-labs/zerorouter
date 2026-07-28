@@ -470,6 +470,12 @@ pub struct ChatCompletionResponse {
 #[derive(Clone, Debug, Serialize)]
 pub struct ZeroRouterResponseMetadata {
     pub priority: Priority,
+    /// Output-token guidance for this request's segment (stage 3b) —
+    /// explicitly guidance, never a quote: `learned` percentiles once the
+    /// segment's estimator cell is warm, else the `cold` byte-bound answer,
+    /// which is the request's own `max_tokens`. The basis names which one
+    /// the customer is reading.
+    pub estimate: ZeroRouterEstimate,
     /// Every walk position in order, skips included: the attempts array is
     /// the customer-visible audit trail for "why did the walk look like
     /// this", mirroring the `request_attempts` rows the same walk settled.
@@ -486,6 +492,38 @@ pub struct ZeroRouterAttempt {
     pub candidate: String,
     pub outcome: String,
     pub latency_ms: i32,
+}
+
+/// The `estimate` member of the response block (design doc: "Response
+/// metadata"): the segment's expected output size and the provenance of
+/// that expectation. `quote` exists in the design's ladder but no code path
+/// can produce it until the gated quote stage ships.
+#[derive(Clone, Copy, Debug, Serialize)]
+pub struct ZeroRouterEstimate {
+    pub output_tokens_p50: u64,
+    pub output_tokens_p90: u64,
+    pub basis: EstimateBasis,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EstimateBasis {
+    Cold,
+    Learned,
+}
+
+impl ZeroRouterEstimate {
+    /// The cold answer: no warm cell, so the only honest output bound is the
+    /// request's own `max_tokens` — p50 and p90 alike, which is itself the
+    /// signal that the segment is unmeasured.
+    #[must_use]
+    pub fn cold(max_output_tokens: u32) -> Self {
+        Self {
+            output_tokens_p50: max_output_tokens.into(),
+            output_tokens_p90: max_output_tokens.into(),
+            basis: EstimateBasis::Cold,
+        }
+    }
 }
 
 #[derive(Serialize)]

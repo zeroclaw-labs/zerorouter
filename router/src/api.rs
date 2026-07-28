@@ -41,10 +41,10 @@ use crate::{
     estimator::{CellKey, CellRead, EstimatorState, REFRESH_BATCH, REFRESH_INTERVAL},
     health::{ProviderHealth, WalkLedger},
     openai::{
-        ChatCompletionRequest, ChatCompletionResponse, EmittedOutput, ModelList, OpenAiUsage,
-        StreamMetadata, TaskSignature, ZeroRouterAttempt, ZeroRouterResponseMetadata,
-        finish_reason, shape_ok, stream_delta_json, stream_tool_call_delta, stream_usage_json,
-        task_signature, tool_args_all_json, usage_cost,
+        ChatCompletionRequest, ChatCompletionResponse, EmittedOutput, EstimateBasis, ModelList,
+        OpenAiUsage, StreamMetadata, TaskSignature, ZeroRouterAttempt, ZeroRouterEstimate,
+        ZeroRouterResponseMetadata, finish_reason, shape_ok, stream_delta_json,
+        stream_tool_call_delta, stream_usage_json, task_signature, tool_args_all_json, usage_cost,
     },
     priority::Priority,
     providers::{ProviderCandidate, ProviderRoute},
@@ -71,6 +71,12 @@ struct RequestFeatures {
     // never mentioned the knob keeps its byte-identical legacy response
     // while still recording its resolved `balanced`.
     knob_engaged: bool,
+    // The segment's output estimate, read from the candidate-agnostic cell
+    // once in `chat_completions` and carried to every serve site so the
+    // response block shows it. Response-only, never persisted
+    // (`usage_events.estimator_basis` stays 'cold' until Stage 4 sizes
+    // reservations from this).
+    estimate: ZeroRouterEstimate,
 }
 
 impl RequestFeatures {
@@ -78,6 +84,7 @@ impl RequestFeatures {
         request: &ChatCompletionRequest,
         reservation_usage: OpenAiUsage,
         priority: PriorityResolution,
+        estimate: ZeroRouterEstimate,
     ) -> Self {
         Self {
             requested_max_tokens: request
@@ -89,6 +96,7 @@ impl RequestFeatures {
             tool_count: i32::try_from(request.tools.len()).unwrap_or(i32::MAX),
             priority: priority.resolved,
             knob_engaged: priority.engaged,
+            estimate,
         }
     }
 }
@@ -122,6 +130,7 @@ fn zerorouter_block(
 ) -> Option<ZeroRouterResponseMetadata> {
     features.knob_engaged.then(|| ZeroRouterResponseMetadata {
         priority: features.priority,
+        estimate: features.estimate,
         attempts: attempts
             .rows()
             .iter()
@@ -776,6 +785,18 @@ async fn chat_completions(
     let signature_cell = services
         .estimator
         .lookup(&CellKey::for_signature(&signature));
+    // The estimate the response block will show: learned percentiles from
+    // the warm cell, else the cold byte-bound answer. Guidance, never a
+    // quote — and never an input to admission, which stays byte-bound until
+    // Stage 4.
+    let estimate = match signature_cell {
+        CellRead::Warm(percentiles) => ZeroRouterEstimate {
+            output_tokens_p50: round_tokens(percentiles.p50),
+            output_tokens_p90: round_tokens(percentiles.p90),
+            basis: EstimateBasis::Learned,
+        },
+        CellRead::Cold => ZeroRouterEstimate::cold(max_output_tokens),
+    };
     let mut provider_route = services.provider_route(&resolved, max_output_tokens)?;
     order_candidates(
         priority.resolved,
@@ -819,6 +840,7 @@ async fn chat_completions(
             provider_route,
             reservation_usage,
             priority,
+            estimate,
         )
     } else {
         non_streaming_response(
@@ -830,6 +852,7 @@ async fn chat_completions(
             provider_route,
             reservation_usage,
             priority,
+            estimate,
         )
         .await
     }
@@ -964,6 +987,15 @@ fn order_by_expected_cost(candidates: &mut Vec<ProviderCandidate>, estimates: &C
     candidates.extend(priced.into_iter().map(|(_, candidate)| candidate));
 }
 
+/// A percentile as the wire shows it: output tokens are whole numbers, and
+/// the scan cannot produce a negative or astronomically large quantile from
+/// nonnegative integer inputs — the saturating cast is belt-and-braces.
+fn round_tokens(value: f64) -> u64 {
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let rounded = value.round().max(0.0) as u64;
+    rounded
+}
+
 /// Expected COST BASIS of dispatching one candidate: the byte-bound input at
 /// the candidate's input rate plus the estimated output at its output rate.
 /// A candidate whose rate table cannot price a dimension prices at infinity
@@ -988,6 +1020,7 @@ async fn non_streaming_response(
     provider_route: ProviderRoute,
     reservation_usage: OpenAiUsage,
     priority: PriorityResolution,
+    estimate: ZeroRouterEstimate,
 ) -> Result<Response, ApiError> {
     runtime
         .tasks
@@ -1000,6 +1033,7 @@ async fn non_streaming_response(
             provider_route,
             reservation_usage,
             priority,
+            estimate,
         ))
         .await
         .map_err(|_| ApiError::UpstreamUnavailable)?
@@ -1015,9 +1049,10 @@ async fn run_non_streaming(
     provider_route: ProviderRoute,
     reservation_usage: OpenAiUsage,
     priority: PriorityResolution,
+    estimate: ZeroRouterEstimate,
 ) -> Result<Response, ApiError> {
     let request_id = usage_session.request_id();
-    let features = RequestFeatures::from_request(&request, reservation_usage, priority);
+    let features = RequestFeatures::from_request(&request, reservation_usage, priority, estimate);
     let tools = request.provider_tools();
     let max_tokens = request.max_tokens;
     // One clock for the whole walk, exactly as the streaming walk keeps one:
@@ -1636,6 +1671,7 @@ fn streaming_response(
     provider_route: ProviderRoute,
     reservation_usage: OpenAiUsage,
     priority: PriorityResolution,
+    estimate: ZeroRouterEstimate,
 ) -> Result<Response, ApiError> {
     let metadata = StreamMetadata::new(
         usage_session.request_id(),
@@ -1657,6 +1693,7 @@ fn streaming_response(
             provider_route.into_candidates(),
             reservation_usage,
             priority,
+            estimate,
         )
         .await;
     });
@@ -1685,11 +1722,12 @@ async fn stream_to_channel(
     candidates: Vec<ProviderCandidate>,
     reservation_usage: OpenAiUsage,
     priority: PriorityResolution,
+    estimate: ZeroRouterEstimate,
 ) {
     let messages = request.provider_messages();
     let tools = request.provider_tools();
     let max_tokens = request.max_tokens;
-    let features = RequestFeatures::from_request(&request, reservation_usage, priority);
+    let features = RequestFeatures::from_request(&request, reservation_usage, priority, estimate);
     let started = Instant::now();
     let mut last_candidate = None;
     let mut usage_session = Some(usage_session);
@@ -3136,6 +3174,7 @@ mod tests {
             ],
             reservation_usage,
             PriorityResolution::new(None),
+            ZeroRouterEstimate::cold(64),
         )
         .await;
         assert!(
@@ -3222,6 +3261,7 @@ mod tests {
             vec![ProviderCandidate::with_provider(candidate.clone(), fake)],
             reservation_usage,
             PriorityResolution::new(None),
+            ZeroRouterEstimate::cold(64),
         )
         .await;
         tokio::time::resume();
@@ -3323,6 +3363,7 @@ mod tests {
             vec![ProviderCandidate::with_provider(candidate.clone(), fake)],
             reservation_usage,
             PriorityResolution::new(None),
+            ZeroRouterEstimate::cold(64),
         )
         .await;
         assert!(
@@ -3417,6 +3458,7 @@ mod tests {
             )],
             reservation_usage,
             PriorityResolution::new(None),
+            ZeroRouterEstimate::cold(64),
         )
         .await;
         client.await.expect("client task should join");
