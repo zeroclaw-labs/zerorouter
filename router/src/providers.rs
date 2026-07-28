@@ -12,20 +12,12 @@ use zeroclaw_providers::{
     anthropic::AnthropicModelProvider,
     bedrock::BedrockModelProvider,
     compatible::{AuthStyle, OpenAiCompatibleModelProvider},
-    model_pin::ModelPinnedProvider,
-    reliable::{
-        ProviderFallbackInfo, ReliableModelProvider, scope_provider_fallback,
-        take_last_provider_fallback,
-    },
     traits::{ChatRequest, ChatResponse, ModelProvider, StreamEvent, StreamOptions, StreamResult},
 };
 
 use crate::config::TierCandidate;
 
 const PROVIDER_INVENTORY_JSON: &str = include_str!("../config/providers.json");
-const PROVIDER_RETRIES: u32 = 2;
-const PROVIDER_BACKOFF_MS: u64 = 500;
-const ROUTE_ALIAS: &str = "zerorouter";
 
 #[derive(Debug, Deserialize)]
 struct ProviderInventory {
@@ -148,9 +140,8 @@ pub enum ProviderBuildError {
 /// An available upstream candidate and its canonical tier-table definition.
 ///
 /// The provider client is deliberately private so all attributed calls pass
-/// through [`ProviderDispatch`]. Streaming callers can try these entries in
-/// order without going through `ReliableModelProvider`, whose stream method
-/// cannot fail over after polling has begun.
+/// through [`ProviderDispatch`]. Both walks try these entries in order
+/// themselves; nothing in this module decides when to retry or when to move on.
 pub struct ProviderCandidate {
     definition: TierCandidate,
     provider: Arc<dyn ModelProvider>,
@@ -245,11 +236,11 @@ impl fmt::Debug for ProviderCandidate {
 /// Provider clients for one resolved route.
 ///
 /// `candidates` preserves the tier-table order after candidates whose ECS
-/// credential is unavailable have been removed. `non_streaming` wraps the same
-/// clients with model pins and ZeroClaw's retry/fallback implementation.
+/// credential is unavailable have been removed. That order is the whole of the
+/// route's policy: which candidate is tried, how often, and when to give up are
+/// the walk's decisions, in `api.rs`.
 pub struct ProviderRoute {
     candidates: Vec<ProviderCandidate>,
-    non_streaming: Arc<dyn ModelProvider>,
 }
 
 impl ProviderRoute {
@@ -267,10 +258,10 @@ impl ProviderRoute {
 
     /// Assemble a route from pre-built candidates.
     ///
-    /// Goes through the same [`assemble_route`] wiring as [`Self::new`], so the
-    /// non-streaming retry/fallback chain a test drives is the production one
-    /// and only the leaf provider clients differ. Gated on the `testing`
-    /// feature for the same reason [`ProviderCandidate::with_provider`] is.
+    /// Goes through the same [`assemble_route`] wiring as [`Self::new`], so a
+    /// test drives the production route and only the leaf provider clients
+    /// differ. Gated on the `testing` feature for the same reason
+    /// [`ProviderCandidate::with_provider`] is.
     #[cfg(feature = "testing")]
     #[must_use]
     pub fn from_candidates(candidates: Vec<ProviderCandidate>) -> Self {
@@ -285,68 +276,6 @@ impl ProviderRoute {
     #[must_use]
     pub fn into_candidates(self) -> Vec<ProviderCandidate> {
         self.candidates
-    }
-
-    /// Run a non-streaming request with retry/fallback and report the candidate
-    /// that actually served it.
-    pub async fn chat<'route>(
-        &'route self,
-        request: ChatRequest<'_>,
-        requested_model: &str,
-        temperature: Option<f64>,
-    ) -> anyhow::Result<SelectedChatResponse<'route>> {
-        let (response, fallback) = scope_provider_fallback(async {
-            let response = ProviderDispatch::new(Arc::clone(&self.non_streaming))
-                .chat(request, requested_model, temperature)
-                .await;
-            let fallback = take_last_provider_fallback();
-            (response, fallback)
-        })
-        .await;
-
-        let response = response?;
-        let candidate = self.selected_candidate(fallback.as_ref())?;
-        Ok(SelectedChatResponse {
-            response,
-            candidate: candidate.definition(),
-        })
-    }
-
-    fn selected_candidate(
-        &self,
-        fallback: Option<&ProviderFallbackInfo>,
-    ) -> anyhow::Result<&ProviderCandidate> {
-        let Some(fallback) = fallback else {
-            return self
-                .candidates
-                .first()
-                .ok_or_else(|| anyhow::anyhow!("provider route unexpectedly has no candidates"));
-        };
-
-        self.candidates
-            .iter()
-            .find(|candidate| candidate.definition.id == fallback.actual_provider)
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "provider fallback selected unknown candidate {}",
-                    fallback.actual_provider
-                )
-            })
-    }
-}
-
-/// A non-streaming response paired with the canonical candidate that served it.
-pub struct SelectedChatResponse<'route> {
-    pub response: ChatResponse,
-    pub candidate: &'route TierCandidate,
-}
-
-impl fmt::Debug for SelectedChatResponse<'_> {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("SelectedChatResponse")
-            .field("candidate", &self.candidate)
-            .finish_non_exhaustive()
     }
 }
 
@@ -418,33 +347,13 @@ where
     Ok(assemble_route(available))
 }
 
-/// Wrap ordered candidates in the model-pinned retry/fallback chain the
-/// non-streaming path dispatches through.
+/// Put ordered candidates behind a route.
+///
+/// Kept as its own function, rather than inlined into the two constructors, so
+/// a test-supplied route and a credential-built one go through the same wiring
+/// and cannot diverge.
 fn assemble_route(candidates: Vec<ProviderCandidate>) -> ProviderRoute {
-    let fallback_chain = candidates
-        .iter()
-        .map(|candidate| {
-            let pinned = ModelPinnedProvider::builder(&candidate.definition.id)
-                .pinned_model(&candidate.definition.model)
-                .inner(Box::new(Arc::clone(&candidate.provider)))
-                .build();
-            (
-                candidate.definition.id.clone(),
-                Box::new(pinned) as Box<dyn ModelProvider>,
-            )
-        })
-        .collect();
-    let non_streaming: Arc<dyn ModelProvider> = Arc::new(ReliableModelProvider::new(
-        ROUTE_ALIAS,
-        fallback_chain,
-        PROVIDER_RETRIES,
-        PROVIDER_BACKOFF_MS,
-    ));
-
-    ProviderRoute {
-        candidates,
-        non_streaming,
-    }
+    ProviderRoute { candidates }
 }
 
 fn read_credential(name: &str) -> Option<String> {
@@ -659,24 +568,12 @@ mod tests {
         assert!(!format!("{route:?}").contains(credential));
     }
 
+    /// The upstream model a candidate is dispatched against is its own, taken
+    /// from the tier table — never the tier id the customer asked for. The pin
+    /// used to come from a wrapper around the chain; it now comes from
+    /// `ProviderCandidate::chat`, and this asserts the value it reads.
     #[test]
-    fn selected_response_debug_omits_completion_body() {
-        let definition = candidate("one", "deepinfra");
-        let selected = SelectedChatResponse {
-            response: ChatResponse {
-                text: Some("private completion".to_owned()),
-                tool_calls: Vec::new(),
-                usage: None,
-                reasoning_content: None,
-            },
-            candidate: &definition,
-        };
-
-        assert!(!format!("{selected:?}").contains("private completion"));
-    }
-
-    #[test]
-    fn reliable_chain_is_model_pinned() {
+    fn candidates_carry_their_pinned_upstream_model() {
         let route = build_with_credentials(
             vec![candidate("one", "fireworks")],
             zeroclaw_api::model_provider::BASELINE_MAX_TOKENS,
@@ -685,39 +582,5 @@ mod tests {
         .expect("Fireworks provider should build");
 
         assert_eq!(route.candidates[0].definition.model, "upstream/one");
-    }
-
-    #[test]
-    fn selected_candidate_defaults_to_primary_and_matches_fallback() {
-        let route = build_with_credentials(
-            vec![candidate("one", "fireworks"), candidate("two", "together")],
-            zeroclaw_api::model_provider::BASELINE_MAX_TOKENS,
-            |_| Some("secret".to_owned()),
-        )
-        .expect("providers should build");
-
-        assert_eq!(
-            route
-                .selected_candidate(None)
-                .expect("primary should exist")
-                .definition()
-                .id,
-            "one"
-        );
-
-        let fallback = ProviderFallbackInfo {
-            requested_provider: "one".to_owned(),
-            requested_model: "zero/test".to_owned(),
-            actual_provider: "two".to_owned(),
-            actual_model: "zero/test".to_owned(),
-        };
-        assert_eq!(
-            route
-                .selected_candidate(Some(&fallback))
-                .expect("fallback should match")
-                .definition()
-                .id,
-            "two"
-        );
     }
 }

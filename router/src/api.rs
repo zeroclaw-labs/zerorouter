@@ -43,6 +43,7 @@ use crate::{
         stream_tool_call_delta, stream_usage_json, task_signature, tool_args_all_json, usage_cost,
     },
     providers::{ProviderCandidate, ProviderRoute},
+    retry,
     sqlx::PgPool,
 };
 
@@ -334,6 +335,17 @@ const SSE_CHANNEL_CAPACITY: usize = 32;
 const SSE_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 const SSE_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 const UPSTREAM_REQUEST_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+
+/// Retries one candidate gets after its first call, so three upstream calls per
+/// candidate and never a fourth. Reproduces the delegated walk's
+/// `PROVIDER_RETRIES` exactly; changing it changes what every failing request
+/// costs in provider spend.
+const CANDIDATE_RETRIES: u32 = 2;
+
+/// First wait between a candidate's attempts, doubled per retry and capped by
+/// `retry::next_backoff`. Reset for each candidate, so a fresh rung starts from
+/// the base interval rather than inheriting the previous one's.
+const CANDIDATE_BACKOFF_MS: u64 = 500;
 const MAX_REQUEST_BODY_BYTES: usize = 8 * 1024 * 1024;
 
 /// Supplies the per-request [`ProviderRoute`] the walk runs over, standing in
@@ -668,106 +680,397 @@ async fn run_non_streaming(
 ) -> Result<Response, ApiError> {
     let request_id = usage_session.request_id();
     let features = RequestFeatures::from_request(&request, reservation_usage);
-    let messages = request.provider_messages();
     let tools = request.provider_tools();
     let max_tokens = request.max_tokens;
-    let provider_request = ChatRequest {
-        messages: &messages,
-        tools: (!tools.is_empty()).then_some(tools.as_slice()),
-        thinking: None,
-    };
+    // One clock for the whole walk, exactly as the streaming walk keeps one:
+    // the upstream deadline belongs to the REQUEST, so it is spent down across
+    // candidates and retries and never refreshed for a fresh rung.
     let started = Instant::now();
+    let candidates = provider_route.into_candidates();
 
-    let selected = tokio::select! {
+    // The prompt the walk is actually sending, which a context-window rejection
+    // shortens in place. Both this and the flag are walk-scoped, so candidate
+    // #1's truncation is still in force for #2..N — preserved deliberately from
+    // the delegated walk rather than improved here, since making the walk more
+    // available is a resilience change with no baseline to measure it against.
+    let mut effective_messages = request.provider_messages();
+    let mut context_truncated = false;
+    // The walk ledger. Built here so `attempt_no` already counts real
+    // dispatches, but deliberately NOT yet drained into the settle sites: this
+    // commit replaces who dispatches and must change nothing a settled row can
+    // observe, so every terminal still writes an empty ledger and still names
+    // the `fallback-chain` sentinel.
+    let mut attempts: Vec<AttemptRecord> = Vec::new();
+
+    'walk: for candidate in &candidates {
+        // Reset per candidate: a fresh rung starts from the base interval
+        // rather than inheriting the last one's exhausted patience.
+        let mut backoff_ms = CANDIDATE_BACKOFF_MS;
+        for attempt in 0..=CANDIDATE_RETRIES {
+            // Checked BEFORE dispatch, not only enforced by dropping a future,
+            // so an expiry is attributable instead of destroying the walk's
+            // state. Subtractive off the one `started` clock.
+            let Some(remaining) = remaining_upstream_time(started) else {
+                return Err(settle_walk_terminal(
+                    usage_session,
+                    &request_id,
+                    &resolved,
+                    None,
+                    features,
+                    Vec::new(),
+                    started,
+                    WalkTerminal::Timeout,
+                )
+                .await);
+            };
+            let attempt_started = Instant::now();
+            let attempt_no = attempts.len() + 1;
+            let provider_request = ChatRequest {
+                messages: &effective_messages,
+                tools: (!tools.is_empty()).then_some(tools.as_slice()),
+                thinking: None,
+            };
+
+            // `biased`, so a drained deploy wins over an upstream that is about
+            // to answer. The flag distinguishes "cancelled before this call
+            // started" from "cancelled with a call in flight" — only the latter
+            // burnt an upstream request and deserves a ledger row.
+            let candidate_started = AtomicBool::new(false);
+            let result = tokio::select! {
+                biased;
+                () = shutdown.cancelled() => {
+                    if candidate_started.load(Ordering::Relaxed) {
+                        attempts.push(build_attempt(
+                            attempt_no,
+                            candidate.definition(),
+                            "aborted",
+                            false,
+                            attempt_started,
+                            AttemptTokens::unknown(),
+                            false,
+                            None,
+                            None,
+                        ));
+                    }
+                    return Err(settle_walk_terminal(
+                        usage_session,
+                        &request_id,
+                        &resolved,
+                        None,
+                        features,
+                        Vec::new(),
+                        started,
+                        WalkTerminal::Shutdown,
+                    )
+                    .await);
+                }
+                result = async {
+                    candidate_started.store(true, Ordering::Relaxed);
+                    tokio::time::timeout(
+                        remaining,
+                        candidate.chat(provider_request, request.temperature),
+                    )
+                    .await
+                } => result,
+            };
+
+            let err = match result {
+                Err(_elapsed) => {
+                    attempts.push(build_attempt(
+                        attempt_no,
+                        candidate.definition(),
+                        "timeout",
+                        false,
+                        attempt_started,
+                        AttemptTokens::unknown(),
+                        false,
+                        None,
+                        None,
+                    ));
+                    return Err(settle_walk_terminal(
+                        usage_session,
+                        &request_id,
+                        &resolved,
+                        None,
+                        features,
+                        Vec::new(),
+                        started,
+                        WalkTerminal::Timeout,
+                    )
+                    .await);
+                }
+                Ok(Ok(response)) => {
+                    // A blank turn is re-rolled against the same candidate
+                    // rather than returned, bounded by the same budget as an
+                    // error retry. The guard is `attempt < CANDIDATE_RETRIES`,
+                    // so a blank turn on the FINAL attempt is served and billed
+                    // — dropping the re-roll would turn the first blank into
+                    // that outcome, which is a billing change, not a
+                    // resilience one.
+                    if attempt < CANDIDATE_RETRIES && retry::is_empty_completion(&response) {
+                        let measured = OpenAiUsage::try_from_provider(response.usage.as_ref());
+                        attempts.push(build_attempt(
+                            attempt_no,
+                            candidate.definition(),
+                            "validation_failed",
+                            false,
+                            attempt_started,
+                            measured.map_or(AttemptTokens::unknown(), AttemptTokens::measured),
+                            false,
+                            None,
+                            Some("empty_completion"),
+                        ));
+                        // The discarded response's own usage prices the
+                        // attempt's COGS. It never touches `cost_usd`: this is
+                        // ZeroRouter's burn, not the customer's bill.
+                        if !sleep_backoff(backoff_ms, started, &shutdown).await {
+                            return Err(settle_walk_terminal(
+                                usage_session,
+                                &request_id,
+                                &resolved,
+                                None,
+                                features,
+                                Vec::new(),
+                                started,
+                                WalkTerminal::Shutdown,
+                            )
+                            .await);
+                        }
+                        backoff_ms = retry::next_backoff(backoff_ms);
+                        continue;
+                    }
+                    return serve_completion(
+                        usage_session,
+                        request_id,
+                        resolved,
+                        candidate.definition(),
+                        response,
+                        max_tokens,
+                        features,
+                        Vec::new(),
+                        attempt_no,
+                        attempt_started,
+                        started,
+                    )
+                    .await;
+                }
+                Ok(Err(err)) => err,
+            };
+
+            // Evaluation order below is load-bearing: context-window repair,
+            // then abandon-on-non-retryable, then move-on-rather-than-wait for
+            // a live 429, then wait. Reordering any pair changes how many
+            // upstream calls a failing request costs.
+            let class = retry::classify(&err);
+            attempts.push(build_attempt(
+                attempt_no,
+                candidate.definition(),
+                class.outcome(),
+                false,
+                attempt_started,
+                AttemptTokens::unknown(),
+                false,
+                None,
+                None,
+            ));
+            // The ledger has no free-text error column, so the detail the
+            // delegated walk folded into an aggregate string — and then
+            // discarded unread — is emitted per attempt here instead.
+            tracing::warn!(
+                request_id,
+                requested_model = resolved.requested_model,
+                candidate_id = candidate.definition().id,
+                upstream_provider = candidate.definition().provider,
+                upstream_model = candidate.definition().model,
+                attempt = attempt_no,
+                outcome = class.outcome(),
+                detail = retry::compact_error_detail(&err),
+                "upstream candidate attempt failed"
+            );
+
+            if class == retry::FailureClass::ContextWindow && !context_truncated {
+                if retry::truncate_for_context(&mut effective_messages) > 0 {
+                    context_truncated = true;
+                    // Consumes an attempt, deliberately.
+                    continue;
+                }
+                // Nothing left to drop. The prompt cannot fit anywhere, so the
+                // walk ends here rather than paying to learn the same thing
+                // from every remaining candidate.
+                break 'walk;
+            }
+            if class.is_non_retryable() {
+                break;
+            }
+            // Gated on there being somewhere else to go: on a one-candidate
+            // route a 429 is retried like any other transient failure.
+            if class.is_rate_limited() && candidates.len() > 1 {
+                break;
+            }
+            if attempt < CANDIDATE_RETRIES {
+                let wait = retry::compute_backoff(backoff_ms, &err);
+                if !sleep_backoff(wait, started, &shutdown).await {
+                    return Err(settle_walk_terminal(
+                        usage_session,
+                        &request_id,
+                        &resolved,
+                        None,
+                        features,
+                        Vec::new(),
+                        started,
+                        WalkTerminal::Shutdown,
+                    )
+                    .await);
+                }
+                backoff_ms = retry::next_backoff(backoff_ms);
+            }
+        }
+    }
+
+    // Every candidate failed. Unlike the streaming walk, this terminal always
+    // settles: returning without one would leak the reservation to the TTL
+    // sweep, and the buffered path has never done that.
+    Err(settle_walk_terminal(
+        usage_session,
+        &request_id,
+        &resolved,
+        None,
+        features,
+        Vec::new(),
+        started,
+        WalkTerminal::Exhausted,
+    )
+    .await)
+}
+
+/// How a walk ended with no completion to return.
+///
+/// Each variant fixes the status the ledger records and the error the customer
+/// sees. All three settle the reservation at zero cost, because nothing reached
+/// the customer on any of them — a buffered handler either returns the body or
+/// returns an error, with no partial delivery to reason about.
+#[derive(Clone, Copy)]
+enum WalkTerminal {
+    /// Every candidate failed.
+    Exhausted,
+    /// The request's shared upstream deadline elapsed.
+    Timeout,
+    /// The router is draining.
+    Shutdown,
+}
+
+impl WalkTerminal {
+    fn status(self) -> i16 {
+        match self {
+            Self::Exhausted => 502,
+            Self::Timeout => 504,
+            Self::Shutdown => 503,
+        }
+    }
+
+    fn api_error(self) -> ApiError {
+        match self {
+            Self::Exhausted => ApiError::UpstreamUnavailable,
+            Self::Timeout => ApiError::UpstreamTimeout,
+            Self::Shutdown => ApiError::ServerShuttingDown,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Exhausted => "all upstream candidates failed",
+            Self::Timeout => "upstream inference deadline exceeded",
+            Self::Shutdown => "router draining",
+        }
+    }
+}
+
+/// Release the reservation without a charge and report why.
+///
+/// The single settle site for every buffered terminal that has no completion:
+/// nothing was delivered, so nothing is billed, and the reservation is closed
+/// here rather than left for the TTL sweep. A settle failure surfaces as
+/// `MeteringUnavailable`, exactly as `persist_usage`'s `?` used to.
+#[allow(clippy::too_many_arguments)]
+async fn settle_walk_terminal(
+    usage_session: UsageSession,
+    request_id: &str,
+    resolved: &ResolvedRoute,
+    candidate: Option<&TierCandidate>,
+    features: RequestFeatures,
+    attempts: Vec<AttemptRecord>,
+    started: Instant,
+    terminal: WalkTerminal,
+) -> ApiError {
+    let (upstream_provider, upstream_model) = candidate.map_or(
+        ("fallback-chain", resolved.requested_model.as_str()),
+        |candidate| (candidate.provider.as_str(), candidate.model.as_str()),
+    );
+    let error = match persist_usage(
+        usage_session,
+        &resolved.requested_model,
+        upstream_provider,
+        upstream_model,
+        candidate,
+        OpenAiUsage::default(),
+        resolved.sell_rates,
+        features,
+        None,
+        None,
+        attempts,
+        started,
+        terminal.status(),
+    )
+    .await
+    {
+        Ok(()) => terminal.api_error(),
+        Err(error) => error,
+    };
+    tracing::warn!(
+        request_id,
+        requested_model = resolved.requested_model,
+        upstream_provider,
+        upstream_model,
+        terminal = terminal.label(),
+        "upstream walk ended without a completion"
+    );
+    error
+}
+
+/// Wait out one backoff interval without outliving the request.
+///
+/// Two bounds a bare `tokio::time::sleep` would not have, both of which the
+/// delegated walk got for free from the timeout and the shutdown select it sat
+/// inside: a drained deploy must not be held open for up to a minute of
+/// accumulated backoff, and a wait must never push the walk past the very
+/// deadline it is retrying inside. Returns whether the wait finished rather
+/// than being cut short by shutdown.
+async fn sleep_backoff(wait_ms: u64, started: Instant, shutdown: &CancellationToken) -> bool {
+    let remaining = remaining_upstream_time(started).unwrap_or(Duration::ZERO);
+    let wait = Duration::from_millis(wait_ms).min(remaining);
+    tokio::select! {
         biased;
-        () = shutdown.cancelled() => {
-            // No tokens were delivered; release the reservation without a
-            // charge rather than billing the conservative estimate.
-            persist_usage(
-                usage_session,
-                &resolved.requested_model,
-                "fallback-chain",
-                &resolved.requested_model,
-                None,
-                OpenAiUsage::default(),
-                resolved.sell_rates,
-                features,
-                None,
-                None,
-                Vec::new(),
-                started,
-                503,
-            )
-            .await?;
-            return Err(ApiError::ServerShuttingDown);
-        }
-        result = tokio::time::timeout(
-            UPSTREAM_REQUEST_TIMEOUT,
-            provider_route.chat(
-                provider_request,
-                &resolved.requested_model,
-                request.temperature,
-            ),
-        ) => result,
-    };
+        () = shutdown.cancelled() => false,
+        () = tokio::time::sleep(wait) => true,
+    }
+}
 
-    let selected = match selected {
-        Ok(Ok(selected)) => selected,
-        Ok(Err(_)) => {
-            // Every candidate failed and no tokens were delivered; release the
-            // reservation without a charge.
-            persist_usage(
-                usage_session,
-                &resolved.requested_model,
-                "fallback-chain",
-                &resolved.requested_model,
-                None,
-                OpenAiUsage::default(),
-                resolved.sell_rates,
-                features,
-                None,
-                None,
-                Vec::new(),
-                started,
-                502,
-            )
-            .await?;
-            tracing::warn!(
-                request_id,
-                requested_model = resolved.requested_model,
-                "all upstream candidates failed"
-            );
-            return Err(ApiError::UpstreamUnavailable);
-        }
-        Err(_) => {
-            // The deadline elapsed with no delivered tokens; release without a
-            // charge.
-            persist_usage(
-                usage_session,
-                &resolved.requested_model,
-                "fallback-chain",
-                &resolved.requested_model,
-                None,
-                OpenAiUsage::default(),
-                resolved.sell_rates,
-                features,
-                None,
-                None,
-                Vec::new(),
-                started,
-                504,
-            )
-            .await?;
-            tracing::warn!(
-                request_id,
-                requested_model = resolved.requested_model,
-                "upstream inference deadline exceeded"
-            );
-            return Err(ApiError::UpstreamTimeout);
-        }
-    };
-
-    let Some(usage) = OpenAiUsage::try_from_provider(selected.response.usage.as_ref()) else {
+/// Settle and return the completion that won the walk.
+#[allow(clippy::too_many_arguments)]
+async fn serve_completion(
+    usage_session: UsageSession,
+    request_id: String,
+    resolved: ResolvedRoute,
+    candidate: &TierCandidate,
+    response: ChatResponse,
+    max_tokens: Option<u32>,
+    features: RequestFeatures,
+    mut attempts: Vec<AttemptRecord>,
+    attempt_no: usize,
+    attempt_started: Instant,
+    started: Instant,
+) -> Result<Response, ApiError> {
+    let Some(usage) = OpenAiUsage::try_from_provider(response.usage.as_ref()) else {
         // The buffered twin of `complete_synthetic_stream`'s gap, settled by
         // the same rule: no metered usage, no bill.
         //
@@ -787,16 +1090,32 @@ async fn run_non_streaming(
         log_metering_gap(
             &request_id,
             &resolved,
-            Some(selected.candidate),
+            Some(candidate),
             false,
             "non_streaming",
         );
+        // The served attempt is still recorded, with NULL token columns, so the
+        // gap is countable in the ledger and not only in the log. `served` is
+        // FALSE: the body is discarded below and the customer gets a 503, so
+        // nothing was served — which also keeps the metering-gap detector
+        // (a served attempt on a zero-token row) correctly silent.
+        attempts.push(build_attempt(
+            attempt_no,
+            candidate,
+            "ok",
+            false,
+            attempt_started,
+            AttemptTokens::unknown(),
+            false,
+            None,
+            None,
+        ));
         persist_usage(
             usage_session,
             &resolved.requested_model,
-            &selected.candidate.provider,
-            &selected.candidate.model,
-            Some(selected.candidate),
+            &candidate.provider,
+            &candidate.model,
+            Some(candidate),
             OpenAiUsage::default(),
             resolved.sell_rates,
             features,
@@ -813,19 +1132,35 @@ async fn run_non_streaming(
     // content, or tool calls. Reasoning used to be excluded, so a thinking
     // model that answered entirely in `reasoning_content` was labelled an empty
     // response and would have trained the success estimator to distrust it.
-    let emitted = EmittedOutput::from_response(&selected.response);
+    let emitted = EmittedOutput::from_response(&response);
     let synthesized_finish = finish_reason(emitted.has_tool_calls(), usage, max_tokens);
     let shape_label = shape_ok(
         emitted,
-        tool_args_all_json(&selected.response.tool_calls),
+        tool_args_all_json(&response.tool_calls),
         synthesized_finish,
     );
+    // The one attempt whose body becomes the 200 and whose usage prices the
+    // settled row. Every other row on this request is `served = false`, and
+    // this site returns immediately, which is what keeps
+    // `request_attempts_one_served_per_request` satisfiable without any
+    // cross-candidate bookkeeping.
+    attempts.push(build_attempt(
+        attempt_no,
+        candidate,
+        "ok",
+        true,
+        attempt_started,
+        AttemptTokens::measured(usage),
+        false,
+        Some(synthesized_finish),
+        None,
+    ));
     persist_usage(
         usage_session,
         &resolved.requested_model,
-        &selected.candidate.provider,
-        &selected.candidate.model,
-        Some(selected.candidate),
+        &candidate.provider,
+        &candidate.model,
+        Some(candidate),
         usage,
         resolved.sell_rates,
         features,
@@ -839,34 +1174,30 @@ async fn run_non_streaming(
     tracing::info!(
         request_id,
         requested_model = resolved.requested_model,
-        upstream_provider = selected.candidate.provider,
-        upstream_model = selected.candidate.model,
+        upstream_provider = candidate.provider,
+        upstream_model = candidate.model,
         input_tokens = usage.prompt_tokens,
         cached_input_tokens = usage.cached_input_tokens(),
         output_tokens = usage.completion_tokens,
         "chat completion served"
     );
 
-    let response = ChatCompletionResponse::new(
+    let completion = ChatCompletionResponse::new(
         request_id.clone(),
         resolved.requested_model,
-        selected.response,
+        response,
         usage,
         max_tokens,
     );
-    let mut response = Json(response).into_response();
-    insert_header(&mut response, "x-request-id", &request_id);
+    let mut completion = Json(completion).into_response();
+    insert_header(&mut completion, "x-request-id", &request_id);
     insert_header(
-        &mut response,
+        &mut completion,
         "x-zerorouter-provider",
-        &selected.candidate.provider,
+        &candidate.provider,
     );
-    insert_header(
-        &mut response,
-        "x-zerorouter-model",
-        &selected.candidate.model,
-    );
-    Ok(response)
+    insert_header(&mut completion, "x-zerorouter-model", &candidate.model);
+    Ok(completion)
 }
 
 fn streaming_response(
