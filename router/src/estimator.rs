@@ -24,6 +24,7 @@ use std::{
 };
 
 use tokio::time::Instant;
+use uuid::Uuid;
 
 use crate::openai::TaskSignature;
 
@@ -51,6 +52,39 @@ const MAX_CELLS: usize = 65_536;
 /// Bound on the refresh queue. A full queue drops the enqueue; the next
 /// request that misses re-offers the cell.
 const MAX_PENDING: usize = 1_024;
+
+/// Reservation-sizing headroom over the segment's p99 (design doc: "Cost
+/// estimator" / Risks §1 — "p99 × 1.25").
+pub const RESERVATION_HEADROOM: f64 = 1.25;
+
+/// The structural floor: a learned reservation never drops below this
+/// fraction of the requested `max_tokens`. Caps per-row clamp loss at
+/// `0.75 × requested_max × sell output rate` no matter how poisoned the
+/// percentile, and makes dilution self-defeating — filler traffic carrying
+/// a huge `max_tokens` still reserves a quarter of it, burning the
+/// attacker's own velocity and balance headroom.
+pub const RESERVATION_FLOOR_FRACTION: f64 = 0.25;
+
+/// Heavy-tail gate: a segment whose p99/p50 exceeds this never leaves cold
+/// sizing — a fat right tail is exactly where a percentile reservation
+/// under-covers.
+pub const TAIL_GATE_RATIO: f64 = 8.0;
+
+/// How long a revert keeps a segment (or user) on cold sizing. Trailing
+/// windows keep re-firing the trigger while the loss evidence is inside
+/// them, so the effective cold period is at least this and at most the
+/// window plus this.
+pub const REVERT_COOLDOWN: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
+/// Auto-revert thresholds (design doc: "Auto-revert triggers on dollars,
+/// not rates"). Judgment-set numbers to be re-fit against Stage-4 shadow
+/// telemetry; the dollar-denominated mechanism is the commitment. The
+/// clamp-hit RATE stays secondary because a rate is dilutable with filler
+/// traffic while per-row dollar losses are not.
+pub const SEGMENT_LOSS_LIMIT_7D_USD: f64 = 10.0;
+pub const ROW_LOSS_LIMIT_USD: f64 = 1.0;
+pub const SEGMENT_HIT_RATE_LIMIT: f64 = 0.005;
+pub const USER_LOSS_LIMIT_30D_USD: f64 = 50.0;
 
 /// One estimator cell's identity. `candidate: None` is the
 /// candidate-agnostic per-signature cell.
@@ -107,6 +141,32 @@ impl OutputPercentiles {
     }
 }
 
+/// The learned output-token reservation for one request, or `None` when the
+/// segment's shape disqualifies it:
+/// `min(requested_max, max(p99 × 1.25, 0.25 × requested_max))`.
+///
+/// The tail gate runs here — p99/p50 > 8 (or a degenerate p50 ≤ 0) answers
+/// `None` — so no caller can size from a heavy-tailed segment by forgetting
+/// a check. The result never exceeds `requested_max_tokens`, which keeps the
+/// learned bound inside the byte bound it replaces: admission can only get
+/// SMALLER under this function, never larger.
+#[must_use]
+pub fn learned_output_bound(
+    percentiles: OutputPercentiles,
+    requested_max_tokens: u32,
+) -> Option<u32> {
+    if percentiles.p50 <= 0.0 || percentiles.p99 / percentiles.p50 > TAIL_GATE_RATIO {
+        return None;
+    }
+    let requested = f64::from(requested_max_tokens);
+    let sized = (percentiles.p99 * RESERVATION_HEADROOM).ceil();
+    let floor = (requested * RESERVATION_FLOOR_FRACTION).ceil();
+    let bound = sized.max(floor).min(requested);
+    // The min against `requested` bounds this inside u32 range.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    Some(bound as u32)
+}
+
 /// What one cache read answers.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum CellRead {
@@ -147,6 +207,15 @@ pub struct EstimatorState {
     /// which "six minutes ago" does on a freshly booted CI machine.
     #[cfg(feature = "testing")]
     age_offset: Mutex<Duration>,
+    /// Segments (by signature) whose learned sizing is reverted until the
+    /// marked instant. In-process like the cells, deliberately: the loss
+    /// evidence lives in settled rows, and the refresher's next evaluation
+    /// re-fires any revert a restart forgot — the state is a cache of a
+    /// verdict the database can always re-derive.
+    reverted_segments: Mutex<HashMap<(String, i16), Instant>>,
+    /// Users whose EVERY segment is reverted (trailing-30d aggregate).
+    /// Segments are user-scoped, so re-slicing traffic cannot escape this.
+    reverted_users: Mutex<HashMap<Uuid, Instant>>,
 }
 
 impl EstimatorState {
@@ -260,6 +329,62 @@ impl EstimatorState {
     fn current_offset(&self) -> Duration {
         *self
             .age_offset
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Put one segment on cold sizing for [`REVERT_COOLDOWN`].
+    pub fn revert_segment(&self, signature: &str, scheme: i16) {
+        let until = Instant::now() + REVERT_COOLDOWN;
+        self.lock_reverted_segments()
+            .insert((signature.to_owned(), scheme), until);
+    }
+
+    /// Put every segment of one user on cold sizing for [`REVERT_COOLDOWN`].
+    pub fn revert_user(&self, user_id: Uuid) {
+        let until = Instant::now() + REVERT_COOLDOWN;
+        self.lock_reverted_users().insert(user_id, until);
+    }
+
+    /// Whether this segment's learned sizing is currently reverted. Expired
+    /// marks are dropped on read, so the maps cannot accrete forever.
+    #[must_use]
+    pub fn segment_reverted(&self, signature: &TaskSignature) -> bool {
+        let now = Instant::now();
+        let mut reverted = self.lock_reverted_segments();
+        match reverted.get(&(signature.hex.clone(), signature.scheme)) {
+            Some(until) if *until > now => true,
+            Some(_) => {
+                reverted.remove(&(signature.hex.clone(), signature.scheme));
+                false
+            }
+            None => false,
+        }
+    }
+
+    /// Whether every segment of this user is currently reverted.
+    #[must_use]
+    pub fn user_reverted(&self, user_id: Uuid) -> bool {
+        let now = Instant::now();
+        let mut reverted = self.lock_reverted_users();
+        match reverted.get(&user_id) {
+            Some(until) if *until > now => true,
+            Some(_) => {
+                reverted.remove(&user_id);
+                false
+            }
+            None => false,
+        }
+    }
+
+    fn lock_reverted_segments(&self) -> std::sync::MutexGuard<'_, HashMap<(String, i16), Instant>> {
+        self.reverted_segments
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn lock_reverted_users(&self) -> std::sync::MutexGuard<'_, HashMap<Uuid, Instant>> {
+        self.reverted_users
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
     }
@@ -380,5 +505,82 @@ mod tests {
         estimator.age_cells(CELL_TTL + Duration::from_secs(1));
         assert_eq!(estimator.lookup(&key("a")), CellRead::Cold);
         assert_eq!(estimator.drain_pending(REFRESH_BATCH), vec![key("a")]);
+    }
+}
+
+#[cfg(test)]
+mod sizing_tests {
+    use super::*;
+
+    fn shaped(p50: f64, p99: f64) -> OutputPercentiles {
+        OutputPercentiles {
+            p50,
+            p90: p99,
+            p99,
+            rows: WARM_MIN_ROWS,
+        }
+    }
+
+    #[test]
+    fn the_floor_binds_when_the_segment_is_terse() {
+        // p99 × 1.25 = 250 sits under 0.25 × 4096 = 1024.
+        assert_eq!(
+            learned_output_bound(shaped(180.0, 200.0), 4_096),
+            Some(1_024)
+        );
+    }
+
+    #[test]
+    fn the_percentile_binds_between_floor_and_cap() {
+        // p99 × 1.25 = 2500, between the 1024 floor and the 4096 cap.
+        assert_eq!(
+            learned_output_bound(shaped(1_900.0, 2_000.0), 4_096),
+            Some(2_500)
+        );
+    }
+
+    #[test]
+    fn the_requested_max_caps_the_learned_bound() {
+        // p99 × 1.25 = 6250 exceeds the request's own 4096: the learned
+        // bound can only ever shrink admission, never grow it.
+        assert_eq!(
+            learned_output_bound(shaped(4_900.0, 5_000.0), 4_096),
+            Some(4_096)
+        );
+    }
+
+    #[test]
+    fn heavy_tails_and_degenerate_medians_never_size() {
+        // p99/p50 = 10 > 8: exactly where a percentile reservation
+        // under-covers.
+        assert_eq!(learned_output_bound(shaped(100.0, 1_000.0), 4_096), None);
+        // A zero median cannot form a ratio and cannot be trusted either.
+        assert_eq!(learned_output_bound(shaped(0.0, 100.0), 4_096), None);
+    }
+
+    #[tokio::test]
+    async fn reverts_hold_for_their_cooldown_and_expire() {
+        tokio::time::pause();
+        let estimator = EstimatorState::default();
+        let signature = TaskSignature {
+            hex: "00112233aabbccdd".to_owned(),
+            scheme: 2,
+            tool_names_sha256: String::new(),
+        };
+        let user = Uuid::new_v4();
+        assert!(!estimator.segment_reverted(&signature));
+        assert!(!estimator.user_reverted(user));
+
+        estimator.revert_segment(&signature.hex, signature.scheme);
+        estimator.revert_user(user);
+        assert!(estimator.segment_reverted(&signature));
+        assert!(estimator.user_reverted(user));
+
+        tokio::time::advance(REVERT_COOLDOWN + Duration::from_secs(1)).await;
+        assert!(
+            !estimator.segment_reverted(&signature),
+            "an expired revert clears on read"
+        );
+        assert!(!estimator.user_reverted(user));
     }
 }
