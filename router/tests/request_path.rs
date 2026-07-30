@@ -4355,3 +4355,593 @@ async fn a_failed_refresh_re_enqueues_its_cells() {
         "failed scans re-enqueue rather than strand their cells"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Stage 4: learned reservations. The estimator's first dollar of consequence
+// — sizing at admission, provenance on the row, the clamp holding the
+// customer harmless, and the dollar-denominated auto-revert.
+// ---------------------------------------------------------------------------
+
+/// Reservation provenance of this key's LATEST settled row:
+/// `(reserved_output_tokens, estimator_basis, reserved_cost_usd, cost_usd)`.
+async fn settled_reservation(
+    pool: &PgPool,
+    api_key_id: Uuid,
+) -> (Option<i32>, Option<String>, Option<Decimal>, Decimal) {
+    query_as(
+        r#"
+        SELECT reserved_output_tokens, estimator_basis, reserved_cost_usd, cost_usd
+        FROM usage_events
+        WHERE api_key_id = $1
+        ORDER BY ts DESC, id DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(api_key_id)
+    .fetch_one(pool)
+    .await
+    .expect("settled reservation must query")
+}
+
+/// One learned-basis settled row with an explicit cost/reservation gap — the
+/// clamp-loss evidence the auto-revert evaluator aggregates. Backdated an
+/// hour like every other seed.
+async fn seed_loss_row(
+    pool: &PgPool,
+    api_key_id: Uuid,
+    signature: &str,
+    cost_usd: &str,
+    reserved_cost_usd: &str,
+) {
+    query(
+        r#"
+        INSERT INTO usage_events (
+            request_id, api_key_id, tier, upstream_provider, upstream_model,
+            input_tokens, cached_input_tokens, output_tokens, cost_usd,
+            latency_ms, status, task_signature, task_signature_scheme,
+            estimator_basis, reserved_cost_usd, ts
+        )
+        VALUES ($1, $2, 'zero/test-solo', 'deepinfra', 'upstream/seed',
+                100, 0, 100, $3::NUMERIC, 10, 200, $4, $5,
+                'learned', $6::NUMERIC, NOW() - INTERVAL '1 hour')
+        "#,
+    )
+    .bind(Uuid::new_v4())
+    .bind(api_key_id)
+    .bind(cost_usd)
+    .bind(signature)
+    .bind(TASK_SIGNATURE_SCHEME)
+    .bind(reserved_cost_usd)
+    .execute(pool)
+    .await
+    .expect("loss seed row must insert");
+}
+
+/// Eligible segments reserve the learned bound and stamp it: the floor when
+/// the segment is terse, the p99 × 1.25 when it binds — and a BARE balanced
+/// request on the same warm segment sizes learned too, because eligibility
+/// excludes only the escalation-capable, not the knob-less.
+#[tokio::test]
+async fn an_eligible_segment_reserves_the_learned_bound_and_stamps_it() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    // Terse segment: p99 × 1.25 = 250 loses to the 1024 floor.
+    let (floor_key_id, floor_key) = create_funded_key(&pool, "learned-floor").await;
+    let solo = FakeModelProvider::new(
+        "solo",
+        vec![
+            FakeOutcome::chat("hello from solo", served_usage()),
+            FakeOutcome::chat("hello from solo", served_usage()),
+            FakeOutcome::chat("hello from solo", served_usage()),
+        ],
+    );
+    let state = router(pool.clone(), vec![solo.clone()]);
+
+    let response = app(state.clone())
+        .oneshot(completion_request(
+            &floor_key,
+            &completion_body("zero/test-solo:cost", false),
+        ))
+        .await
+        .expect("cold request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    state.wait_for_background_tasks().await;
+    let (reserved, basis, _, _) = settled_reservation(&pool, floor_key_id).await;
+    assert_eq!(
+        reserved,
+        Some(4_096),
+        "a cold segment reserves the byte bound"
+    );
+    assert_eq!(basis.as_deref(), Some("cold"));
+
+    let signature = settled_signature(&pool, floor_key_id).await;
+    for _ in 0..60 {
+        seed_segment_row(&pool, floor_key_id, &signature, None, 200).await;
+    }
+    state.refresh_estimator_once().await;
+
+    let response = app(state.clone())
+        .oneshot(completion_request(
+            &floor_key,
+            &completion_body("zero/test-solo:cost", false),
+        ))
+        .await
+        .expect("warm request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    state.wait_for_background_tasks().await;
+    let (reserved, basis, reserved_cost, _) = settled_reservation(&pool, floor_key_id).await;
+    assert_eq!(
+        reserved,
+        Some(1_024),
+        "the floor binds: max(250, 0.25 × 4096) = 1024"
+    );
+    assert_eq!(basis.as_deref(), Some("learned"));
+    assert!(reserved_cost.is_some());
+
+    // The bare twin: no knob anywhere, same segment, still learned-sized —
+    // eligibility excludes success mode, not the knob-less.
+    let response = app(state.clone())
+        .oneshot(completion_request(
+            &floor_key,
+            &completion_body("zero/test-solo", false),
+        ))
+        .await
+        .expect("bare request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    state.wait_for_background_tasks().await;
+    let (reserved, basis, _, _) = settled_reservation(&pool, floor_key_id).await;
+    assert_eq!(reserved, Some(1_024));
+    assert_eq!(basis.as_deref(), Some("learned"));
+
+    // Verbose segment on a second user: p99 × 1.25 = 2500 beats the floor.
+    let (p99_key_id, p99_key) = create_funded_key(&pool, "learned-p99").await;
+    let solo = FakeModelProvider::new(
+        "solo",
+        vec![
+            FakeOutcome::chat("hello from solo", served_usage()),
+            FakeOutcome::chat("hello from solo", served_usage()),
+        ],
+    );
+    let state = router(pool.clone(), vec![solo.clone()]);
+    let response = app(state.clone())
+        .oneshot(completion_request(
+            &p99_key,
+            &completion_body("zero/test-solo:cost", false),
+        ))
+        .await
+        .expect("cold request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    state.wait_for_background_tasks().await;
+    let signature = settled_signature(&pool, p99_key_id).await;
+    for _ in 0..60 {
+        seed_segment_row(&pool, p99_key_id, &signature, None, 2_000).await;
+    }
+    state.refresh_estimator_once().await;
+    let response = app(state.clone())
+        .oneshot(completion_request(
+            &p99_key,
+            &completion_body("zero/test-solo:cost", false),
+        ))
+        .await
+        .expect("warm request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    state.wait_for_background_tasks().await;
+    let (reserved, basis, _, _) = settled_reservation(&pool, p99_key_id).await;
+    assert_eq!(
+        reserved,
+        Some(2_500),
+        "p99 × 1.25 binds between floor and cap"
+    );
+    assert_eq!(basis.as_deref(), Some("learned"));
+}
+
+/// Success mode keeps the byte bound outright, even on a warm segment: the
+/// escalation-capable cohort is exactly where a whole-segment p99
+/// under-reserves most.
+#[tokio::test]
+async fn success_mode_keeps_the_byte_bound_even_on_a_warm_segment() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let (api_key_id, key) = create_funded_key(&pool, "learned-success").await;
+    let solo = FakeModelProvider::new(
+        "solo",
+        vec![
+            FakeOutcome::chat("hello from solo", served_usage()),
+            FakeOutcome::chat("hello from solo", served_usage()),
+        ],
+    );
+    let state = router(pool.clone(), vec![solo.clone()]);
+    let response = app(state.clone())
+        .oneshot(completion_request(
+            &key,
+            &completion_body("zero/test-solo:cost", false),
+        ))
+        .await
+        .expect("warming request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    state.wait_for_background_tasks().await;
+    let signature = settled_signature(&pool, api_key_id).await;
+    for _ in 0..60 {
+        seed_segment_row(&pool, api_key_id, &signature, None, 200).await;
+    }
+    state.refresh_estimator_once().await;
+
+    let response = app(state.clone())
+        .oneshot(completion_request(
+            &key,
+            &completion_body("zero/test-solo:success", false),
+        ))
+        .await
+        .expect("success-mode request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    state.wait_for_background_tasks().await;
+    let (reserved, basis, _, _) = settled_reservation(&pool, api_key_id).await;
+    assert_eq!(reserved, Some(4_096));
+    assert_eq!(basis.as_deref(), Some("cold"));
+}
+
+/// A heavy-tailed segment never leaves cold sizing — while its estimate
+/// stays learned in the response, because the tail gate guards reservation
+/// money, not visibility (recorded 3b decision).
+#[tokio::test]
+async fn a_heavy_tailed_segment_never_leaves_cold_sizing() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let (api_key_id, key) = create_funded_key(&pool, "learned-tail").await;
+    let solo = FakeModelProvider::new(
+        "solo",
+        vec![
+            FakeOutcome::chat("hello from solo", served_usage()),
+            FakeOutcome::chat("hello from solo", served_usage()),
+        ],
+    );
+    let state = router(pool.clone(), vec![solo.clone()]);
+    let response = app(state.clone())
+        .oneshot(completion_request(
+            &key,
+            &completion_body("zero/test-solo:cost", false),
+        ))
+        .await
+        .expect("warming request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    state.wait_for_background_tasks().await;
+    let signature = settled_signature(&pool, api_key_id).await;
+    // p50 = 10, p99 = 10_000: ratio far past 8.
+    for _ in 0..55 {
+        seed_segment_row(&pool, api_key_id, &signature, None, 10).await;
+    }
+    for _ in 0..5 {
+        seed_segment_row(&pool, api_key_id, &signature, None, 10_000).await;
+    }
+    state.refresh_estimator_once().await;
+
+    let response = app(state.clone())
+        .oneshot(completion_request(
+            &key,
+            &completion_body("zero/test-solo:cost", false),
+        ))
+        .await
+        .expect("tail-gated request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    assert_eq!(
+        body["zerorouter"]["estimate"]["basis"], "learned",
+        "the tail gate guards money, not visibility"
+    );
+    state.wait_for_background_tasks().await;
+    let (reserved, basis, _, _) = settled_reservation(&pool, api_key_id).await;
+    assert_eq!(reserved, Some(4_096));
+    assert_eq!(basis.as_deref(), Some("cold"));
+}
+
+/// The payoff the rollout row names: a tighter bound directly buys
+/// admissible velocity headroom. Under a cap the byte bound cannot fit, the
+/// cold request 429s and the learned request admits.
+#[tokio::test]
+async fn a_learned_reservation_reclaims_velocity_headroom() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let (api_key_id, key) = create_funded_key(&pool, "learned-velocity").await;
+    let solo = FakeModelProvider::new(
+        "solo",
+        vec![
+            FakeOutcome::chat("hello from solo", served_usage()),
+            FakeOutcome::chat("hello from solo", served_usage()),
+        ],
+    );
+    let state = router(pool.clone(), vec![solo.clone()]);
+
+    let response = app(state.clone())
+        .oneshot(completion_request(
+            &key,
+            &completion_body("zero/test-solo:cost", false),
+        ))
+        .await
+        .expect("warming request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    state.wait_for_background_tasks().await;
+    let signature = settled_signature(&pool, api_key_id).await;
+    for _ in 0..60 {
+        seed_segment_row(&pool, api_key_id, &signature, None, 200).await;
+    }
+
+    // A cap the byte bound cannot fit (recent settled usage + input bound +
+    // 4096) but the learned bound can (… + 1024).
+    query("UPDATE api_keys SET velocity_cap_tokens_per_min = 4000 WHERE id = $1")
+        .bind(api_key_id)
+        .execute(&pool)
+        .await
+        .expect("velocity cap must update");
+
+    // Still cold (no refresh yet): the byte bound blows the cap.
+    let response = app(state.clone())
+        .oneshot(completion_request(
+            &key,
+            &completion_body("zero/test-solo:cost", false),
+        ))
+        .await
+        .expect("cold request should complete");
+    assert_eq!(
+        response.status(),
+        StatusCode::TOO_MANY_REQUESTS,
+        "the byte bound cannot fit the cap"
+    );
+
+    state.refresh_estimator_once().await;
+    let response = app(state.clone())
+        .oneshot(completion_request(
+            &key,
+            &completion_body("zero/test-solo:cost", false),
+        ))
+        .await
+        .expect("learned request should complete");
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "the learned bound admits under the same cap: reclaimed headroom"
+    );
+    state.wait_for_background_tasks().await;
+    let (reserved, basis, _, _) = settled_reservation(&pool, api_key_id).await;
+    assert_eq!(reserved, Some(1_024));
+    assert_eq!(basis.as_deref(), Some("learned"));
+}
+
+/// Under-reservation is ZeroRouter's tail, not the customer's: a served
+/// completion that outruns its learned reservation bills the metered
+/// actuals on the ROW but debits only the reserved ceiling — the clamp-loss
+/// row the auto-revert aggregates.
+#[tokio::test]
+async fn an_under_reserved_row_clamps_the_debit_and_records_the_loss() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let (api_key_id, key) = create_funded_key(&pool, "learned-clamp").await;
+    let overrun = TokenUsage {
+        input_tokens: Some(1_000),
+        cached_input_tokens: Some(0),
+        output_tokens: Some(4_000),
+    };
+    let solo = FakeModelProvider::new(
+        "solo",
+        vec![
+            FakeOutcome::chat("hello from solo", served_usage()),
+            FakeOutcome::chat("hello from solo", overrun),
+        ],
+    );
+    let state = router(pool.clone(), vec![solo.clone()]);
+    let response = app(state.clone())
+        .oneshot(completion_request(
+            &key,
+            &completion_body("zero/test-solo:cost", false),
+        ))
+        .await
+        .expect("warming request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    state.wait_for_background_tasks().await;
+    let signature = settled_signature(&pool, api_key_id).await;
+    for _ in 0..60 {
+        seed_segment_row(&pool, api_key_id, &signature, None, 200).await;
+    }
+    state.refresh_estimator_once().await;
+
+    let response = app(state.clone())
+        .oneshot(completion_request(
+            &key,
+            &completion_body("zero/test-solo:cost", false),
+        ))
+        .await
+        .expect("overrun request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    state.wait_for_background_tasks().await;
+
+    let (reserved, basis, reserved_cost, cost_usd) = settled_reservation(&pool, api_key_id).await;
+    assert_eq!(reserved, Some(1_024));
+    assert_eq!(basis.as_deref(), Some("learned"));
+    let reserved_cost = reserved_cost.expect("learned row snapshots its ceiling");
+    assert!(
+        cost_usd > reserved_cost,
+        "the overrun outran its reservation: {cost_usd} vs {reserved_cost}"
+    );
+    // The customer's balance moved by the CLAMPED amount — the first row's
+    // metered cost plus this row's reserved ceiling, never its actuals.
+    // Exclude the backdated estimator seeds: only the two SERVED rows moved
+    // the ledger.
+    let first_row_cost = query_scalar::<_, Decimal>(
+        r#"
+        SELECT cost_usd FROM usage_events
+        WHERE api_key_id = $1 AND upstream_model <> 'upstream/seed'
+        ORDER BY ts ASC, id ASC LIMIT 1
+        "#,
+    )
+    .bind(api_key_id)
+    .fetch_one(&pool)
+    .await
+    .expect("first row must query");
+    assert_eq!(
+        balance(&pool, user_of(&pool, api_key_id).await)
+            .await
+            .expect("balance must query"),
+        Decimal::from(50) - first_row_cost - reserved_cost,
+        "the debit is clamped at the reservation; the overrun is ZeroRouter's loss"
+    );
+}
+
+/// The dollar-denominated segment revert: one row past the single-row limit
+/// flips the segment back to cold sizing at the next evaluation — while the
+/// response estimate keeps showing the learned percentiles, because display
+/// is measurement and sizing is policy.
+#[tokio::test]
+async fn a_lossy_segment_reverts_to_cold_sizing_while_its_estimate_stays_learned() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let (api_key_id, key) = create_funded_key(&pool, "learned-revert-segment").await;
+    let solo = FakeModelProvider::new(
+        "solo",
+        vec![
+            FakeOutcome::chat("hello from solo", served_usage()),
+            FakeOutcome::chat("hello from solo", served_usage()),
+        ],
+    );
+    let state = router(pool.clone(), vec![solo.clone()]);
+    let response = app(state.clone())
+        .oneshot(completion_request(
+            &key,
+            &completion_body("zero/test-solo:cost", false),
+        ))
+        .await
+        .expect("warming request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    state.wait_for_background_tasks().await;
+    let signature = settled_signature(&pool, api_key_id).await;
+    for _ in 0..60 {
+        seed_segment_row(&pool, api_key_id, &signature, None, 200).await;
+    }
+    // One clamp-loss row past the $1 single-row limit.
+    seed_loss_row(&pool, api_key_id, &signature, "1.50", "0.10").await;
+    state.refresh_estimator_once().await;
+
+    let response = app(state.clone())
+        .oneshot(completion_request(
+            &key,
+            &completion_body("zero/test-solo:cost", false),
+        ))
+        .await
+        .expect("reverted request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    assert_eq!(
+        body["zerorouter"]["estimate"]["basis"], "learned",
+        "display is measurement; sizing is policy"
+    );
+    state.wait_for_background_tasks().await;
+    let (reserved, basis, _, _) = settled_reservation(&pool, api_key_id).await;
+    assert_eq!(reserved, Some(4_096), "the reverted segment sizes cold");
+    assert_eq!(basis.as_deref(), Some("cold"));
+}
+
+/// The per-user aggregate: enough trailing-30d loss on one segment reverts
+/// EVERY segment of the user — re-slicing traffic cannot escape it because
+/// segments are user-scoped.
+#[tokio::test]
+async fn a_lossy_user_reverts_every_segment() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let (api_key_id, key) = create_funded_key(&pool, "learned-revert-user").await;
+    let solo = FakeModelProvider::new(
+        "solo",
+        vec![
+            FakeOutcome::chat("hello from solo", served_usage()),
+            FakeOutcome::chat("hello from solo", served_usage()),
+            FakeOutcome::chat("hello from solo", served_usage()),
+        ],
+    );
+    let state = router(pool.clone(), vec![solo.clone()]);
+
+    // Segment A (max_tokens 4096) and segment B (max_tokens 2048): different
+    // buckets, different signatures, one user.
+    let response = app(state.clone())
+        .oneshot(completion_request(
+            &key,
+            &completion_body("zero/test-solo:cost", false),
+        ))
+        .await
+        .expect("segment A request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut body_b = completion_body("zero/test-solo:cost", false);
+    body_b["max_tokens"] = json!(2_048);
+    let response = app(state.clone())
+        .oneshot(completion_request(&key, &body_b))
+        .await
+        .expect("segment B request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    state.wait_for_background_tasks().await;
+
+    let signatures = query_scalar::<_, String>(
+        "SELECT DISTINCT task_signature FROM usage_events WHERE api_key_id = $1",
+    )
+    .bind(api_key_id)
+    .fetch_all(&pool)
+    .await
+    .expect("signatures must query");
+    assert_eq!(signatures.len(), 2, "two request shapes, two segments");
+    let signature_b = settled_signature_for_max(&pool, api_key_id, 2_048).await;
+    let signature_a = signatures
+        .iter()
+        .find(|signature| **signature != signature_b)
+        .expect("segment A signature")
+        .clone();
+
+    // The seeded losses are settled cost the spend-cap gate would count;
+    // lift the cap so the test exercises the revert, not the cap.
+    query("UPDATE api_keys SET spend_cap_usd = 1000 WHERE id = $1")
+        .bind(api_key_id)
+        .execute(&pool)
+        .await
+        .expect("spend cap must update");
+    // Segment A: $60 of trailing loss — far past the $50 user aggregate.
+    for _ in 0..40 {
+        seed_loss_row(&pool, api_key_id, &signature_a, "1.55", "0.05").await;
+    }
+    // Segment B: perfectly healthy and warm.
+    for _ in 0..60 {
+        seed_segment_row(&pool, api_key_id, &signature_b, None, 200).await;
+    }
+    state.refresh_estimator_once().await;
+
+    let response = app(state.clone())
+        .oneshot(completion_request(&key, &body_b))
+        .await
+        .expect("segment B request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    state.wait_for_background_tasks().await;
+    let (reserved, basis, _, _) = settled_reservation(&pool, api_key_id).await;
+    assert_eq!(
+        reserved,
+        Some(2_048),
+        "segment B sizes cold — its own health cannot outvote its user's losses"
+    );
+    assert_eq!(basis.as_deref(), Some("cold"));
+}
+
+/// The segment key of this key's settled row with the given requested
+/// max_tokens — for telling one user's segments apart.
+async fn settled_signature_for_max(pool: &PgPool, api_key_id: Uuid, max_tokens: i32) -> String {
+    query_scalar::<_, String>(
+        r#"
+        SELECT task_signature FROM usage_events
+        WHERE api_key_id = $1 AND requested_max_tokens = $2
+        LIMIT 1
+        "#,
+    )
+    .bind(api_key_id)
+    .bind(max_tokens)
+    .fetch_one(pool)
+    .await
+    .expect("segment signature must query")
+}
