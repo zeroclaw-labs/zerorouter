@@ -11,8 +11,8 @@ use zerorouter::{
         AuthenticatedKey, AuthenticationError, KeyAuthenticator, generate_api_key, hash_api_key,
     },
     db::{
-        AttemptRecord, AttemptTokens, RequestTelemetry, UsageAdmission, UsageRecord, UsageSession,
-        begin_usage_session, migrate, output_token_percentiles,
+        AttemptRecord, AttemptTokens, RequestTelemetry, ReservationBasis, UsageAdmission,
+        UsageRecord, UsageSession, begin_usage_session, migrate, output_token_percentiles,
     },
     openai::{OpenAiUsage, TASK_SIGNATURE_SCHEME, TaskSignature, tool_names_digest, usage_cost},
     priority::Priority,
@@ -106,6 +106,7 @@ async fn postgres_enforces_reservations_revocation_and_append_only_usage() {
         500,
         Decimal::ONE,
         test_signature("0123456789abcdef"),
+        ReservationBasis::Cold,
         false,
     )
     .await
@@ -122,6 +123,7 @@ async fn postgres_enforces_reservations_revocation_and_append_only_usage() {
             500,
             Decimal::from(20),
             test_signature("0123456789abcdef"),
+            ReservationBasis::Cold,
             false,
         )
         .await
@@ -177,6 +179,7 @@ async fn postgres_enforces_reservations_revocation_and_append_only_usage() {
             400,
             Decimal::ZERO,
             test_signature("0123456789abcdef"),
+            ReservationBasis::Cold,
             false
         ),
         begin_usage_session(
@@ -186,6 +189,7 @@ async fn postgres_enforces_reservations_revocation_and_append_only_usage() {
             400,
             Decimal::ZERO,
             test_signature("0123456789abcdef"),
+            ReservationBasis::Cold,
             false
         ),
     );
@@ -240,6 +244,7 @@ async fn postgres_enforces_reservations_revocation_and_append_only_usage() {
             1,
             Decimal::ZERO,
             test_signature("0123456789abcdef"),
+            ReservationBasis::Cold,
             false
         )
         .await
@@ -297,6 +302,7 @@ async fn admit(pool: &PgPool, key: &AuthenticatedKey) -> UsageSession {
         500,
         Decimal::ONE,
         test_signature("00112233aabbccdd"),
+        ReservationBasis::Cold,
         false,
     )
     .await

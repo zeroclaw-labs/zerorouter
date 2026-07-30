@@ -18,8 +18,8 @@ use zerorouter::{
         ledger_entries, record_checkout_intent, settle_checkout_intent,
     },
     db::{
-        RequestTelemetry, UsageAdmission, UsageRecord, UsageSession, begin_usage_session, migrate,
-        quarantined_settlements, recover_owed_settlements,
+        RequestTelemetry, ReservationBasis, UsageAdmission, UsageRecord, UsageSession,
+        begin_usage_session, migrate, quarantined_settlements, recover_owed_settlements,
     },
     openai::{OpenAiUsage, TASK_SIGNATURE_SCHEME, TaskSignature, tool_names_digest},
     priority::Priority,
@@ -272,6 +272,7 @@ async fn usage_settlement_debits_the_balance_exactly_once() {
         500,
         Decimal::from(2),
         test_signature(),
+        ReservationBasis::Cold,
         true,
     )
     .await
@@ -341,6 +342,7 @@ async fn credit_admission_fails_closed_and_cannot_jointly_overdraw() {
             50,
             Decimal::from(2),
             test_signature(),
+            ReservationBasis::Cold,
             true
         )
         .await
@@ -356,6 +358,7 @@ async fn credit_admission_fails_closed_and_cannot_jointly_overdraw() {
         50,
         Decimal::from(2),
         test_signature(),
+        ReservationBasis::Cold,
         false,
     )
     .await
@@ -386,6 +389,7 @@ async fn credit_admission_fails_closed_and_cannot_jointly_overdraw() {
             50,
             Decimal::from(2),
             test_signature(),
+            ReservationBasis::Cold,
             true
         ),
         begin_usage_session(
@@ -395,6 +399,7 @@ async fn credit_admission_fails_closed_and_cannot_jointly_overdraw() {
             50,
             Decimal::from(2),
             test_signature(),
+            ReservationBasis::Cold,
             true
         ),
     );
@@ -500,6 +505,7 @@ async fn settlement_debit_is_clamped_to_the_reservation_and_cannot_overdraw() {
         500,
         Decimal::from(2),
         test_signature(),
+        ReservationBasis::Cold,
         true,
     )
     .await
@@ -547,6 +553,7 @@ async fn cap_only_settlement_records_usage_without_touching_the_balance() {
         500,
         Decimal::from(2),
         test_signature(),
+        ReservationBasis::Cold,
         false,
     )
     .await
@@ -718,6 +725,7 @@ async fn admit(pool: &PgPool, key: &AuthenticatedKey, require_credits: bool) -> 
         500,
         Decimal::from(2),
         test_signature(),
+        ReservationBasis::Cold,
         require_credits,
     )
     .await

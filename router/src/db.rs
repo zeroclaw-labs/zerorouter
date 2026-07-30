@@ -24,6 +24,97 @@ use crate::{
     },
 };
 
+/// One segment's clamp-loss evidence over the trailing 7 days (design doc:
+/// "Auto-revert triggers on dollars, not rates"): the summed and worst
+/// per-row dollar loss, the clamped-row count, and the learned-row count —
+/// everything the revert evaluator needs in one scan. Only learned-basis
+/// rows count: a cold row cannot clamp-lose by construction (its
+/// reservation was the byte bound the bill is clamped to).
+#[derive(Clone, Debug, PartialEq)]
+pub struct SegmentClampStats {
+    pub loss_7d_usd: Decimal,
+    pub max_row_loss_usd: Decimal,
+    pub clamped_rows: i64,
+    pub learned_rows: i64,
+}
+
+/// Background-only, like the percentile scan: the revert evaluator runs on
+/// the refresher's cadence, never on a request.
+pub async fn segment_clamp_stats(
+    pool: &PgPool,
+    task_signature: &str,
+    task_signature_scheme: i16,
+) -> Result<SegmentClampStats, sqlx::Error> {
+    let (loss_7d_usd, max_row_loss_usd, clamped_rows, learned_rows) =
+        sqlx::query_as::<_, (Decimal, Decimal, i64, i64)>(
+            r#"
+            SELECT
+                COALESCE(SUM(GREATEST(0, cost_usd - reserved_cost_usd)), 0),
+                COALESCE(MAX(GREATEST(0, cost_usd - reserved_cost_usd)), 0),
+                COUNT(*) FILTER (WHERE cost_usd > reserved_cost_usd),
+                COUNT(*)
+            FROM usage_events
+            WHERE task_signature = $1::CHAR(16)
+              AND task_signature_scheme = $2
+              AND estimator_basis = 'learned'
+              AND ts >= NOW() - INTERVAL '7 days'
+            "#,
+        )
+        .bind(task_signature)
+        .bind(task_signature_scheme)
+        .fetch_one(pool)
+        .await?;
+    Ok(SegmentClampStats {
+        loss_7d_usd,
+        max_row_loss_usd,
+        clamped_rows,
+        learned_rows,
+    })
+}
+
+/// The user a segment belongs to. Segments are user-scoped by construction
+/// (the user id is inside the signature hash), so any row's owner is THE
+/// owner; `None` only when the segment has no settled rows at all.
+pub async fn segment_user(
+    pool: &PgPool,
+    task_signature: &str,
+    task_signature_scheme: i16,
+) -> Result<Option<Uuid>, sqlx::Error> {
+    sqlx::query_scalar::<_, Uuid>(
+        r#"
+        SELECT k.user_id
+        FROM usage_events e
+        JOIN api_keys k ON k.id = e.api_key_id
+        WHERE e.task_signature = $1::CHAR(16)
+          AND e.task_signature_scheme = $2
+        LIMIT 1
+        "#,
+    )
+    .bind(task_signature)
+    .bind(task_signature_scheme)
+    .fetch_optional(pool)
+    .await
+}
+
+/// One user's summed clamp loss across ALL their segments, trailing 30
+/// days. The per-user aggregate exists because segments are user-scoped:
+/// re-slicing traffic into new segments cannot escape it.
+pub async fn user_clamp_loss_30d(pool: &PgPool, user_id: Uuid) -> Result<Decimal, sqlx::Error> {
+    sqlx::query_scalar::<_, Decimal>(
+        r#"
+        SELECT COALESCE(SUM(GREATEST(0, e.cost_usd - e.reserved_cost_usd)), 0)
+        FROM usage_events e
+        JOIN api_keys k ON k.id = e.api_key_id
+        WHERE k.user_id = $1
+          AND e.estimator_basis = 'learned'
+          AND e.ts >= NOW() - INTERVAL '30 days'
+        "#,
+    )
+    .bind(user_id)
+    .fetch_one(pool)
+    .await
+}
+
 /// The estimator's output-percentile scan (design doc: "Cost estimator";
 /// rollout Stage 3b): one SQL aggregate over settled rows — never ML, and
 /// never run on the request path (only the background refresher calls this).
@@ -85,10 +176,38 @@ pub async fn output_token_percentiles(
     }))
 }
 
-/// The permanent Stage-1 reservation sizing basis: byte bound + max_tokens.
-/// Learned/quote sizings arrive in later rollout stages (migration 0004
-/// comment on `estimator_basis`).
-const ESTIMATOR_BASIS_COLD: &str = "cold";
+/// Which sizing produced a reservation (migration 0004 `estimator_basis`).
+/// `Cold` is the byte bound — the permanent fallback; `Learned` is the
+/// estimator-sized bound (rollout Stage 4). `quote` exists in the column's
+/// CHECK constraint but no code path can produce it until its gated stage.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReservationBasis {
+    Cold,
+    Learned,
+}
+
+impl ReservationBasis {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Cold => "cold",
+            Self::Learned => "learned",
+        }
+    }
+
+    fn from_keyword(keyword: &str) -> Self {
+        // Anything unrecognized reads as cold — the permanent fallback and
+        // the truthful reading of an intent written by an older build.
+        match keyword {
+            "learned" => Self::Learned,
+            _ => Self::Cold,
+        }
+    }
+}
+
+fn default_estimator_basis() -> String {
+    ReservationBasis::Cold.as_str().to_owned()
+}
 
 #[derive(Clone, Debug)]
 pub struct UsageRecord {
@@ -404,6 +523,7 @@ pub struct UsageSession {
     task_signature: TaskSignature,
     reserved_output_tokens: i32,
     reserved_cost_usd: Decimal,
+    estimator_basis: ReservationBasis,
 }
 
 const DATABASE_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -559,6 +679,7 @@ pub async fn migrate(pool: &PgPool) -> Result<()> {
         .context("database migration failed")
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn begin_usage_session(
     pool: &PgPool,
     key: &AuthenticatedKey,
@@ -566,6 +687,7 @@ pub async fn begin_usage_session(
     reserved_output_tokens: i64,
     reserved_cost_usd: Decimal,
     task_signature: TaskSignature,
+    estimator_basis: ReservationBasis,
     require_credits: bool,
 ) -> Result<UsageAdmission, sqlx::Error> {
     if reserved_tokens < 0 || reserved_output_tokens < 0 || reserved_cost_usd < Decimal::ZERO {
@@ -901,6 +1023,7 @@ pub async fn begin_usage_session(
         task_signature,
         reserved_output_tokens,
         reserved_cost_usd,
+        estimator_basis,
     }))
 }
 
@@ -1221,7 +1344,7 @@ async fn settle_once(
     .bind(telemetry.shape_ok)
     .bind(intent.reserved_output_tokens)
     .bind(reserved_cost_snapshot)
-    .bind(ESTIMATOR_BASIS_COLD)
+    .bind(ReservationBasis::from_keyword(&intent.estimator_basis).as_str())
     .bind(attempts_cogs.complete)
     // Both NULL when replaying an intent persisted before migration 0007:
     // the payload predates the fields, and NULL is exactly "scheme 1, tool
@@ -1704,6 +1827,11 @@ struct SettlementIntent {
     /// settled row. The clamp itself still reads the live value returned by the
     /// settle `DELETE ... RETURNING`, never this copy.
     reserved_cost_usd: String,
+    /// Which sizing produced the reservation. `#[serde(default)]` to cold:
+    /// an intent written by a pre-Stage-4 build was byte-bound by
+    /// construction, so cold is the truthful reading, not a guess.
+    #[serde(default = "default_estimator_basis")]
+    estimator_basis: String,
     tier: String,
     upstream_provider: String,
     upstream_model: String,
@@ -1789,6 +1917,7 @@ impl SettlementIntent {
             tool_names_sha256: Some(session.task_signature.tool_names_sha256.clone()),
             reserved_output_tokens: session.reserved_output_tokens,
             reserved_cost_usd: session.reserved_cost_usd.to_string(),
+            estimator_basis: session.estimator_basis.as_str().to_owned(),
             tier: record.tier.clone(),
             upstream_provider: record.upstream_provider.clone(),
             upstream_model: record.upstream_model.clone(),
