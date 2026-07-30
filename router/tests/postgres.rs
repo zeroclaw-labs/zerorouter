@@ -13,6 +13,7 @@ use zerorouter::{
     db::{
         AttemptRecord, AttemptTokens, RequestTelemetry, ReservationBasis, UsageAdmission,
         UsageRecord, UsageSession, begin_usage_session, migrate, output_token_percentiles,
+        segment_clamp_stats, user_clamp_loss,
     },
     openai::{OpenAiUsage, TASK_SIGNATURE_SCHEME, TaskSignature, tool_names_digest, usage_cost},
     priority::Priority,
@@ -1063,4 +1064,98 @@ async fn output_percentiles_scan_measures_only_the_cell_it_is_asked_about() {
             .is_none(),
         "an unmeasured signature answers None, not zeros"
     );
+}
+
+/// One learned-basis row shaped for the clamp-stats scan, aged as asked.
+#[allow(clippy::too_many_arguments)]
+async fn seed_clamp_row(
+    pool: &PgPool,
+    api_key_id: Uuid,
+    signature: &str,
+    basis: &str,
+    cost_usd: &str,
+    reserved_cost_usd: &str,
+    age_days: i32,
+) {
+    query(
+        r#"
+        INSERT INTO usage_events (
+            request_id, api_key_id, tier, upstream_provider, upstream_model,
+            input_tokens, cached_input_tokens, output_tokens, cost_usd,
+            latency_ms, status, task_signature, task_signature_scheme,
+            estimator_basis, reserved_cost_usd, ts
+        )
+        VALUES ($1, $2, 'zero/clamp-test', 'fireworks', 'upstream/clamp',
+                100, 0, 100, $3::NUMERIC, 10, 200, $4, $5, $6, $7::NUMERIC,
+                NOW() - ($8 * INTERVAL '1 day'))
+        "#,
+    )
+    .bind(Uuid::new_v4())
+    .bind(api_key_id)
+    .bind(cost_usd)
+    .bind(signature)
+    .bind(TASK_SIGNATURE_SCHEME)
+    .bind(basis)
+    .bind(reserved_cost_usd)
+    .bind(age_days)
+    .execute(pool)
+    .await
+    .expect("clamp seed row must insert");
+}
+
+/// The clamp-stats scan's arithmetic, pinned row by row: losses sum through
+/// GREATEST so over-reserved rows cannot offset them, cold rows are
+/// invisible, and each window sees exactly its own era.
+#[tokio::test]
+async fn clamp_stats_sum_losses_only_and_respect_their_windows() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let key = seed_key(&pool).await;
+    let signature = Uuid::new_v4().simple().to_string()[..16].to_owned();
+    let signature = signature.as_str();
+
+    // Trigger window (< 7d): a $0.40 loss, an over-reserved row (reserved
+    // exceeds cost by $5 — must NOT offset), and a clean exact-cost row.
+    seed_clamp_row(&pool, key.id, signature, "learned", "0.50", "0.10", 1).await;
+    seed_clamp_row(&pool, key.id, signature, "learned", "1.00", "6.00", 1).await;
+    seed_clamp_row(&pool, key.id, signature, "learned", "0.20", "0.20", 1).await;
+    // Re-derivation era (7–14d): a $1.50 single-row loss.
+    seed_clamp_row(&pool, key.id, signature, "learned", "1.60", "0.10", 10).await;
+    // Outside both windows.
+    seed_clamp_row(&pool, key.id, signature, "learned", "9.00", "0.10", 20).await;
+    // Cold-basis loss-shaped row: invisible to the aggregates entirely.
+    seed_clamp_row(&pool, key.id, signature, "cold", "9.00", "0.10", 1).await;
+
+    let stats = segment_clamp_stats(&pool, signature, TASK_SIGNATURE_SCHEME)
+        .await
+        .expect("stats must scan");
+    assert_eq!(stats.loss_7d_usd, "0.40".parse().unwrap());
+    assert_eq!(stats.max_row_loss_7d_usd, "0.40".parse().unwrap());
+    assert_eq!(stats.clamped_rows_7d, 1);
+    assert_eq!(stats.learned_rows_7d, 3);
+    assert_eq!(
+        stats.loss_14d_usd,
+        "1.90".parse().unwrap(),
+        "the re-derivation window adds the aged loss and still no offsets"
+    );
+    assert_eq!(stats.max_row_loss_14d_usd, "1.50".parse().unwrap());
+    assert_eq!(stats.clamped_rows_14d, 2);
+    assert_eq!(stats.learned_rows_14d, 4);
+
+    // The user aggregate over the same rows: 30d catches everything above
+    // except nothing (all under 30d except the 20d row IS under 30d) — so
+    // 30d = 0.40 + 1.50 + 8.90; the 37d window matches here. An out-of-era
+    // row at 33 days lands only in the 37-day re-derivation sum.
+    let user_id = query_scalar::<_, Uuid>("SELECT user_id FROM api_keys WHERE id = $1")
+        .bind(key.id)
+        .fetch_one(&pool)
+        .await
+        .expect("owner must query");
+    seed_clamp_row(&pool, key.id, signature, "learned", "5.00", "0.50", 33).await;
+    let (loss_30d, loss_37d) = user_clamp_loss(&pool, user_id)
+        .await
+        .expect("user loss must scan");
+    assert_eq!(loss_30d, "10.80".parse().unwrap());
+    assert_eq!(loss_37d, "15.30".parse().unwrap());
 }

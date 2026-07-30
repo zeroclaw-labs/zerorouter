@@ -24,18 +24,26 @@ use crate::{
     },
 };
 
-/// One segment's clamp-loss evidence over the trailing 7 days (design doc:
-/// "Auto-revert triggers on dollars, not rates"): the summed and worst
-/// per-row dollar loss, the clamped-row count, and the learned-row count —
-/// everything the revert evaluator needs in one scan. Only learned-basis
-/// rows count: a cold row cannot clamp-lose by construction (its
-/// reservation was the byte bound the bill is clamped to).
+/// One segment's clamp-loss evidence in two windows (design doc:
+/// "Auto-revert triggers on dollars, not rates"): the trigger window (7
+/// days, the spec's thresholds) and the re-derivation window (trigger +
+/// cooldown), which is what makes a revert a verdict the database can
+/// always re-derive — evidence that tripped a mark stays visible for at
+/// least as long as the mark it justified, so a restart can never shorten
+/// a revert (it can only be conservative). Only learned-basis rows count:
+/// a cold row cannot clamp-lose by construction (its reservation was the
+/// byte bound the bill is clamped to).
 #[derive(Clone, Debug, PartialEq)]
 pub struct SegmentClampStats {
     pub loss_7d_usd: Decimal,
-    pub max_row_loss_usd: Decimal,
-    pub clamped_rows: i64,
-    pub learned_rows: i64,
+    pub max_row_loss_7d_usd: Decimal,
+    pub clamped_rows_7d: i64,
+    pub learned_rows_7d: i64,
+    /// The same aggregates over the 14-day re-derivation window.
+    pub loss_14d_usd: Decimal,
+    pub max_row_loss_14d_usd: Decimal,
+    pub clamped_rows_14d: i64,
+    pub learned_rows_14d: i64,
 }
 
 /// Background-only, like the percentile scan: the revert evaluator runs on
@@ -45,30 +53,50 @@ pub async fn segment_clamp_stats(
     task_signature: &str,
     task_signature_scheme: i16,
 ) -> Result<SegmentClampStats, sqlx::Error> {
-    let (loss_7d_usd, max_row_loss_usd, clamped_rows, learned_rows) =
-        sqlx::query_as::<_, (Decimal, Decimal, i64, i64)>(
-            r#"
-            SELECT
-                COALESCE(SUM(GREATEST(0, cost_usd - reserved_cost_usd)), 0),
-                COALESCE(MAX(GREATEST(0, cost_usd - reserved_cost_usd)), 0),
-                COUNT(*) FILTER (WHERE cost_usd > reserved_cost_usd),
-                COUNT(*)
-            FROM usage_events
-            WHERE task_signature = $1::CHAR(16)
-              AND task_signature_scheme = $2
-              AND estimator_basis = 'learned'
-              AND ts >= NOW() - INTERVAL '7 days'
-            "#,
-        )
-        .bind(task_signature)
-        .bind(task_signature_scheme)
-        .fetch_one(pool)
-        .await?;
+    let row = sqlx::query_as::<_, (Decimal, Decimal, i64, i64, Decimal, Decimal, i64, i64)>(
+        r#"
+        SELECT
+            COALESCE(SUM(GREATEST(0, cost_usd - reserved_cost_usd))
+                FILTER (WHERE ts >= NOW() - INTERVAL '7 days'), 0),
+            COALESCE(MAX(GREATEST(0, cost_usd - reserved_cost_usd))
+                FILTER (WHERE ts >= NOW() - INTERVAL '7 days'), 0),
+            COUNT(*) FILTER (WHERE cost_usd > reserved_cost_usd
+                AND ts >= NOW() - INTERVAL '7 days'),
+            COUNT(*) FILTER (WHERE ts >= NOW() - INTERVAL '7 days'),
+            COALESCE(SUM(GREATEST(0, cost_usd - reserved_cost_usd)), 0),
+            COALESCE(MAX(GREATEST(0, cost_usd - reserved_cost_usd)), 0),
+            COUNT(*) FILTER (WHERE cost_usd > reserved_cost_usd),
+            COUNT(*)
+        FROM usage_events
+        WHERE task_signature = $1::CHAR(16)
+          AND task_signature_scheme = $2
+          AND estimator_basis = 'learned'
+          AND ts >= NOW() - INTERVAL '14 days'
+        "#,
+    )
+    .bind(task_signature)
+    .bind(task_signature_scheme)
+    .fetch_one(pool)
+    .await?;
+    let (
+        loss_7d_usd,
+        max_row_loss_7d_usd,
+        clamped_rows_7d,
+        learned_rows_7d,
+        loss_14d_usd,
+        max_row_loss_14d_usd,
+        clamped_rows_14d,
+        learned_rows_14d,
+    ) = row;
     Ok(SegmentClampStats {
         loss_7d_usd,
-        max_row_loss_usd,
-        clamped_rows,
-        learned_rows,
+        max_row_loss_7d_usd,
+        clamped_rows_7d,
+        learned_rows_7d,
+        loss_14d_usd,
+        max_row_loss_14d_usd,
+        clamped_rows_14d,
+        learned_rows_14d,
     })
 }
 
@@ -96,18 +124,26 @@ pub async fn segment_user(
     .await
 }
 
-/// One user's summed clamp loss across ALL their segments, trailing 30
-/// days. The per-user aggregate exists because segments are user-scoped:
-/// re-slicing traffic into new segments cannot escape it.
-pub async fn user_clamp_loss_30d(pool: &PgPool, user_id: Uuid) -> Result<Decimal, sqlx::Error> {
-    sqlx::query_scalar::<_, Decimal>(
+/// One user's summed clamp loss across ALL their segments: the trigger
+/// window (trailing 30 days) and the 37-day re-derivation window (trigger +
+/// cooldown), same contract as [`segment_clamp_stats`]. The per-user
+/// aggregate exists because segments are user-scoped: re-slicing traffic
+/// into new segments cannot escape it.
+pub async fn user_clamp_loss(
+    pool: &PgPool,
+    user_id: Uuid,
+) -> Result<(Decimal, Decimal), sqlx::Error> {
+    sqlx::query_as::<_, (Decimal, Decimal)>(
         r#"
-        SELECT COALESCE(SUM(GREATEST(0, e.cost_usd - e.reserved_cost_usd)), 0)
+        SELECT
+            COALESCE(SUM(GREATEST(0, e.cost_usd - e.reserved_cost_usd))
+                FILTER (WHERE e.ts >= NOW() - INTERVAL '30 days'), 0),
+            COALESCE(SUM(GREATEST(0, e.cost_usd - e.reserved_cost_usd)), 0)
         FROM usage_events e
         JOIN api_keys k ON k.id = e.api_key_id
         WHERE k.user_id = $1
           AND e.estimator_basis = 'learned'
-          AND e.ts >= NOW() - INTERVAL '30 days'
+          AND e.ts >= NOW() - INTERVAL '37 days'
         "#,
     )
     .bind(user_id)

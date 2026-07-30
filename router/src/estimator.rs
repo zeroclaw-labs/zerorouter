@@ -86,6 +86,13 @@ pub const ROW_LOSS_LIMIT_USD: f64 = 1.0;
 pub const SEGMENT_HIT_RATE_LIMIT: f64 = 0.005;
 pub const USER_LOSS_LIMIT_30D_USD: f64 = 50.0;
 
+/// Bound on each revert map. On insert past the cap, expired marks are
+/// swept first; an over-cap insert still lands — dropping a revert would
+/// fail OPEN, and the population of live marks is evidence-bounded (each
+/// requires real dollar losses), unlike the expired residue this cap
+/// exists to clear.
+const MAX_REVERT_MARKS: usize = 4_096;
+
 /// One estimator cell's identity. `candidate: None` is the
 /// candidate-agnostic per-signature cell.
 ///
@@ -335,15 +342,22 @@ impl EstimatorState {
 
     /// Put one segment on cold sizing for [`REVERT_COOLDOWN`].
     pub fn revert_segment(&self, signature: &str, scheme: i16) {
-        let until = Instant::now() + REVERT_COOLDOWN;
-        self.lock_reverted_segments()
-            .insert((signature.to_owned(), scheme), until);
+        let now = Instant::now();
+        let mut reverted = self.lock_reverted_segments();
+        if reverted.len() >= MAX_REVERT_MARKS {
+            reverted.retain(|_, until| *until > now);
+        }
+        reverted.insert((signature.to_owned(), scheme), now + REVERT_COOLDOWN);
     }
 
     /// Put every segment of one user on cold sizing for [`REVERT_COOLDOWN`].
     pub fn revert_user(&self, user_id: Uuid) {
-        let until = Instant::now() + REVERT_COOLDOWN;
-        self.lock_reverted_users().insert(user_id, until);
+        let now = Instant::now();
+        let mut reverted = self.lock_reverted_users();
+        if reverted.len() >= MAX_REVERT_MARKS {
+            reverted.retain(|_, until| *until > now);
+        }
+        reverted.insert(user_id, now + REVERT_COOLDOWN);
     }
 
     /// Whether this segment's learned sizing is currently reverted. Expired

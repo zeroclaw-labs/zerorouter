@@ -36,7 +36,7 @@ use crate::{
         AttemptRecord, AttemptTokens, RequestTelemetry, ReservationBasis, SegmentClampStats,
         SettlementRecovery, UsageAdmission, UsageRecord, UsageSession, begin_usage_session,
         output_token_percentiles, recover_owed_settlements, segment_clamp_stats, segment_user,
-        user_clamp_loss_30d,
+        user_clamp_loss,
     },
     error::{ApiError, streaming_error_json},
     estimator::{
@@ -691,16 +691,22 @@ async fn refresh_estimator_batch(
                 // Revert evaluation rides the same cadence as the segment's
                 // percentile refresh — candidate-agnostic cells only, since
                 // reverts are per segment, never per rung. A failed
-                // evaluation is only logged: the next refresh re-evaluates,
-                // and the evidence is durable rows either way.
+                // evaluation fails toward cold, symmetric with the
+                // percentile-failure arm below: the cell is NOT applied (so
+                // sizing stays cold) and is re-enqueued for the next pass —
+                // warming a cell whose durable loss evidence was never
+                // consulted would let a lossy segment size learned for a
+                // full TTL on the strength of a transient query error.
                 if key.candidate.is_none()
                     && let Err(error) = evaluate_revert(pool, estimator, &key).await
                 {
                     tracing::warn!(
                         error = %error,
                         signature = key.signature,
-                        "clamp-loss revert evaluation failed; retried next refresh"
+                        "clamp-loss revert evaluation failed; cell left cold and re-queued"
                     );
+                    estimator.enqueue(key);
+                    continue;
                 }
                 estimator.apply(key, measured);
             }
@@ -733,23 +739,28 @@ async fn evaluate_revert(
     key: &CellKey,
 ) -> Result<(), crate::sqlx::Error> {
     let stats = segment_clamp_stats(pool, &key.signature, key.scheme).await?;
-    if stats.learned_rows == 0 {
-        return Ok(());
-    }
     if segment_tripped(&stats) {
         tracing::warn!(
             signature = key.signature,
             loss_7d = %stats.loss_7d_usd,
-            max_row_loss = %stats.max_row_loss_usd,
-            clamped_rows = stats.clamped_rows,
-            learned_rows = stats.learned_rows,
+            max_row_loss_7d = %stats.max_row_loss_7d_usd,
+            clamped_rows_7d = stats.clamped_rows_7d,
+            learned_rows_7d = stats.learned_rows_7d,
             "clamp-loss revert: segment returns to cold sizing"
         );
         estimator.revert_segment(&key.signature, key.scheme);
     }
+    // The user-level check runs UNCONDITIONALLY of the segment's own learned
+    // rows: a reverted user settles only cold rows, so any gate on this
+    // segment's learned count would let the standing 30-day evidence expire
+    // unconsulted the moment the mark's cooldown lapsed — the exact escape
+    // the user aggregate exists to close. It depends on nothing but the
+    // segment's owner and the user's own trailing windows.
     if let Some(user_id) = segment_user(pool, &key.signature, key.scheme).await? {
-        let loss_30d = user_clamp_loss_30d(pool, user_id).await?;
-        if decimal_to_f64(loss_30d) > USER_LOSS_LIMIT_30D_USD {
+        let (loss_30d, loss_rederive) = user_clamp_loss(pool, user_id).await?;
+        if decimal_to_f64(loss_30d) > USER_LOSS_LIMIT_30D_USD
+            || decimal_to_f64(loss_rederive) > USER_LOSS_LIMIT_30D_USD
+        {
             tracing::warn!(
                 %user_id,
                 loss_30d = %loss_30d,
@@ -761,11 +772,38 @@ async fn evaluate_revert(
     Ok(())
 }
 
+/// Whether a segment's clamp-loss evidence trips a revert, in EITHER
+/// window: the 7-day trigger window carries the spec's thresholds; the
+/// 14-day re-derivation window (trigger + cooldown) is what lets a restart
+/// re-derive a mark whose evidence has aged past the trigger window but not
+/// past the cold period that evidence justified. Re-derivation can only be
+/// conservative — a mark re-fired from old evidence extends cold sizing,
+/// never learned exposure. The hit rate stays a within-window ratio; an
+/// empty window's 0/0 is NaN, and NaN compares false — no trip.
 fn segment_tripped(stats: &SegmentClampStats) -> bool {
+    window_tripped(
+        stats.loss_7d_usd,
+        stats.max_row_loss_7d_usd,
+        stats.clamped_rows_7d,
+        stats.learned_rows_7d,
+    ) || window_tripped(
+        stats.loss_14d_usd,
+        stats.max_row_loss_14d_usd,
+        stats.clamped_rows_14d,
+        stats.learned_rows_14d,
+    )
+}
+
+fn window_tripped(
+    loss_usd: rust_decimal::Decimal,
+    max_row_loss_usd: rust_decimal::Decimal,
+    clamped_rows: i64,
+    learned_rows: i64,
+) -> bool {
     #[allow(clippy::cast_precision_loss)]
-    let hit_rate = stats.clamped_rows as f64 / stats.learned_rows as f64;
-    decimal_to_f64(stats.loss_7d_usd) > SEGMENT_LOSS_LIMIT_7D_USD
-        || decimal_to_f64(stats.max_row_loss_usd) > ROW_LOSS_LIMIT_USD
+    let hit_rate = clamped_rows as f64 / learned_rows as f64;
+    decimal_to_f64(loss_usd) > SEGMENT_LOSS_LIMIT_7D_USD
+        || decimal_to_f64(max_row_loss_usd) > ROW_LOSS_LIMIT_USD
         || hit_rate > SEGMENT_HIT_RATE_LIMIT
 }
 
@@ -3635,5 +3673,73 @@ mod tests {
         .await
         .expect("attempts must query");
         assert_eq!(attempts, vec![("aborted".to_owned(), false)]);
+    }
+}
+
+#[cfg(test)]
+mod revert_trip_tests {
+    use rust_decimal::Decimal;
+
+    use super::{SegmentClampStats, segment_tripped};
+
+    #[allow(clippy::too_many_arguments)]
+    fn stats(
+        loss_7d: &str,
+        max_7d: &str,
+        clamped_7d: i64,
+        learned_7d: i64,
+        loss_14d: &str,
+        max_14d: &str,
+        clamped_14d: i64,
+        learned_14d: i64,
+    ) -> SegmentClampStats {
+        let decimal = |value: &str| value.parse::<Decimal>().expect("decimal literal");
+        SegmentClampStats {
+            loss_7d_usd: decimal(loss_7d),
+            max_row_loss_7d_usd: decimal(max_7d),
+            clamped_rows_7d: clamped_7d,
+            learned_rows_7d: learned_7d,
+            loss_14d_usd: decimal(loss_14d),
+            max_row_loss_14d_usd: decimal(max_14d),
+            clamped_rows_14d: clamped_14d,
+            learned_rows_14d: learned_14d,
+        }
+    }
+
+    #[test]
+    fn each_trigger_trips_alone() {
+        // Sum only: rate 12/3000 = 0.4% under the 0.5% limit, max under $1.
+        assert!(segment_tripped(&stats(
+            "10.80", "0.90", 12, 3_000, "10.80", "0.90", 12, 3_000
+        )));
+        // Single row only.
+        assert!(segment_tripped(&stats(
+            "1.50", "1.50", 1, 3_000, "1.50", "1.50", 1, 3_000
+        )));
+        // Rate only: 1/10 clamped, dollars tiny.
+        assert!(segment_tripped(&stats(
+            "0.05", "0.05", 1, 10, "0.05", "0.05", 1, 10
+        )));
+    }
+
+    #[test]
+    fn under_every_threshold_does_not_trip() {
+        assert!(!segment_tripped(&stats(
+            "9.99", "0.99", 10, 3_000, "9.99", "0.99", 10, 3_000
+        )));
+    }
+
+    #[test]
+    fn an_empty_window_cannot_trip() {
+        // 0/0 hit rate is NaN; NaN comparisons are false by design.
+        assert!(!segment_tripped(&stats("0", "0", 0, 0, "0", "0", 0, 0)));
+    }
+
+    #[test]
+    fn the_rederivation_window_trips_when_the_trigger_window_has_aged_clean() {
+        // Evidence older than 7 days but inside 14: the restart story.
+        assert!(segment_tripped(&stats(
+            "0", "0", 0, 0, "1.50", "1.50", 1, 40
+        )));
     }
 }

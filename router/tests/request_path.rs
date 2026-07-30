@@ -4314,6 +4314,12 @@ async fn streaming_shows_the_learned_estimate_once_the_segment_warms() {
         200
     );
     state.wait_for_background_tasks().await;
+
+    // Stage 4: the streaming request sized learned too — sizing is decided
+    // before the paths split, and this pins it.
+    let (reserved, basis, _, _) = settled_reservation(&pool, api_key_id).await;
+    assert_eq!(reserved, Some(1_024));
+    assert_eq!(basis.as_deref(), Some("learned"));
 }
 
 /// The refresher's failure arm, pinned as the design records it: a failed
@@ -4393,6 +4399,19 @@ async fn seed_loss_row(
     cost_usd: &str,
     reserved_cost_usd: &str,
 ) {
+    seed_loss_row_aged(pool, api_key_id, signature, cost_usd, reserved_cost_usd, 1).await;
+}
+
+/// A loss row backdated `age_hours` — for placing evidence inside or outside
+/// specific trailing windows.
+async fn seed_loss_row_aged(
+    pool: &PgPool,
+    api_key_id: Uuid,
+    signature: &str,
+    cost_usd: &str,
+    reserved_cost_usd: &str,
+    age_hours: i32,
+) {
     query(
         r#"
         INSERT INTO usage_events (
@@ -4403,7 +4422,7 @@ async fn seed_loss_row(
         )
         VALUES ($1, $2, 'zero/test-solo', 'deepinfra', 'upstream/seed',
                 100, 0, 100, $3::NUMERIC, 10, 200, $4, $5,
-                'learned', $6::NUMERIC, NOW() - INTERVAL '1 hour')
+                'learned', $6::NUMERIC, NOW() - ($7 * INTERVAL '1 hour'))
         "#,
     )
     .bind(Uuid::new_v4())
@@ -4412,6 +4431,7 @@ async fn seed_loss_row(
     .bind(signature)
     .bind(TASK_SIGNATURE_SCHEME)
     .bind(reserved_cost_usd)
+    .bind(age_hours)
     .execute(pool)
     .await
     .expect("loss seed row must insert");
@@ -4944,4 +4964,70 @@ async fn settled_signature_for_max(pool: &PgPool, api_key_id: Uuid, max_tokens: 
     .fetch_one(pool)
     .await
     .expect("segment signature must query")
+}
+
+/// The re-derivation contract, pinned as a restart: a FRESH router (fresh
+/// in-process registry — exactly what a deploy leaves behind) whose database
+/// holds loss evidence older than the 7-day trigger window but inside the
+/// re-derivation window re-fires both reverts from the rows alone. Before
+/// the two-window evaluator, this state sized learned: the segment's 7d
+/// stats were clean and the user check sat behind a learned-rows gate the
+/// reverted user could never satisfy.
+#[tokio::test]
+async fn standing_evidence_outside_the_trigger_window_still_reverts() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let (api_key_id, key) = create_funded_key(&pool, "learned-rederive").await;
+    query("UPDATE api_keys SET spend_cap_usd = 1000 WHERE id = $1")
+        .bind(api_key_id)
+        .execute(&pool)
+        .await
+        .expect("spend cap must update");
+    let solo = FakeModelProvider::new(
+        "solo",
+        vec![
+            FakeOutcome::chat("hello from solo", served_usage()),
+            FakeOutcome::chat("hello from solo", served_usage()),
+        ],
+    );
+    let state = router(pool.clone(), vec![solo.clone()]);
+
+    let response = app(state.clone())
+        .oneshot(completion_request(
+            &key,
+            &completion_body("zero/test-solo:cost", false),
+        ))
+        .await
+        .expect("warming request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    state.wait_for_background_tasks().await;
+    let signature = settled_signature(&pool, api_key_id).await;
+    for _ in 0..60 {
+        seed_segment_row(&pool, api_key_id, &signature, None, 200).await;
+    }
+    // Eight-day-old losses: outside the 7-day trigger window, inside the
+    // 14-day segment and 37-day user re-derivation windows. $60 total also
+    // crosses the user aggregate.
+    for _ in 0..40 {
+        seed_loss_row_aged(&pool, api_key_id, &signature, "1.55", "0.05", 8 * 24).await;
+    }
+    state.refresh_estimator_once().await;
+
+    let response = app(state.clone())
+        .oneshot(completion_request(
+            &key,
+            &completion_body("zero/test-solo:cost", false),
+        ))
+        .await
+        .expect("re-derived request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    state.wait_for_background_tasks().await;
+    let (reserved, basis, _, _) = settled_reservation(&pool, api_key_id).await;
+    assert_eq!(
+        reserved,
+        Some(4_096),
+        "aged-but-standing evidence re-derives the revert on a fresh registry"
+    );
+    assert_eq!(basis.as_deref(), Some("cold"));
 }

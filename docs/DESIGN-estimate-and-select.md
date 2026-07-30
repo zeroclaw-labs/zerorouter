@@ -447,15 +447,26 @@ the floor and alarmed in dollars instead.
 >   construction, so cold is the truthful replay) → the settled row.
 > - **The revert registry is in-process like the cells**, deliberately: the
 >   loss evidence is settled rows, and the refresher's next evaluation
->   re-fires any revert a restart forgot — the registry is a cache of a
->   verdict the database can always re-derive. Marks expire on read after
->   their cooldown; trailing windows re-firing while evidence remains is
->   the intended ratchet.
+>   re-fires any revert a restart forgot. What makes that re-derivation
+>   claim actually true (the stage's adversarial review caught it as
+>   initially false) is a **second, wider evidence window per aggregate** —
+>   trigger + cooldown (14d for segments, 37d for users) — so evidence that
+>   justified a mark stays visible for at least as long as the mark it
+>   justified. Re-derivation can only be conservative: old evidence extends
+>   cold sizing, never learned exposure. Marks expire on read after their
+>   cooldown; each map is bounded with expired-mark sweeps that never drop
+>   a live mark (dropping one would fail open).
 > - **Evaluation rides the refresher** beside each segment's
->   candidate-agnostic cell refresh — never a request. Only learned-basis
->   rows feed the aggregates (a cold row cannot clamp-lose by
->   construction). The display estimate stays learned on a reverted
->   segment: display is measurement, sizing is policy.
+>   candidate-agnostic cell refresh — never a request — and the per-USER
+>   check runs unconditionally of the segment's own learned rows (also a
+>   review catch: a reverted user settles only cold rows, so any gate on
+>   learned counts would let the standing 30-day evidence expire
+>   unconsulted at cooldown lapse). An evaluation failure fails toward
+>   cold: the cell is left unapplied and re-queued, never warmed on
+>   unconsulted evidence. Only learned-basis rows feed the aggregates (a
+>   cold row cannot clamp-lose by construction). The display estimate stays
+>   learned on a reverted segment: display is measurement, sizing is
+>   policy.
 
 **Maturity ladder, per segment:** `cold` (byte bound — the permanent floor)
 → `learned` (estimator-sized reservations + shown estimates) → `quote`
