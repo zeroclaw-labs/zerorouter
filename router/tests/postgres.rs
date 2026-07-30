@@ -929,7 +929,12 @@ async fn output_percentiles_scan_measures_only_the_cell_it_is_asked_about() {
         return;
     };
     let key = seed_key(&pool).await;
-    let signature = "aabb001122334455";
+    // Random per run: usage_events is append-only (no cleanup is possible),
+    // so a fixed signature would accrete rows across local runs against a
+    // persistent database and break the exact counts below on the second
+    // run.
+    let signature = Uuid::new_v4().simple().to_string()[..16].to_owned();
+    let signature = signature.as_str();
 
     // Candidate A: 101 settled rows with outputs 0..=100, so the quantile
     // index lands on whole ranks and p50/p90/p99 are exact.
@@ -983,6 +988,30 @@ async fn output_percentiles_scan_measures_only_the_cell_it_is_asked_about() {
         )
         .await;
     }
+    // And a row outside the trailing window: same cell, right status, wrong
+    // era — the 14-day clause is what keeps a segment's months-old output
+    // regime from steering today's ordering, so it gets the same negative
+    // coverage as the scheme/status/candidate filters.
+    query(
+        r#"
+        INSERT INTO usage_events (
+            request_id, api_key_id, tier, upstream_provider, upstream_model,
+            input_tokens, cached_input_tokens, output_tokens, cost_usd,
+            latency_ms, status, task_signature, task_signature_scheme,
+            candidate_id, ts
+        )
+        VALUES ($1, $2, 'zero/estimator-test', 'fireworks', 'upstream/est',
+                100, 0, 9999, 0.001, 10, 200, $3, $4, 'fireworks/est-a',
+                NOW() - INTERVAL '15 days')
+        "#,
+    )
+    .bind(Uuid::new_v4())
+    .bind(key.id)
+    .bind(signature)
+    .bind(TASK_SIGNATURE_SCHEME)
+    .execute(&pool)
+    .await
+    .expect("out-of-window seed row must insert");
 
     let cell_a = output_token_percentiles(
         &pool,

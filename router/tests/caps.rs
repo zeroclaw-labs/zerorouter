@@ -827,11 +827,18 @@ async fn default_priority_rides_mint_list_and_the_key_patch() {
         json!({ "default_priorty": "cost" }),
         json!({ "default_priority": "fast" }),
     ] {
-        let (status, _) = send(
-            &app,
-            patch_json(&format!("/api/keys/{key_id}"), &cookie, garbage.clone()),
-        )
-        .await;
+        // Status only: axum's Json extractor rejects these with a PLAIN TEXT
+        // body, which the JSON-insisting `send` helper cannot read.
+        let status = app
+            .clone()
+            .oneshot(patch_json(
+                &format!("/api/keys/{key_id}"),
+                &cookie,
+                garbage.clone(),
+            ))
+            .await
+            .expect("request should complete")
+            .status();
         assert!(
             status.is_client_error(),
             "{garbage} must be refused, got {status}"
