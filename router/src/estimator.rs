@@ -126,6 +126,12 @@ struct CachedCell {
     /// numbers so `rows` is inspectable, but only [`OutputPercentiles::is_warm`]
     /// cells ever answer [`CellRead::Warm`].
     measured: Option<OutputPercentiles>,
+    /// The state's age offset when this cell was fetched. Aging must apply
+    /// only to cells that existed when `age_cells` was called — a cell
+    /// re-measured afterwards starts fresh — so freshness reads the DELTA
+    /// between the current offset and this snapshot, not the whole offset.
+    #[cfg(feature = "testing")]
+    offset_at_fetch: Duration,
 }
 
 /// The estimator cache handle. Clones share state; `RouterServices` holds
@@ -135,6 +141,12 @@ struct CachedCell {
 pub struct EstimatorState {
     cells: RwLock<HashMap<CellKey, CachedCell>>,
     pending: Mutex<HashSet<CellKey>>,
+    /// Test-only extra age added to every cell's elapsed time. An offset
+    /// rather than backdated `fetched_at`s because `Instant` subtraction
+    /// panics when the result would precede the host's monotonic epoch —
+    /// which "six minutes ago" does on a freshly booted CI machine.
+    #[cfg(feature = "testing")]
+    age_offset: Mutex<Duration>,
 }
 
 impl EstimatorState {
@@ -145,7 +157,7 @@ impl EstimatorState {
         {
             let cells = self.read_cells();
             if let Some(cell) = cells.get(key)
-                && now.duration_since(cell.fetched_at) <= CELL_TTL
+                && self.aged(cell, now) <= CELL_TTL
             {
                 return match cell.measured {
                     Some(measured) if measured.is_warm() => CellRead::Warm(measured),
@@ -185,7 +197,15 @@ impl EstimatorState {
         let now = Instant::now();
         let mut cells = self.write_cells();
         if cells.len() >= MAX_CELLS && !cells.contains_key(&key) {
-            cells.retain(|_, cell| now.duration_since(cell.fetched_at) <= CELL_TTL);
+            let mut evictable = Vec::new();
+            for (cell_key, cell) in cells.iter() {
+                if self.aged(cell, now) > CELL_TTL {
+                    evictable.push(cell_key.clone());
+                }
+            }
+            for cell_key in evictable {
+                cells.remove(&cell_key);
+            }
             if cells.len() >= MAX_CELLS {
                 return;
             }
@@ -195,18 +215,53 @@ impl EstimatorState {
             CachedCell {
                 fetched_at: now,
                 measured,
+                #[cfg(feature = "testing")]
+                offset_at_fetch: self.current_offset(),
             },
         );
     }
 
-    /// Backdate every cached cell, so a test can cross [`CELL_TTL`] without
-    /// touching the clock the rest of the router runs on.
+    /// Age every cached cell, so a test can cross [`CELL_TTL`] without
+    /// touching the clock the rest of the router runs on. Additive on an
+    /// offset — never a backdated `Instant`, which would panic on hosts
+    /// whose uptime is shorter than the requested age.
     #[cfg(feature = "testing")]
     pub fn age_cells(&self, by: Duration) {
-        let mut cells = self.write_cells();
-        for cell in cells.values_mut() {
-            cell.fetched_at -= by;
+        let mut offset = self
+            .age_offset
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        *offset = offset.saturating_add(by);
+    }
+
+    /// How many cells are queued for refresh (testing visibility).
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn pending_len(&self) -> usize {
+        self.lock_pending().len()
+    }
+
+    /// A cell's elapsed time as the freshness check reads it: real elapsed,
+    /// plus — in testing builds — however much aging was requested since the
+    /// cell was fetched. Production builds read the plain elapsed.
+    fn aged(&self, cell: &CachedCell, now: Instant) -> Duration {
+        let elapsed = now.duration_since(cell.fetched_at);
+        #[cfg(feature = "testing")]
+        {
+            elapsed.saturating_add(self.current_offset().saturating_sub(cell.offset_at_fetch))
         }
+        #[cfg(not(feature = "testing"))]
+        {
+            elapsed
+        }
+    }
+
+    #[cfg(feature = "testing")]
+    fn current_offset(&self) -> Duration {
+        *self
+            .age_offset
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     fn read_cells(&self) -> std::sync::RwLockReadGuard<'_, HashMap<CellKey, CachedCell>> {

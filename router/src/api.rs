@@ -593,7 +593,7 @@ impl RouterState {
                     () = shutdown.cancelled() => return,
                     () = tokio::time::sleep(REFRESH_INTERVAL) => {}
                 }
-                refresh_estimator_batch(&services.pool, &services.estimator).await;
+                refresh_estimator_batch(&services.pool, &services.estimator, Some(&shutdown)).await;
             }
         });
     }
@@ -603,8 +603,18 @@ impl RouterState {
     #[cfg(feature = "testing")]
     pub async fn refresh_estimator_once(&self) {
         if let Some(services) = &self.services {
-            refresh_estimator_batch(&services.pool, &services.estimator).await;
+            refresh_estimator_batch(&services.pool, &services.estimator, None).await;
         }
+    }
+
+    /// How many estimator cells are queued for refresh — visibility for the
+    /// re-enqueue-on-error pin, nothing more.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn estimator_pending_len(&self) -> usize {
+        self.services
+            .as_ref()
+            .map_or(0, |services| services.estimator.pending_len())
     }
 
     /// Backdate every cached estimator cell, so a test can cross the
@@ -653,8 +663,22 @@ impl RouterServices {
 /// this, a cell that failed once would stay cold until its TTL re-offered
 /// it. Shared verbatim by the production loop and the testing seam, so tests
 /// exercise the code that ships.
-async fn refresh_estimator_batch(pool: &PgPool, estimator: &EstimatorState) {
+///
+/// The batch checks `shutdown` between scans: a full batch is up to
+/// [`REFRESH_BATCH`] sequential queries, and on a degraded database each can
+/// block for its own timeout — without the check, a SIGTERM landing
+/// mid-batch would hold `wait_for_background_tasks` for the whole remainder.
+/// Undrained keys are simply dropped on shutdown; the process is exiting and
+/// a restart is cold everywhere anyway.
+async fn refresh_estimator_batch(
+    pool: &PgPool,
+    estimator: &EstimatorState,
+    shutdown: Option<&CancellationToken>,
+) {
     for key in estimator.drain_pending(REFRESH_BATCH) {
+        if shutdown.is_some_and(CancellationToken::is_cancelled) {
+            return;
+        }
         match output_token_percentiles(pool, &key.signature, key.scheme, key.candidate.as_deref())
             .await
         {

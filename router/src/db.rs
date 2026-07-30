@@ -36,7 +36,11 @@ use crate::{
 /// Only `status = 200` rows train the estimator: a settled non-200 row's
 /// output count reflects a failure shape, not what a completion of this
 /// segment costs. Served by `usage_events_signature_candidate_idx`
-/// (migration 0004; partial over non-NULL signatures).
+/// (migration 0004; partial over non-NULL signatures) — which requires the
+/// `$1::CHAR(16)` cast: the column is CHAR(16) (bpchar), and a TEXT-typed
+/// parameter would make the planner cast the COLUMN to text, structurally
+/// disqualifying the bpchar-opclass index and turning every cell refresh
+/// into a sequential scan of an append-only, ever-growing table.
 ///
 /// Returns `None` when the window holds no rows at all.
 pub async fn output_token_percentiles(
@@ -52,7 +56,7 @@ pub async fn output_token_percentiles(
                 WITHIN GROUP (ORDER BY output_tokens::FLOAT8),
             COUNT(*)
         FROM usage_events
-        WHERE task_signature = $1
+        WHERE task_signature = $1::CHAR(16)
           AND task_signature_scheme = $2
           AND ($3::TEXT IS NULL OR candidate_id = $3)
           AND status = 200
