@@ -103,19 +103,22 @@ input_per_mtok = 1.30
 cached_input_per_mtok = 0.10
 output_per_mtok = 2.60
 
-# OpenAI first-party. gpt-4.1-mini clears the balanced sell on every
-# dimension (0.40/0.10/1.60 vs 1.74/0.14/3.48) and sits behind the DeepSeek
-# rungs as the cheap western failover; live-smoked through the
-# openai_compatible adapter 2026-07-31. Inert until OPENAI_API_KEY is set.
+# OpenAI first-party. gpt-5.6-luna is the small tier of the 5.6 family
+# (verified 2026-07-31 on developers.openai.com/api/docs/pricing:
+# 0.20/0.02/1.20) and clears the balanced sell on every dimension; it sits
+# behind the DeepSeek rungs as the cheap western failover. The larger 5.6
+# variants do not fit any current tier (terra 2.00/12.00, sol 5.00/30.00
+# both exceed the high-end output sell) — placing them is a pricing
+# decision, not a config edit. Inert until OPENAI_API_KEY is set.
 [[tiers."zero/balanced".candidates]]
-id = "openai/gpt-4.1-mini"
+id = "openai/gpt-5.6-luna"
 provider = "openai"
-model = "gpt-4.1-mini"
+model = "gpt-5.6-luna"
 
 [tiers."zero/balanced".candidates.rates]
-input_per_mtok = 0.40
-cached_input_per_mtok = 0.10
-output_per_mtok = 1.60
+input_per_mtok = 0.20
+cached_input_per_mtok = 0.02
+output_per_mtok = 1.20
 
 # Bedrock-only private-beta fallback. This is priced at the canonical Bedrock
 # us-east-1 on-demand rate while the tier keeps its existing sell rate.
