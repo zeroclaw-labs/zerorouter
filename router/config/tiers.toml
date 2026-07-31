@@ -114,8 +114,10 @@ output_per_mtok = 2.60
 # zeroclaw-providers: parse the Responses API usage object into
 # `TokenUsage`. When that lands and the pin advances, swap this rung to
 # gpt-5.6-luna (price-verified 0.20/0.02/1.20 — newer and cheaper) on an
-# `openai_responses` adapter arm (this PR's history has the 15-line arm
-# ready). Inert until OPENAI_API_KEY is set.
+# `openai_responses` adapter arm (15 lines: OpenAiResponsesModelProvider
+# with credential/max_tokens/timeout, api_url when base_url is set — it was
+# built and live-tested during this investigation but deliberately not
+# committed while unmeterable). Inert until OPENAI_API_KEY is set.
 [[tiers."zero/balanced".candidates]]
 id = "openai/gpt-4.1-mini"
 provider = "openai"
