@@ -103,15 +103,19 @@ input_per_mtok = 1.30
 cached_input_per_mtok = 0.10
 output_per_mtok = 2.60
 
-# OpenAI first-party. gpt-4.1-mini, NOT a gpt-5.x: the whole 5.x line
-# rejects `max_tokens` (demanding `max_completion_tokens`), which the
-# pinned openai_compatible adapter cannot send — live-verified 2026-07-31,
-# tracked as a zeroclaw-providers ask. When the adapter learns the
-# parameter, the intended swap is gpt-5.6-luna (price-verified
-# 0.20/0.02/1.20 — newer AND cheaper than this rung); the larger 5.6
-# variants (terra 2.00/12.00, sol 5.00/30.00) exceed every tier's output
-# sell either way. This rung was live-smoked end to end and is inert until
-# OPENAI_API_KEY is set.
+# OpenAI first-party. gpt-4.1-mini and not a gpt-5.x, after a three-layer
+# live investigation (2026-07-31): the chat-completions wire rejects
+# gpt-5.x over `max_tokens`; the pinned OpenAiModelProvider is a hybrid
+# whose non-streaming path IS that chat wire (captured on a local sink);
+# and the pinned OpenAiResponsesModelProvider speaks the right wire on both
+# paths but hardcodes `usage: None` — which this router's
+# metered-actuals-only policy correctly refuses to bill
+# (`metering_unavailable`, observed live). The unlock is upstream in
+# zeroclaw-providers: parse the Responses API usage object into
+# `TokenUsage`. When that lands and the pin advances, swap this rung to
+# gpt-5.6-luna (price-verified 0.20/0.02/1.20 — newer and cheaper) on an
+# `openai_responses` adapter arm (this PR's history has the 15-line arm
+# ready). Inert until OPENAI_API_KEY is set.
 [[tiers."zero/balanced".candidates]]
 id = "openai/gpt-4.1-mini"
 provider = "openai"
