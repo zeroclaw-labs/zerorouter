@@ -199,7 +199,7 @@ async fn models_are_materialized_from_tiers_toml() {
     assert!(data.iter().any(|model| model["id"] == "minimax/MiniMax-M3"));
     assert!(
         data.iter()
-            .any(|model| model["id"] == "openai/gpt-5.6-luna")
+            .any(|model| model["id"] == "openai/gpt-4.1-mini")
     );
 }
 
