@@ -39,6 +39,22 @@ input_per_mtok = 0.30
 cached_input_per_mtok = 0.06
 output_per_mtok = 1.20
 
+# MiniMax first-party (platform.minimax.io, OpenAI-compatible surface).
+# Priced at the M2-era first-party rate; RE-VERIFY against the platform's M3
+# price card before enabling MINIMAX_API_KEY in production — the rung is
+# inert until that credential is set. Grouped with its aggregator twins so
+# the same model is the walk's immediate same-quality failover; the western
+# hosts stay ahead of bedrock per the note below. No cached-input rate is
+# published for the first-party surface, so none is claimed.
+[[tiers."zero/low-cost".candidates]]
+id = "minimax/MiniMax-M3"
+provider = "minimax"
+model = "MiniMax-M3"
+
+[tiers."zero/low-cost".candidates.rates]
+input_per_mtok = 0.30
+output_per_mtok = 1.20
+
 [[tiers."zero/low-cost".candidates]]
 id = "deepinfra/deepseek-ai/DeepSeek-V4-Flash"
 provider = "deepinfra"
@@ -86,6 +102,20 @@ model = "deepseek-ai/DeepSeek-V4-Pro"
 input_per_mtok = 1.30
 cached_input_per_mtok = 0.10
 output_per_mtok = 2.60
+
+# OpenAI first-party. gpt-4.1-mini clears the balanced sell on every
+# dimension (0.40/0.10/1.60 vs 1.74/0.14/3.48) and sits behind the DeepSeek
+# rungs as the cheap western failover; live-smoked through the
+# openai_compatible adapter 2026-07-31. Inert until OPENAI_API_KEY is set.
+[[tiers."zero/balanced".candidates]]
+id = "openai/gpt-4.1-mini"
+provider = "openai"
+model = "gpt-4.1-mini"
+
+[tiers."zero/balanced".candidates.rates]
+input_per_mtok = 0.40
+cached_input_per_mtok = 0.10
+output_per_mtok = 1.60
 
 # Bedrock-only private-beta fallback. This is priced at the canonical Bedrock
 # us-east-1 on-demand rate while the tier keeps its existing sell rate.

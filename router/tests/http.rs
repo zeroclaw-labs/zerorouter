@@ -176,8 +176,8 @@ async fn models_are_materialized_from_tiers_toml() {
         .expect("models response should contain a data array");
 
     assert_eq!(json["object"], "list");
-    // 3 tier ids + 9 concrete candidates (4 low-cost, 3 balanced, 2 high-end).
-    assert_eq!(data.len(), 12);
+    // 3 tier ids + 11 concrete candidates (5 low-cost, 4 balanced, 2 high-end).
+    assert_eq!(data.len(), 14);
     assert!(data.iter().all(|model| model["object"] == "model"));
     assert!(data.iter().any(|model| model["id"] == "zero/balanced"));
     assert!(
@@ -195,6 +195,11 @@ async fn models_are_materialized_from_tiers_toml() {
     assert!(
         data.iter()
             .any(|model| model["id"] == "bedrock/deepseek.v3.2")
+    );
+    assert!(data.iter().any(|model| model["id"] == "minimax/MiniMax-M3"));
+    assert!(
+        data.iter()
+            .any(|model| model["id"] == "openai/gpt-4.1-mini")
     );
 }
 
@@ -588,9 +593,9 @@ async fn sonnet_intro_pricing_expiry_withholds_high_end_and_nothing_else() {
     assert_eq!(sell.output_per_mtok, Some(10.00));
 
     // And the public catalog stops advertising what it cannot serve: the two
-    // surviving tier ids plus their seven candidates, with no sonnet row.
+    // surviving tier ids plus their nine candidates, with no sonnet row.
     let listed = listed_model_ids(RouterState::new(path)).await;
-    assert_eq!(listed.len(), 9);
+    assert_eq!(listed.len(), 11);
     assert!(listed.iter().any(|id| id == "zero/low-cost"));
     assert!(listed.iter().any(|id| id == "zero/balanced"));
     assert!(
