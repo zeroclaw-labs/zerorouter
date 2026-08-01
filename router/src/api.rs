@@ -34,15 +34,17 @@ use crate::{
     config::{ResolvedRoute, TierCandidate, TierCatalog, load_tier_catalog},
     db::{
         AttemptRecord, AttemptTokens, RequestTelemetry, SettlementRecovery, UsageAdmission,
-        UsageRecord, UsageSession, begin_usage_session, recover_owed_settlements,
+        UsageRecord, UsageSession, begin_usage_session, output_token_percentiles,
+        recover_owed_settlements,
     },
     error::{ApiError, streaming_error_json},
+    estimator::{CellKey, CellRead, EstimatorState, REFRESH_BATCH, REFRESH_INTERVAL},
     health::{ProviderHealth, WalkLedger},
     openai::{
-        ChatCompletionRequest, ChatCompletionResponse, EmittedOutput, ModelList, OpenAiUsage,
-        StreamMetadata, TaskSignature, ZeroRouterAttempt, ZeroRouterResponseMetadata,
-        finish_reason, shape_ok, stream_delta_json, stream_tool_call_delta, stream_usage_json,
-        task_signature, tool_args_all_json, usage_cost,
+        ChatCompletionRequest, ChatCompletionResponse, EmittedOutput, EstimateBasis, ModelList,
+        OpenAiUsage, StreamMetadata, TaskSignature, ZeroRouterAttempt, ZeroRouterEstimate,
+        ZeroRouterResponseMetadata, finish_reason, shape_ok, stream_delta_json,
+        stream_tool_call_delta, stream_usage_json, task_signature, tool_args_all_json, usage_cost,
     },
     priority::Priority,
     providers::{ProviderCandidate, ProviderRoute},
@@ -69,6 +71,12 @@ struct RequestFeatures {
     // never mentioned the knob keeps its byte-identical legacy response
     // while still recording its resolved `balanced`.
     knob_engaged: bool,
+    // The segment's output estimate, read from the candidate-agnostic cell
+    // once in `chat_completions` and carried to every serve site so the
+    // response block shows it. Response-only, never persisted
+    // (`usage_events.estimator_basis` stays 'cold' until Stage 4 sizes
+    // reservations from this).
+    estimate: ZeroRouterEstimate,
 }
 
 impl RequestFeatures {
@@ -76,6 +84,7 @@ impl RequestFeatures {
         request: &ChatCompletionRequest,
         reservation_usage: OpenAiUsage,
         priority: PriorityResolution,
+        estimate: ZeroRouterEstimate,
     ) -> Self {
         Self {
             requested_max_tokens: request
@@ -87,6 +96,7 @@ impl RequestFeatures {
             tool_count: i32::try_from(request.tools.len()).unwrap_or(i32::MAX),
             priority: priority.resolved,
             knob_engaged: priority.engaged,
+            estimate,
         }
     }
 }
@@ -120,6 +130,7 @@ fn zerorouter_block(
 ) -> Option<ZeroRouterResponseMetadata> {
     features.knob_engaged.then(|| ZeroRouterResponseMetadata {
         priority: features.priority,
+        estimate: features.estimate,
         attempts: attempts
             .rows()
             .iter()
@@ -429,6 +440,11 @@ struct RouterServices {
     /// Cross-request rung health (stage 2b). Lives exactly as long as the
     /// services — in-process and lost on restart, deliberately.
     health: ProviderHealth,
+    /// The cost estimator's cell cache (stage 3b), on the same contract:
+    /// in-process, lost on restart, and restart-cold is exactly today's
+    /// behavior. Requests only read it; the background refresher
+    /// ([`RouterState::spawn_estimator_refresher`]) is its only writer.
+    estimator: EstimatorState,
     #[cfg(feature = "testing")]
     injected_route: Option<InjectedRoute>,
 }
@@ -472,6 +488,7 @@ impl RouterState {
                 runtime: RuntimeControl::new(),
                 require_credits,
                 health: ProviderHealth::default(),
+                estimator: EstimatorState::default(),
                 #[cfg(feature = "testing")]
                 injected_route: None,
             })),
@@ -497,6 +514,7 @@ impl RouterState {
                 runtime: RuntimeControl::new(),
                 require_credits,
                 health: ProviderHealth::default(),
+                estimator: EstimatorState::default(),
                 injected_route: Some(route),
             })),
         }
@@ -553,6 +571,61 @@ impl RouterState {
         });
     }
 
+    /// Start the background estimator refresher: every
+    /// [`REFRESH_INTERVAL`], drain the cells requests enqueued and run their
+    /// percentile scans off the request path.
+    ///
+    /// Opt-in and called only by `serve`, for the same reason as
+    /// [`RouterState::spawn_settlement_recovery`]: the loop exits only on
+    /// shutdown, so a test harness that started it could never drain
+    /// [`RouterState::wait_for_background_tasks`]. Tests drive the identical
+    /// batch synchronously through [`RouterState::refresh_estimator_once`].
+    pub fn spawn_estimator_refresher(&self) {
+        let Some(services) = &self.services else {
+            return;
+        };
+        let services = Arc::clone(services);
+        let shutdown = services.runtime.shutdown.clone();
+        services.runtime.tasks.clone().spawn(async move {
+            loop {
+                tokio::select! {
+                    biased;
+                    () = shutdown.cancelled() => return,
+                    () = tokio::time::sleep(REFRESH_INTERVAL) => {}
+                }
+                refresh_estimator_batch(&services.pool, &services.estimator, Some(&shutdown)).await;
+            }
+        });
+    }
+
+    /// Run one refresher batch synchronously — the testing seam for the loop
+    /// [`RouterState::spawn_estimator_refresher`] runs in production.
+    #[cfg(feature = "testing")]
+    pub async fn refresh_estimator_once(&self) {
+        if let Some(services) = &self.services {
+            refresh_estimator_batch(&services.pool, &services.estimator, None).await;
+        }
+    }
+
+    /// How many estimator cells are queued for refresh — visibility for the
+    /// re-enqueue-on-error pin, nothing more.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn estimator_pending_len(&self) -> usize {
+        self.services
+            .as_ref()
+            .map_or(0, |services| services.estimator.pending_len())
+    }
+
+    /// Backdate every cached estimator cell, so a test can cross the
+    /// staleness TTL without touching the runtime clock.
+    #[cfg(feature = "testing")]
+    pub fn age_estimator_cells(&self, by: Duration) {
+        if let Some(services) = &self.services {
+            services.estimator.age_cells(by);
+        }
+    }
+
     pub fn begin_shutdown(&self) {
         if let Some(services) = &self.services {
             services.runtime.shutdown.cancel();
@@ -582,6 +655,44 @@ impl RouterServices {
         }
         ProviderRoute::new(resolved.candidates.clone(), max_output_tokens)
             .map_err(|_| ApiError::NoProviderAvailable)
+    }
+}
+
+/// One refresher pass: drain the pending cells and run each percentile scan.
+/// A failed scan re-enqueues its cell so the next pass retries it — without
+/// this, a cell that failed once would stay cold until its TTL re-offered
+/// it. Shared verbatim by the production loop and the testing seam, so tests
+/// exercise the code that ships.
+///
+/// The batch checks `shutdown` between scans: a full batch is up to
+/// [`REFRESH_BATCH`] sequential queries, and on a degraded database each can
+/// block for its own timeout — without the check, a SIGTERM landing
+/// mid-batch would hold `wait_for_background_tasks` for the whole remainder.
+/// Undrained keys are simply dropped on shutdown; the process is exiting and
+/// a restart is cold everywhere anyway.
+async fn refresh_estimator_batch(
+    pool: &PgPool,
+    estimator: &EstimatorState,
+    shutdown: Option<&CancellationToken>,
+) {
+    for key in estimator.drain_pending(REFRESH_BATCH) {
+        if shutdown.is_some_and(CancellationToken::is_cancelled) {
+            return;
+        }
+        match output_token_percentiles(pool, &key.signature, key.scheme, key.candidate.as_deref())
+            .await
+        {
+            Ok(measured) => estimator.apply(key, measured),
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    signature = key.signature,
+                    candidate = key.candidate.as_deref().unwrap_or("<signature>"),
+                    "estimator cell refresh failed; cell re-queued"
+                );
+                estimator.enqueue(key);
+            }
+        }
     }
 }
 
@@ -672,23 +783,12 @@ async fn chat_completions(
             .or(authenticated.default_priority),
     );
     let max_output_tokens = *request.max_tokens.get_or_insert(BASELINE_MAX_TOKENS);
-    let mut provider_route = services.provider_route(&resolved, max_output_tokens)?;
-    order_candidates(
-        priority.resolved,
-        provider_route.candidates_mut(),
-        &services.health,
-    );
     let reservation_usage = request.reservation_usage(max_output_tokens);
-    let reserved_tokens =
-        i64::try_from(reservation_usage.total_tokens).map_err(|_| ApiError::InvalidRequest)?;
-    // Fail closed before admission: a tier whose sell rates cannot be priced
-    // cannot size a reservation, and a request that cannot be metered must not
-    // be dispatched. The catalog validated these rates at load, so this is a
-    // backstop rather than a live path.
-    let reserved_cost =
-        usage_cost(resolved.sell_rates, reservation_usage).ok_or(ApiError::MeteringUnavailable)?;
     // The user-scoped segmentation key (design: Engine "Task signature"),
-    // computed beside the reservation over the same request-shape fields.
+    // computed over the same request-shape fields the reservation measures.
+    // Moved ahead of route construction in stage 3b because selection now
+    // reads the segment's estimator cells; the computation is pure, so only
+    // the order changed.
     let tool_names: Vec<String> = request
         .tools
         .iter()
@@ -702,6 +802,45 @@ async fn chat_completions(
         request.stream,
         max_output_tokens,
     );
+    // One cache read per request for the candidate-agnostic cell. Every
+    // request — engaged or not — offers its segment to the refresher through
+    // this lookup's miss path: the flywheel warms on all traffic, which is
+    // what Stage 4's reservation sizing will want already spinning.
+    let signature_cell = services
+        .estimator
+        .lookup(&CellKey::for_signature(&signature));
+    // The estimate the response block will show: learned percentiles from
+    // the warm cell, else the cold byte-bound answer. Guidance, never a
+    // quote — and never an input to admission, which stays byte-bound until
+    // Stage 4.
+    let estimate = match signature_cell {
+        CellRead::Warm(percentiles) => ZeroRouterEstimate {
+            output_tokens_p50: round_tokens(percentiles.p50),
+            output_tokens_p90: round_tokens(percentiles.p90),
+            basis: EstimateBasis::Learned,
+        },
+        CellRead::Cold => ZeroRouterEstimate::cold(max_output_tokens),
+    };
+    let mut provider_route = services.provider_route(&resolved, max_output_tokens)?;
+    order_candidates(
+        priority.resolved,
+        provider_route.candidates_mut(),
+        &CostContext {
+            estimator: &services.estimator,
+            signature: &signature,
+            signature_cell,
+            input_bytes: reservation_usage.prompt_tokens,
+        },
+        &services.health,
+    );
+    let reserved_tokens =
+        i64::try_from(reservation_usage.total_tokens).map_err(|_| ApiError::InvalidRequest)?;
+    // Fail closed before admission: a tier whose sell rates cannot be priced
+    // cannot size a reservation, and a request that cannot be metered must not
+    // be dispatched. The catalog validated these rates at load, so this is a
+    // backstop rather than a live path.
+    let reserved_cost =
+        usage_cost(resolved.sell_rates, reservation_usage).ok_or(ApiError::MeteringUnavailable)?;
     let usage_session = admit_usage(
         &services.pool,
         &authenticated,
@@ -725,6 +864,7 @@ async fn chat_completions(
             provider_route,
             reservation_usage,
             priority,
+            estimate,
         )
     } else {
         non_streaming_response(
@@ -736,6 +876,7 @@ async fn chat_completions(
             provider_route,
             reservation_usage,
             priority,
+            estimate,
         )
         .await
     }
@@ -767,11 +908,12 @@ fn model_unresolvable(catalog: &TierCatalog, requested_model: &str) -> ApiError 
 /// Selection policy (design doc: Engine "Selection policy"), applied to the
 /// built route before either walk starts.
 ///
-/// Stage 3a ships the knob visibility-only: there is no estimator yet, so
-/// every mode's base ordering is the identity — the tiers.toml order, which
-/// is the human-curated quality prior. The `priority` arms exist so the
-/// cost- and success-mode orderings (stage 3b) land in this function's body
-/// without touching its callers.
+/// Since stage 3b, `cost` orders ascending by expected cost basis —
+/// estimator-backed, with a whole-route fall-through to the identity while
+/// the segment is cold (`order_by_expected_cost`). `balanced` stays the
+/// identity — the tiers.toml order, the human-curated prior and the frozen
+/// control group. `success` stays the identity until its estimator and
+/// escalation machinery arrive in stage 5a.
 ///
 /// Health demotion applies last, in every mode: demoted rungs sink to the
 /// back — preserving table order within each group — and never disappear.
@@ -784,18 +926,112 @@ fn model_unresolvable(catalog: &TierCatalog, requested_model: &str) -> ApiError 
 fn order_candidates(
     priority: Priority,
     candidates: &mut Vec<ProviderCandidate>,
+    estimates: &CostContext<'_>,
     health: &ProviderHealth,
 ) {
     match priority {
-        // 3a: no estimator, so cost, balanced, and success all keep the
-        // identity base order. The arms split when 3b's estimator arrives.
-        Priority::Cost | Priority::Balanced | Priority::Success => {}
+        // Since 3b, cost orders by expected cost basis (cold-fallback:
+        // identity). balanced: identity by definition, the frozen control
+        // group. success: identity until its machinery arrives in 5a.
+        Priority::Cost => order_by_expected_cost(candidates, estimates),
+        Priority::Balanced | Priority::Success => {}
     }
     let (healthy, demoted): (Vec<_>, Vec<_>) = candidates
         .drain(..)
         .partition(|candidate| !health.should_skip(candidate.definition()));
     candidates.extend(healthy);
     candidates.extend(demoted);
+}
+
+/// The request-scoped inputs cost-mode ordering reads (design doc: Engine
+/// "Selection policy" and "Cost estimator"). All cache; the request path
+/// never touches the database for an estimate.
+struct CostContext<'a> {
+    estimator: &'a EstimatorState,
+    signature: &'a TaskSignature,
+    /// The candidate-agnostic cell, read once per request in
+    /// `chat_completions` (it also feeds the response `estimate` block).
+    signature_cell: CellRead,
+    /// The byte-bound input measure — the same number admission reserves
+    /// against, reused as the input side of expected cost.
+    input_bytes: u64,
+}
+
+/// Cost mode's base ordering: ascending expected cost basis, stable, so
+/// candidates the estimator prices identically keep their table order.
+///
+/// Each candidate's expected output is its own warm selection cell's p50
+/// when one exists, else the segment's candidate-agnostic p50 — the shared
+/// fallback that breaks the cold-start circle where a candidate that never
+/// serves never warms and so never gets ordered past. With the shared
+/// fallback every candidate prices at the same expected output and the
+/// ordering degenerates to rate order, which is exactly the right cold-ish
+/// answer. Only when the segment itself is cold (no candidate-agnostic cell
+/// either) does the whole route fall through to the identity — the design's
+/// cold-fallback, and bit-for-bit today's behavior.
+///
+/// f64 per-mtok arithmetic prices an ORDERING, never a bill: within a tier
+/// every candidate bills at the same tier sell rate (sell-price invariance),
+/// so this chooses ZeroRouter's COGS and the customer's odds, never the
+/// customer's price. Billing math stays in `Decimal` (`usage_cost`).
+fn order_by_expected_cost(candidates: &mut Vec<ProviderCandidate>, estimates: &CostContext<'_>) {
+    let shared_fallback = match estimates.signature_cell {
+        CellRead::Warm(percentiles) => Some(percentiles.p50),
+        CellRead::Cold => None,
+    };
+    let expected: Vec<Option<f64>> = candidates
+        .iter()
+        .map(|candidate| {
+            let definition = candidate.definition();
+            let cell = estimates
+                .estimator
+                .lookup(&CellKey::for_candidate(estimates.signature, &definition.id));
+            let expected_output = match cell {
+                CellRead::Warm(percentiles) => percentiles.p50,
+                CellRead::Cold => shared_fallback?,
+            };
+            Some(expected_cost_basis(
+                definition.rates,
+                estimates.input_bytes,
+                expected_output,
+            ))
+        })
+        .collect();
+    if expected.iter().any(Option::is_none) {
+        // Cold fallback: some rung has no estimate from any grain, so the
+        // route keeps the table order rather than sorting on partial data.
+        return;
+    }
+    let mut priced: Vec<(f64, ProviderCandidate)> = expected
+        .into_iter()
+        .map(|cost| cost.unwrap_or(f64::INFINITY))
+        .zip(candidates.drain(..))
+        .collect();
+    priced.sort_by(|left, right| left.0.total_cmp(&right.0));
+    candidates.extend(priced.into_iter().map(|(_, candidate)| candidate));
+}
+
+/// A percentile as the wire shows it: output tokens are whole numbers, and
+/// the scan cannot produce a negative or astronomically large quantile from
+/// nonnegative integer inputs — the saturating cast is belt-and-braces.
+fn round_tokens(value: f64) -> u64 {
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let rounded = value.round().max(0.0) as u64;
+    rounded
+}
+
+/// Expected COST BASIS of dispatching one candidate: the byte-bound input at
+/// the candidate's input rate plus the estimated output at its output rate.
+/// A candidate whose rate table cannot price a dimension prices at infinity
+/// and sorts last — defensive only; catalog validation refuses such tables.
+fn expected_cost_basis(rates: ModelRates, input_bytes: u64, expected_output_tokens: f64) -> f64 {
+    // Precision loss on the u64 → f64 cast is irrelevant at ordering
+    // magnitudes (bytes are far below 2^52).
+    #[allow(clippy::cast_precision_loss)]
+    let input_bytes = input_bytes as f64;
+    let input_rate = rates.input_per_mtok.unwrap_or(f64::INFINITY);
+    let output_rate = rates.output_per_mtok.unwrap_or(f64::INFINITY);
+    input_bytes * input_rate / 1_000_000.0 + expected_output_tokens * output_rate / 1_000_000.0
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -808,6 +1044,7 @@ async fn non_streaming_response(
     provider_route: ProviderRoute,
     reservation_usage: OpenAiUsage,
     priority: PriorityResolution,
+    estimate: ZeroRouterEstimate,
 ) -> Result<Response, ApiError> {
     runtime
         .tasks
@@ -820,6 +1057,7 @@ async fn non_streaming_response(
             provider_route,
             reservation_usage,
             priority,
+            estimate,
         ))
         .await
         .map_err(|_| ApiError::UpstreamUnavailable)?
@@ -835,9 +1073,10 @@ async fn run_non_streaming(
     provider_route: ProviderRoute,
     reservation_usage: OpenAiUsage,
     priority: PriorityResolution,
+    estimate: ZeroRouterEstimate,
 ) -> Result<Response, ApiError> {
     let request_id = usage_session.request_id();
-    let features = RequestFeatures::from_request(&request, reservation_usage, priority);
+    let features = RequestFeatures::from_request(&request, reservation_usage, priority, estimate);
     let tools = request.provider_tools();
     let max_tokens = request.max_tokens;
     // One clock for the whole walk, exactly as the streaming walk keeps one:
@@ -1456,6 +1695,7 @@ fn streaming_response(
     provider_route: ProviderRoute,
     reservation_usage: OpenAiUsage,
     priority: PriorityResolution,
+    estimate: ZeroRouterEstimate,
 ) -> Result<Response, ApiError> {
     let metadata = StreamMetadata::new(
         usage_session.request_id(),
@@ -1477,6 +1717,7 @@ fn streaming_response(
             provider_route.into_candidates(),
             reservation_usage,
             priority,
+            estimate,
         )
         .await;
     });
@@ -1505,11 +1746,12 @@ async fn stream_to_channel(
     candidates: Vec<ProviderCandidate>,
     reservation_usage: OpenAiUsage,
     priority: PriorityResolution,
+    estimate: ZeroRouterEstimate,
 ) {
     let messages = request.provider_messages();
     let tools = request.provider_tools();
     let max_tokens = request.max_tokens;
-    let features = RequestFeatures::from_request(&request, reservation_usage, priority);
+    let features = RequestFeatures::from_request(&request, reservation_usage, priority, estimate);
     let started = Instant::now();
     let mut last_candidate = None;
     let mut usage_session = Some(usage_session);
@@ -2956,6 +3198,7 @@ mod tests {
             ],
             reservation_usage,
             PriorityResolution::new(None),
+            ZeroRouterEstimate::cold(64),
         )
         .await;
         assert!(
@@ -3042,6 +3285,7 @@ mod tests {
             vec![ProviderCandidate::with_provider(candidate.clone(), fake)],
             reservation_usage,
             PriorityResolution::new(None),
+            ZeroRouterEstimate::cold(64),
         )
         .await;
         tokio::time::resume();
@@ -3143,6 +3387,7 @@ mod tests {
             vec![ProviderCandidate::with_provider(candidate.clone(), fake)],
             reservation_usage,
             PriorityResolution::new(None),
+            ZeroRouterEstimate::cold(64),
         )
         .await;
         assert!(
@@ -3237,6 +3482,7 @@ mod tests {
             )],
             reservation_usage,
             PriorityResolution::new(None),
+            ZeroRouterEstimate::cold(64),
         )
         .await;
         client.await.expect("client task should join");

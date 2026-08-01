@@ -74,6 +74,7 @@ async fn serve() -> Result<()> {
     // intent persisted on the reservation row (migration 0006) so delivered
     // inference cannot go unbilled because one transaction lost a connection.
     state.spawn_settlement_recovery();
+    state.spawn_estimator_refresher();
     let mut router = app(state.clone());
     if let Some(config) = web_config {
         let portal_dist = config.portal_dist_path.clone();

@@ -275,6 +275,18 @@ improvement over invisible.
 > for header-less streaming clients is **not** in 3a — it ships with a later
 > portal pass.
 
+> **Stage 3b added the `estimate` member** to the engaged block, with three
+> decisions recorded. The display gate is **n ≥ 50 alone**: the p99/p50 ≤ 8
+> tail gate guards reservation *money* (Stage 4) and deliberately does not
+> hide guidance — a heavy-tailed segment shows its measured percentiles.
+> The **cold shape echoes the request's own `max_tokens`** on both
+> percentiles: an unmeasured segment's only honest bound, and legibly so.
+> And the response basis is the **estimate's** provenance, not the
+> reservation's: `usage_events.estimator_basis` keeps stamping `cold` until
+> Stage 4 sizes reservations from these cells — a `learned` estimate shown
+> beside a cold-sized reservation is exactly the
+> visibility-before-financial-exposure split the rollout row names.
+
 
 ### Error semantics
 
@@ -424,6 +436,31 @@ the floor and alarmed in dollars instead.
 row, so an audit can prove no quote-grade estimate ever shipped from an
 ungated segment.
 
+> **Shipped in Stage 3b** (`estimator.rs`, `db.rs`, `api.rs`) — the read
+> path only, reservations untouched. Decisions recorded:
+>
+> - **The cell key carries the signature scheme** (migration 0007): scheme-1
+>   and scheme-2 rows are different segments, and the scan filters
+>   `task_signature_scheme` so pre-0007 NULL-scheme rows are invisible to a
+>   current-scheme cell. Only `status = 200` rows train a cell — a failure
+>   shape's output count is not what a completion of the segment costs.
+> - **Both grains live in one cache**: `(signature, candidate)` selection
+>   cells and the candidate-agnostic `(signature)` cell the estimate block
+>   and Stage 4's sizing read. The per-signature cell is looked up — and its
+>   miss enqueued — on **every** request, engaged or not, so the flywheel
+>   warms on all traffic; per-candidate cells are touched only inside the
+>   cost arm, so balanced traffic never churns selection cells.
+> - **Fresh-but-thin cells wait for their TTL** rather than re-querying per
+>   request: a segment under the n ≥ 50 gate re-measures at staleness
+>   cadence, not request cadence. Cell map and pending queue are both
+>   bounded, and both overflow toward cold — cold is the status quo.
+> - **The refresher follows the settlement-recovery pattern**: opt-in,
+>   spawned only by `serve`, exiting only on shutdown (a test harness that
+>   started it could never drain `wait_for_background_tasks`); tests drive
+>   the identical batch synchronously (`refresh_estimator_once`) and cross
+>   the TTL by backdating cells (`age_estimator_cells`). A failed scan logs
+>   and re-enqueues its cell rather than stranding it cold until TTL.
+
 ### Success estimator
 
 `P(success | task_signature, candidate, validator_kind)` = Beta(1,1)-smoothed
@@ -532,6 +569,21 @@ never removes, so it can never manufacture either.
 > `health_skipped` rows and its never-below-one-candidate floor. An
 > all-demoted route partitions to itself, so ordering never manufactures an
 > empty route.
+
+> **Stage 3b flipped the cost arm** to expected-cost ordering, with one
+> decision this section left open now recorded: **the cold-start circle is
+> broken by a shared fallback.** A rung's expected output is its own warm
+> `(signature, candidate)` p50 when one exists, else the segment's
+> candidate-agnostic p50 — so a candidate that has never served (and so can
+> never warm its own cell) is still orderable, and an all-thin route prices
+> every rung at the same expected output, degenerating to rate order: the
+> right cold-ish answer. Only when the segment itself is cold does the whole
+> route fall through to the identity; the sort never runs on partial data.
+> The sort is stable (ties keep the human-curated table order), runs on the
+> built route like health demotion, and is f64 per-mtok arithmetic pricing
+> an ORDERING, never a bill — sell-price invariance means it chooses
+> ZeroRouter's COGS, and billing stays in `Decimal`. Balanced remains the
+> frozen control group; success remains identity until 5a.
 
 ### Provider-health state
 

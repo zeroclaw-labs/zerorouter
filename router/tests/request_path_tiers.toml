@@ -52,3 +52,34 @@ model = "upstream/solo"
 input_per_mtok = 1.00
 cached_input_per_mtok = 0.20
 output_per_mtok = 2.00
+
+# Stage-3b ordering fixture: the tier's table order is NOT its cheapest-first
+# order, so a cost-mode reorder is observable as a served-candidate flip while
+# balanced traffic keeps serving the table's first rung.
+
+[tiers."zero/test-pricier-first"]
+
+[tiers."zero/test-pricier-first".rates]
+input_per_mtok = 3.00
+cached_input_per_mtok = 0.60
+output_per_mtok = 6.00
+
+[[tiers."zero/test-pricier-first".candidates]]
+id = "fireworks/pricier"
+provider = "fireworks"
+model = "upstream/pricier"
+
+[tiers."zero/test-pricier-first".candidates.rates]
+input_per_mtok = 2.00
+cached_input_per_mtok = 0.40
+output_per_mtok = 4.00
+
+[[tiers."zero/test-pricier-first".candidates]]
+id = "together/cheaper"
+provider = "together"
+model = "upstream/cheaper"
+
+[tiers."zero/test-pricier-first".candidates.rates]
+input_per_mtok = 1.00
+cached_input_per_mtok = 0.20
+output_per_mtok = 2.00
