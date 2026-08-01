@@ -691,11 +691,16 @@ async fn every_shipped_tier_keeps_its_structural_promise() {
             assert_eq!(
                 (
                     candidate.rates.input_per_mtok,
+                    candidate.rates.cached_input_per_mtok,
                     candidate.rates.output_per_mtok
                 ),
-                (tier.rates.input_per_mtok, tier.rates.output_per_mtok),
-                "{tier_id} must sell at list (flagship shape): margin is \
-                 volume discounts, never markup"
+                (
+                    tier.rates.input_per_mtok,
+                    tier.rates.cached_input_per_mtok,
+                    tier.rates.output_per_mtok
+                ),
+                "{tier_id} must sell at list on EVERY dimension (cached \
+                 input included): margin is volume discounts, never markup"
             );
         } else {
             panic!("{tier_id} is neither routed nor pass-through — decide");

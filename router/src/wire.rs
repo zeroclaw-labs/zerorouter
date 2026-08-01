@@ -135,8 +135,14 @@ fn build_responses_input(messages: &[ChatMessage]) -> (String, Vec<Value>) {
                 // ZR packs assistant turns that carry tool calls or
                 // reasoning as a JSON envelope; a plain string is a plain
                 // reply.
+                // ZR's packed envelopes always carry `tool_calls` or
+                // `reasoning_content`; an assistant reply that merely IS a
+                // JSON object (a model answering in JSON) has neither and
+                // must pass through as plain text, not vanish.
                 if let Ok(envelope) = serde_json::from_str::<Value>(&message.content)
                     && envelope.is_object()
+                    && (envelope.get("tool_calls").is_some()
+                        || envelope.get("reasoning_content").is_some())
                 {
                     if let Some(text) = envelope
                         .get("content")
@@ -193,6 +199,24 @@ fn build_responses_input(messages: &[ChatMessage]) -> (String, Vec<Value>) {
     }
 
     (system_parts.join("\n\n"), input)
+}
+
+/// The next SSE event boundary: LF-LF or CRLF-CRLF, whichever comes first.
+fn find_event_boundary(buffer: &str) -> Option<(usize, usize)> {
+    let lf = buffer.find("\n\n").map(|at| (at, 2));
+    let crlf = buffer.find("\r\n\r\n").map(|at| (at, 4));
+    match (lf, crlf) {
+        (Some((lf_at, _)), Some((crlf_at, _))) if crlf_at + 2 == lf_at => crlf,
+        (Some(lf), Some(crlf)) => {
+            if crlf.0 < lf.0 {
+                Some(crlf)
+            } else {
+                Some(lf)
+            }
+        }
+        (only, None) => only,
+        (None, only) => only,
+    }
 }
 
 fn message_item(role: &str, content_type: &str, text: &str) -> Value {
@@ -430,19 +454,33 @@ impl ModelProvider for OpenAiResponsesWire {
             }
 
             let mut bytes = response.bytes_stream();
+            // Byte buffer, decoded only at valid UTF-8 prefixes: a multibyte
+            // character split across network chunks must never become a
+            // replacement character in a customer's stream.
+            let mut raw_buffer: Vec<u8> = Vec::new();
             let mut buffer = String::new();
             let mut finished = false;
             while let Some(chunk) = bytes.next().await {
                 let chunk = chunk.map_err(|error| StreamError::Http(error.to_string()))?;
-                buffer.push_str(&String::from_utf8_lossy(&chunk));
+                raw_buffer.extend_from_slice(&chunk);
+                let valid_up_to = match std::str::from_utf8(&raw_buffer) {
+                    Ok(_) => raw_buffer.len(),
+                    Err(error) => error.valid_up_to(),
+                };
+                buffer.push_str(
+                    std::str::from_utf8(&raw_buffer[..valid_up_to])
+                        .expect("prefix was just validated"),
+                );
+                raw_buffer.drain(..valid_up_to);
 
-                // SSE events are separated by a blank line; each carries
-                // `event:` and `data:` lines.
-                while let Some(boundary) = buffer.find("\n\n") {
+                // SSE events are separated by a blank line — LF or CRLF
+                // framing are both legal; `data:` lines strip a trailing CR.
+                while let Some((boundary, delimiter_len)) = find_event_boundary(&buffer) {
                     let raw = buffer[..boundary].to_owned();
-                    buffer.drain(..boundary + 2);
+                    buffer.drain(..boundary + delimiter_len);
                     let data = raw
                         .lines()
+                        .map(|line| line.strip_suffix('\r').unwrap_or(line))
                         .filter_map(|line| line.strip_prefix("data:"))
                         .map(str::trim_start)
                         .collect::<Vec<_>>()
@@ -492,7 +530,13 @@ impl ModelProvider for OpenAiResponsesWire {
                                 });
                             }
                         }
-                        Some("response.completed") => {
+                        // `response.incomplete` is a TERMINAL event too — a
+                        // max_output_tokens clip lands here with usage
+                        // attached, and this router always sets
+                        // max_output_tokens. Treating only `completed` as
+                        // terminal would deliver the clipped output and then
+                        // settle it unbilled (codex-sol review finding).
+                        Some("response.completed" | "response.incomplete") => {
                             if let Some(usage) = value
                                 .get("response")
                                 .and_then(|response| response.get("usage"))
@@ -505,13 +549,33 @@ impl ModelProvider for OpenAiResponsesWire {
                             yield StreamEvent::Final;
                         }
                         Some("response.failed" | "error") => {
-                            let detail = value
+                            let error_value = value
                                 .get("response")
                                 .and_then(|response| response.get("error"))
-                                .or_else(|| value.get("error"))
+                                .or_else(|| value.get("error"));
+                            let detail = error_value
                                 .map_or_else(|| data.clone(), Value::to_string);
+                            // In-band errors carry no HTTP status, but the
+                            // walk's classifier reads status digits and rate
+                            // hints from the TEXT. Restore the digits for
+                            // the shapes that need classifying: a rate limit
+                            // must feed the health cooldown, not read as a
+                            // generic broken stream.
+                            let code = error_value
+                                .and_then(|error| error.get("code"))
+                                .and_then(Value::as_str)
+                                .unwrap_or_default();
+                            let prefix = if code.contains("rate_limit")
+                                || detail.contains("rate limit")
+                            {
+                                "429 Too Many Requests: "
+                            } else if code.contains("insufficient_quota") {
+                                "429 Too Many Requests: insufficient_quota — "
+                            } else {
+                                ""
+                            };
                             Err(StreamError::ModelProvider(format!(
-                                "{alias} responses stream failed: {detail}"
+                                "{alias} responses stream failed: {prefix}{detail}"
                             )))?;
                         }
                         _ => {}
@@ -645,5 +709,80 @@ mod tests {
             ),
             "{error}"
         );
+    }
+}
+
+#[cfg(test)]
+mod review_fix_tests {
+    use super::*;
+
+    #[test]
+    fn incomplete_is_a_terminal_event_shape() {
+        // The streaming arm matches completed|incomplete identically; this
+        // pins the envelope side: an incomplete response still lifts usage,
+        // so a max_output_tokens clip is billable, never a free delivery.
+        let envelope: ResponsesEnvelope = serde_json::from_value(serde_json::json!({
+            "status": "incomplete",
+            "incomplete_details": {"reason": "max_output_tokens"},
+            "output": [{"type": "message", "role": "assistant",
+                        "content": [{"type": "output_text", "text": "clipped"}]}],
+            "usage": {"input_tokens": 20, "output_tokens": 64}
+        }))
+        .expect("envelope parses");
+        let response = parse_envelope(envelope);
+        assert_eq!(response.text.as_deref(), Some("clipped"));
+        let usage = response.usage.expect("clipped output still meters");
+        assert_eq!(usage.output_tokens, Some(64));
+    }
+
+    #[test]
+    fn event_boundaries_handle_lf_and_crlf_framing() {
+        assert_eq!(find_event_boundary("data: a\n\nrest"), Some((7, 2)));
+        assert_eq!(find_event_boundary("data: a\r\n\r\nrest"), Some((7, 4)));
+        assert_eq!(find_event_boundary("data: a\r\n"), None);
+        // Mixed stream: the earlier boundary wins.
+        assert_eq!(find_event_boundary("a\n\nb\r\n\r\nc"), Some((1, 2)));
+    }
+
+    #[test]
+    fn a_json_object_assistant_reply_is_not_swallowed() {
+        // A model that answered in pure JSON round-trips as plain assistant
+        // text — only ZR's own packing markers make an envelope.
+        let messages = vec![ChatMessage::assistant(r#"{"answer":42}"#)];
+        let (_, input) = build_responses_input(&messages);
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0]["type"], "message");
+        assert_eq!(input[0]["content"][0]["text"], r#"{"answer":42}"#);
+    }
+
+    #[test]
+    fn split_multibyte_utf8_survives_chunking() {
+        // The decoder logic under test: hold back an incomplete UTF-8 tail.
+        let text = "naïve — 日本語";
+        let bytes = text.as_bytes();
+        let mut raw: Vec<u8> = Vec::new();
+        let mut out = String::new();
+        for chunk in bytes.chunks(1) {
+            raw.extend_from_slice(chunk);
+            let valid_up_to = match std::str::from_utf8(&raw) {
+                Ok(_) => raw.len(),
+                Err(error) => error.valid_up_to(),
+            };
+            out.push_str(std::str::from_utf8(&raw[..valid_up_to]).unwrap());
+            raw.drain(..valid_up_to);
+        }
+        assert_eq!(out, text);
+        assert!(raw.is_empty());
+    }
+
+    #[test]
+    fn in_band_rate_limit_shapes_classify_as_429() {
+        // Mirror of the streaming arm's prefixing rule, run through the
+        // real classifier.
+        let error = anyhow!(
+            "openai responses stream failed: 429 Too Many Requests: {}",
+            r#"{"code":"rate_limit_exceeded","message":"Rate limit reached"}"#
+        );
+        assert!(crate::retry::is_rate_limited(&error));
     }
 }
