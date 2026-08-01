@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import type { FormEvent } from 'react'
 import { useSearchParams } from 'react-router-dom'
 import { api, ApiError } from '../api'
+import type { AutopayStatus } from '../api'
 import {
   Badge,
   Banner,
@@ -63,6 +64,11 @@ export function Credits() {
   const [unavailable, setUnavailable] = useState(false)
 
   const [autopayNotice, setAutopayNotice] = useState<'saved' | 'cancelled' | null>(null)
+  // The PUT response is the authoritative status the moment it lands; a
+  // fresh GET supersedes it (cleared in the seed effect below). Without
+  // this, a successful PUT followed by a failed reload leaves the badge
+  // showing the opposite of what the server just confirmed (sol review).
+  const [autopayOverride, setAutopayOverride] = useState<AutopayStatus | null>(null)
   const [threshold, setThreshold] = useState('')
   const [topup, setTopup] = useState('')
   const [autopayError, setAutopayError] = useState<string | null>(null)
@@ -93,13 +99,17 @@ export function Credits() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [searchParams])
 
-  // Seed the autopay form from the saved settings whenever they (re)load.
+  // Seed the autopay form from the saved settings whenever they (re)load,
+  // and let the fresh GET supersede any PUT-response override.
   useEffect(() => {
+    setAutopayOverride(null)
     if (autopay.data !== null) {
       setThreshold(autopay.data.threshold_usd ?? '')
       setTopup(autopay.data.topup_usd ?? '')
     }
   }, [autopay.data])
+
+  const autopayStatus = autopayOverride ?? autopay.data
 
   if (user === null) return null
 
@@ -158,9 +168,13 @@ export function Credits() {
     setAutopayError(null)
     setAutopaySubmitting(true)
     try {
-      await api.putAutopay({ enabled: true, threshold_usd: trigger, topup_usd: amount })
+      const status = await api.putAutopay({
+        enabled: true,
+        threshold_usd: trigger,
+        topup_usd: amount,
+      })
+      setAutopayOverride(status)
       toast('Autopay is on.', 'success')
-      autopay.reload()
     } catch (err) {
       if (err instanceof ApiError && err.code === 'billing_unavailable') {
         setUnavailable(true)
@@ -182,9 +196,9 @@ export function Credits() {
   async function disableAutopay() {
     setAutopaySubmitting(true)
     try {
-      await api.putAutopay({ enabled: false })
+      const status = await api.putAutopay({ enabled: false })
+      setAutopayOverride(status)
       toast('Autopay is off.')
-      autopay.reload()
     } catch (err) {
       toast(err instanceof Error ? err.message : 'Could not update autopay.', 'error')
     } finally {
@@ -281,9 +295,9 @@ export function Credits() {
       <section className="panel">
         <div className="panel-head">
           <h2>Autopay</h2>
-          {autopay.data !== null && (
-            <Badge tone={autopay.data.enabled ? 'good' : 'neutral'}>
-              {autopay.data.enabled ? 'on' : 'off'}
+          {autopayStatus !== null && (
+            <Badge tone={autopayStatus.enabled ? 'good' : 'neutral'}>
+              {autopayStatus.enabled ? 'on' : 'off'}
             </Badge>
           )}
         </div>
@@ -291,13 +305,13 @@ export function Credits() {
           <div className="panel-body">
             <Banner kind="info">Billing is not enabled on this deployment.</Banner>
           </div>
-        ) : autopay.loading ? (
+        ) : autopayStatus === null && autopay.loading ? (
           <Loading />
-        ) : autopay.error !== null ? (
+        ) : autopayStatus === null && autopay.error !== null ? (
           <div className="panel-body">
             <Banner kind="error">{autopay.error}</Banner>
           </div>
-        ) : autopay.data === null ? null : (
+        ) : autopayStatus === null ? null : (
           <div className="panel-body autopay-body">
             <p className="field-hint">
               When your balance falls below the threshold, ZeroRouter charges your saved card for
@@ -306,7 +320,7 @@ export function Credits() {
             </p>
             <div className="card-row">
               <span className="dim">
-                {autopay.data.card_setup_started
+                {autopayStatus.card_setup_started
                   ? 'A card setup has been started or completed with Stripe.'
                   : 'No card on file yet.'}
               </span>
@@ -318,21 +332,21 @@ export function Credits() {
               >
                 {cardSubmitting
                   ? 'Redirecting to Stripe…'
-                  : autopay.data.card_setup_started
-                    ? 'Replace card'
+                  : autopayStatus.card_setup_started
+                    ? 'Save or replace card'
                     : 'Save a card'}
               </button>
             </div>
-            {autopay.data.consecutive_failures >= 3 && !autopay.data.enabled && (
+            {autopayStatus.consecutive_failures >= 3 && !autopayStatus.enabled && (
               <Banner kind="error">
                 Autopay turned itself off after three failed charges. Replace the card, then turn
                 it back on.
               </Banner>
             )}
-            {autopay.data.consecutive_failures > 0 && autopay.data.enabled && (
+            {autopayStatus.consecutive_failures > 0 && autopayStatus.enabled && (
               <Banner kind="info">
-                {autopay.data.consecutive_failures} failed charge
-                {autopay.data.consecutive_failures === 1 ? '' : 's'} so far — autopay turns itself
+                {autopayStatus.consecutive_failures} failed charge
+                {autopayStatus.consecutive_failures === 1 ? '' : 's'} so far — autopay turns itself
                 off after three in a row.
               </Banner>
             )}
@@ -372,11 +386,11 @@ export function Credits() {
                 <button className="btn btn-primary" type="submit" disabled={autopaySubmitting}>
                   {autopaySubmitting
                     ? 'Saving…'
-                    : autopay.data.enabled
+                    : autopayStatus.enabled
                       ? 'Save changes'
                       : 'Turn on autopay'}
                 </button>
-                {autopay.data.enabled && (
+                {autopayStatus.enabled && (
                   <button
                     className="btn btn-ghost"
                     type="button"
