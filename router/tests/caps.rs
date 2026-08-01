@@ -29,8 +29,8 @@ use zeroclaw_providers::pricing::ModelRates;
 use zerorouter::{
     auth::{AuthenticatedKey, generate_api_key, hash_api_key},
     db::{
-        KEY_CREATION_WINDOW_HOURS, MAX_KEYS_CREATED_PER_WINDOW, RequestTelemetry, UsageAdmission,
-        UsageRecord, begin_usage_session, migrate,
+        KEY_CREATION_WINDOW_HOURS, MAX_KEYS_CREATED_PER_WINDOW, RequestTelemetry, ReservationBasis,
+        UsageAdmission, UsageRecord, begin_usage_session, migrate,
     },
     device,
     openai::{OpenAiUsage, TASK_SIGNATURE_SCHEME, TaskSignature, tool_names_digest},
@@ -175,6 +175,7 @@ async fn admit(
         reserved_tokens.min(64),
         reserved_cost_usd,
         test_signature(),
+        ReservationBasis::Cold,
         false,
     )
     .await

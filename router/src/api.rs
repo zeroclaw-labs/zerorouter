@@ -33,12 +33,17 @@ use crate::{
     auth::{AuthenticatedKey, AuthenticationError, KeyAuthenticator},
     config::{ResolvedRoute, TierCandidate, TierCatalog, load_tier_catalog},
     db::{
-        AttemptRecord, AttemptTokens, RequestTelemetry, SettlementRecovery, UsageAdmission,
-        UsageRecord, UsageSession, begin_usage_session, output_token_percentiles,
-        recover_owed_settlements,
+        AttemptRecord, AttemptTokens, RequestTelemetry, ReservationBasis, SegmentClampStats,
+        SettlementRecovery, UsageAdmission, UsageRecord, UsageSession, begin_usage_session,
+        output_token_percentiles, recover_owed_settlements, segment_clamp_stats, segment_user,
+        user_clamp_loss,
     },
     error::{ApiError, streaming_error_json},
-    estimator::{CellKey, CellRead, EstimatorState, REFRESH_BATCH, REFRESH_INTERVAL},
+    estimator::{
+        CellKey, CellRead, EstimatorState, REFRESH_BATCH, REFRESH_INTERVAL, ROW_LOSS_LIMIT_USD,
+        SEGMENT_HIT_RATE_LIMIT, SEGMENT_LOSS_LIMIT_7D_USD, USER_LOSS_LIMIT_30D_USD,
+        learned_output_bound,
+    },
     health::{ProviderHealth, WalkLedger},
     openai::{
         ChatCompletionRequest, ChatCompletionResponse, EmittedOutput, EstimateBasis, ModelList,
@@ -682,7 +687,29 @@ async fn refresh_estimator_batch(
         match output_token_percentiles(pool, &key.signature, key.scheme, key.candidate.as_deref())
             .await
         {
-            Ok(measured) => estimator.apply(key, measured),
+            Ok(measured) => {
+                // Revert evaluation rides the same cadence as the segment's
+                // percentile refresh — candidate-agnostic cells only, since
+                // reverts are per segment, never per rung. A failed
+                // evaluation fails toward cold, symmetric with the
+                // percentile-failure arm below: the cell is NOT applied (so
+                // sizing stays cold) and is re-enqueued for the next pass —
+                // warming a cell whose durable loss evidence was never
+                // consulted would let a lossy segment size learned for a
+                // full TTL on the strength of a transient query error.
+                if key.candidate.is_none()
+                    && let Err(error) = evaluate_revert(pool, estimator, &key).await
+                {
+                    tracing::warn!(
+                        error = %error,
+                        signature = key.signature,
+                        "clamp-loss revert evaluation failed; cell left cold and re-queued"
+                    );
+                    estimator.enqueue(key);
+                    continue;
+                }
+                estimator.apply(key, measured);
+            }
             Err(error) => {
                 tracing::warn!(
                     error = %error,
@@ -694,6 +721,97 @@ async fn refresh_estimator_batch(
             }
         }
     }
+}
+
+/// The auto-revert evaluator (design doc: "Auto-revert triggers on dollars,
+/// not rates"), run beside a segment's percentile refresh and never on a
+/// request. Fires per segment on trailing-7d clamp-loss dollars, any single
+/// row's loss, or — secondary, a distribution-shift signal — the clamp-hit
+/// rate; and per USER on the trailing-30d aggregate across all their
+/// segments, which re-slicing traffic cannot escape because segments are
+/// user-scoped. Reverted sizing goes cold for at least the cooldown;
+/// trailing windows keep re-firing while the loss evidence is inside them,
+/// which is the intended ratchet, and the marks expire on their own once
+/// the evidence ages out.
+async fn evaluate_revert(
+    pool: &PgPool,
+    estimator: &EstimatorState,
+    key: &CellKey,
+) -> Result<(), crate::sqlx::Error> {
+    let stats = segment_clamp_stats(pool, &key.signature, key.scheme).await?;
+    if segment_tripped(&stats) {
+        tracing::warn!(
+            signature = key.signature,
+            loss_7d = %stats.loss_7d_usd,
+            max_row_loss_7d = %stats.max_row_loss_7d_usd,
+            clamped_rows_7d = stats.clamped_rows_7d,
+            learned_rows_7d = stats.learned_rows_7d,
+            "clamp-loss revert: segment returns to cold sizing"
+        );
+        estimator.revert_segment(&key.signature, key.scheme);
+    }
+    // The user-level check runs UNCONDITIONALLY of the segment's own learned
+    // rows: a reverted user settles only cold rows, so any gate on this
+    // segment's learned count would let the standing 30-day evidence expire
+    // unconsulted the moment the mark's cooldown lapsed — the exact escape
+    // the user aggregate exists to close. It depends on nothing but the
+    // segment's owner and the user's own trailing windows.
+    if let Some(user_id) = segment_user(pool, &key.signature, key.scheme).await? {
+        let (loss_30d, loss_rederive) = user_clamp_loss(pool, user_id).await?;
+        if decimal_to_f64(loss_30d) > USER_LOSS_LIMIT_30D_USD
+            || decimal_to_f64(loss_rederive) > USER_LOSS_LIMIT_30D_USD
+        {
+            tracing::warn!(
+                %user_id,
+                loss_30d = %loss_30d,
+                "clamp-loss revert: every segment of this user returns to cold sizing"
+            );
+            estimator.revert_user(user_id);
+        }
+    }
+    Ok(())
+}
+
+/// Whether a segment's clamp-loss evidence trips a revert, in EITHER
+/// window: the 7-day trigger window carries the spec's thresholds; the
+/// 14-day re-derivation window (trigger + cooldown) is what lets a restart
+/// re-derive a mark whose evidence has aged past the trigger window but not
+/// past the cold period that evidence justified. Re-derivation can only be
+/// conservative — a mark re-fired from old evidence extends cold sizing,
+/// never learned exposure. The hit rate stays a within-window ratio; an
+/// empty window's 0/0 is NaN, and NaN compares false — no trip.
+fn segment_tripped(stats: &SegmentClampStats) -> bool {
+    window_tripped(
+        stats.loss_7d_usd,
+        stats.max_row_loss_7d_usd,
+        stats.clamped_rows_7d,
+        stats.learned_rows_7d,
+    ) || window_tripped(
+        stats.loss_14d_usd,
+        stats.max_row_loss_14d_usd,
+        stats.clamped_rows_14d,
+        stats.learned_rows_14d,
+    )
+}
+
+fn window_tripped(
+    loss_usd: rust_decimal::Decimal,
+    max_row_loss_usd: rust_decimal::Decimal,
+    clamped_rows: i64,
+    learned_rows: i64,
+) -> bool {
+    #[allow(clippy::cast_precision_loss)]
+    let hit_rate = clamped_rows as f64 / learned_rows as f64;
+    decimal_to_f64(loss_usd) > SEGMENT_LOSS_LIMIT_7D_USD
+        || decimal_to_f64(max_row_loss_usd) > ROW_LOSS_LIMIT_USD
+        || hit_rate > SEGMENT_HIT_RATE_LIMIT
+}
+
+/// Threshold comparison only — never billing math. A Decimal that cannot
+/// render as f64 reads as infinite loss, which fails toward cold.
+fn decimal_to_f64(value: rust_decimal::Decimal) -> f64 {
+    use rust_decimal::prelude::ToPrimitive;
+    value.to_f64().unwrap_or(f64::INFINITY)
 }
 
 pub fn app(state: RouterState) -> Router {
@@ -811,8 +929,9 @@ async fn chat_completions(
         .lookup(&CellKey::for_signature(&signature));
     // The estimate the response block will show: learned percentiles from
     // the warm cell, else the cold byte-bound answer. Guidance, never a
-    // quote — and never an input to admission, which stays byte-bound until
-    // Stage 4.
+    // quote. Display is deliberately NOT the sizing decision below: a
+    // reverted segment keeps showing its learned percentiles (they are still
+    // the segment's best measurement) while its reservations size cold.
     let estimate = match signature_cell {
         CellRead::Warm(percentiles) => ZeroRouterEstimate {
             output_tokens_p50: round_tokens(percentiles.p50),
@@ -821,6 +940,34 @@ async fn chat_completions(
         },
         CellRead::Cold => ZeroRouterEstimate::cold(max_output_tokens),
     };
+    // Stage 4: reservation sizing (design doc: "Use — reservation sizing
+    // only, never billing"). A request sizes learned only when every gate
+    // holds: the segment cell is warm (n ≥ 50, fresh), the tail gate inside
+    // `learned_output_bound` passes (p99/p50 ≤ 8), the request is not
+    // escalation-capable (success mode keeps the byte bound outright — the
+    // tail-correlated cohort), and neither the segment nor its user is
+    // auto-reverted. Everything else reserves exactly today's byte bound.
+    // The learned bound can only shrink admission (capped at the request's
+    // own max_tokens), and the generation limit sent upstream is untouched —
+    // only the reservation narrows.
+    let learned_bound = match signature_cell {
+        CellRead::Warm(percentiles)
+            if priority.resolved != Priority::Success
+                && !services.estimator.segment_reverted(&signature)
+                && !services.estimator.user_reverted(authenticated.user_id) =>
+        {
+            learned_output_bound(percentiles, max_output_tokens)
+        }
+        _ => None,
+    };
+    let (reserved_output_bound, reservation_basis) = match learned_bound {
+        Some(bound) => (bound, ReservationBasis::Learned),
+        None => (max_output_tokens, ReservationBasis::Cold),
+    };
+    // Re-measure the reservation against the sized output bound. The input
+    // side is byte-bound either way and identical to `reservation_usage`
+    // above; only the output side narrows.
+    let reservation_usage = request.reservation_usage(reserved_output_bound);
     let mut provider_route = services.provider_route(&resolved, max_output_tokens)?;
     order_candidates(
         priority.resolved,
@@ -845,9 +992,10 @@ async fn chat_completions(
         &services.pool,
         &authenticated,
         reserved_tokens,
-        i64::from(max_output_tokens),
+        i64::from(reserved_output_bound),
         reserved_cost,
         signature,
+        reservation_basis,
         services.require_credits,
     )
     .await?;
@@ -2801,6 +2949,7 @@ async fn admit_usage(
     reserved_output_tokens: i64,
     reserved_cost: rust_decimal::Decimal,
     task_signature: TaskSignature,
+    estimator_basis: ReservationBasis,
     require_credits: bool,
 ) -> Result<UsageSession, ApiError> {
     match begin_usage_session(
@@ -2810,6 +2959,7 @@ async fn admit_usage(
         reserved_output_tokens,
         reserved_cost,
         task_signature,
+        estimator_basis,
         require_credits,
     )
     .await
@@ -3138,6 +3288,7 @@ mod tests {
             64,
             usage_cost(resolved.sell_rates, reservation_usage).expect("sell rates must price"),
             task_signature("walk-user", &[], 1, 128, true, 64),
+            ReservationBasis::Cold,
             false,
         )
         .await
@@ -3522,5 +3673,73 @@ mod tests {
         .await
         .expect("attempts must query");
         assert_eq!(attempts, vec![("aborted".to_owned(), false)]);
+    }
+}
+
+#[cfg(test)]
+mod revert_trip_tests {
+    use rust_decimal::Decimal;
+
+    use super::{SegmentClampStats, segment_tripped};
+
+    #[allow(clippy::too_many_arguments)]
+    fn stats(
+        loss_7d: &str,
+        max_7d: &str,
+        clamped_7d: i64,
+        learned_7d: i64,
+        loss_14d: &str,
+        max_14d: &str,
+        clamped_14d: i64,
+        learned_14d: i64,
+    ) -> SegmentClampStats {
+        let decimal = |value: &str| value.parse::<Decimal>().expect("decimal literal");
+        SegmentClampStats {
+            loss_7d_usd: decimal(loss_7d),
+            max_row_loss_7d_usd: decimal(max_7d),
+            clamped_rows_7d: clamped_7d,
+            learned_rows_7d: learned_7d,
+            loss_14d_usd: decimal(loss_14d),
+            max_row_loss_14d_usd: decimal(max_14d),
+            clamped_rows_14d: clamped_14d,
+            learned_rows_14d: learned_14d,
+        }
+    }
+
+    #[test]
+    fn each_trigger_trips_alone() {
+        // Sum only: rate 12/3000 = 0.4% under the 0.5% limit, max under $1.
+        assert!(segment_tripped(&stats(
+            "10.80", "0.90", 12, 3_000, "10.80", "0.90", 12, 3_000
+        )));
+        // Single row only.
+        assert!(segment_tripped(&stats(
+            "1.50", "1.50", 1, 3_000, "1.50", "1.50", 1, 3_000
+        )));
+        // Rate only: 1/10 clamped, dollars tiny.
+        assert!(segment_tripped(&stats(
+            "0.05", "0.05", 1, 10, "0.05", "0.05", 1, 10
+        )));
+    }
+
+    #[test]
+    fn under_every_threshold_does_not_trip() {
+        assert!(!segment_tripped(&stats(
+            "9.99", "0.99", 10, 3_000, "9.99", "0.99", 10, 3_000
+        )));
+    }
+
+    #[test]
+    fn an_empty_window_cannot_trip() {
+        // 0/0 hit rate is NaN; NaN comparisons are false by design.
+        assert!(!segment_tripped(&stats("0", "0", 0, 0, "0", "0", 0, 0)));
+    }
+
+    #[test]
+    fn the_rederivation_window_trips_when_the_trigger_window_has_aged_clean() {
+        // Evidence older than 7 days but inside 14: the restart story.
+        assert!(segment_tripped(&stats(
+            "0", "0", 0, 0, "1.50", "1.50", 1, 40
+        )));
     }
 }
