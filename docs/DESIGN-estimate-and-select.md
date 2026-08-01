@@ -500,6 +500,37 @@ deferred.
 > be read back. Its only observable effect, the move-on-instead-of-wait break,
 > is reproduced directly. Cross-request cooldown arrives with health.
 
+> **Shipped in Stage 2b**, at exactly those two seams and on both walks in one
+> change (`health.rs`; the funnel is `WalkLedger::push`, so recording an
+> attempt row and observing it are the same act and no settle terminal can
+> bypass health). Four points where this section was terse are now decided,
+> recorded here so they are re-decided rather than re-derived:
+>
+> - **Demotion is the recorded skip**, not a reorder: `error_ewma > 0.5` or
+>   cooling ⇒ a `'health_skipped'` row takes the rung's walk position and the
+>   walk moves on — the shape migration 0004 already documents for that
+>   outcome. Health-informed *ordering* ("sink to the back") belongs to the
+>   knob's ordering modes and stays in Stage 3a.
+> - **The skip is floored at one dispatch per walk** ("never below one
+>   candidate", as in cost-mode filtering): a walk that has dispatched nothing
+>   will not skip its last rung. A solo route therefore rides out a cooldown
+>   the way it rides out the 429 itself, an all-cooling walk still dispatches
+>   its final rung, and — on the streaming walk — every terminal keeps a
+>   candidate to settle against, so an all-skipped walk cannot strand its
+>   reservation.
+> - **A 429 sets the cooldown and only the cooldown; availability errors move
+>   only the EWMA; a success decays the EWMA and clears any cooldown.**
+>   Pressure is time-bounded, brokenness is evidence-bounded: folding 429s
+>   into the EWMA would ratchet a chronically busy rung past the threshold
+>   where, skipped and therefore never observed, nothing could bring it back
+>   before a restart. `validation_failed` and `aborted` are health-neutral —
+>   the first is an answer-quality fact, the second is the router's doing.
+> - **The streaming walk now labels an upstream 429 `'rate_limited'`** (it
+>   recorded `stream_error`/`upstream_error` before), because the outcome
+>   column is what feeds the cooldown and a mislabelled 429 on one path is
+>   precisely the cross-path divergence this stage exists not to open. Labels
+>   only; the streaming walk's control flow is unchanged.
+
 ### The escalation loop
 
 **Non-streaming: unroll `ReliableModelProvider`** (map §5.4 — one change,

@@ -37,6 +37,7 @@ use crate::{
         UsageRecord, UsageSession, begin_usage_session, recover_owed_settlements,
     },
     error::{ApiError, streaming_error_json},
+    health::{ProviderHealth, WalkLedger},
     openai::{
         ChatCompletionRequest, ChatCompletionResponse, EmittedOutput, ModelList, OpenAiUsage,
         StreamMetadata, TaskSignature, finish_reason, shape_ok, stream_delta_json,
@@ -366,6 +367,9 @@ struct RouterServices {
     authenticator: KeyAuthenticator,
     runtime: RuntimeControl,
     require_credits: bool,
+    /// Cross-request rung health (stage 2b). Lives exactly as long as the
+    /// services — in-process and lost on restart, deliberately.
+    health: ProviderHealth,
     #[cfg(feature = "testing")]
     injected_route: Option<InjectedRoute>,
 }
@@ -408,6 +412,7 @@ impl RouterState {
                 authenticator: KeyAuthenticator::new(),
                 runtime: RuntimeControl::new(),
                 require_credits,
+                health: ProviderHealth::default(),
                 #[cfg(feature = "testing")]
                 injected_route: None,
             })),
@@ -432,6 +437,7 @@ impl RouterState {
                 authenticator: KeyAuthenticator::new(),
                 runtime: RuntimeControl::new(),
                 require_credits,
+                health: ProviderHealth::default(),
                 injected_route: Some(route),
             })),
         }
@@ -625,10 +631,12 @@ async fn chat_completions(
     )
     .await?;
     let runtime = services.runtime.clone();
+    let health = services.health.clone();
 
     if request.stream {
         streaming_response(
             runtime,
+            health,
             usage_session,
             request,
             resolved,
@@ -638,6 +646,7 @@ async fn chat_completions(
     } else {
         non_streaming_response(
             runtime,
+            health,
             usage_session,
             request,
             resolved,
@@ -650,6 +659,7 @@ async fn chat_completions(
 
 async fn non_streaming_response(
     runtime: RuntimeControl,
+    health: ProviderHealth,
     usage_session: UsageSession,
     request: ChatCompletionRequest,
     resolved: ResolvedRoute,
@@ -660,6 +670,7 @@ async fn non_streaming_response(
         .tasks
         .spawn(run_non_streaming(
             runtime.shutdown,
+            health,
             usage_session,
             request,
             resolved,
@@ -670,8 +681,10 @@ async fn non_streaming_response(
         .map_err(|_| ApiError::UpstreamUnavailable)?
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_non_streaming(
     shutdown: CancellationToken,
+    health: ProviderHealth,
     usage_session: UsageSession,
     request: ChatCompletionRequest,
     resolved: ResolvedRoute,
@@ -700,11 +713,37 @@ async fn run_non_streaming(
     // candidate had been selected", and after the unroll that is only true
     // before the first dispatch — where `None` still says it.
     let mut last_candidate: Option<&TierCandidate> = None;
-    // The router-owned walk ledger: one row per dispatched upstream call,
-    // drained into whichever terminal settles this request.
-    let mut attempts: Vec<AttemptRecord> = Vec::new();
+    // The router-owned walk ledger: one row per walk position, drained into
+    // whichever terminal settles this request. Pushing a row is also what
+    // feeds the health registry — the single funnel, so no terminal can
+    // record an outcome health does not see.
+    let mut attempts = WalkLedger::new(health.clone());
 
-    'walk: for candidate in &candidates {
+    'walk: for (position, candidate) in candidates.iter().enumerate() {
+        // Cross-request health demotion (stage 2b): a rung cooling after a
+        // 429, or error-heavy on its EWMA, is recorded and skipped rather
+        // than dispatched. The guard is the design's never-below-one-
+        // candidate floor — a skip is taken only while this walk has already
+        // dispatched somewhere or still has somewhere left to go — so health
+        // can cost a walk a rung but never cost it the whole walk, and a
+        // single-candidate route rides out a cooldown exactly as it rides
+        // out the 429 itself.
+        if health.should_skip(candidate.definition())
+            && (last_candidate.is_some() || position + 1 < candidates.len())
+        {
+            attempts.push(build_attempt(
+                attempts.len() + 1,
+                candidate.definition(),
+                "health_skipped",
+                false,
+                Instant::now(),
+                AttemptTokens::unknown(),
+                false,
+                None,
+                None,
+            ));
+            continue;
+        }
         // Reset per candidate: a fresh rung starts from the base interval
         // rather than inheriting the last one's exhausted patience.
         let mut backoff_ms = CANDIDATE_BACKOFF_MS;
@@ -719,7 +758,7 @@ async fn run_non_streaming(
                     &resolved,
                     last_candidate,
                     features,
-                    std::mem::take(&mut attempts),
+                    attempts.take_rows(),
                     started,
                     WalkTerminal::Timeout,
                 )
@@ -761,7 +800,7 @@ async fn run_non_streaming(
                         &resolved,
                         last_candidate,
                         features,
-                        std::mem::take(&mut attempts),
+                        attempts.take_rows(),
                         started,
                         WalkTerminal::Shutdown,
                     )
@@ -797,7 +836,7 @@ async fn run_non_streaming(
                         &resolved,
                         last_candidate,
                         features,
-                        std::mem::take(&mut attempts),
+                        attempts.take_rows(),
                         started,
                         WalkTerminal::Timeout,
                     )
@@ -834,7 +873,7 @@ async fn run_non_streaming(
                                 &resolved,
                                 last_candidate,
                                 features,
-                                std::mem::take(&mut attempts),
+                                attempts.take_rows(),
                                 started,
                                 WalkTerminal::Shutdown,
                             )
@@ -964,7 +1003,7 @@ async fn run_non_streaming(
                         &resolved,
                         last_candidate,
                         features,
-                        std::mem::take(&mut attempts),
+                        attempts.take_rows(),
                         started,
                         WalkTerminal::Shutdown,
                     )
@@ -984,7 +1023,7 @@ async fn run_non_streaming(
         &resolved,
         last_candidate,
         features,
-        attempts,
+        attempts.into_rows(),
         started,
         WalkTerminal::Exhausted,
     )
@@ -1113,7 +1152,7 @@ async fn serve_completion(
     response: ChatResponse,
     max_tokens: Option<u32>,
     features: RequestFeatures,
-    mut attempts: Vec<AttemptRecord>,
+    mut attempts: WalkLedger,
     attempt_no: usize,
     attempt_started: Instant,
     started: Instant,
@@ -1169,7 +1208,7 @@ async fn serve_completion(
             features,
             None,
             None,
-            attempts,
+            attempts.into_rows(),
             started,
             502,
         )
@@ -1214,7 +1253,7 @@ async fn serve_completion(
         features,
         Some(synthesized_finish),
         Some(shape_label),
-        attempts,
+        attempts.into_rows(),
         started,
         200,
     )
@@ -1248,8 +1287,10 @@ async fn serve_completion(
     Ok(completion)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn streaming_response(
     runtime: RuntimeControl,
+    health: ProviderHealth,
     usage_session: UsageSession,
     request: ChatCompletionRequest,
     resolved: ResolvedRoute,
@@ -1268,6 +1309,7 @@ fn streaming_response(
         stream_to_channel(
             sender,
             runtime.shutdown,
+            health,
             usage_session,
             metadata,
             request,
@@ -1294,6 +1336,7 @@ fn streaming_response(
 async fn stream_to_channel(
     sender: mpsc::Sender<Event>,
     shutdown: CancellationToken,
+    health: ProviderHealth,
     usage_session: UsageSession,
     metadata: StreamMetadata,
     request: ChatCompletionRequest,
@@ -1310,11 +1353,13 @@ async fn stream_to_channel(
     let mut usage_session = Some(usage_session);
     let mut client_connected = true;
     let mut delivery = StreamDelivery::default();
-    // The router-owned walk ledger: one row per candidate tried, drained into
+    // The router-owned walk ledger: one row per walk position, drained into
     // the settle transaction at whichever terminal settles this request.
-    let mut attempts: Vec<AttemptRecord> = Vec::new();
+    // Pushing a row is also what feeds the health registry — the same single
+    // funnel the buffered walk records through.
+    let mut attempts = WalkLedger::new(health.clone());
 
-    for candidate in &candidates {
+    for (position, candidate) in candidates.iter().enumerate() {
         if sender.is_closed() {
             if let Some(session) = usage_session.take() {
                 // The walk only re-enters this loop after a candidate that
@@ -1340,13 +1385,35 @@ async fn stream_to_channel(
                     features,
                     None,
                     None,
-                    std::mem::take(&mut attempts),
+                    attempts.take_rows(),
                     started,
                     499,
                 )
                 .await;
             }
             return;
+        }
+        // Cross-request health demotion (stage 2b), the same rule at the same
+        // place as the buffered walk: a cooling or error-heavy rung is
+        // recorded and skipped, guarded by the never-below-one-candidate
+        // floor so a walk can lose a rung to health but never lose its only
+        // dispatch. Checked before the deadline because a skip consumes no
+        // walk time — admissibility first, ceilings second.
+        if health.should_skip(candidate.definition())
+            && (last_candidate.is_some() || position + 1 < candidates.len())
+        {
+            attempts.push(build_attempt(
+                attempts.len() + 1,
+                candidate.definition(),
+                "health_skipped",
+                false,
+                Instant::now(),
+                AttemptTokens::unknown(),
+                false,
+                None,
+                None,
+            ));
+            continue;
         }
         let Some(remaining) = remaining_upstream_time(started) else {
             settle_stream_interruption(
@@ -1357,7 +1424,7 @@ async fn stream_to_channel(
                 last_candidate,
                 None,
                 features,
-                std::mem::take(&mut attempts),
+                attempts.take_rows(),
                 started,
                 client_connected,
                 // The delivery flag is passed rather than assumed, but it is
@@ -1407,7 +1474,7 @@ async fn stream_to_channel(
                         interrupted_candidate,
                         None,
                         features,
-                        std::mem::take(&mut attempts),
+                        attempts.take_rows(),
                         started,
                         client_connected,
                         // This candidate cannot stream: the only site that
@@ -1450,11 +1517,18 @@ async fn stream_to_channel(
                     .await;
                     return;
                 }
-                Ok(Err(_)) => {
+                Ok(Err(err)) => {
+                    // The buffered walk's classifier, for the LABEL only — the
+                    // control flow stays one dispatch then move on. Migration
+                    // 0004 documents `outcome` as what feeds the health
+                    // cooldown, so a 429 recorded as a generic upstream error
+                    // would hide this rung's state from the thing that has to
+                    // notice it. `false`: this walk has no truncation repair,
+                    // so no truncation has ever been spent.
                     attempts.push(build_attempt(
                         attempt_no,
                         candidate.definition(),
-                        "upstream_error",
+                        retry::classify(&err, false).outcome(),
                         false,
                         attempt_started,
                         AttemptTokens::unknown(),
@@ -1484,7 +1558,7 @@ async fn stream_to_channel(
                         Some(candidate.definition()),
                         None,
                         features,
-                        std::mem::take(&mut attempts),
+                        attempts.take_rows(),
                         started,
                         client_connected,
                         // The non-streaming call timed out, so
@@ -1514,6 +1588,11 @@ async fn stream_to_channel(
         // price and label this attempt if it is abandoned or served.
         let mut estimated_output = 0_u64;
         let mut tool_args_ok = true;
+        // Whether the stream died on a 429-shaped error, read off the failure
+        // text by the same check the buffered walk applies to a chat error.
+        // Label-only: a broken stream falls through to the next candidate
+        // whatever its text said.
+        let mut stream_rate_limited = false;
         // What this candidate actually put out, folded from the deltas
         // themselves. The shape label used to be derived from
         // `usage.completion_tokens`, which is the provider's accounting rather
@@ -1623,7 +1702,10 @@ async fn stream_to_channel(
                 }
                 Ok(StreamEvent::PreExecutedToolCall { .. })
                 | Ok(StreamEvent::PreExecutedToolResult { .. }) => {}
-                Err(_) => break,
+                Err(error) => {
+                    stream_rate_limited = retry::is_rate_limited(&anyhow::Error::new(error));
+                    break;
+                }
             }
         }
 
@@ -1663,7 +1745,7 @@ async fn stream_to_channel(
                 Some(candidate.definition()),
                 usage,
                 features,
-                std::mem::take(&mut attempts),
+                attempts.take_rows(),
                 started,
                 client_connected,
                 // This candidate's stream was polled, so the delivery signal is
@@ -1733,10 +1815,18 @@ async fn stream_to_channel(
             // the served attempt even though the stream broke.
             let served = delivery.model_output_sent;
             let tokens = attempt_tokens(usage, estimated_output);
+            // A 429 that delivered nothing is labelled as the rate limit it
+            // was. Once model output has flowed the story of this attempt is
+            // the broken delivery, whatever text the failure carried.
+            let outcome = if stream_rate_limited && !delivery.model_output_sent {
+                "rate_limited"
+            } else {
+                "stream_error"
+            };
             attempts.push(build_attempt(
                 attempt_no,
                 candidate.definition(),
-                "stream_error",
+                outcome,
                 served,
                 attempt_started,
                 tokens,
@@ -1755,7 +1845,7 @@ async fn stream_to_channel(
                 features,
                 None,
                 None,
-                std::mem::take(&mut attempts),
+                attempts.take_rows(),
                 started,
                 if client_connected { 502 } else { 499 },
             )
@@ -1772,11 +1862,16 @@ async fn stream_to_channel(
         }
 
         // Nothing delivered and the stream ended without completing: record a
-        // non-served failure and fall through to the next candidate.
+        // non-served failure — as the 429 it was when the failure text says so
+        // — and fall through to the next candidate.
         attempts.push(build_attempt(
             attempt_no,
             candidate.definition(),
-            "stream_error",
+            if stream_rate_limited {
+                "rate_limited"
+            } else {
+                "stream_error"
+            },
             false,
             attempt_started,
             attempt_tokens(usage, estimated_output),
@@ -1800,7 +1895,7 @@ async fn stream_to_channel(
             features,
             None,
             None,
-            std::mem::take(&mut attempts),
+            attempts.take_rows(),
             started,
             502,
         )
@@ -1948,7 +2043,7 @@ async fn complete_synthetic_stream(
     response: ChatResponse,
     max_tokens: Option<u32>,
     features: RequestFeatures,
-    mut attempts: Vec<AttemptRecord>,
+    mut attempts: WalkLedger,
     attempt_no: usize,
     attempt_started: Instant,
     started: Instant,
@@ -1998,7 +2093,7 @@ async fn complete_synthetic_stream(
             features,
             None,
             None,
-            attempts,
+            attempts.into_rows(),
             started,
             502,
         )
@@ -2040,7 +2135,7 @@ async fn complete_synthetic_stream(
         features,
         Some(synthesized_finish),
         Some(shape_label),
-        attempts,
+        attempts.into_rows(),
         started,
         completion_status,
     )
@@ -2115,7 +2210,7 @@ async fn finish_successful_stream(
     tool_args_ok: bool,
     max_tokens: Option<u32>,
     features: RequestFeatures,
-    mut attempts: Vec<AttemptRecord>,
+    mut attempts: WalkLedger,
     attempt_no: usize,
     attempt_started: Instant,
     completion_status: i16,
@@ -2165,7 +2260,7 @@ async fn finish_successful_stream(
             features,
             None,
             None,
-            attempts,
+            attempts.into_rows(),
             started,
             502,
         )
@@ -2201,7 +2296,7 @@ async fn finish_successful_stream(
         features,
         Some(synthesized_finish),
         Some(shape_label),
-        attempts,
+        attempts.into_rows(),
         started,
         completion_status,
     )
@@ -2668,6 +2763,7 @@ mod tests {
         stream_to_channel(
             sender,
             CancellationToken::new(),
+            ProviderHealth::default(),
             session,
             metadata,
             request,
@@ -2755,6 +2851,7 @@ mod tests {
         stream_to_channel(
             sender,
             CancellationToken::new(),
+            ProviderHealth::default(),
             session,
             metadata,
             request,
@@ -2854,6 +2951,7 @@ mod tests {
         stream_to_channel(
             sender,
             shutdown,
+            ProviderHealth::default(),
             session,
             metadata,
             request,
@@ -2943,6 +3041,7 @@ mod tests {
         stream_to_channel(
             sender,
             shutdown,
+            ProviderHealth::default(),
             session,
             metadata,
             request,

@@ -2418,6 +2418,18 @@ async fn the_walk_never_logs_an_upstream_error_body() {
     // what stops the detail.
     let subscriber = logging::subscriber("trace", captured.clone());
     let _guard = tracing::dispatcher::set_default(&tracing::Dispatch::new(subscriber));
+    // Repair the callsite interest cache before driving the walk. While
+    // exactly one `Dispatch` is registered — and the one above is the only one
+    // in this binary — tracing-core resolves a newly registered callsite's
+    // interest against *the registering thread's* default subscriber instead
+    // of against the registered dispatch. Ours is thread-local to this test,
+    // so a callsite first hit on another test's thread caches `never`, and a
+    // `never` callsite is skipped by the macro before this thread's subscriber
+    // is ever consulted. That reads here as "the walk logged nothing", failing
+    // the positive controls below on a walk that logged correctly.
+    // `Dispatch::new` above already repaired every callsite registered before
+    // it; this rebuild, run from this thread, covers the ones after.
+    tracing::callsite::rebuild_interest_cache();
 
     let response = app(state.clone())
         .oneshot(completion_request(
@@ -2863,4 +2875,557 @@ async fn non_streaming_shutdown_during_a_backoff_releases_the_reservation_withou
         Decimal::from(50)
     );
     assert_eq!(open_reservations(&pool, api_key_id).await, 0);
+}
+
+/// Cross-request health (stage 2b, design "Provider-health state"): a 429
+/// sets a 60-second cooldown keyed `(provider, upstream_model)`, so the very
+/// next request through the same router records `health_skipped` for the
+/// cooling rung — a real walk position in the ledger, never a silent
+/// reorder — and dispatches straight to the next rung. Until stage 2b this
+/// test pinned the opposite baseline: the walk kept no state between
+/// requests and dispatched the 429'd rung again.
+#[tokio::test]
+async fn non_streaming_a_rate_limited_rung_is_skipped_by_the_next_request() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let (first_key_id, first_key) = create_funded_key(&pool, "cooldown-sync-1").await;
+    let (second_key_id, second_key) = create_funded_key(&pool, "cooldown-sync-2").await;
+    let primary = FakeModelProvider::new("primary", vec![FakeOutcome::RateLimited]);
+    let secondary = FakeModelProvider::new(
+        "secondary",
+        vec![
+            FakeOutcome::chat("hello from secondary", served_usage()),
+            FakeOutcome::chat("hello from secondary", served_usage()),
+        ],
+    );
+    let state = router(pool.clone(), vec![primary.clone(), secondary.clone()]);
+
+    let response = app(state.clone())
+        .oneshot(completion_request(
+            &first_key,
+            &completion_body("zero/test-pair", false),
+        ))
+        .await
+        .expect("first completion request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(header(&response, "x-zerorouter-provider"), "together");
+
+    // The second request walks the same tier through the same router process,
+    // inside the rate-limited rung's cooldown window.
+    let response = app(state.clone())
+        .oneshot(completion_request(
+            &second_key,
+            &completion_body("zero/test-pair", false),
+        ))
+        .await
+        .expect("second completion request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(header(&response, "x-zerorouter-provider"), "together");
+    state.wait_for_background_tasks().await;
+
+    assert_eq!(
+        primary.call_count(),
+        1,
+        "a cooling rung is not dispatched to again"
+    );
+    assert_eq!(secondary.call_count(), 2);
+    assert_eq!(
+        attempt_rows(&pool, second_key_id).await,
+        [
+            (
+                1,
+                "fireworks/primary".to_owned(),
+                "health_skipped".to_owned(),
+                false
+            ),
+            (2, "together/secondary".to_owned(), "ok".to_owned(), true),
+        ],
+        "the skip is a recorded walk position, not a silent reorder"
+    );
+    assert_eq!(open_reservations(&pool, first_key_id).await, 0);
+    assert_eq!(open_reservations(&pool, second_key_id).await, 0);
+}
+
+/// The streaming twin of the test above, because stage 2b's health state
+/// lands on both walks together or not at all: a 429-shaped stream failure
+/// cools the rung for the streaming walk exactly as a buffered 429 does, and
+/// the next request's walk records `health_skipped` instead of dispatching.
+#[tokio::test]
+async fn streaming_a_rate_limited_rung_is_skipped_by_the_next_request() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let (first_key_id, first_key) = create_funded_key(&pool, "cooldown-stream-1").await;
+    let (second_key_id, second_key) = create_funded_key(&pool, "cooldown-stream-2").await;
+    let served_stream = || {
+        FakeOutcome::Stream(vec![
+            FakeStreamStep::text("served"),
+            FakeStreamStep::Usage(served_usage()),
+            FakeStreamStep::Final,
+        ])
+    };
+    let primary = FakeModelProvider::new("primary", vec![FakeOutcome::RateLimited]);
+    let secondary = FakeModelProvider::new("secondary", vec![served_stream(), served_stream()]);
+    let state = router(pool.clone(), vec![primary.clone(), secondary.clone()]);
+
+    let response = app(state.clone())
+        .oneshot(completion_request(
+            &first_key,
+            &completion_body("zero/test-pair", true),
+        ))
+        .await
+        .expect("first stream request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    let chunks = sse_chunks(response).await;
+    assert_eq!(chunks[1]["choices"][0]["delta"]["content"], "served");
+
+    let response = app(state.clone())
+        .oneshot(completion_request(
+            &second_key,
+            &completion_body("zero/test-pair", true),
+        ))
+        .await
+        .expect("second stream request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    let chunks = sse_chunks(response).await;
+    assert_eq!(chunks[1]["choices"][0]["delta"]["content"], "served");
+    state.wait_for_background_tasks().await;
+
+    assert_eq!(
+        primary.call_count(),
+        1,
+        "a cooling rung is not dispatched to again"
+    );
+    assert_eq!(secondary.call_count(), 2);
+    assert_eq!(
+        attempt_rows(&pool, second_key_id).await,
+        [
+            (
+                1,
+                "fireworks/primary".to_owned(),
+                "health_skipped".to_owned(),
+                false
+            ),
+            (2, "together/secondary".to_owned(), "ok".to_owned(), true),
+        ],
+        "the skip is a recorded walk position, not a silent reorder"
+    );
+    assert_eq!(open_reservations(&pool, first_key_id).await, 0);
+    assert_eq!(open_reservations(&pool, second_key_id).await, 0);
+}
+
+/// A 429-shaped stream failure is recorded as the rate limit it was, not as a
+/// generic broken stream. Migration 0004 documents `outcome` as what feeds the
+/// health cooldown, and the streaming walk is one of the two paths that has to
+/// feed it — a `stream_error` label here would leave a rate-limited rung
+/// invisible to health while the buffered walk could see it.
+#[tokio::test]
+async fn streaming_a_rate_limited_stream_failure_is_labelled_as_the_429_it_was() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let (api_key_id, key) = create_funded_key(&pool, "stream-429-label").await;
+    let primary = FakeModelProvider::new("primary", vec![FakeOutcome::RateLimited]);
+    let secondary = FakeModelProvider::new(
+        "secondary",
+        vec![FakeOutcome::Stream(vec![
+            FakeStreamStep::text("served"),
+            FakeStreamStep::Usage(served_usage()),
+            FakeStreamStep::Final,
+        ])],
+    );
+    let state = router(pool.clone(), vec![primary.clone(), secondary.clone()]);
+
+    let response = app(state.clone())
+        .oneshot(completion_request(
+            &key,
+            &completion_body("zero/test-pair", true),
+        ))
+        .await
+        .expect("stream request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    let chunks = sse_chunks(response).await;
+    state.wait_for_background_tasks().await;
+
+    assert_eq!(chunks[1]["choices"][0]["delta"]["content"], "served");
+    assert_eq!(primary.call_count(), 1, "a stream 429 is still not retried");
+    assert_eq!(secondary.call_count(), 1);
+    assert_eq!(
+        attempt_rows(&pool, api_key_id).await,
+        vec![
+            (
+                1,
+                "fireworks/primary".to_owned(),
+                "rate_limited".to_owned(),
+                false
+            ),
+            (2, "together/secondary".to_owned(), "ok".to_owned(), true),
+        ]
+    );
+    assert_eq!(open_reservations(&pool, api_key_id).await, 0);
+}
+
+/// The synthetic-stream sibling: a candidate that cannot stream fails its
+/// buffered call with a 429, and the row says so. The label comes from the
+/// same classifier the buffered walk dispatches on; only the label is taken —
+/// the walk still moves on after one call rather than retrying.
+#[tokio::test]
+async fn synthetic_stream_a_rate_limited_chat_failure_is_labelled_as_the_429_it_was() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let (api_key_id, key) = create_funded_key(&pool, "synthetic-429-label").await;
+    let primary = FakeModelProvider::without_streaming("primary", vec![FakeOutcome::RateLimited]);
+    let secondary = FakeModelProvider::new(
+        "secondary",
+        vec![FakeOutcome::Stream(vec![
+            FakeStreamStep::text("served"),
+            FakeStreamStep::Usage(served_usage()),
+            FakeStreamStep::Final,
+        ])],
+    );
+    let state = router(pool.clone(), vec![primary.clone(), secondary.clone()]);
+
+    let response = app(state.clone())
+        .oneshot(completion_request(
+            &key,
+            &completion_body("zero/test-pair", true),
+        ))
+        .await
+        .expect("stream request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    let chunks = sse_chunks(response).await;
+    state.wait_for_background_tasks().await;
+
+    assert_eq!(chunks[1]["choices"][0]["delta"]["content"], "served");
+    assert_eq!(primary.call_count(), 1);
+    assert_eq!(secondary.call_count(), 1);
+    assert_eq!(
+        attempt_rows(&pool, api_key_id).await,
+        vec![
+            (
+                1,
+                "fireworks/primary".to_owned(),
+                "rate_limited".to_owned(),
+                false
+            ),
+            (2, "together/secondary".to_owned(), "ok".to_owned(), true),
+        ]
+    );
+    assert_eq!(open_reservations(&pool, api_key_id).await, 0);
+}
+
+/// The EWMA half of demotion: three availability failures on one request push
+/// the rung's error EWMA past 0.5 (0.3 → 0.51 → 0.657), so the next request
+/// skips it without a 429 ever having been involved.
+#[tokio::test]
+async fn non_streaming_an_error_heavy_rung_is_skipped_by_the_next_request() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let (first_key_id, first_key) = create_funded_key(&pool, "ewma-sync-1").await;
+    let (second_key_id, second_key) = create_funded_key(&pool, "ewma-sync-2").await;
+    let primary = FakeModelProvider::new(
+        "primary",
+        vec![
+            FakeOutcome::Transport,
+            FakeOutcome::Transport,
+            FakeOutcome::Transport,
+        ],
+    );
+    let secondary = FakeModelProvider::new(
+        "secondary",
+        vec![
+            FakeOutcome::chat("hello from secondary", served_usage()),
+            FakeOutcome::chat("hello from secondary", served_usage()),
+        ],
+    );
+    let state = router(pool.clone(), vec![primary.clone(), secondary.clone()]);
+
+    let response = app(state.clone())
+        .oneshot(completion_request(
+            &first_key,
+            &completion_body("zero/test-pair", false),
+        ))
+        .await
+        .expect("first completion request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(header(&response, "x-zerorouter-provider"), "together");
+
+    let response = app(state.clone())
+        .oneshot(completion_request(
+            &second_key,
+            &completion_body("zero/test-pair", false),
+        ))
+        .await
+        .expect("second completion request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(header(&response, "x-zerorouter-provider"), "together");
+    state.wait_for_background_tasks().await;
+
+    assert_eq!(
+        primary.call_count(),
+        3,
+        "all three dispatches belong to the first request's retry budget"
+    );
+    assert_eq!(secondary.call_count(), 2);
+    assert_eq!(
+        attempt_rows(&pool, second_key_id).await,
+        [
+            (
+                1,
+                "fireworks/primary".to_owned(),
+                "health_skipped".to_owned(),
+                false
+            ),
+            (2, "together/secondary".to_owned(), "ok".to_owned(), true),
+        ]
+    );
+    assert_eq!(open_reservations(&pool, first_key_id).await, 0);
+    assert_eq!(open_reservations(&pool, second_key_id).await, 0);
+}
+
+/// The never-below-one-candidate floor on a solo route: health may not skip a
+/// rung when doing so would leave the walk with nothing to dispatch, so a
+/// cooling solo rung is still tried — and its success both serves the request
+/// and ends the cooldown early.
+#[tokio::test]
+async fn non_streaming_a_cooling_solo_rung_is_still_dispatched() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let (first_key_id, first_key) = create_funded_key(&pool, "solo-cooling-1").await;
+    let (second_key_id, second_key) = create_funded_key(&pool, "solo-cooling-2").await;
+    let solo = FakeModelProvider::new(
+        "solo",
+        vec![
+            FakeOutcome::RateLimited,
+            FakeOutcome::RateLimited,
+            FakeOutcome::RateLimited,
+            FakeOutcome::chat("hello from solo", served_usage()),
+        ],
+    );
+    let state = router(pool.clone(), vec![solo.clone()]);
+
+    let response = app(state.clone())
+        .oneshot(completion_request(
+            &first_key,
+            &completion_body("zero/test-solo", false),
+        ))
+        .await
+        .expect("first completion request should complete");
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+
+    // The rung is cooling, but it is also the only rung there is.
+    let response = app(state.clone())
+        .oneshot(completion_request(
+            &second_key,
+            &completion_body("zero/test-solo", false),
+        ))
+        .await
+        .expect("second completion request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    state.wait_for_background_tasks().await;
+
+    assert_eq!(solo.call_count(), 4, "the cooldown does not starve a solo route");
+    assert_eq!(
+        attempt_rows(&pool, second_key_id).await,
+        [(1, "deepinfra/solo".to_owned(), "ok".to_owned(), true)],
+        "no health_skipped row: the guard dispatched rather than skipped"
+    );
+    assert_eq!(open_reservations(&pool, first_key_id).await, 0);
+    assert_eq!(open_reservations(&pool, second_key_id).await, 0);
+}
+
+/// The same floor on a multi-candidate route where EVERY rung is cooling: the
+/// walk records a skip for each rung it can afford to lose and dispatches the
+/// last one rather than exhausting without an upstream call.
+#[tokio::test]
+async fn non_streaming_a_walk_of_cooling_rungs_still_dispatches_the_last() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let (first_key_id, first_key) = create_funded_key(&pool, "all-cooling-1").await;
+    let (second_key_id, second_key) = create_funded_key(&pool, "all-cooling-2").await;
+    let primary = FakeModelProvider::new("primary", vec![FakeOutcome::RateLimited]);
+    let secondary = FakeModelProvider::new(
+        "secondary",
+        vec![
+            FakeOutcome::RateLimited,
+            FakeOutcome::chat("hello from secondary", served_usage()),
+        ],
+    );
+    let state = router(pool.clone(), vec![primary.clone(), secondary.clone()]);
+
+    let response = app(state.clone())
+        .oneshot(completion_request(
+            &first_key,
+            &completion_body("zero/test-pair", false),
+        ))
+        .await
+        .expect("first completion request should complete");
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+
+    let response = app(state.clone())
+        .oneshot(completion_request(
+            &second_key,
+            &completion_body("zero/test-pair", false),
+        ))
+        .await
+        .expect("second completion request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(header(&response, "x-zerorouter-provider"), "together");
+    state.wait_for_background_tasks().await;
+
+    assert_eq!(primary.call_count(), 1);
+    assert_eq!(secondary.call_count(), 2);
+    assert_eq!(
+        attempt_rows(&pool, second_key_id).await,
+        [
+            (
+                1,
+                "fireworks/primary".to_owned(),
+                "health_skipped".to_owned(),
+                false
+            ),
+            (2, "together/secondary".to_owned(), "ok".to_owned(), true),
+        ],
+        "the walk skips what it can afford to and dispatches what it cannot"
+    );
+    assert_eq!(open_reservations(&pool, first_key_id).await, 0);
+    assert_eq!(open_reservations(&pool, second_key_id).await, 0);
+}
+
+/// Health is keyed `(provider, upstream_model)`, not by provider alone: a
+/// demoted rung must not drag its provider-mate down with it. Both twin
+/// candidates name `together`; only the model that actually failed is
+/// skipped.
+#[tokio::test]
+async fn non_streaming_a_demoted_rung_does_not_demote_its_provider_mate() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let (first_key_id, first_key) = create_funded_key(&pool, "twin-health-1").await;
+    let (second_key_id, second_key) = create_funded_key(&pool, "twin-health-2").await;
+    let twin_a = FakeModelProvider::new(
+        "twin-a",
+        vec![
+            FakeOutcome::Transport,
+            FakeOutcome::Transport,
+            FakeOutcome::Transport,
+        ],
+    );
+    let twin_b = FakeModelProvider::new(
+        "twin-b",
+        vec![
+            FakeOutcome::chat("hello from twin b", served_usage()),
+            FakeOutcome::chat("hello from twin b", served_usage()),
+        ],
+    );
+    let state = router_with_catalog(
+        pool.clone(),
+        vec![twin_a.clone(), twin_b.clone()],
+        twin_tier_config_path(),
+    );
+
+    let response = app(state.clone())
+        .oneshot(completion_request(
+            &first_key,
+            &completion_body("zero/test-twin", false),
+        ))
+        .await
+        .expect("first completion request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = app(state.clone())
+        .oneshot(completion_request(
+            &second_key,
+            &completion_body("zero/test-twin", false),
+        ))
+        .await
+        .expect("second completion request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    state.wait_for_background_tasks().await;
+
+    assert_eq!(twin_a.call_count(), 3);
+    assert_eq!(twin_b.call_count(), 2);
+    assert_eq!(
+        attempt_rows(&pool, second_key_id).await,
+        [
+            (
+                1,
+                "together/twin-a".to_owned(),
+                "health_skipped".to_owned(),
+                false
+            ),
+            (2, "together/twin-b".to_owned(), "ok".to_owned(), true),
+        ],
+        "the verdict follows the upstream model, not the provider name"
+    );
+    assert_eq!(open_reservations(&pool, first_key_id).await, 0);
+    assert_eq!(open_reservations(&pool, second_key_id).await, 0);
+}
+
+/// The streaming twin of the solo-route floor, for the same reason the
+/// cooldown tests come in pairs: a cooling solo rung is still dispatched by a
+/// streaming walk, which also proves an all-skipped streaming walk can never
+/// strand its reservation — the guard makes at least one dispatch happen, so
+/// every streaming terminal keeps a candidate to settle against.
+#[tokio::test]
+async fn streaming_a_cooling_solo_rung_is_still_dispatched() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let (first_key_id, first_key) = create_funded_key(&pool, "solo-cooling-stream-1").await;
+    let (second_key_id, second_key) = create_funded_key(&pool, "solo-cooling-stream-2").await;
+    let solo = FakeModelProvider::new(
+        "solo",
+        vec![
+            FakeOutcome::RateLimited,
+            FakeOutcome::Stream(vec![
+                FakeStreamStep::text("served"),
+                FakeStreamStep::Usage(served_usage()),
+                FakeStreamStep::Final,
+            ]),
+        ],
+    );
+    let state = router(pool.clone(), vec![solo.clone()]);
+
+    let response = app(state.clone())
+        .oneshot(completion_request(
+            &first_key,
+            &completion_body("zero/test-solo", true),
+        ))
+        .await
+        .expect("first stream request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    let chunks = sse_chunks(response).await;
+    assert_eq!(
+        chunks
+            .last()
+            .expect("an error chunk should terminate the stream")["error"]["code"],
+        "upstream_unavailable"
+    );
+
+    let response = app(state.clone())
+        .oneshot(completion_request(
+            &second_key,
+            &completion_body("zero/test-solo", true),
+        ))
+        .await
+        .expect("second stream request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    let chunks = sse_chunks(response).await;
+    assert_eq!(chunks[1]["choices"][0]["delta"]["content"], "served");
+    state.wait_for_background_tasks().await;
+
+    assert_eq!(solo.call_count(), 2, "the cooldown does not starve a solo route");
+    assert_eq!(
+        attempt_rows(&pool, second_key_id).await,
+        [(1, "deepinfra/solo".to_owned(), "ok".to_owned(), true)],
+        "no health_skipped row: the guard dispatched rather than skipped"
+    );
+    assert_eq!(open_reservations(&pool, first_key_id).await, 0);
+    assert_eq!(open_reservations(&pool, second_key_id).await, 0);
 }
