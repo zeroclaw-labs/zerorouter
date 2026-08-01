@@ -15,7 +15,7 @@ use zeroclaw_providers::{
     traits::{ChatRequest, ChatResponse, ModelProvider, StreamEvent, StreamOptions, StreamResult},
 };
 
-use crate::config::TierCandidate;
+use crate::{config::TierCandidate, wire::OpenAiResponsesWire};
 
 const PROVIDER_INVENTORY_JSON: &str = include_str!("../config/providers.json");
 
@@ -44,6 +44,13 @@ enum ProviderAdapter {
     Bedrock,
     #[serde(rename = "openai_compatible")]
     OpenAiCompatible,
+    /// First-party OpenAI on ZeroRouter's own Responses wire client
+    /// (`crate::wire`) — billing-grade usage extraction on the wire where
+    /// gpt-5.x and codex actually live. The pinned adapters cannot serve
+    /// this family: the chat wire rejects it and the pinned Responses
+    /// provider discards usage.
+    #[serde(rename = "openai_responses")]
+    OpenAiResponses,
 }
 
 impl ProviderInventory {
@@ -401,6 +408,15 @@ fn create_provider(
                     .build(),
             )
         }
+        ProviderAdapter::OpenAiResponses => Arc::new(OpenAiResponsesWire::new(
+            alias,
+            credential,
+            metadata.base_url.as_deref(),
+            Some(max_output_tokens),
+            // Same budget note as the Anthropic arm: honor ZR's 15-minute
+            // upstream budget, not an adapter default.
+            900,
+        )),
         ProviderAdapter::OpenAiCompatible => {
             let Some(base_url) = metadata.base_url.as_deref() else {
                 return Err(ProviderBuildError::InvalidInventory {

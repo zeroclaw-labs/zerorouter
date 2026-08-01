@@ -14,11 +14,12 @@ resolver = "2"
 # enabled by `cargo build` — a binary that moves money must not carry a way to
 # swap an upstream. `router/tests` turns it on through the self dev-dependency
 # below, which Cargo's v2 resolver keeps out of non-test builds.
-testing = ["dep:async-trait"]
+testing = []
 
 [dependencies]
 anyhow = "1.0"
-async-trait = { version = "0.1", optional = true }
+async-stream = "0.3"
+async-trait = "0.1"
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "query", "form"] }
 chrono = { version = "0.4", features = ["clock", "serde"] }
 clap = { version = "4.5", features = ["derive"] }
