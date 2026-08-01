@@ -22,6 +22,7 @@ use axum::{
 };
 use chrono::{DateTime, NaiveDate, Utc};
 use rust_decimal::Decimal;
+use serde::Deserializer;
 use serde::{Deserialize, Serialize};
 use tower_http::services::{ServeDir, ServeFile};
 use uuid::Uuid;
@@ -30,6 +31,7 @@ use crate::{
     auth::{generate_api_key, hash_api_key},
     billing::{self, LedgerEntry},
     db::{KeyMintAdmission, admit_key_mint},
+    priority::Priority,
     session::PortalUser,
     sqlx,
     web::WebCtx,
@@ -51,7 +53,7 @@ pub fn router() -> Router<WebCtx> {
     Router::new()
         .route("/api/me", get(me))
         .route("/api/keys", get(list_keys).post(create_key))
-        .route("/api/keys/{id}", delete(disable_key))
+        .route("/api/keys/{id}", delete(disable_key).patch(update_key))
         .route("/api/usage", get(usage))
         .route("/api/billing/ledger", get(ledger))
 }
@@ -143,6 +145,10 @@ struct KeySummary {
     disabled: bool,
     spend_cap_usd: Decimal,
     velocity_cap_tokens_per_min: i32,
+    /// Per-key default for the priority knob; `null` means balanced
+    /// (migration 0004). Additive, so pre-knob portal clients are
+    /// undisturbed.
+    default_priority: Option<Priority>,
     created_at: DateTime<Utc>,
     last_used_at: Option<DateTime<Utc>>,
 }
@@ -164,13 +170,14 @@ async fn list_keys(
             bool,
             Decimal,
             i32,
+            Option<String>,
             DateTime<Utc>,
             Option<DateTime<Utc>>,
         ),
     >(
         r#"
         SELECT id, name, disabled, spend_cap_usd, velocity_cap_tokens_per_min,
-               created_at, last_used_at
+               default_priority, created_at, last_used_at
         FROM api_keys
         WHERE user_id = $1
         ORDER BY created_at DESC, id DESC
@@ -187,6 +194,7 @@ async fn list_keys(
             disabled,
             spend_cap_usd,
             velocity_cap_tokens_per_min,
+            default_priority,
             created_at,
             last_used_at,
         )| {
@@ -196,6 +204,7 @@ async fn list_keys(
                 disabled,
                 spend_cap_usd,
                 velocity_cap_tokens_per_min,
+                default_priority: default_priority.as_deref().and_then(Priority::from_keyword),
                 created_at,
                 last_used_at,
             }
@@ -210,12 +219,17 @@ struct CreateKeyRequest {
     name: String,
     spend_cap_usd: Option<Decimal>,
     velocity_cap_tokens_per_min: Option<i32>,
+    // Plain `Deserialize`, no `deny_unknown_fields`, so the added field is
+    // wire-backward-compatible: a pre-knob portal build simply never sends
+    // it. An unknown VALUE is still refused — `Priority` parses strictly.
+    default_priority: Option<Priority>,
 }
 
 struct ValidatedNewKey {
     name: String,
     spend_cap_usd: Option<Decimal>,
     velocity_cap_tokens_per_min: Option<i32>,
+    default_priority: Option<Priority>,
 }
 
 fn validate_new_key(request: &CreateKeyRequest) -> Result<ValidatedNewKey, PortalError> {
@@ -256,6 +270,7 @@ fn validate_new_key(request: &CreateKeyRequest) -> Result<ValidatedNewKey, Porta
         name: name.to_owned(),
         spend_cap_usd: request.spend_cap_usd,
         velocity_cap_tokens_per_min: request.velocity_cap_tokens_per_min,
+        default_priority: request.default_priority,
     })
 }
 
@@ -268,6 +283,7 @@ struct CreatedKeyResponse {
     disabled: bool,
     spend_cap_usd: Decimal,
     velocity_cap_tokens_per_min: i32,
+    default_priority: Option<Priority>,
     created_at: DateTime<Utc>,
     last_used_at: Option<DateTime<Utc>>,
 }
@@ -312,19 +328,24 @@ async fn create_key(
     .bind(&validated.name)
     .execute(&mut *transaction)
     .await?;
-    if validated.spend_cap_usd.is_some() || validated.velocity_cap_tokens_per_min.is_some() {
+    if validated.spend_cap_usd.is_some()
+        || validated.velocity_cap_tokens_per_min.is_some()
+        || validated.default_priority.is_some()
+    {
         sqlx::query(
             r#"
             UPDATE api_keys
             SET
                 spend_cap_usd = COALESCE($2, spend_cap_usd),
-                velocity_cap_tokens_per_min = COALESCE($3, velocity_cap_tokens_per_min)
+                velocity_cap_tokens_per_min = COALESCE($3, velocity_cap_tokens_per_min),
+                default_priority = COALESCE($4, default_priority)
             WHERE id = $1
             "#,
         )
         .bind(key_id)
         .bind(validated.spend_cap_usd)
         .bind(validated.velocity_cap_tokens_per_min)
+        .bind(validated.default_priority.map(Priority::as_str))
         .execute(&mut *transaction)
         .await?;
     }
@@ -350,6 +371,7 @@ async fn create_key(
             disabled: false,
             spend_cap_usd,
             velocity_cap_tokens_per_min,
+            default_priority: validated.default_priority,
             created_at,
             last_used_at: None,
         }),
@@ -393,6 +415,99 @@ async fn disable_key(
         return Err(PortalError::KeyNotFound);
     }
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// `PATCH /api/keys/{id}` — the portal's first post-mint key mutation
+/// (rollout stage 3a), accepting `default_priority` alone until a second
+/// field earns its place.
+///
+/// PATCH semantics are field-presence semantics, so the field is a double
+/// `Option`: absent = leave unchanged (a `{}` PATCH is a no-op that returns
+/// the current summary), `null` = clear back to balanced, a keyword = set.
+/// `deny_unknown_fields` keeps a typo'd or premature field a loud 400, the
+/// same contract as the request-side `zerorouter` object.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UpdateKeyRequest {
+    #[serde(default, deserialize_with = "present_field")]
+    default_priority: Option<Option<Priority>>,
+}
+
+/// Wrap a present-but-possibly-null field as `Some(inner)`, so absence
+/// (`None` via `serde(default)`) stays distinguishable from an explicit
+/// `null` (`Some(None)`).
+fn present_field<'de, D>(deserializer: D) -> Result<Option<Option<Priority>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Option::<Priority>::deserialize(deserializer).map(Some)
+}
+
+async fn update_key(
+    State(ctx): State<WebCtx>,
+    user: PortalUser,
+    Path(key_id): Path<Uuid>,
+    Json(request): Json<UpdateKeyRequest>,
+) -> Result<Json<KeySummary>, PortalError> {
+    if let Some(default_priority) = request.default_priority {
+        // Disabled keys stay patchable: the flag governs dispatch, not
+        // ownership, and a metadata edit on a disabled key is coherent (it
+        // stays disabled). The user_id predicate is the tenancy wall, as in
+        // `disable_key`.
+        let result =
+            sqlx::query("UPDATE api_keys SET default_priority = $3 WHERE id = $1 AND user_id = $2")
+                .bind(key_id)
+                .bind(user.user_id)
+                .bind(default_priority.map(Priority::as_str))
+                .execute(&ctx.pool)
+                .await?;
+        if result.rows_affected() == 0 {
+            return Err(PortalError::KeyNotFound);
+        }
+    }
+    let row = sqlx::query_as::<
+        _,
+        (
+            String,
+            bool,
+            Decimal,
+            i32,
+            Option<String>,
+            DateTime<Utc>,
+            Option<DateTime<Utc>>,
+        ),
+    >(
+        r#"
+        SELECT name, disabled, spend_cap_usd, velocity_cap_tokens_per_min,
+               default_priority, created_at, last_used_at
+        FROM api_keys
+        WHERE id = $1 AND user_id = $2
+        "#,
+    )
+    .bind(key_id)
+    .bind(user.user_id)
+    .fetch_optional(&ctx.pool)
+    .await?
+    .ok_or(PortalError::KeyNotFound)?;
+    let (
+        name,
+        disabled,
+        spend_cap_usd,
+        velocity_cap_tokens_per_min,
+        default_priority,
+        created_at,
+        last_used_at,
+    ) = row;
+    Ok(Json(KeySummary {
+        id: key_id,
+        name,
+        disabled,
+        spend_cap_usd,
+        velocity_cap_tokens_per_min,
+        default_priority: default_priority.as_deref().and_then(Priority::from_keyword),
+        created_at,
+        last_used_at,
+    }))
 }
 
 #[derive(Deserialize)]
@@ -662,42 +777,50 @@ mod tests {
             name: "  ci key  ".to_owned(),
             spend_cap_usd: Some(Decimal::from(5)),
             velocity_cap_tokens_per_min: Some(1_000),
+            default_priority: Some(Priority::Cost),
         })
         .expect("a well-formed key request should validate");
         assert_eq!(valid.name, "ci key");
         assert_eq!(valid.spend_cap_usd, Some(Decimal::from(5)));
         assert_eq!(valid.velocity_cap_tokens_per_min, Some(1_000));
+        assert_eq!(valid.default_priority, Some(Priority::Cost));
 
         let rejects = [
             CreateKeyRequest {
                 name: "   ".to_owned(),
                 spend_cap_usd: None,
                 velocity_cap_tokens_per_min: None,
+                default_priority: None,
             },
             CreateKeyRequest {
                 name: "n".repeat(MAX_KEY_NAME_CHARS + 1),
                 spend_cap_usd: None,
                 velocity_cap_tokens_per_min: None,
+                default_priority: None,
             },
             CreateKeyRequest {
                 name: "ok".to_owned(),
                 spend_cap_usd: Some(Decimal::ZERO),
                 velocity_cap_tokens_per_min: None,
+                default_priority: None,
             },
             CreateKeyRequest {
                 name: "ok".to_owned(),
                 spend_cap_usd: Some(Decimal::from(MAX_SPEND_CAP_USD) + Decimal::ONE),
                 velocity_cap_tokens_per_min: None,
+                default_priority: None,
             },
             CreateKeyRequest {
                 name: "ok".to_owned(),
                 spend_cap_usd: None,
                 velocity_cap_tokens_per_min: Some(0),
+                default_priority: None,
             },
             CreateKeyRequest {
                 name: "ok".to_owned(),
                 spend_cap_usd: None,
                 velocity_cap_tokens_per_min: Some(MAX_VELOCITY_CAP_TOKENS_PER_MIN + 1),
+                default_priority: None,
             },
         ];
         for request in &rejects {

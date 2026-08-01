@@ -11,6 +11,8 @@ use zeroclaw_providers::{
     traits::{ChatMessage, ChatResponse, TokenUsage, ToolCall},
 };
 
+use crate::priority::Priority;
+
 #[derive(Clone, Deserialize)]
 pub struct ChatCompletionRequest {
     pub model: String,
@@ -23,8 +25,30 @@ pub struct ChatCompletionRequest {
     pub tools: Vec<OpenAiTool>,
     pub tool_choice: Option<Value>,
     pub stream_options: Option<StreamOptionsRequest>,
+    // Typed and named BEFORE the flatten, so serde consumes the key and it
+    // never lands in `extra` — the one namespaced field ZeroRouter owns on an
+    // otherwise OpenAI-shaped request (design doc: "The priority knob").
+    pub zerorouter: Option<ZeroRouterRequestOptions>,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
+}
+
+/// ZeroRouter's own request namespace, strictly validated where the
+/// OpenAI-compat surface is strictly rejected: `deny_unknown_fields` makes a
+/// typo like `"priorty"` a loud 400 through the same deserialization error
+/// any malformed body takes, without touching
+/// [`ChatCompletionRequest::contains_unsupported_extensions`]. Before this
+/// field existed, a request carrying `zerorouter` landed in `extra` and was
+/// 400-rejected as an unsupported field — so the typed object cannot change
+/// the meaning of any request that worked before it.
+///
+/// Stage 3a carries `priority` alone. `validator` and `budget_usd` are
+/// stage-5a fields; until then `deny_unknown_fields` keeps them loud 400s
+/// rather than silently accepted no-ops.
+#[derive(Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ZeroRouterRequestOptions {
+    pub priority: Option<Priority>,
 }
 
 #[derive(Clone, Deserialize)]
@@ -429,6 +453,39 @@ pub struct ChatCompletionResponse {
     pub model: String,
     pub choices: Vec<CompletionChoice>,
     pub usage: OpenAiUsage,
+    /// ZeroRouter's response-side namespace, attached only when the request
+    /// engaged the priority knob through any carrier — `skip_serializing_if`
+    /// keeps every legacy response byte-stable (response strictness is not
+    /// part of ZR's contract; request strictness is).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub zerorouter: Option<ZeroRouterResponseMetadata>,
+}
+
+/// The `zerorouter` response block (design doc: "Response metadata"),
+/// stage-3a shape: the resolved priority, the walk story, and the
+/// declared-validator verdict. The designed block's `estimate`, `limited`,
+/// and `savings` fields arrive with the stages that give them meaning (3b,
+/// 5a, 5c) — absent fields rather than null ones, so each field's appearance
+/// is itself the capability signal.
+#[derive(Clone, Debug, Serialize)]
+pub struct ZeroRouterResponseMetadata {
+    pub priority: Priority,
+    /// Every walk position in order, skips included: the attempts array is
+    /// the customer-visible audit trail for "why did the walk look like
+    /// this", mirroring the `request_attempts` rows the same walk settled.
+    pub attempts: Vec<ZeroRouterAttempt>,
+    /// Governing declared-validator verdict. Always `null` in 3a — no
+    /// validator can be declared yet, and the design defines `null` as "no
+    /// validator was declared", which is exactly true.
+    pub validated: Option<bool>,
+}
+
+/// One walk position as the customer sees it.
+#[derive(Clone, Debug, Serialize)]
+pub struct ZeroRouterAttempt {
+    pub candidate: String,
+    pub outcome: String,
+    pub latency_ms: i32,
 }
 
 #[derive(Serialize)]
@@ -505,6 +562,7 @@ impl ChatCompletionResponse {
         response: ChatResponse,
         usage: OpenAiUsage,
         max_tokens: Option<u32>,
+        zerorouter: Option<ZeroRouterResponseMetadata>,
     ) -> Self {
         let has_tools = !response.tool_calls.is_empty();
         let tool_calls = response
@@ -528,6 +586,7 @@ impl ChatCompletionResponse {
                 finish_reason: finish_reason(has_tools, usage, max_tokens),
             }],
             usage,
+            zerorouter,
         }
     }
 }
@@ -828,16 +887,27 @@ pub fn stream_delta_json(
 }
 
 #[must_use]
-pub fn stream_usage_json(metadata: &StreamMetadata, usage: OpenAiUsage) -> String {
-    json!({
+pub fn stream_usage_json(
+    metadata: &StreamMetadata,
+    usage: OpenAiUsage,
+    zerorouter: Option<&ZeroRouterResponseMetadata>,
+) -> String {
+    let mut chunk = json!({
         "id": metadata.request_id,
         "object": "chat.completion.chunk",
         "created": metadata.created,
         "model": metadata.requested_model,
         "choices": [],
         "usage": usage,
-    })
-    .to_string()
+    });
+    // SSE headers left before the walk resolved, so streaming metadata is
+    // in-band only: the same block a buffered response carries rides the
+    // final usage chunk, for exactly the clients that asked to see usage.
+    if let Some(block) = zerorouter {
+        chunk["zerorouter"] = serde_json::to_value(block)
+            .expect("a zerorouter block of strings and integers serializes");
+    }
+    chunk.to_string()
 }
 
 #[must_use]
@@ -1169,6 +1239,37 @@ mod tests {
         .expect("request should parse");
 
         assert!(request.contains_unsupported_extensions());
+    }
+
+    #[test]
+    fn the_zerorouter_object_is_typed_not_an_unsupported_extension() {
+        // Before the knob, a top-level `zerorouter` key landed in `extra` and
+        // was 400-rejected as unsupported — so typing it cannot change any
+        // request that worked. Typed, it must no longer read as an extension,
+        // and its contents are strictly validated.
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "zero/balanced",
+            "messages": [{"role": "user", "content": "hello"}],
+            "zerorouter": {"priority": "cost"}
+        }))
+        .expect("request should parse");
+        assert!(!request.contains_unsupported_extensions());
+        assert!(request.extra.is_empty());
+        assert_eq!(
+            request.zerorouter.and_then(|options| options.priority),
+            Some(Priority::Cost)
+        );
+
+        // deny_unknown_fields: a typo inside ZeroRouter's own namespace is a
+        // deserialization failure, not a silently dropped field.
+        assert!(
+            serde_json::from_value::<ChatCompletionRequest>(json!({
+                "model": "zero/balanced",
+                "messages": [{"role": "user", "content": "hello"}],
+                "zerorouter": {"priorty": "cost"}
+            }))
+            .is_err()
+        );
     }
 
     #[test]

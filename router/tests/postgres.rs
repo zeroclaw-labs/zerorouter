@@ -15,6 +15,7 @@ use zerorouter::{
         begin_usage_session, migrate,
     },
     openai::{OpenAiUsage, TASK_SIGNATURE_SCHEME, TaskSignature, tool_names_digest, usage_cost},
+    priority::Priority,
 };
 
 /// A fixed segment key for tests that only need the reservation to carry one.
@@ -47,6 +48,7 @@ fn sentinel_telemetry() -> RequestTelemetry {
         sell_rates: test_rates(),
         finish_reason: None,
         shape_ok: None,
+        priority: Some(Priority::Balanced),
     }
 }
 
@@ -377,6 +379,7 @@ async fn settled_row_carries_estimate_and_select_telemetry() {
         sell_rates: sell,
         finish_reason: Some("stop".to_owned()),
         shape_ok: Some(true),
+        priority: Some(Priority::Success),
     };
     session
         .record(&UsageRecord {

@@ -10,6 +10,7 @@ use zeroclaw_providers::pricing::ModelRates;
 
 use crate::{
     openai::{MAX_RATE_PER_MTOK, billable_rate},
+    priority::Priority,
     providers::is_supported_provider,
 };
 
@@ -137,6 +138,11 @@ pub enum TierConfigError {
     UnsupportedProvider { tier: String, provider: String },
     #[error("duplicate concrete model id {0}")]
     DuplicateModelId(String),
+    #[error(
+        "model id {0} ends in a priority keyword after ':', which the model-suffix carrier \
+         (design doc: 'Model-suffix carrier') would mask — rename the id"
+    )]
+    PrioritySuffixCollision(String),
     #[error(
         "candidate {candidate} in tier {tier} costs more than the tier sells: \
          {dimension} cost basis {basis} exceeds tier sell rate {sell}"
@@ -382,6 +388,7 @@ fn validate_tier_catalog(
         if !tier_id.starts_with("zero/") || tier_id.len() == "zero/".len() {
             return Err(TierConfigError::InvalidTierId(tier_id.clone()));
         }
+        reject_priority_suffix_collision(tier_id)?;
         if definition.candidates.is_empty() {
             return Err(TierConfigError::EmptyTier {
                 tier: tier_id.clone(),
@@ -399,6 +406,7 @@ fn validate_tier_catalog(
                     tier: tier_id.clone(),
                 });
             }
+            reject_priority_suffix_collision(&candidate.id)?;
             if !is_supported_provider(&candidate.provider) {
                 return Err(TierConfigError::UnsupportedProvider {
                     tier: tier_id.clone(),
@@ -433,6 +441,34 @@ fn validate_tier_catalog(
         .into_iter()
         .map(|(tier, error)| (tier, error.to_string()))
         .collect())
+}
+
+/// Reject a tier or candidate id whose final `:`-delimited segment is a
+/// priority keyword.
+///
+/// The model-suffix carrier (`zero/balanced:cost`, design doc: "Model-suffix
+/// carrier") strips a trailing `:keyword` only after resolving the untouched
+/// string fails, so an id that itself ends in `:cost` would still resolve —
+/// but a request for `that-id:cost` meaning "that id, cost priority" would
+/// resolve to the literal id instead and silently drop the customer's
+/// priority. Resolve-first keeps a hypothetical colliding id *serving*; this
+/// rule keeps the collision from ever being introduced. Today no shipped id
+/// contains a colon at all, but that is a data-file convention — Bedrock
+/// ARN-style ids (`arn:aws:bedrock:...`) are one plausible future counter-
+/// example, and they pass this rule because their final segment is not a
+/// priority keyword.
+///
+/// Structural, like [`TierConfigError::InvalidTierId`]: it condemns the file,
+/// not just the tier, because a colliding id is an authoring error with a
+/// one-line fix, never an economics verdict to route around.
+fn reject_priority_suffix_collision(id: &str) -> Result<(), TierConfigError> {
+    let colliding = id
+        .rsplit_once(':')
+        .is_some_and(|(_, keyword)| Priority::from_keyword(keyword).is_some());
+    if colliding {
+        return Err(TierConfigError::PrioritySuffixCollision(id.to_owned()));
+    }
+    Ok(())
 }
 
 /// Reject a candidate that costs more than its owning tier sells for.
@@ -945,6 +981,97 @@ output_per_mtok = 0.20
         assert!(
             matches!(error, TierConfigError::DuplicateModelId(ref id) if id == "fireworks/cheap"),
             "unexpected error {error:?}"
+        );
+    }
+
+    #[test]
+    fn an_id_ending_in_a_priority_keyword_after_a_colon_is_refused() {
+        // The model-suffix carrier strips `:cost|:balanced|:success` only
+        // after resolution fails, so a literal id ending in a priority
+        // keyword would keep resolving — while silently swallowing a
+        // customer's suffix. The collision is refused at load, whole-file,
+        // for tier ids and candidate ids alike.
+        for (label, id_line) in [
+            ("tier id", "zero/fast:cost"),
+            ("tier id", "zero/fast:success"),
+            ("tier id", "zero/fast:balanced"),
+        ] {
+            let toml = format!(
+                r#"
+schema_version = 1
+[tiers."{id_line}"]
+[tiers."{id_line}".rates]
+input_per_mtok = 1
+output_per_mtok = 2
+[[tiers."{id_line}".candidates]]
+id = "fireworks/fast"
+provider = "fireworks"
+model = "upstream/fast"
+[tiers."{id_line}".candidates.rates]
+input_per_mtok = 1
+output_per_mtok = 2
+"#
+            );
+            let catalog: TierCatalog = toml::from_str(&toml).expect("catalog should parse");
+            let error = validate_tier_catalog(&catalog)
+                .expect_err("a colliding tier id must refuse the catalog");
+            assert!(
+                matches!(error, TierConfigError::PrioritySuffixCollision(ref id) if id == id_line),
+                "unexpected error for {label}: {error:?}"
+            );
+        }
+
+        let catalog: TierCatalog = toml::from_str(
+            r#"
+schema_version = 1
+[tiers."zero/test"]
+[tiers."zero/test".rates]
+input_per_mtok = 1
+output_per_mtok = 2
+[[tiers."zero/test".candidates]]
+id = "fireworks/fast:cost"
+provider = "fireworks"
+model = "upstream/fast"
+[tiers."zero/test".candidates.rates]
+input_per_mtok = 1
+output_per_mtok = 2
+"#,
+        )
+        .expect("catalog should parse");
+        let error = validate_tier_catalog(&catalog)
+            .expect_err("a colliding candidate id must refuse the catalog");
+        assert!(
+            matches!(error, TierConfigError::PrioritySuffixCollision(ref id) if id == "fireworks/fast:cost"),
+            "unexpected error {error:?}"
+        );
+    }
+
+    #[test]
+    fn colons_that_do_not_end_in_a_priority_keyword_stay_loadable() {
+        // The rule bans the collision, not the character: an ARN-style id
+        // whose final segment is not a priority keyword must keep loading,
+        // because the carrier's resolve-first algorithm never misreads it.
+        let catalog: TierCatalog = toml::from_str(
+            r#"
+schema_version = 1
+[tiers."zero/test"]
+[tiers."zero/test".rates]
+input_per_mtok = 1
+output_per_mtok = 2
+[[tiers."zero/test".candidates]]
+id = "arn:aws:bedrock:us-east-1"
+provider = "fireworks"
+model = "upstream/fast"
+[tiers."zero/test".candidates.rates]
+input_per_mtok = 1
+output_per_mtok = 2
+"#,
+        )
+        .expect("catalog should parse");
+        validate_tier_catalog(&catalog).expect("a non-colliding colon id should validate");
+        assert!(
+            catalog.resolve("arn:aws:bedrock:us-east-1").is_some(),
+            "the colon id must stay resolvable"
         );
     }
 

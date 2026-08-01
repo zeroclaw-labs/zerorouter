@@ -418,6 +418,36 @@ async fn settled_shape_ok(pool: &PgPool, api_key_id: Uuid) -> Option<bool> {
         .expect("shape label must query")
 }
 
+/// The resolved priority written on the settled row (rollout stage 3a):
+/// always present once the knob ships, `'balanced'` when nothing engaged it.
+async fn settled_priority(pool: &PgPool, api_key_id: Uuid) -> Option<String> {
+    query_scalar::<_, Option<String>>("SELECT priority FROM usage_events WHERE api_key_id = $1")
+        .bind(api_key_id)
+        .fetch_one(pool)
+        .await
+        .expect("settled priority must query")
+}
+
+/// The tier name on the settled row — the STRIPPED model name when the
+/// request carried a priority suffix.
+async fn settled_tier(pool: &PgPool, api_key_id: Uuid) -> String {
+    query_scalar::<_, String>("SELECT tier FROM usage_events WHERE api_key_id = $1")
+        .bind(api_key_id)
+        .fetch_one(pool)
+        .await
+        .expect("settled tier must query")
+}
+
+/// How many rows this key settled — for asserting a refused request settled
+/// nothing.
+async fn settled_count(pool: &PgPool, api_key_id: Uuid) -> i64 {
+    query_scalar::<_, i64>("SELECT COUNT(*) FROM usage_events WHERE api_key_id = $1")
+        .bind(api_key_id)
+        .fetch_one(pool)
+        .await
+        .expect("settled count must query")
+}
+
 async fn open_reservations(pool: &PgPool, api_key_id: Uuid) -> i64 {
     query_scalar::<_, i64>("SELECT COUNT(*) FROM usage_reservations WHERE api_key_id = $1")
         .bind(api_key_id)
@@ -2877,15 +2907,18 @@ async fn non_streaming_shutdown_during_a_backoff_releases_the_reservation_withou
     assert_eq!(open_reservations(&pool, api_key_id).await, 0);
 }
 
-/// Cross-request health (stage 2b, design "Provider-health state"): a 429
-/// sets a 60-second cooldown keyed `(provider, upstream_model)`, so the very
-/// next request through the same router records `health_skipped` for the
-/// cooling rung — a real walk position in the ledger, never a silent
-/// reorder — and dispatches straight to the next rung. Until stage 2b this
-/// test pinned the opposite baseline: the walk kept no state between
-/// requests and dispatched the 429'd rung again.
+/// Cross-request health (stage 2b, design "Provider-health state"; ordering
+/// since stage 3a): a 429 sets a 60-second cooldown keyed
+/// `(provider, upstream_model)`, and the very next request through the same
+/// router sinks the cooling rung to the back of its route
+/// (`order_candidates`), walking straight to the healthy rung. The walk
+/// ledger records the walk that happened — one served position, no skip row,
+/// because the demoted rung was never a position of this walk. Stage 2b
+/// pinned the interim shape (a recorded `health_skipped` at position 1);
+/// before 2b, the walk kept no state at all and dispatched the 429'd rung
+/// again.
 #[tokio::test]
-async fn non_streaming_a_rate_limited_rung_is_skipped_by_the_next_request() {
+async fn non_streaming_a_rate_limited_rung_sinks_behind_the_healthy_rung_for_the_next_request() {
     let Some(pool) = connect().await else {
         return;
     };
@@ -2932,27 +2965,19 @@ async fn non_streaming_a_rate_limited_rung_is_skipped_by_the_next_request() {
     assert_eq!(secondary.call_count(), 2);
     assert_eq!(
         attempt_rows(&pool, second_key_id).await,
-        [
-            (
-                1,
-                "fireworks/primary".to_owned(),
-                "health_skipped".to_owned(),
-                false
-            ),
-            (2, "together/secondary".to_owned(), "ok".to_owned(), true),
-        ],
-        "the skip is a recorded walk position, not a silent reorder"
+        [(1, "together/secondary".to_owned(), "ok".to_owned(), true)],
+        "the demoted rung sank out of the walk entirely: one position, served"
     );
     assert_eq!(open_reservations(&pool, first_key_id).await, 0);
     assert_eq!(open_reservations(&pool, second_key_id).await, 0);
 }
 
-/// The streaming twin of the test above, because stage 2b's health state
-/// lands on both walks together or not at all: a 429-shaped stream failure
-/// cools the rung for the streaming walk exactly as a buffered 429 does, and
-/// the next request's walk records `health_skipped` instead of dispatching.
+/// The streaming twin of the test above, because health lands on both walks
+/// together or not at all: a 429-shaped stream failure cools the rung for
+/// the streaming walk exactly as a buffered 429 does, and the next request's
+/// route is reordered before the streaming walk starts.
 #[tokio::test]
-async fn streaming_a_rate_limited_rung_is_skipped_by_the_next_request() {
+async fn streaming_a_rate_limited_rung_sinks_behind_the_healthy_rung_for_the_next_request() {
     let Some(pool) = connect().await else {
         return;
     };
@@ -3000,16 +3025,8 @@ async fn streaming_a_rate_limited_rung_is_skipped_by_the_next_request() {
     assert_eq!(secondary.call_count(), 2);
     assert_eq!(
         attempt_rows(&pool, second_key_id).await,
-        [
-            (
-                1,
-                "fireworks/primary".to_owned(),
-                "health_skipped".to_owned(),
-                false
-            ),
-            (2, "together/secondary".to_owned(), "ok".to_owned(), true),
-        ],
-        "the skip is a recorded walk position, not a silent reorder"
+        [(1, "together/secondary".to_owned(), "ok".to_owned(), true)],
+        "the demoted rung sank out of the walk entirely: one position, served"
     );
     assert_eq!(open_reservations(&pool, first_key_id).await, 0);
     assert_eq!(open_reservations(&pool, second_key_id).await, 0);
@@ -3118,9 +3135,9 @@ async fn synthetic_stream_a_rate_limited_chat_failure_is_labelled_as_the_429_it_
 
 /// The EWMA half of demotion: three availability failures on one request push
 /// the rung's error EWMA past 0.5 (0.3 → 0.51 → 0.657), so the next request
-/// skips it without a 429 ever having been involved.
+/// sinks it behind the healthy rung without a 429 ever having been involved.
 #[tokio::test]
-async fn non_streaming_an_error_heavy_rung_is_skipped_by_the_next_request() {
+async fn non_streaming_an_error_heavy_rung_sinks_behind_the_healthy_rung_for_the_next_request() {
     let Some(pool) = connect().await else {
         return;
     };
@@ -3172,15 +3189,7 @@ async fn non_streaming_an_error_heavy_rung_is_skipped_by_the_next_request() {
     assert_eq!(secondary.call_count(), 2);
     assert_eq!(
         attempt_rows(&pool, second_key_id).await,
-        [
-            (
-                1,
-                "fireworks/primary".to_owned(),
-                "health_skipped".to_owned(),
-                false
-            ),
-            (2, "together/secondary".to_owned(), "ok".to_owned(), true),
-        ]
+        [(1, "together/secondary".to_owned(), "ok".to_owned(), true)]
     );
     assert_eq!(open_reservations(&pool, first_key_id).await, 0);
     assert_eq!(open_reservations(&pool, second_key_id).await, 0);
@@ -3228,7 +3237,11 @@ async fn non_streaming_a_cooling_solo_rung_is_still_dispatched() {
     assert_eq!(response.status(), StatusCode::OK);
     state.wait_for_background_tasks().await;
 
-    assert_eq!(solo.call_count(), 4, "the cooldown does not starve a solo route");
+    assert_eq!(
+        solo.call_count(),
+        4,
+        "the cooldown does not starve a solo route"
+    );
     assert_eq!(
         attempt_rows(&pool, second_key_id).await,
         [(1, "deepinfra/solo".to_owned(), "ok".to_owned(), true)],
@@ -3299,8 +3312,7 @@ async fn non_streaming_a_walk_of_cooling_rungs_still_dispatches_the_last() {
 
 /// Health is keyed `(provider, upstream_model)`, not by provider alone: a
 /// demoted rung must not drag its provider-mate down with it. Both twin
-/// candidates name `together`; only the model that actually failed is
-/// skipped.
+/// candidates name `together`; only the model that actually failed sinks.
 #[tokio::test]
 async fn non_streaming_a_demoted_rung_does_not_demote_its_provider_mate() {
     let Some(pool) = connect().await else {
@@ -3352,15 +3364,7 @@ async fn non_streaming_a_demoted_rung_does_not_demote_its_provider_mate() {
     assert_eq!(twin_b.call_count(), 2);
     assert_eq!(
         attempt_rows(&pool, second_key_id).await,
-        [
-            (
-                1,
-                "together/twin-a".to_owned(),
-                "health_skipped".to_owned(),
-                false
-            ),
-            (2, "together/twin-b".to_owned(), "ok".to_owned(), true),
-        ],
+        [(1, "together/twin-b".to_owned(), "ok".to_owned(), true)],
         "the verdict follows the upstream model, not the provider name"
     );
     assert_eq!(open_reservations(&pool, first_key_id).await, 0);
@@ -3420,7 +3424,11 @@ async fn streaming_a_cooling_solo_rung_is_still_dispatched() {
     assert_eq!(chunks[1]["choices"][0]["delta"]["content"], "served");
     state.wait_for_background_tasks().await;
 
-    assert_eq!(solo.call_count(), 2, "the cooldown does not starve a solo route");
+    assert_eq!(
+        solo.call_count(),
+        2,
+        "the cooldown does not starve a solo route"
+    );
     assert_eq!(
         attempt_rows(&pool, second_key_id).await,
         [(1, "deepinfra/solo".to_owned(), "ok".to_owned(), true)],
@@ -3428,4 +3436,459 @@ async fn streaming_a_cooling_solo_rung_is_still_dispatched() {
     );
     assert_eq!(open_reservations(&pool, first_key_id).await, 0);
     assert_eq!(open_reservations(&pool, second_key_id).await, 0);
+}
+
+// ---------------------------------------------------------------------------
+// Stage 3a: the priority knob, visibility-only (design doc: "The priority
+// knob"). The knob is accepted from three carriers, resolved by precedence,
+// and recorded on every settled row; ordering stays the identity in every
+// mode until the estimator ships (3b).
+// ---------------------------------------------------------------------------
+
+/// The frozen control group: a request that never mentions the knob resolves
+/// `balanced` and still records it — migration 0004 documents NULL as "row
+/// predates the knob", so a post-knob row must never write NULL.
+#[tokio::test]
+async fn a_request_without_the_knob_records_balanced() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let (api_key_id, key) = create_funded_key(&pool, "knob-default").await;
+    let solo = FakeModelProvider::new(
+        "solo",
+        vec![FakeOutcome::chat("hello from solo", served_usage())],
+    );
+    let state = router(pool.clone(), vec![solo.clone()]);
+
+    let response = app(state.clone())
+        .oneshot(completion_request(
+            &key,
+            &completion_body("zero/test-solo", false),
+        ))
+        .await
+        .expect("completion request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    // The attempts header is additive and rides every served response; the
+    // BODY of a knob-less request stays byte-identical, which is the
+    // backward-compatibility anchor — no `zerorouter` key at all, not a null.
+    assert_eq!(header(&response, "x-zerorouter-attempts"), "1");
+    let body = json_body(response).await;
+    state.wait_for_background_tasks().await;
+    assert!(
+        !body
+            .as_object()
+            .expect("body is an object")
+            .contains_key("zerorouter"),
+        "a request that never engaged the knob keeps the legacy response shape: {body}"
+    );
+
+    assert_eq!(
+        settled_priority(&pool, api_key_id).await,
+        Some("balanced".to_owned())
+    );
+}
+
+/// The model-suffix carrier: `zero/test-solo:cost` resolves the stripped
+/// name, records the carried priority, and every surface that names the model
+/// — the settled tier and the response `model` field — reads the stripped
+/// name, exactly as `usage_events.tier` is specified to.
+#[tokio::test]
+async fn a_priority_suffix_is_stripped_carried_and_recorded() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let (api_key_id, key) = create_funded_key(&pool, "knob-suffix").await;
+    let solo = FakeModelProvider::new(
+        "solo",
+        vec![FakeOutcome::chat("hello from solo", served_usage())],
+    );
+    let state = router(pool.clone(), vec![solo.clone()]);
+
+    let response = app(state.clone())
+        .oneshot(completion_request(
+            &key,
+            &completion_body("zero/test-solo:cost", false),
+        ))
+        .await
+        .expect("completion request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(header(&response, "x-zerorouter-attempts"), "1");
+    let body = json_body(response).await;
+    state.wait_for_background_tasks().await;
+
+    assert_eq!(body["model"], "zero/test-solo");
+    // Engaging the knob through any carrier attaches the response block:
+    // resolved priority, the walk story, and the (null until validators
+    // exist) declared-validator verdict.
+    assert_eq!(body["zerorouter"]["priority"], "cost");
+    assert_eq!(
+        body["zerorouter"]["attempts"][0]["candidate"],
+        "deepinfra/solo"
+    );
+    assert_eq!(body["zerorouter"]["attempts"][0]["outcome"], "ok");
+    assert!(body["zerorouter"]["attempts"][0]["latency_ms"].is_i64());
+    assert!(body["zerorouter"]["validated"].is_null());
+    assert_eq!(
+        settled_priority(&pool, api_key_id).await,
+        Some("cost".to_owned())
+    );
+    assert_eq!(settled_tier(&pool, api_key_id).await, "zero/test-solo");
+}
+
+/// The typed carrier: `zerorouter.priority` is consumed by serde before the
+/// unknown-field flatten, so the same request that was 400-rejected as an
+/// unsupported extension before the knob now resolves and records.
+#[tokio::test]
+async fn the_typed_zerorouter_object_carries_a_priority() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let (api_key_id, key) = create_funded_key(&pool, "knob-typed").await;
+    let solo = FakeModelProvider::new(
+        "solo",
+        vec![FakeOutcome::chat("hello from solo", served_usage())],
+    );
+    let state = router(pool.clone(), vec![solo.clone()]);
+
+    let mut body = completion_body("zero/test-solo", false);
+    body["zerorouter"] = json!({ "priority": "success" });
+    let response = app(state.clone())
+        .oneshot(completion_request(&key, &body))
+        .await
+        .expect("completion request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    state.wait_for_background_tasks().await;
+
+    assert_eq!(
+        settled_priority(&pool, api_key_id).await,
+        Some("success".to_owned())
+    );
+}
+
+/// Typed field and suffix disagreeing is a client bug, refused loudly before
+/// anything is reserved or dispatched — precedence is for filling gaps, not
+/// for silently picking a winner between two explicit contradictory asks.
+#[tokio::test]
+async fn a_typed_priority_disagreeing_with_the_suffix_is_refused_before_admission() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let (api_key_id, key) = create_funded_key(&pool, "knob-conflict").await;
+    let solo = FakeModelProvider::new("solo", vec![]);
+    let state = router(pool.clone(), vec![solo.clone()]);
+
+    let mut body = completion_body("zero/test-solo:cost", false);
+    body["zerorouter"] = json!({ "priority": "success" });
+    let response = app(state.clone())
+        .oneshot(completion_request(&key, &body))
+        .await
+        .expect("completion request should complete");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = json_body(response).await;
+    assert_eq!(body["error"]["code"], "priority_conflict");
+
+    assert_eq!(solo.call_count(), 0);
+    assert_eq!(open_reservations(&pool, api_key_id).await, 0);
+    assert_eq!(settled_count(&pool, api_key_id).await, 0);
+
+    // The same two carriers AGREEING is not a conflict: redundancy is fine,
+    // contradiction is not.
+    let solo = FakeModelProvider::new(
+        "solo",
+        vec![FakeOutcome::chat("hello from solo", served_usage())],
+    );
+    let state = router(pool.clone(), vec![solo.clone()]);
+    let mut body = completion_body("zero/test-solo:cost", false);
+    body["zerorouter"] = json!({ "priority": "cost" });
+    let response = app(state.clone())
+        .oneshot(completion_request(&key, &body))
+        .await
+        .expect("completion request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    state.wait_for_background_tasks().await;
+    assert_eq!(
+        settled_priority(&pool, api_key_id).await,
+        Some("cost".to_owned())
+    );
+}
+
+/// The per-key default is the weakest carrier: it governs a bare request, and
+/// any request-level carrier overrides it.
+#[tokio::test]
+async fn a_key_default_priority_governs_bare_requests_and_yields_to_the_request() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let (bare_key_id, bare_key) = create_funded_key(&pool, "knob-key-default-bare").await;
+    let (typed_key_id, typed_key) = create_funded_key(&pool, "knob-key-default-typed").await;
+    for key_id in [bare_key_id, typed_key_id] {
+        query("UPDATE api_keys SET default_priority = 'cost' WHERE id = $1")
+            .bind(key_id)
+            .execute(&pool)
+            .await
+            .expect("key default must update");
+    }
+    let solo = FakeModelProvider::new(
+        "solo",
+        vec![
+            FakeOutcome::chat("hello from solo", served_usage()),
+            FakeOutcome::chat("hello from solo", served_usage()),
+        ],
+    );
+    let state = router(pool.clone(), vec![solo.clone()]);
+
+    let response = app(state.clone())
+        .oneshot(completion_request(
+            &bare_key,
+            &completion_body("zero/test-solo", false),
+        ))
+        .await
+        .expect("bare completion request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let mut body = completion_body("zero/test-solo", false);
+    body["zerorouter"] = json!({ "priority": "success" });
+    let response = app(state.clone())
+        .oneshot(completion_request(&typed_key, &body))
+        .await
+        .expect("typed completion request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    state.wait_for_background_tasks().await;
+
+    assert_eq!(
+        settled_priority(&pool, bare_key_id).await,
+        Some("cost".to_owned()),
+        "a bare request takes the key default"
+    );
+    assert_eq!(
+        settled_priority(&pool, typed_key_id).await,
+        Some("success".to_owned()),
+        "a request-level carrier overrides the key default"
+    );
+}
+
+/// ZeroRouter's own namespace is strictly validated: a typo'd field or an
+/// unknown priority value inside `zerorouter` is a loud 400, never a silently
+/// ignored no-op — while the object's absence stays perfectly legal.
+#[tokio::test]
+async fn garbage_inside_the_zerorouter_object_is_a_loud_400() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let (api_key_id, key) = create_funded_key(&pool, "knob-strict").await;
+    let solo = FakeModelProvider::new("solo", vec![]);
+    let state = router(pool.clone(), vec![solo.clone()]);
+
+    for zerorouter in [
+        json!({ "priorty": "cost" }),
+        json!({ "priority": "fast" }),
+        json!({ "priority": "Balanced" }),
+    ] {
+        let mut body = completion_body("zero/test-solo", false);
+        body["zerorouter"] = zerorouter.clone();
+        let response = app(state.clone())
+            .oneshot(completion_request(&key, &body))
+            .await
+            .expect("completion request should complete");
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "{zerorouter} must be refused"
+        );
+        let body = json_body(response).await;
+        assert_eq!(body["error"]["code"], "invalid_request");
+    }
+    assert_eq!(solo.call_count(), 0);
+    assert_eq!(settled_count(&pool, api_key_id).await, 0);
+}
+
+/// Resolve-first fall-through: a priority suffix cannot conjure a model that
+/// does not exist, and a colon segment that is not a priority keyword is not
+/// a carrier at all — both land on the same 404 an unknown model always got.
+#[tokio::test]
+async fn a_suffix_never_invents_a_model() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let (_api_key_id, key) = create_funded_key(&pool, "knob-404").await;
+    let solo = FakeModelProvider::new("solo", vec![]);
+    let state = router(pool.clone(), vec![solo.clone()]);
+
+    for model in ["zero/nope:cost", "zero/test-solo:turbo", ":cost"] {
+        let response = app(state.clone())
+            .oneshot(completion_request(&key, &completion_body(model, false)))
+            .await
+            .expect("completion request should complete");
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "{model} must not resolve"
+        );
+    }
+    assert_eq!(solo.call_count(), 0);
+}
+
+/// The streaming twin of the suffix test: the resolved priority reaches the
+/// settled row through the streaming walk's terminals too, the stream's
+/// chunks carry the stripped model name, and — because SSE headers left
+/// before the walk resolved — the response block rides the final usage chunk
+/// for exactly the clients that opted into usage. A knob-less stream's usage
+/// chunk stays byte-identical.
+#[tokio::test]
+async fn streaming_carries_the_block_on_the_usage_chunk_and_records_the_priority() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let (api_key_id, key) = create_funded_key(&pool, "knob-stream").await;
+    let (bare_key_id, bare_key) = create_funded_key(&pool, "knob-stream-bare").await;
+    let served_stream = || {
+        FakeOutcome::Stream(vec![
+            FakeStreamStep::text("served"),
+            FakeStreamStep::Usage(served_usage()),
+            FakeStreamStep::Final,
+        ])
+    };
+    let solo = FakeModelProvider::new("solo", vec![served_stream(), served_stream()]);
+    let state = router(pool.clone(), vec![solo.clone()]);
+
+    let response = app(state.clone())
+        .oneshot(completion_request(
+            &key,
+            &completion_body("zero/test-solo:cost", true),
+        ))
+        .await
+        .expect("stream request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    let chunks = sse_chunks(response).await;
+    assert_eq!(chunks[1]["choices"][0]["delta"]["content"], "served");
+    assert_eq!(chunks[1]["model"], "zero/test-solo");
+    let usage_chunk = chunks.last().expect("stream ends with the usage chunk");
+    assert_eq!(usage_chunk["usage"]["prompt_tokens"], 1_000);
+    assert_eq!(usage_chunk["zerorouter"]["priority"], "cost");
+    assert_eq!(
+        usage_chunk["zerorouter"]["attempts"][0]["candidate"],
+        "deepinfra/solo"
+    );
+    assert_eq!(usage_chunk["zerorouter"]["attempts"][0]["outcome"], "ok");
+    assert!(usage_chunk["zerorouter"]["validated"].is_null());
+
+    let response = app(state.clone())
+        .oneshot(completion_request(
+            &bare_key,
+            &completion_body("zero/test-solo", true),
+        ))
+        .await
+        .expect("bare stream request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    let chunks = sse_chunks(response).await;
+    let usage_chunk = chunks.last().expect("stream ends with the usage chunk");
+    assert_eq!(usage_chunk["usage"]["prompt_tokens"], 1_000);
+    assert!(
+        !usage_chunk
+            .as_object()
+            .expect("usage chunk is an object")
+            .contains_key("zerorouter"),
+        "a knob-less stream keeps its legacy usage chunk: {usage_chunk}"
+    );
+    state.wait_for_background_tasks().await;
+
+    assert_eq!(
+        settled_priority(&pool, api_key_id).await,
+        Some("cost".to_owned())
+    );
+    assert_eq!(settled_tier(&pool, api_key_id).await, "zero/test-solo");
+    assert_eq!(
+        settled_priority(&pool, bare_key_id).await,
+        Some("balanced".to_owned())
+    );
+}
+
+/// The walk story in the block is the whole walk, skips and failures
+/// included: a rate-limited first rung appears beside the serving rung, and
+/// the attempts header counts both — the customer-visible mirror of the
+/// `request_attempts` rows the same walk settled.
+#[tokio::test]
+async fn the_response_block_tells_the_whole_walk_story() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let (api_key_id, key) = create_funded_key(&pool, "knob-walk-story").await;
+    let primary = FakeModelProvider::new("primary", vec![FakeOutcome::RateLimited]);
+    let secondary = FakeModelProvider::new(
+        "secondary",
+        vec![FakeOutcome::chat("hello from secondary", served_usage())],
+    );
+    let state = router(pool.clone(), vec![primary.clone(), secondary.clone()]);
+
+    let mut body = completion_body("zero/test-pair", false);
+    body["zerorouter"] = json!({ "priority": "balanced" });
+    let response = app(state.clone())
+        .oneshot(completion_request(&key, &body))
+        .await
+        .expect("completion request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(header(&response, "x-zerorouter-attempts"), "2");
+    let body = json_body(response).await;
+    state.wait_for_background_tasks().await;
+
+    assert_eq!(body["zerorouter"]["priority"], "balanced");
+    let attempts = body["zerorouter"]["attempts"]
+        .as_array()
+        .expect("attempts is an array");
+    assert_eq!(attempts.len(), 2);
+    assert_eq!(attempts[0]["candidate"], "fireworks/primary");
+    assert_eq!(attempts[0]["outcome"], "rate_limited");
+    assert_eq!(attempts[1]["candidate"], "together/secondary");
+    assert_eq!(attempts[1]["outcome"], "ok");
+    assert_eq!(
+        attempt_rows(&pool, api_key_id).await,
+        [
+            (
+                1,
+                "fireworks/primary".to_owned(),
+                "rate_limited".to_owned(),
+                false
+            ),
+            (2, "together/secondary".to_owned(), "ok".to_owned(), true),
+        ],
+        "the block and the ledger are the same story"
+    );
+}
+
+/// The synthetic-stream serve path — a non-streaming candidate replayed as
+/// SSE — attaches the same block to its usage chunk as a live stream does.
+#[tokio::test]
+async fn synthetic_stream_carries_the_block_on_the_usage_chunk() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let (api_key_id, key) = create_funded_key(&pool, "knob-synthetic").await;
+    let solo = FakeModelProvider::without_streaming(
+        "solo",
+        vec![FakeOutcome::chat("whole answer", served_usage())],
+    );
+    let state = router(pool.clone(), vec![solo.clone()]);
+
+    let response = app(state.clone())
+        .oneshot(completion_request(
+            &key,
+            &completion_body("zero/test-solo:success", true),
+        ))
+        .await
+        .expect("stream request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    let chunks = sse_chunks(response).await;
+    state.wait_for_background_tasks().await;
+
+    let usage_chunk = chunks.last().expect("stream ends with the usage chunk");
+    assert_eq!(usage_chunk["usage"]["prompt_tokens"], 1_000);
+    assert_eq!(usage_chunk["zerorouter"]["priority"], "success");
+    assert_eq!(
+        usage_chunk["zerorouter"]["attempts"][0]["candidate"],
+        "deepinfra/solo"
+    );
+    assert_eq!(
+        settled_priority(&pool, api_key_id).await,
+        Some("success".to_owned())
+    );
 }

@@ -22,6 +22,7 @@ use zerorouter::{
         quarantined_settlements, recover_owed_settlements,
     },
     openai::{OpenAiUsage, TASK_SIGNATURE_SCHEME, TaskSignature, tool_names_digest},
+    priority::Priority,
 };
 
 /// A fixed segment key for tests that only need the reservation to carry one.
@@ -74,6 +75,7 @@ async fn create_key(pool: &PgPool, user_id: Uuid) -> AuthenticatedKey {
     AuthenticatedKey {
         id: key_id,
         user_id,
+        default_priority: None,
     }
 }
 
@@ -110,6 +112,7 @@ fn usage_record(cost_usd: Decimal) -> UsageRecord {
             },
             finish_reason: None,
             shape_ok: None,
+            priority: Some(Priority::Balanced),
         },
         attempts: Vec::new(),
     }

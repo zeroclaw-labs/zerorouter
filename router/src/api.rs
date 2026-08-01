@@ -31,7 +31,7 @@ use zeroclaw_providers::{
 
 use crate::{
     auth::{AuthenticatedKey, AuthenticationError, KeyAuthenticator},
-    config::{ResolvedRoute, TierCandidate, load_tier_catalog},
+    config::{ResolvedRoute, TierCandidate, TierCatalog, load_tier_catalog},
     db::{
         AttemptRecord, AttemptTokens, RequestTelemetry, SettlementRecovery, UsageAdmission,
         UsageRecord, UsageSession, begin_usage_session, recover_owed_settlements,
@@ -40,9 +40,11 @@ use crate::{
     health::{ProviderHealth, WalkLedger},
     openai::{
         ChatCompletionRequest, ChatCompletionResponse, EmittedOutput, ModelList, OpenAiUsage,
-        StreamMetadata, TaskSignature, finish_reason, shape_ok, stream_delta_json,
-        stream_tool_call_delta, stream_usage_json, task_signature, tool_args_all_json, usage_cost,
+        StreamMetadata, TaskSignature, ZeroRouterAttempt, ZeroRouterResponseMetadata,
+        finish_reason, shape_ok, stream_delta_json, stream_tool_call_delta, stream_usage_json,
+        task_signature, tool_args_all_json, usage_cost,
     },
+    priority::Priority,
     providers::{ProviderCandidate, ProviderRoute},
     retry,
     sqlx::PgPool,
@@ -58,10 +60,23 @@ struct RequestFeatures {
     prompt_bytes: i64,
     message_count: i32,
     tool_count: i32,
+    // The resolved priority knob for this request (rollout Stage 3a) —
+    // resolved before admission from typed field > model suffix > per-key
+    // default > balanced, and written on the settled row at every terminal.
+    priority: Priority,
+    // Whether any carrier actually engaged the knob. Response-block
+    // visibility only (`zerorouter_block`), never persisted: a request that
+    // never mentioned the knob keeps its byte-identical legacy response
+    // while still recording its resolved `balanced`.
+    knob_engaged: bool,
 }
 
 impl RequestFeatures {
-    fn from_request(request: &ChatCompletionRequest, reservation_usage: OpenAiUsage) -> Self {
+    fn from_request(
+        request: &ChatCompletionRequest,
+        reservation_usage: OpenAiUsage,
+        priority: PriorityResolution,
+    ) -> Self {
         Self {
             requested_max_tokens: request
                 .max_tokens
@@ -70,8 +85,52 @@ impl RequestFeatures {
             prompt_bytes: i64::try_from(reservation_usage.prompt_tokens).unwrap_or(i64::MAX),
             message_count: i32::try_from(request.messages.len()).unwrap_or(i32::MAX),
             tool_count: i32::try_from(request.tools.len()).unwrap_or(i32::MAX),
+            priority: priority.resolved,
+            knob_engaged: priority.engaged,
         }
     }
+}
+
+/// The outcome of resolving the priority knob for one request (design doc:
+/// "Precedence and conflicts"): which priority governs, and whether any
+/// carrier actually set it.
+#[derive(Clone, Copy)]
+struct PriorityResolution {
+    resolved: Priority,
+    engaged: bool,
+}
+
+impl PriorityResolution {
+    fn new(engaged: Option<Priority>) -> Self {
+        Self {
+            resolved: engaged.unwrap_or(Priority::Balanced),
+            engaged: engaged.is_some(),
+        }
+    }
+}
+
+/// The `zerorouter` response block for a served completion, built from the
+/// same walk ledger the settle transaction drains — the customer-visible
+/// attempts array and the persisted `request_attempts` rows are one story by
+/// construction. `None` while the knob was never engaged, which is what
+/// keeps legacy responses byte-stable.
+fn zerorouter_block(
+    features: RequestFeatures,
+    attempts: &WalkLedger,
+) -> Option<ZeroRouterResponseMetadata> {
+    features.knob_engaged.then(|| ZeroRouterResponseMetadata {
+        priority: features.priority,
+        attempts: attempts
+            .rows()
+            .iter()
+            .map(|row| ZeroRouterAttempt {
+                candidate: row.candidate_id.clone(),
+                outcome: row.outcome.clone(),
+                latency_ms: row.latency_ms,
+            })
+            .collect(),
+        validated: None,
+    })
 }
 
 /// Build one `request_attempts` row from an in-walk candidate outcome. Cost
@@ -578,24 +637,47 @@ async fn chat_completions(
     let catalog = load_tier_catalog(state.tier_config_path())
         .await
         .map_err(|_| ApiError::TierCatalogUnavailable)?;
-    let resolved = match catalog.resolve(&request.model) {
-        Some(resolved) => resolved,
-        // Absent from the servable catalog means one of two very different
-        // things. Either the id does not exist (the caller's mistake, 404), or
-        // it exists in a tier withheld for below-cost pricing — ZeroRouter's
-        // mistake, which the caller cannot fix and must not be told is a
-        // missing model.
-        None => {
-            return Err(catalog.unavailable_for(&request.model).map_or(
-                ApiError::ModelNotFound,
-                |withheld| ApiError::ModelUnavailable {
-                    tier: withheld.tier.clone(),
-                },
-            ));
-        }
+    // The model-suffix priority carrier (design doc: "Model-suffix carrier"),
+    // resolve-first: the untouched model string is tried before anything is
+    // stripped, so a hypothetical id ending in a priority keyword — catalog
+    // validation refuses to load one — would still resolve as itself. Only
+    // when that fails, and the segment after the last ':' is exactly a
+    // priority keyword, is the suffix stripped and the remainder resolved;
+    // anything else falls through to the same not-found answer as before.
+    // Everything downstream — `usage_events.tier`, the response `model`
+    // field, stream metadata — reads the resolved (stripped) name.
+    let (resolved, suffix_priority) = match catalog.resolve(&request.model) {
+        Some(resolved) => (resolved, None),
+        None => match split_priority_suffix(&request.model) {
+            Some((base, priority)) => match catalog.resolve(base) {
+                Some(resolved) => (resolved, Some(priority)),
+                None => return Err(model_unresolvable(&catalog, base)),
+            },
+            None => return Err(model_unresolvable(&catalog, &request.model)),
+        },
     };
+    // Precedence: typed `zerorouter.priority` > model suffix > per-key
+    // default > balanced. Typed and suffix present with different values is
+    // a client bug and refused loudly (`priority_conflict`), before anything
+    // is reserved.
+    let typed_priority = request.zerorouter.and_then(|options| options.priority);
+    if let (Some(typed), Some(suffix)) = (typed_priority, suffix_priority)
+        && typed != suffix
+    {
+        return Err(ApiError::PriorityConflict);
+    }
+    let priority = PriorityResolution::new(
+        typed_priority
+            .or(suffix_priority)
+            .or(authenticated.default_priority),
+    );
     let max_output_tokens = *request.max_tokens.get_or_insert(BASELINE_MAX_TOKENS);
-    let provider_route = services.provider_route(&resolved, max_output_tokens)?;
+    let mut provider_route = services.provider_route(&resolved, max_output_tokens)?;
+    order_candidates(
+        priority.resolved,
+        provider_route.candidates_mut(),
+        &services.health,
+    );
     let reservation_usage = request.reservation_usage(max_output_tokens);
     let reserved_tokens =
         i64::try_from(reservation_usage.total_tokens).map_err(|_| ApiError::InvalidRequest)?;
@@ -642,6 +724,7 @@ async fn chat_completions(
             resolved,
             provider_route,
             reservation_usage,
+            priority,
         )
     } else {
         non_streaming_response(
@@ -652,11 +735,70 @@ async fn chat_completions(
             resolved,
             provider_route,
             reservation_usage,
+            priority,
         )
         .await
     }
 }
 
+/// The model-suffix carrier's split: `Some((base, priority))` when the last
+/// `:`-delimited segment is exactly a priority keyword and a base remains.
+/// Never consulted while the untouched string resolves (resolve-first).
+fn split_priority_suffix(model: &str) -> Option<(&str, Priority)> {
+    let (base, keyword) = model.rsplit_once(':')?;
+    let priority = Priority::from_keyword(keyword)?;
+    (!base.is_empty()).then_some((base, priority))
+}
+
+/// Absent from the servable catalog means one of two very different things.
+/// Either the id does not exist (the caller's mistake, 404), or it exists in
+/// a tier withheld for below-cost pricing — ZeroRouter's mistake, which the
+/// caller cannot fix and must not be told is a missing model.
+fn model_unresolvable(catalog: &TierCatalog, requested_model: &str) -> ApiError {
+    catalog
+        .unavailable_for(requested_model)
+        .map_or(ApiError::ModelNotFound, |withheld| {
+            ApiError::ModelUnavailable {
+                tier: withheld.tier.clone(),
+            }
+        })
+}
+
+/// Selection policy (design doc: Engine "Selection policy"), applied to the
+/// built route before either walk starts.
+///
+/// Stage 3a ships the knob visibility-only: there is no estimator yet, so
+/// every mode's base ordering is the identity — the tiers.toml order, which
+/// is the human-curated quality prior. The `priority` arms exist so the
+/// cost- and success-mode orderings (stage 3b) land in this function's body
+/// without touching its callers.
+///
+/// Health demotion applies last, in every mode: demoted rungs sink to the
+/// back — preserving table order within each group — and never disappear.
+/// Sinking replaces the recorded skip as demotion's first line (stage 2b
+/// shipped the skip while ordering belonged to this stage); the walk-time
+/// `should_skip` check remains as the backstop for a rung that cools between
+/// this ordering and the walk reaching it, and its never-below-one-candidate
+/// floor is unchanged. An all-demoted route partitions to itself, so this
+/// can never manufacture an empty route.
+fn order_candidates(
+    priority: Priority,
+    candidates: &mut Vec<ProviderCandidate>,
+    health: &ProviderHealth,
+) {
+    match priority {
+        // 3a: no estimator, so cost, balanced, and success all keep the
+        // identity base order. The arms split when 3b's estimator arrives.
+        Priority::Cost | Priority::Balanced | Priority::Success => {}
+    }
+    let (healthy, demoted): (Vec<_>, Vec<_>) = candidates
+        .drain(..)
+        .partition(|candidate| !health.should_skip(candidate.definition()));
+    candidates.extend(healthy);
+    candidates.extend(demoted);
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn non_streaming_response(
     runtime: RuntimeControl,
     health: ProviderHealth,
@@ -665,6 +807,7 @@ async fn non_streaming_response(
     resolved: ResolvedRoute,
     provider_route: ProviderRoute,
     reservation_usage: OpenAiUsage,
+    priority: PriorityResolution,
 ) -> Result<Response, ApiError> {
     runtime
         .tasks
@@ -676,6 +819,7 @@ async fn non_streaming_response(
             resolved,
             provider_route,
             reservation_usage,
+            priority,
         ))
         .await
         .map_err(|_| ApiError::UpstreamUnavailable)?
@@ -690,9 +834,10 @@ async fn run_non_streaming(
     resolved: ResolvedRoute,
     provider_route: ProviderRoute,
     reservation_usage: OpenAiUsage,
+    priority: PriorityResolution,
 ) -> Result<Response, ApiError> {
     let request_id = usage_session.request_id();
-    let features = RequestFeatures::from_request(&request, reservation_usage);
+    let features = RequestFeatures::from_request(&request, reservation_usage, priority);
     let tools = request.provider_tools();
     let max_tokens = request.max_tokens;
     // One clock for the whole walk, exactly as the streaming walk keeps one:
@@ -720,12 +865,16 @@ async fn run_non_streaming(
     let mut attempts = WalkLedger::new(health.clone());
 
     'walk: for (position, candidate) in candidates.iter().enumerate() {
-        // Cross-request health demotion (stage 2b): a rung cooling after a
-        // 429, or error-heavy on its EWMA, is recorded and skipped rather
-        // than dispatched. The guard is the design's never-below-one-
-        // candidate floor — a skip is taken only while this walk has already
-        // dispatched somewhere or still has somewhere left to go — so health
-        // can cost a walk a rung but never cost it the whole walk, and a
+        // The walk-time health backstop. Since stage 3a, demotion's first
+        // line is `order_candidates` sinking a cooling or error-heavy rung
+        // to the back of the route, so a demoted rung is normally never
+        // reached; this check catches the rung that cools BETWEEN that
+        // ordering and the walk arriving here (a concurrent request's 429),
+        // and the rungs an all-demoted or all-failing walk still visits.
+        // The guard is the design's never-below-one-candidate floor — a
+        // skip is taken only while this walk has already dispatched
+        // somewhere or still has somewhere left to go — so health can cost
+        // a walk a rung but never cost it the whole walk, and a
         // single-candidate route rides out a cooldown exactly as it rides
         // out the 429 itself.
         if health.should_skip(candidate.definition())
@@ -1242,6 +1391,10 @@ async fn serve_completion(
         Some(synthesized_finish),
         None,
     ));
+    // Read from the ledger before the settle drains it, so the block and the
+    // persisted rows cannot diverge.
+    let walk_positions = attempts.len();
+    let zerorouter = zerorouter_block(features, &attempts);
     persist_usage(
         usage_session,
         &resolved.requested_model,
@@ -1275,6 +1428,7 @@ async fn serve_completion(
         response,
         usage,
         max_tokens,
+        zerorouter,
     );
     let mut completion = Json(completion).into_response();
     insert_header(&mut completion, "x-request-id", &request_id);
@@ -1284,6 +1438,11 @@ async fn serve_completion(
         &candidate.provider,
     );
     insert_header(&mut completion, "x-zerorouter-model", &candidate.model);
+    insert_header(
+        &mut completion,
+        "x-zerorouter-attempts",
+        &walk_positions.to_string(),
+    );
     Ok(completion)
 }
 
@@ -1296,6 +1455,7 @@ fn streaming_response(
     resolved: ResolvedRoute,
     provider_route: ProviderRoute,
     reservation_usage: OpenAiUsage,
+    priority: PriorityResolution,
 ) -> Result<Response, ApiError> {
     let metadata = StreamMetadata::new(
         usage_session.request_id(),
@@ -1316,6 +1476,7 @@ fn streaming_response(
             resolved,
             provider_route.into_candidates(),
             reservation_usage,
+            priority,
         )
         .await;
     });
@@ -1343,11 +1504,12 @@ async fn stream_to_channel(
     resolved: ResolvedRoute,
     candidates: Vec<ProviderCandidate>,
     reservation_usage: OpenAiUsage,
+    priority: PriorityResolution,
 ) {
     let messages = request.provider_messages();
     let tools = request.provider_tools();
     let max_tokens = request.max_tokens;
-    let features = RequestFeatures::from_request(&request, reservation_usage);
+    let features = RequestFeatures::from_request(&request, reservation_usage, priority);
     let started = Instant::now();
     let mut last_candidate = None;
     let mut usage_session = Some(usage_session);
@@ -1393,12 +1555,14 @@ async fn stream_to_channel(
             }
             return;
         }
-        // Cross-request health demotion (stage 2b), the same rule at the same
-        // place as the buffered walk: a cooling or error-heavy rung is
-        // recorded and skipped, guarded by the never-below-one-candidate
-        // floor so a walk can lose a rung to health but never lose its only
-        // dispatch. Checked before the deadline because a skip consumes no
-        // walk time — admissibility first, ceilings second.
+        // The walk-time health backstop, the same rule at the same place as
+        // the buffered walk (demotion's first line is `order_candidates`
+        // sinking demoted rungs — see the buffered walk's twin comment):
+        // a rung found cooling or error-heavy on arrival is recorded and
+        // skipped, guarded by the never-below-one-candidate floor so a walk
+        // can lose a rung to health but never lose its only dispatch.
+        // Checked before the deadline because a skip consumes no walk time
+        // — admissibility first, ceilings second.
         if health.should_skip(candidate.definition())
             && (last_candidate.is_some() || position + 1 < candidates.len())
         {
@@ -2124,6 +2288,9 @@ async fn complete_synthetic_stream(
         Some(synthesized_finish),
         None,
     ));
+    // Read before the settle drains the ledger — same rule as the buffered
+    // serve site.
+    let zerorouter = zerorouter_block(features, &attempts);
     if persist_usage(
         session,
         &resolved.requested_model,
@@ -2194,6 +2361,7 @@ async fn complete_synthetic_stream(
         candidate,
         usage,
         finish_reason(has_tool_calls, usage, max_tokens),
+        zerorouter,
     )
     .await;
 }
@@ -2285,6 +2453,9 @@ async fn finish_successful_stream(
         Some(synthesized_finish),
         None,
     ));
+    // Read before the settle drains the ledger — same rule as the buffered
+    // serve site.
+    let zerorouter = zerorouter_block(features, &attempts);
     if persist_usage(
         session,
         &resolved.requested_model,
@@ -2314,10 +2485,12 @@ async fn finish_successful_stream(
         candidate,
         usage,
         synthesized_finish,
+        zerorouter,
     )
     .await;
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn emit_stream_finish(
     sender: &mpsc::Sender<Event>,
     metadata: &StreamMetadata,
@@ -2325,6 +2498,7 @@ async fn emit_stream_finish(
     candidate: &ProviderCandidate,
     usage: OpenAiUsage,
     finish_reason: &'static str,
+    zerorouter: Option<ZeroRouterResponseMetadata>,
 ) {
     if !send_data(
         sender,
@@ -2334,7 +2508,13 @@ async fn emit_stream_finish(
     {
         return;
     }
-    if metadata.include_usage && !send_data(sender, stream_usage_json(metadata, usage)).await {
+    if metadata.include_usage
+        && !send_data(
+            sender,
+            stream_usage_json(metadata, usage, zerorouter.as_ref()),
+        )
+        .await
+    {
         return;
     }
     let _ = send_data(sender, "[DONE]".to_owned()).await;
@@ -2435,6 +2615,7 @@ async fn persist_usage(
         sell_rates,
         finish_reason: finish_reason.map(str::to_owned),
         shape_ok: shape_label,
+        priority: Some(features.priority),
     };
     usage_session
         .record(&UsageRecord {
@@ -2655,6 +2836,7 @@ mod tests {
         let key = AuthenticatedKey {
             id: Uuid::new_v4(),
             user_id,
+            default_priority: None,
         };
         query("INSERT INTO users (id, email) VALUES ($1, $2)")
             .bind(user_id)
@@ -2773,6 +2955,7 @@ mod tests {
                 ProviderCandidate::against_local_upstream(second.clone(), &ok_url),
             ],
             reservation_usage,
+            PriorityResolution::new(None),
         )
         .await;
         assert!(
@@ -2858,6 +3041,7 @@ mod tests {
             resolved,
             vec![ProviderCandidate::with_provider(candidate.clone(), fake)],
             reservation_usage,
+            PriorityResolution::new(None),
         )
         .await;
         tokio::time::resume();
@@ -2958,6 +3142,7 @@ mod tests {
             resolved,
             vec![ProviderCandidate::with_provider(candidate.clone(), fake)],
             reservation_usage,
+            PriorityResolution::new(None),
         )
         .await;
         assert!(
@@ -3051,6 +3236,7 @@ mod tests {
                 &ok_url,
             )],
             reservation_usage,
+            PriorityResolution::new(None),
         )
         .await;
         client.await.expect("client task should join");

@@ -10,6 +10,7 @@ use crate::{
         database_pool_from_env, migrate, parse_decimal, quarantined_settlements,
         recover_owed_settlements,
     },
+    priority::Priority,
     sqlx::{self, PgPool},
 };
 
@@ -45,6 +46,15 @@ pub struct MintKeyArgs {
     pub spend_cap_usd: Option<String>,
     #[arg(long)]
     pub velocity_cap_tokens_per_min: Option<i32>,
+    /// Per-key default for the priority knob (cost | balanced | success);
+    /// omitted means NULL, which reads as balanced.
+    #[arg(long, value_parser = parse_priority)]
+    pub default_priority: Option<Priority>,
+}
+
+fn parse_priority(value: &str) -> Result<Priority, String> {
+    Priority::from_keyword(value)
+        .ok_or_else(|| format!("unknown priority '{value}' (expected cost, balanced, or success)"))
 }
 
 #[derive(Debug, Args)]
@@ -84,6 +94,7 @@ struct KeyMetadata {
     name: String,
     spend_cap_usd: Decimal,
     velocity_cap_tokens_per_min: i32,
+    default_priority: Option<String>,
     disabled: bool,
     created_at: chrono::DateTime<chrono::Utc>,
     last_used_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -181,19 +192,24 @@ async fn mint_key(pool: &PgPool, args: MintKeyArgs) -> Result<()> {
     .execute(&mut *transaction)
     .await
     .context("failed to store API key digest")?;
-    if spend_cap.is_some() || args.velocity_cap_tokens_per_min.is_some() {
+    if spend_cap.is_some()
+        || args.velocity_cap_tokens_per_min.is_some()
+        || args.default_priority.is_some()
+    {
         sqlx::query(
             r#"
             UPDATE api_keys
             SET
                 spend_cap_usd = COALESCE($2, spend_cap_usd),
-                velocity_cap_tokens_per_min = COALESCE($3, velocity_cap_tokens_per_min)
+                velocity_cap_tokens_per_min = COALESCE($3, velocity_cap_tokens_per_min),
+                default_priority = COALESCE($4, default_priority)
             WHERE id = $1
             "#,
         )
         .bind(key_id)
         .bind(spend_cap)
         .bind(args.velocity_cap_tokens_per_min)
+        .bind(args.default_priority.map(Priority::as_str))
         .execute(&mut *transaction)
         .await
         .context("failed to apply API key cap overrides")?;
@@ -232,6 +248,7 @@ async fn list_keys(pool: &PgPool, args: ListKeysArgs) -> Result<()> {
             String,
             Decimal,
             i32,
+            Option<String>,
             bool,
             chrono::DateTime<chrono::Utc>,
             Option<chrono::DateTime<chrono::Utc>>,
@@ -244,6 +261,7 @@ async fn list_keys(pool: &PgPool, args: ListKeysArgs) -> Result<()> {
             api_keys.name,
             api_keys.spend_cap_usd,
             api_keys.velocity_cap_tokens_per_min,
+            api_keys.default_priority,
             api_keys.disabled,
             api_keys.created_at,
             api_keys.last_used_at
@@ -265,6 +283,7 @@ async fn list_keys(pool: &PgPool, args: ListKeysArgs) -> Result<()> {
             name,
             spend_cap_usd,
             velocity_cap_tokens_per_min,
+            default_priority,
             disabled,
             created_at,
             last_used_at,
@@ -274,6 +293,7 @@ async fn list_keys(pool: &PgPool, args: ListKeysArgs) -> Result<()> {
             name,
             spend_cap_usd,
             velocity_cap_tokens_per_min,
+            default_priority,
             disabled,
             created_at,
             last_used_at,

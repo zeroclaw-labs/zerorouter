@@ -4,7 +4,10 @@ use sha2::{Digest, Sha256};
 use tokio::{sync::RwLock, time::Instant};
 use uuid::Uuid;
 
-use crate::sqlx::{self, PgPool};
+use crate::{
+    priority::Priority,
+    sqlx::{self, PgPool},
+};
 
 const KEY_PREFIX: &str = "zcr_";
 const KEY_BYTES: usize = 32;
@@ -16,6 +19,13 @@ const DUMMY_HASH: &str = "000000000000000000000000000000000000000000000000000000
 pub struct AuthenticatedKey {
     pub id: Uuid,
     pub user_id: Uuid,
+    /// The key's `default_priority` (migration 0004), carried on the
+    /// authenticated identity because it must be known before candidate
+    /// ordering — which runs ahead of the admission SELECT, so admission
+    /// cannot fetch it in time. Rides the same 30-second cache as the key
+    /// itself: a changed default has exactly the staleness contract of a
+    /// disablement. `None` means balanced.
+    pub default_priority: Option<Priority>,
 }
 
 #[derive(Clone, Debug)]
@@ -64,9 +74,9 @@ impl KeyAuthenticator {
             return Ok(key);
         }
 
-        let row = sqlx::query_as::<_, (Uuid, Uuid, String, bool)>(
+        let row = sqlx::query_as::<_, (Uuid, Uuid, String, bool, Option<String>)>(
             r#"
-            SELECT id, user_id, key_hash, disabled
+            SELECT id, user_id, key_hash, disabled, default_priority
             FROM api_keys
             WHERE key_hash = $1
             "#,
@@ -78,13 +88,19 @@ impl KeyAuthenticator {
 
         let stored_hash = row.as_ref().map_or(DUMMY_HASH, |record| record.2.as_str());
         let hashes_match = constant_time_eq(stored_hash, &hash);
-        let Some((id, user_id, _, _)) =
+        let Some((id, user_id, _, _, default_priority)) =
             row.filter(|row| syntactically_valid && hashes_match && !row.3)
         else {
             return Err(AuthenticationError::Invalid);
         };
 
-        let key = AuthenticatedKey { id, user_id };
+        let key = AuthenticatedKey {
+            id,
+            user_id,
+            // The column is CHECK-constrained to the three keywords, so a
+            // `None` here is a genuine NULL — balanced — not a parse loss.
+            default_priority: default_priority.as_deref().and_then(Priority::from_keyword),
+        };
         let mut cache = self.cache.write().await;
         cache.retain(|_, entry| entry.expires_at > now);
         cache.insert(

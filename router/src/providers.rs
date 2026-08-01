@@ -273,6 +273,16 @@ impl ProviderRoute {
         &self.candidates
     }
 
+    /// The selection-policy seam (design doc: Engine "Selection policy"):
+    /// `api::order_candidates` permutes the route here, AFTER construction,
+    /// so a reorder moves each candidate's definition and its transport
+    /// together and can never pair one rung's definition with another's
+    /// client — and an injected test route is reordered exactly as a
+    /// production one.
+    pub fn candidates_mut(&mut self) -> &mut Vec<ProviderCandidate> {
+        &mut self.candidates
+    }
+
     #[must_use]
     pub fn into_candidates(self) -> Vec<ProviderCandidate> {
         self.candidates

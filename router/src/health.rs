@@ -88,8 +88,7 @@ struct RungHealth {
 
 impl RungHealth {
     fn demoted(self, now: Instant) -> bool {
-        self.error_ewma > DEMOTION_THRESHOLD
-            || self.cooldown_until.is_some_and(|until| now < until)
+        self.error_ewma > DEMOTION_THRESHOLD || self.cooldown_until.is_some_and(|until| now < until)
     }
 }
 
@@ -133,10 +132,13 @@ impl ProviderHealth {
         }
     }
 
-    /// Whether the walk should demote this candidate — record `health_skipped`
-    /// and move on — instead of dispatching to it. Advisory: the walk's own
-    /// guard keeps a skip from ever leaving a request with nothing to
-    /// dispatch.
+    /// Whether this candidate is demoted. Two consumers, one verdict:
+    /// `api::order_candidates` sinks a demoted rung to the back of the route
+    /// (demotion's first line since stage 3a), and the walk records
+    /// `health_skipped` and moves on when it still reaches one (the
+    /// backstop). Advisory either way: ordering never removes a rung, and
+    /// the walk's own guard keeps a skip from ever leaving a request with
+    /// nothing to dispatch.
     #[must_use]
     pub fn should_skip(&self, candidate: &TierCandidate) -> bool {
         let now = Instant::now();
@@ -187,6 +189,15 @@ impl WalkLedger {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.rows.is_empty()
+    }
+
+    /// The rows recorded so far, in walk order — read by the response-block
+    /// builder (`api::zerorouter_block`); draining stays with
+    /// [`WalkLedger::take_rows`]/[`WalkLedger::into_rows`], so a peek cannot
+    /// detach a row from its settle transaction.
+    #[must_use]
+    pub fn rows(&self) -> &[AttemptRecord] {
+        &self.rows
     }
 
     /// Drain the rows for a settle site, leaving the ledger empty but usable —

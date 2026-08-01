@@ -35,6 +35,7 @@ use zerorouter::{
     device,
     openai::{OpenAiUsage, TASK_SIGNATURE_SCHEME, TaskSignature, tool_names_digest},
     portal,
+    priority::Priority,
     session::{CSRF_HEADER, SESSION_COOKIE, create_session},
     web::{WebConfig, WebCtx},
 };
@@ -98,6 +99,7 @@ async fn create_key(
     AuthenticatedKey {
         id: key_id,
         user_id,
+        default_priority: None,
     }
 }
 
@@ -147,6 +149,7 @@ fn usage_record(cost_usd: Decimal) -> UsageRecord {
             },
             finish_reason: None,
             shape_ok: None,
+            priority: Some(Priority::Balanced),
         },
         attempts: Vec::new(),
     }
@@ -482,6 +485,17 @@ fn post_json(uri: &str, cookie: &str, body: Value) -> Request<Body> {
         .expect("POST request should build")
 }
 
+fn patch_json(uri: &str, cookie: &str, body: Value) -> Request<Body> {
+    Request::builder()
+        .method("PATCH")
+        .uri(uri)
+        .header(header::COOKIE, cookie)
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(CSRF_HEADER, "1")
+        .body(Body::from(body.to_string()))
+        .expect("PATCH request should build")
+}
+
 async fn portal_cookie(pool: &PgPool, user_id: Uuid) -> String {
     let (token, _) = create_session(pool, user_id, Duration::from_secs(3_600))
         .await
@@ -728,4 +742,121 @@ async fn device_claims_below_the_creation_limit_still_mint() {
         key_counts(&pool, user_id).await.1,
         MAX_KEYS_CREATED_PER_WINDOW
     );
+}
+
+/// The per-key priority default's full portal lifecycle (rollout stage 3a):
+/// set at mint, visible in the listing, mutated by the portal's first PATCH
+/// endpoint, cleared by an explicit null — with `{}` a no-op, an unknown
+/// field a loud 400, and another tenant's key a 404.
+#[tokio::test]
+async fn default_priority_rides_mint_list_and_the_key_patch() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let app = portal_app(&pool);
+    let user_id = create_user(&pool, "knob-portal").await;
+    let cookie = portal_cookie(&pool, user_id).await;
+
+    let (status, body) = send(
+        &app,
+        post_json(
+            "/api/keys",
+            &cookie,
+            json!({ "name": "knob key", "default_priority": "cost" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["default_priority"], "cost");
+    let key_id = body["id"]
+        .as_str()
+        .expect("created key has an id")
+        .to_owned();
+
+    let (status, body) = send(
+        &app,
+        Request::builder()
+            .method("GET")
+            .uri("/api/keys")
+            .header(header::COOKIE, &cookie)
+            .body(Body::empty())
+            .expect("GET request should build"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["keys"][0]["default_priority"], "cost");
+
+    // PATCH set.
+    let (status, body) = send(
+        &app,
+        patch_json(
+            &format!("/api/keys/{key_id}"),
+            &cookie,
+            json!({ "default_priority": "success" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["default_priority"], "success");
+
+    // `{}` is a no-op PATCH that answers with the current summary.
+    let (status, body) = send(
+        &app,
+        patch_json(&format!("/api/keys/{key_id}"), &cookie, json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["default_priority"], "success");
+
+    // Explicit null clears back to balanced (NULL).
+    let (status, body) = send(
+        &app,
+        patch_json(
+            &format!("/api/keys/{key_id}"),
+            &cookie,
+            json!({ "default_priority": null }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body["default_priority"].is_null());
+
+    // Strict namespace: a typo'd field and an unknown value are refused, and
+    // neither mutates the key.
+    for garbage in [
+        json!({ "default_priorty": "cost" }),
+        json!({ "default_priority": "fast" }),
+    ] {
+        let (status, _) = send(
+            &app,
+            patch_json(&format!("/api/keys/{key_id}"), &cookie, garbage.clone()),
+        )
+        .await;
+        assert!(
+            status.is_client_error(),
+            "{garbage} must be refused, got {status}"
+        );
+    }
+    let stored = query_scalar::<_, Option<String>>(
+        "SELECT default_priority FROM api_keys WHERE id = $1::uuid",
+    )
+    .bind(&key_id)
+    .fetch_one(&pool)
+    .await
+    .expect("stored default must query");
+    assert_eq!(stored, None, "refused PATCHes must not mutate");
+
+    // Tenancy: another user's key answers 404 through the same endpoint.
+    let stranger = create_user(&pool, "knob-portal-stranger").await;
+    let stranger_cookie = portal_cookie(&pool, stranger).await;
+    let (status, body) = send(
+        &app,
+        patch_json(
+            &format!("/api/keys/{key_id}"),
+            &stranger_cookie,
+            json!({ "default_priority": "cost" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
 }
