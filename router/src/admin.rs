@@ -7,7 +7,7 @@ use uuid::Uuid;
 use crate::{
     auth::{generate_api_key, hash_api_key},
     db::{
-        database_pool_from_env, migrate, parse_decimal, quarantined_settlements,
+        database_pool_from_env, migrate, parse_decimal, provider_cogs, quarantined_settlements,
         recover_owed_settlements,
     },
     priority::Priority,
@@ -24,6 +24,9 @@ pub struct AdminArgs {
 pub enum AdminCommand {
     /// Mint a key and print its plaintext value exactly once.
     MintKey(MintKeyArgs),
+    /// Per-provider trailing-window COGS: what each upstream account is
+    /// owed, for invoice reconciliation and deposit sizing.
+    Treasury(TreasuryArgs),
     /// Disable an existing key.
     RevokeKey(RevokeKeyArgs),
     /// List key metadata without hashes or plaintext credentials.
@@ -55,6 +58,13 @@ pub struct MintKeyArgs {
 fn parse_priority(value: &str) -> Result<Priority, String> {
     Priority::from_keyword(value)
         .ok_or_else(|| format!("unknown priority '{value}' (expected cost, balanced, or success)"))
+}
+
+#[derive(Debug, Args)]
+pub struct TreasuryArgs {
+    /// Trailing window in days.
+    #[arg(long, default_value_t = 7)]
+    pub days: i32,
 }
 
 #[derive(Debug, Args)]
@@ -106,6 +116,7 @@ pub async fn run(args: AdminArgs) -> Result<()> {
 
     match args.command {
         AdminCommand::MintKey(args) => mint_key(&pool, args).await,
+        AdminCommand::Treasury(args) => treasury(&pool, args).await,
         AdminCommand::RevokeKey(args) => revoke_key(&pool, args).await,
         AdminCommand::ListKeys(args) => list_keys(&pool, args).await,
         AdminCommand::OwedSettlements(args) => owed_settlements(&pool, args).await,
@@ -128,6 +139,23 @@ async fn settle_owed(pool: &PgPool, args: SettleOwedArgs) -> Result<()> {
         .await
         .context("failed to recover owed settlements")?;
     println!("{}", serde_json::to_string_pretty(&summary)?);
+    Ok(())
+}
+
+async fn treasury(pool: &PgPool, args: TreasuryArgs) -> Result<()> {
+    if args.days <= 0 {
+        bail!("days must be positive")
+    }
+    let rows = provider_cogs(pool, args.days)
+        .await
+        .context("failed to aggregate provider COGS")?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "window_days": args.days,
+            "providers": rows,
+        }))?
+    );
     Ok(())
 }
 

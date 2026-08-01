@@ -704,6 +704,13 @@ pub async fn migrate(pool: &PgPool) -> Result<()> {
                 Cow::Borrowed(include_str!("../migrations/0007_ledger_honesty.sql")),
                 false,
             ),
+            Migration::new(
+                8,
+                Cow::Borrowed("autopay"),
+                MigrationType::Simple,
+                Cow::Borrowed(include_str!("../migrations/0008_autopay.sql")),
+                false,
+            ),
         ]),
         ignore_missing: false,
         locking: true,
@@ -2304,4 +2311,94 @@ mod tests {
         const { assert!(MAX_KEYS_CREATED_PER_WINDOW <= MAX_ACTIVE_KEYS_PER_USER) };
         const { assert!(KEY_CREATION_WINDOW_HOURS > 0) };
     }
+}
+
+/// One provider's trailing-window COGS: what serving cost us (served
+/// attempts, from the settled rows) and what the walk burnt beside it
+/// (non-served attempts). `unpriced_rows` counts rows whose basis could not
+/// be captured — the sums are labeled lower bounds exactly as the attempts
+/// ledger documents, never silently complete.
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+pub struct ProviderCogs {
+    pub provider: String,
+    pub served_cogs_usd: Decimal,
+    pub walk_cogs_usd: Decimal,
+    pub served_requests: i64,
+    pub unpriced_rows: i64,
+    /// Attempt rows whose basis is a token-count floor rather than a
+    /// provider usage report: included in `walk_cogs_usd`, counted here so
+    /// the sum reads as the labeled lower bound it is.
+    pub estimated_rows: i64,
+}
+
+/// The treasury view's substrate: per-provider spend over a trailing
+/// window, for reconciling against provider invoices and sizing the
+/// prepaid deposits each upstream account needs.
+pub async fn provider_cogs(pool: &PgPool, days: i32) -> Result<Vec<ProviderCogs>, sqlx::Error> {
+    let served = sqlx::query_as::<_, (String, Decimal, i64, i64)>(
+        r#"
+        SELECT upstream_provider,
+               COALESCE(SUM(cost_basis_usd), 0),
+               COUNT(*),
+               COUNT(*) FILTER (WHERE cost_basis_usd IS NULL)
+        FROM usage_events
+        WHERE ts >= NOW() - ($1 * INTERVAL '1 day')
+        GROUP BY upstream_provider
+        "#,
+    )
+    .bind(days)
+    .fetch_all(pool)
+    .await?;
+    // Window caveat, documented rather than hidden: settled rows window on
+    // settle time, attempt rows on (backdated) attempt-start time, so a
+    // request spanning the cutoff splits its two sides across adjacent
+    // windows. Provider invoices bucket on their own clocks anyway; this
+    // view reconciles to the dollar over any window materially wider than
+    // one request's lifetime.
+    let walk = sqlx::query_as::<_, (String, Decimal, i64, i64)>(
+        r#"
+        SELECT upstream_provider,
+               COALESCE(SUM(cost_basis_usd), 0),
+               COUNT(*) FILTER (WHERE cost_basis_usd IS NULL),
+               COUNT(*) FILTER (WHERE tokens_estimated)
+        FROM request_attempts
+        WHERE NOT served AND ts >= NOW() - ($1 * INTERVAL '1 day')
+        GROUP BY upstream_provider
+        "#,
+    )
+    .bind(days)
+    .fetch_all(pool)
+    .await?;
+    let mut by_provider: std::collections::BTreeMap<String, ProviderCogs> = served
+        .into_iter()
+        .map(|(provider, served_cogs_usd, served_requests, unpriced)| {
+            (
+                provider.clone(),
+                ProviderCogs {
+                    provider,
+                    served_cogs_usd,
+                    walk_cogs_usd: Decimal::ZERO,
+                    served_requests,
+                    unpriced_rows: unpriced,
+                    estimated_rows: 0,
+                },
+            )
+        })
+        .collect();
+    for (provider, walk_cogs_usd, unpriced, estimated) in walk {
+        let entry = by_provider
+            .entry(provider.clone())
+            .or_insert_with(|| ProviderCogs {
+                provider,
+                served_cogs_usd: Decimal::ZERO,
+                walk_cogs_usd: Decimal::ZERO,
+                served_requests: 0,
+                unpriced_rows: 0,
+                estimated_rows: 0,
+            });
+        entry.walk_cogs_usd = walk_cogs_usd;
+        entry.unpriced_rows += unpriced;
+        entry.estimated_rows = estimated;
+    }
+    Ok(by_provider.into_values().collect())
 }
