@@ -19,6 +19,8 @@ pub const OIDC_ISSUER_URL_ENV: &str = "OIDC_ISSUER_URL";
 pub const OIDC_CLIENT_ID_ENV: &str = "OIDC_CLIENT_ID";
 pub const OIDC_CLIENT_SECRET_ENV: &str = "OIDC_CLIENT_SECRET";
 pub const STRIPE_SECRET_KEY_ENV: &str = "STRIPE_SECRET_KEY";
+pub const STRIPE_API_BASE_ENV: &str = "STRIPE_API_BASE";
+pub const DEFAULT_STRIPE_API_BASE: &str = "https://api.stripe.com";
 pub const STRIPE_WEBHOOK_SECRET_ENV: &str = "STRIPE_WEBHOOK_SECRET";
 pub const SIGNUP_CREDIT_ENV: &str = "ZEROROUTER_SIGNUP_CREDIT_USD";
 pub const REQUIRE_CREDITS_ENV: &str = "ZEROROUTER_REQUIRE_CREDITS";
@@ -46,6 +48,9 @@ pub struct StripeSettings {
     pub webhook_secret: String,
     pub checkout_min_usd: Decimal,
     pub checkout_max_usd: Decimal,
+    /// Stripe API origin. Production default; tests point it at a fixture
+    /// server so the sweep and outbound calls are testable without Stripe.
+    pub api_base: String,
 }
 
 impl std::fmt::Debug for StripeSettings {
@@ -139,6 +144,9 @@ impl WebConfig {
             webhook_secret,
             checkout_min_usd,
             checkout_max_usd,
+            api_base: optional_env(STRIPE_API_BASE_ENV)
+                .map(|base| base.trim_end_matches('/').to_owned())
+                .unwrap_or_else(|| DEFAULT_STRIPE_API_BASE.to_owned()),
         });
 
         let signup_credit_usd = decimal_env(SIGNUP_CREDIT_ENV, Decimal::ZERO)?;

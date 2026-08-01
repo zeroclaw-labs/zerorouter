@@ -13,7 +13,7 @@ use zerorouter::{
     db::{
         AttemptRecord, AttemptTokens, RequestTelemetry, ReservationBasis, UsageAdmission,
         UsageRecord, UsageSession, begin_usage_session, migrate, output_token_percentiles,
-        segment_clamp_stats, user_clamp_loss,
+        provider_cogs, segment_clamp_stats, user_clamp_loss,
     },
     openai::{OpenAiUsage, TASK_SIGNATURE_SCHEME, TaskSignature, tool_names_digest, usage_cost},
     priority::Priority,
@@ -857,7 +857,7 @@ async fn migration_chain_applies_on_a_fresh_database() {
         outcome.4,
         "the 0007 ledger-honesty columns exist after the chain"
     );
-    assert_eq!(outcome.5, 7, "the chain reaches migration version 7");
+    assert_eq!(outcome.5, 8, "the chain reaches migration version 8");
 }
 
 /// Rewrite the database name in a Postgres URL, keeping any query string
@@ -1158,4 +1158,89 @@ async fn clamp_stats_sum_losses_only_and_respect_their_windows() {
         .expect("user loss must scan");
     assert_eq!(loss_30d, "10.80".parse().unwrap());
     assert_eq!(loss_37d, "15.30".parse().unwrap());
+}
+
+/// The treasury aggregation, pinned row by row: served COGS from settled
+/// rows, walk COGS from non-served attempts, unpriced rows counted and
+/// never silently folded into a sum, windows respected.
+#[tokio::test]
+async fn provider_cogs_split_served_from_walk_and_count_the_unpriced() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let key = seed_key(&pool).await;
+    let provider = format!("prov-{}", Uuid::new_v4().simple());
+
+    // Two served rows with basis, one without (unpriced), one out-of-window.
+    for (basis, age_days) in [
+        (Some("0.10"), 0),
+        (Some("0.25"), 0),
+        (None, 0),
+        (Some("9.00"), 40),
+    ] {
+        query(
+            r#"
+            INSERT INTO usage_events (
+                request_id, api_key_id, tier, upstream_provider, upstream_model,
+                input_tokens, cached_input_tokens, output_tokens, cost_usd,
+                latency_ms, status, cost_basis_usd, ts
+            )
+            VALUES ($1, $2, 'zero/treasury-test', $3, 'upstream/t',
+                    10, 0, 10, 0.001, 5, 200, $4::NUMERIC,
+                    NOW() - ($5 * INTERVAL '1 day'))
+            "#,
+        )
+        .bind(Uuid::new_v4())
+        .bind(key.id)
+        .bind(&provider)
+        .bind(basis)
+        .bind(age_days)
+        .execute(&pool)
+        .await
+        .expect("treasury usage row must insert");
+    }
+    // A non-served walk attempt: the losing rung's COGS.
+    let request_id = query_scalar::<_, Uuid>(
+        "SELECT request_id FROM usage_events WHERE api_key_id = $1 LIMIT 1",
+    )
+    .bind(key.id)
+    .fetch_one(&pool)
+    .await
+    .expect("anchor request must exist");
+    query(
+        r#"
+        INSERT INTO request_attempts (
+            request_id, api_key_id, user_id, attempt_no, candidate_id,
+            upstream_provider, upstream_model, outcome, served, latency_ms,
+            cost_basis_usd
+        )
+        SELECT $1, $2, k.user_id, 1, 'x/y', $3, 'upstream/t',
+               'upstream_error', FALSE, 9, 0.07
+        FROM api_keys k WHERE k.id = $2
+        "#,
+    )
+    .bind(request_id)
+    .bind(key.id)
+    .bind(&provider)
+    .execute(&pool)
+    .await
+    .expect("treasury attempt row must insert");
+
+    let rows = provider_cogs(&pool, 7)
+        .await
+        .expect("treasury must aggregate");
+    let row = rows
+        .iter()
+        .find(|row| row.provider == provider)
+        .expect("provider present");
+    assert_eq!(row.served_cogs_usd, "0.35".parse().unwrap());
+    assert_eq!(row.walk_cogs_usd, "0.07".parse().unwrap());
+    assert_eq!(
+        row.served_requests, 3,
+        "in-window settled rows, priced or not"
+    );
+    assert_eq!(
+        row.unpriced_rows, 1,
+        "the basis-less row is counted, not hidden"
+    );
 }

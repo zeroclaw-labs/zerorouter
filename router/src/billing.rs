@@ -332,3 +332,239 @@ pub async fn ledger_entries(
         )
         .collect())
 }
+
+// ---------------------------------------------------------------------------
+// Autopay (migration 0008)
+// ---------------------------------------------------------------------------
+
+/// A user the autopay sweep should recharge: enabled, configured, under
+/// threshold, not mid-charge, and not disabled by consecutive failures.
+#[derive(Clone, Debug)]
+pub struct AutopayCandidate {
+    pub user_id: Uuid,
+    pub stripe_customer_id: String,
+    pub topup_usd: Decimal,
+}
+
+/// The sweep's worklist. Every predicate is in SQL so a candidate observed
+/// here is consistent at read time; the one-pending-per-user partial unique
+/// index is what makes racing sweeps safe rather than this SELECT.
+pub async fn autopay_candidates(
+    pool: &PgPool,
+    limit: i64,
+) -> Result<Vec<AutopayCandidate>, sqlx::Error> {
+    let rows = sqlx::query_as::<_, (Uuid, String, Decimal)>(
+        r#"
+        SELECT u.id, u.stripe_customer_id, u.autopay_topup_usd
+        FROM users u
+        WHERE u.autopay_enabled
+          AND u.autopay_consecutive_failures < 3
+          AND u.credit_balance_usd < u.autopay_threshold_usd
+          AND u.stripe_customer_id IS NOT NULL
+          AND NOT EXISTS (
+              SELECT 1 FROM stripe_autopay_intents i
+              WHERE i.user_id = u.id AND i.status = 'pending'
+          )
+        ORDER BY u.credit_balance_usd ASC
+        LIMIT $1
+        "#,
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(
+            |(user_id, stripe_customer_id, topup_usd)| AutopayCandidate {
+                user_id,
+                stripe_customer_id,
+                topup_usd,
+            },
+        )
+        .collect())
+}
+
+/// Record a freshly created PaymentIntent. `ON CONFLICT DO NOTHING`: the
+/// webhook's metadata-recovery path may have raced us and inserted first,
+/// and the PK is the exactly-once guard either way.
+pub async fn record_autopay_intent(
+    pool: &PgPool,
+    payment_intent_id: &str,
+    user_id: Uuid,
+    amount_usd: Decimal,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"
+        INSERT INTO stripe_autopay_intents (payment_intent_id, user_id, amount_usd)
+        VALUES ($1, $2, $3)
+        ON CONFLICT (payment_intent_id) DO NOTHING
+        "#,
+    )
+    .bind(payment_intent_id)
+    .bind(user_id)
+    .bind(amount_usd)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// What settling an autopay charge did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AutopayOutcome {
+    Credited,
+    AlreadySettled,
+    /// No intent row and no metadata to recover one from — acknowledged and
+    /// ignored (some other system's payment intent).
+    Unknown,
+}
+
+/// Credit a succeeded off-session charge, exactly once.
+///
+/// The pending→succeeded transition on the intents row is the guard; the
+/// credit itself mirrors `credit_purchase` (user advisory lock, balance
+/// update, `autopay` ledger row naming the payment intent). When the sweep
+/// crashed between creating the PaymentIntent at Stripe and recording it,
+/// the webhook passes `recovered` metadata and the row is inserted here —
+/// money taken from a card can never fail to become credits for lack of a
+/// bookkeeping row.
+pub async fn settle_autopay_intent(
+    pool: &PgPool,
+    payment_intent_id: &str,
+    recovered: Option<(Uuid, Decimal)>,
+) -> Result<AutopayOutcome, sqlx::Error> {
+    let mut transaction = pool.begin().await?;
+    sqlx::query("SET LOCAL lock_timeout = '5s'")
+        .execute(&mut *transaction)
+        .await?;
+
+    if let Some((user_id, amount_usd)) = recovered {
+        sqlx::query(
+            r#"
+            INSERT INTO stripe_autopay_intents (payment_intent_id, user_id, amount_usd)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (payment_intent_id) DO NOTHING
+            "#,
+        )
+        .bind(payment_intent_id)
+        .bind(user_id)
+        .bind(amount_usd)
+        .execute(&mut *transaction)
+        .await?;
+    }
+
+    let Some((user_id, amount_usd)) = sqlx::query_as::<_, (Uuid, Decimal)>(
+        r#"
+        UPDATE stripe_autopay_intents
+        SET status = 'succeeded', updated_at = NOW()
+        WHERE payment_intent_id = $1 AND status = 'pending'
+        RETURNING user_id, amount_usd
+        "#,
+    )
+    .bind(payment_intent_id)
+    .fetch_optional(&mut *transaction)
+    .await?
+    else {
+        let known = sqlx::query_scalar::<_, i32>(
+            "SELECT 1 FROM stripe_autopay_intents WHERE payment_intent_id = $1",
+        )
+        .bind(payment_intent_id)
+        .fetch_optional(&mut *transaction)
+        .await?
+        .is_some();
+        transaction.rollback().await?;
+        return Ok(if known {
+            AutopayOutcome::AlreadySettled
+        } else {
+            AutopayOutcome::Unknown
+        });
+    };
+
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1::TEXT, 0))")
+        .bind(user_id.to_string())
+        .execute(&mut *transaction)
+        .await?;
+    let balance_after = sqlx::query_scalar::<_, Decimal>(
+        r#"
+        UPDATE users
+        SET credit_balance_usd = credit_balance_usd + $2,
+            autopay_consecutive_failures = 0
+        WHERE id = $1
+        RETURNING credit_balance_usd
+        "#,
+    )
+    .bind(user_id)
+    .bind(amount_usd)
+    .fetch_one(&mut *transaction)
+    .await?;
+    sqlx::query(
+        r#"
+        INSERT INTO credit_ledger
+            (user_id, entry_type, amount_usd, balance_after_usd, stripe_session_id, note)
+        VALUES ($1, 'autopay', $2, $3, $4, 'autopay recharge')
+        "#,
+    )
+    .bind(user_id)
+    .bind(amount_usd)
+    .bind(balance_after)
+    .bind(payment_intent_id)
+    .execute(&mut *transaction)
+    .await?;
+    transaction.commit().await?;
+    Ok(AutopayOutcome::Credited)
+}
+
+/// Record a failed off-session charge: the intent goes terminal and the
+/// user's consecutive-failure count rises; the sweep's candidate query
+/// stops at three, so a dead card gets three attempts, not a retry loop.
+pub async fn fail_autopay_intent(
+    pool: &PgPool,
+    payment_intent_id: &str,
+) -> Result<bool, sqlx::Error> {
+    let mut transaction = pool.begin().await?;
+    let Some(user_id) = sqlx::query_scalar::<_, Uuid>(
+        r#"
+        UPDATE stripe_autopay_intents
+        SET status = 'failed', updated_at = NOW()
+        WHERE payment_intent_id = $1 AND status = 'pending'
+        RETURNING user_id
+        "#,
+    )
+    .bind(payment_intent_id)
+    .fetch_optional(&mut *transaction)
+    .await?
+    else {
+        transaction.rollback().await?;
+        return Ok(false);
+    };
+    sqlx::query(
+        r#"
+        UPDATE users
+        SET autopay_consecutive_failures = autopay_consecutive_failures + 1,
+            autopay_enabled = autopay_enabled AND autopay_consecutive_failures + 1 < 3
+        WHERE id = $1
+        "#,
+    )
+    .bind(user_id)
+    .execute(&mut *transaction)
+    .await?;
+    transaction.commit().await?;
+    Ok(true)
+}
+
+/// Count a charge attempt that failed before a PaymentIntent existed (no
+/// saved card, malformed amount): the same three-strikes ledger as a
+/// declined intent, without an intent row to anchor it.
+pub async fn bump_autopay_failure(pool: &PgPool, user_id: Uuid) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"
+        UPDATE users
+        SET autopay_consecutive_failures = autopay_consecutive_failures + 1,
+            autopay_enabled = autopay_enabled AND autopay_consecutive_failures + 1 < 3
+        WHERE id = $1
+        "#,
+    )
+    .bind(user_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}

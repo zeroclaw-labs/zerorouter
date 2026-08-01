@@ -25,7 +25,7 @@ use http_body_util::BodyExt;
 use rust_decimal::Decimal;
 use serde_json::{Value, json};
 use sha2::Sha256;
-use sqlx_core::{query::query, query_scalar::query_scalar};
+use sqlx_core::{query::query, query_as::query_as, query_scalar::query_scalar};
 use sqlx_postgres::{PgConnectOptions, PgPool, PgPoolOptions};
 use tower::ServiceExt;
 use uuid::Uuid;
@@ -203,6 +203,7 @@ fn webhook_app(pool: &PgPool) -> axum::Router {
             webhook_secret: SECRET.to_owned(),
             checkout_min_usd: Decimal::from(5),
             checkout_max_usd: Decimal::from(1000),
+            api_base: "https://api.stripe.com".to_owned(),
         }),
         signup_credit_usd: Decimal::ZERO,
         portal_dist_path: PathBuf::from("portal/dist"),
@@ -449,4 +450,197 @@ async fn unpaid_session_is_acknowledged_without_crediting() {
     let (status, _) = post_webhook(&pool, &event.to_string()).await;
     assert_eq!(status, StatusCode::OK);
     assert_nothing_credited(&pool, user_id, "unpaid session").await;
+}
+
+// ---------------------------------------------------------------------------
+// Autopay (migration 0008): payment_intent webhook arms.
+// ---------------------------------------------------------------------------
+
+/// A `payment_intent.*` event with independently controllable money fields,
+/// exactly like the checkout fixture above.
+fn autopay_intent_event(
+    event_type: &str,
+    intent_id: &str,
+    user_id: Uuid,
+    metadata_credit_usd: &str,
+    amount_received: i64,
+    currency: &str,
+) -> String {
+    json!({
+        "id": "evt_test",
+        "type": event_type,
+        "data": {
+            "object": {
+                "id": intent_id,
+                "object": "payment_intent",
+                "amount_received": amount_received,
+                "currency": currency,
+                "metadata": {
+                    "purpose": "zerorouter_autopay",
+                    "user_id": user_id.to_string(),
+                    "credit_usd": metadata_credit_usd,
+                },
+            }
+        }
+    })
+    .to_string()
+}
+
+async fn enable_autopay(pool: &PgPool, user_id: Uuid) {
+    query(
+        r#"
+        UPDATE users
+        SET stripe_customer_id = $2, autopay_enabled = TRUE,
+            autopay_threshold_usd = 5, autopay_topup_usd = 25
+        WHERE id = $1
+        "#,
+    )
+    .bind(user_id)
+    .bind(format!("cus_test_{}", user_id.simple()))
+    .execute(pool)
+    .await
+    .expect("autopay enablement must update");
+}
+
+async fn balance_of(pool: &PgPool, user_id: Uuid) -> Decimal {
+    query_scalar::<_, Decimal>("SELECT credit_balance_usd FROM users WHERE id = $1")
+        .bind(user_id)
+        .fetch_one(pool)
+        .await
+        .expect("balance must query")
+}
+
+/// The success arm credits exactly once — including the crash-recovery
+/// shape where the sweep died before recording the intent row, so the
+/// webhook's metadata is the only record the charge ever happened.
+#[tokio::test]
+async fn autopay_success_credits_exactly_once_even_without_a_prior_intent_row() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let user_id = create_user(&pool, "autopay-success").await;
+    enable_autopay(&pool, user_id).await;
+    let intent_id = format!("pi_test_{}", Uuid::new_v4().simple());
+
+    // No intent row exists — the metadata-recovery path must build one.
+    let payload = autopay_intent_event(
+        "payment_intent.succeeded",
+        &intent_id,
+        user_id,
+        "25",
+        2500,
+        "usd",
+    );
+    let (status, _) = post_webhook(&pool, &payload).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(balance_of(&pool, user_id).await, Decimal::from(25));
+
+    // Stripe redelivers; the replay must not double-credit.
+    let (status, _) = post_webhook(&pool, &payload).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(balance_of(&pool, user_id).await, Decimal::from(25));
+
+    let ledger_rows = query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM credit_ledger WHERE stripe_session_id = $1 AND entry_type = 'autopay'",
+    )
+    .bind(&intent_id)
+    .fetch_one(&pool)
+    .await
+    .expect("ledger must query");
+    assert_eq!(ledger_rows, 1);
+}
+
+/// The corroboration bar from the checkout arm holds here: metadata that
+/// disagrees with the money Stripe collected credits nothing.
+#[tokio::test]
+async fn autopay_success_with_forged_metadata_credits_nothing() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let user_id = create_user(&pool, "autopay-forged").await;
+    enable_autopay(&pool, user_id).await;
+    let intent_id = format!("pi_test_{}", Uuid::new_v4().simple());
+
+    // Claims $250 of credit against $25 actually collected.
+    let payload = autopay_intent_event(
+        "payment_intent.succeeded",
+        &intent_id,
+        user_id,
+        "250",
+        2500,
+        "usd",
+    );
+    let (status, _) = post_webhook(&pool, &payload).await;
+    assert_ne!(status, StatusCode::OK);
+    assert_eq!(balance_of(&pool, user_id).await, Decimal::ZERO);
+}
+
+/// Three consecutive failures disable autopay; a success in between resets
+/// the count (pinned via the settle path's reset).
+#[tokio::test]
+async fn three_consecutive_failures_disable_autopay() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let user_id = create_user(&pool, "autopay-failures").await;
+    enable_autopay(&pool, user_id).await;
+
+    for round in 0..3 {
+        let intent_id = format!("pi_test_{}", Uuid::new_v4().simple());
+        // The failed intent must exist as pending first (the sweep records
+        // it when Stripe reports the declined intent).
+        query(
+            "INSERT INTO stripe_autopay_intents (payment_intent_id, user_id, amount_usd) VALUES ($1, $2, 25)",
+        )
+        .bind(&intent_id)
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .expect("pending intent must insert");
+        let payload = autopay_intent_event(
+            "payment_intent.payment_failed",
+            &intent_id,
+            user_id,
+            "25",
+            0,
+            "usd",
+        );
+        let (status, _) = post_webhook(&pool, &payload).await;
+        assert_eq!(status, StatusCode::OK, "failure round {round}");
+    }
+
+    let (enabled, failures) = query_as::<_, (bool, i32)>(
+        "SELECT autopay_enabled, autopay_consecutive_failures FROM users WHERE id = $1",
+    )
+    .bind(user_id)
+    .fetch_one(&pool)
+    .await
+    .expect("user must query");
+    assert_eq!(failures, 3);
+    assert!(!enabled, "the third strike disables autopay");
+}
+
+/// Foreign payment intents — no autopay purpose — are acknowledged and
+/// ignored, never credited.
+#[tokio::test]
+async fn foreign_payment_intents_are_ignored() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let user_id = create_user(&pool, "autopay-foreign").await;
+    let payload = json!({
+        "id": "evt_test",
+        "type": "payment_intent.succeeded",
+        "data": { "object": {
+            "id": format!("pi_test_{}", Uuid::new_v4().simple()),
+            "object": "payment_intent",
+            "amount_received": 2500,
+            "currency": "usd",
+            "metadata": { "user_id": user_id.to_string(), "credit_usd": "25" }
+        }}
+    })
+    .to_string();
+    let (status, _) = post_webhook(&pool, &payload).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(balance_of(&pool, user_id).await, Decimal::ZERO);
 }

@@ -75,6 +75,9 @@ async fn serve() -> Result<()> {
     // inference cannot go unbilled because one transaction lost a connection.
     state.spawn_settlement_recovery();
     state.spawn_estimator_refresher();
+    if let Some(stripe) = web_config.as_ref().and_then(|config| config.stripe.clone()) {
+        state.spawn_autopay_sweep(stripe);
+    }
     let mut router = app(state.clone());
     if let Some(config) = web_config {
         let portal_dist = config.portal_dist_path.clone();

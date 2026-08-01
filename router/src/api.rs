@@ -631,6 +631,28 @@ impl RouterState {
         }
     }
 
+    /// Start the autopay sweep: every minute, charge saved cards for users
+    /// under their recharge threshold. Same opt-in serve-only contract as
+    /// the other background loops; tests drive
+    /// `stripe::run_autopay_sweep_once` directly.
+    pub fn spawn_autopay_sweep(&self, settings: crate::web::StripeSettings) {
+        let Some(services) = &self.services else {
+            return;
+        };
+        let pool = services.pool.clone();
+        let shutdown = services.runtime.shutdown.clone();
+        services.runtime.tasks.spawn(async move {
+            loop {
+                tokio::select! {
+                    biased;
+                    () = shutdown.cancelled() => return,
+                    () = tokio::time::sleep(Duration::from_secs(60)) => {}
+                }
+                crate::stripe::run_autopay_sweep_once(&pool, &settings).await;
+            }
+        });
+    }
+
     pub fn begin_shutdown(&self) {
         if let Some(services) = &self.services {
             services.runtime.shutdown.cancel();

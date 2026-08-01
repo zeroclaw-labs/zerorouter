@@ -72,7 +72,9 @@ pub const STRIPE_SIGNATURE_HEADER: &str = "stripe-signature";
 
 /// Maximum accepted skew between the signed timestamp and the current time.
 const WEBHOOK_TOLERANCE: Duration = Duration::from_secs(300);
-const STRIPE_CHECKOUT_SESSIONS_URL: &str = "https://api.stripe.com/v1/checkout/sessions";
+fn checkout_sessions_url(settings: &StripeSettings) -> String {
+    format!("{}/v1/checkout/sessions", settings.api_base)
+}
 const STRIPE_HTTP_TIMEOUT: Duration = Duration::from_secs(15);
 const CHECKOUT_COMPLETED_EVENT: &str = "checkout.session.completed";
 const CHECKOUT_ASYNC_SUCCEEDED_EVENT: &str = "checkout.session.async_payment_succeeded";
@@ -191,6 +193,11 @@ fn parse_signature_header(header: &str) -> Result<ParsedSignatureHeader<'_>, Web
 pub fn router() -> Router<WebCtx> {
     Router::new()
         .route("/api/billing/checkout", post(create_checkout))
+        .route(
+            "/api/billing/autopay",
+            axum::routing::get(get_autopay).put(put_autopay),
+        )
+        .route("/api/billing/autopay/setup", post(create_autopay_setup))
         .route("/webhooks/stripe", post(stripe_webhook))
 }
 
@@ -443,7 +450,7 @@ async fn create_checkout_session(
         ("cancel_url", &params.cancel_url),
     ];
     let response = client
-        .post(STRIPE_CHECKOUT_SESSIONS_URL)
+        .post(checkout_sessions_url(settings))
         .bearer_auth(&settings.secret_key)
         .form(&form)
         .send()
@@ -524,6 +531,11 @@ async fn stripe_webhook(
         tracing::warn!("stripe webhook rejected: event is not valid JSON");
         StripeHttpError::MalformedEvent
     })?;
+    if event.event_type == "payment_intent.succeeded"
+        || event.event_type == "payment_intent.payment_failed"
+    {
+        return handle_autopay_intent_event(&ctx, &event).await;
+    }
     if event.event_type != CHECKOUT_COMPLETED_EVENT
         && event.event_type != CHECKOUT_ASYNC_SUCCEEDED_EVENT
     {
@@ -736,6 +748,7 @@ mod tests {
             webhook_secret: "whsec_unused".to_owned(),
             checkout_min_usd: Decimal::from(5),
             checkout_max_usd: Decimal::from(1000),
+            api_base: "https://api.stripe.com".to_owned(),
         }
     }
 
@@ -817,4 +830,407 @@ mod tests {
             );
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Autopay (migration 0008): saved-card auto-recharge.
+// ---------------------------------------------------------------------------
+
+const AUTOPAY_PURPOSE: &str = "zerorouter_autopay";
+const AUTOPAY_SWEEP_BATCH: i64 = 16;
+
+/// Ensure the user has a Stripe Customer, creating one on first use. The
+/// stored id wins any race: a concurrent creation that loses the UPDATE
+/// leaves an orphan customer at Stripe, which is inert.
+async fn ensure_stripe_customer(
+    ctx: &WebCtx,
+    settings: &StripeSettings,
+    user_id: Uuid,
+    email: &str,
+) -> Result<String, StripeHttpError> {
+    if let Some(existing) = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT stripe_customer_id FROM users WHERE id = $1",
+    )
+    .bind(user_id)
+    .fetch_one(&ctx.pool)
+    .await
+    .map_err(|_| StripeHttpError::BillingUnavailable)?
+        && !existing.is_empty()
+    {
+        return Ok(existing);
+    }
+    let client = stripe_client()?;
+    let user_id_text = user_id.to_string();
+    let form: [(&str, &str); 2] = [("email", email), ("metadata[user_id]", &user_id_text)];
+    let response = client
+        .post(format!("{}/v1/customers", settings.api_base))
+        .bearer_auth(&settings.secret_key)
+        .form(&form)
+        .send()
+        .await
+        .map_err(|_| StripeHttpError::CheckoutFailed)?;
+    if !response.status().is_success() {
+        tracing::warn!(
+            status = response.status().as_u16(),
+            "stripe customer creation rejected"
+        );
+        return Err(StripeHttpError::CheckoutFailed);
+    }
+    let body: Value = response
+        .json()
+        .await
+        .map_err(|_| StripeHttpError::CheckoutFailed)?;
+    let Some(customer_id) = body.get("id").and_then(Value::as_str) else {
+        return Err(StripeHttpError::CheckoutFailed);
+    };
+    sqlx::query(
+        "UPDATE users SET stripe_customer_id = $2 WHERE id = $1 AND stripe_customer_id IS NULL",
+    )
+    .bind(user_id)
+    .bind(customer_id)
+    .execute(&ctx.pool)
+    .await
+    .map_err(|_| StripeHttpError::BillingUnavailable)?;
+    let stored = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT stripe_customer_id FROM users WHERE id = $1",
+    )
+    .bind(user_id)
+    .fetch_one(&ctx.pool)
+    .await
+    .map_err(|_| StripeHttpError::BillingUnavailable)?;
+    Ok(stored.unwrap_or_else(|| customer_id.to_owned()))
+}
+
+fn stripe_client() -> Result<reqwest::Client, StripeHttpError> {
+    reqwest::Client::builder()
+        .timeout(STRIPE_HTTP_TIMEOUT)
+        .build()
+        .map_err(|_| StripeHttpError::CheckoutFailed)
+}
+
+// POST /api/billing/autopay/setup — a Checkout session in `setup` mode that
+// saves a card to the user's Stripe customer for off-session charging.
+async fn create_autopay_setup(
+    State(ctx): State<WebCtx>,
+    user: PortalUser,
+) -> Result<Json<Value>, StripeHttpError> {
+    let Some(stripe) = ctx.config.stripe.as_ref() else {
+        return Err(StripeHttpError::BillingUnavailable);
+    };
+    let customer = ensure_stripe_customer(&ctx, stripe, user.user_id, &user.email).await?;
+    let client = stripe_client()?;
+    let success_url = ctx.config.absolute_url("/credits?autopay=saved");
+    let cancel_url = ctx.config.absolute_url("/credits?autopay=cancelled");
+    let form: [(&str, &str); 4] = [
+        ("mode", "setup"),
+        ("customer", &customer),
+        ("success_url", &success_url),
+        ("cancel_url", &cancel_url),
+    ];
+    let response = client
+        .post(checkout_sessions_url(stripe))
+        .bearer_auth(&stripe.secret_key)
+        .form(&form)
+        .send()
+        .await
+        .map_err(|_| StripeHttpError::CheckoutFailed)?;
+    if !response.status().is_success() {
+        tracing::warn!(
+            status = response.status().as_u16(),
+            "stripe setup session rejected"
+        );
+        return Err(StripeHttpError::CheckoutFailed);
+    }
+    let body: Value = response
+        .json()
+        .await
+        .map_err(|_| StripeHttpError::CheckoutFailed)?;
+    let Some(url) = body.get("url").and_then(Value::as_str) else {
+        return Err(StripeHttpError::CheckoutFailed);
+    };
+    Ok(Json(serde_json::json!({ "url": url })))
+}
+
+#[derive(Debug, serde::Serialize)]
+struct AutopayStatus {
+    enabled: bool,
+    threshold_usd: Option<Decimal>,
+    topup_usd: Option<Decimal>,
+    consecutive_failures: i32,
+    card_setup_started: bool,
+}
+
+// GET /api/billing/autopay
+async fn get_autopay(
+    State(ctx): State<WebCtx>,
+    user: PortalUser,
+) -> Result<Json<AutopayStatus>, StripeHttpError> {
+    let row = sqlx::query_as::<_, (bool, Option<Decimal>, Option<Decimal>, i32, Option<String>)>(
+        r#"
+        SELECT autopay_enabled, autopay_threshold_usd, autopay_topup_usd,
+               autopay_consecutive_failures, stripe_customer_id
+        FROM users WHERE id = $1
+        "#,
+    )
+    .bind(user.user_id)
+    .fetch_one(&ctx.pool)
+    .await
+    .map_err(|_| StripeHttpError::BillingUnavailable)?;
+    Ok(Json(AutopayStatus {
+        enabled: row.0,
+        threshold_usd: row.1,
+        topup_usd: row.2,
+        consecutive_failures: row.3,
+        card_setup_started: row.4.is_some(),
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+struct AutopayUpdate {
+    enabled: bool,
+    threshold_usd: Option<Decimal>,
+    topup_usd: Option<Decimal>,
+}
+
+// PUT /api/billing/autopay
+async fn put_autopay(
+    State(ctx): State<WebCtx>,
+    user: PortalUser,
+    Json(update): Json<AutopayUpdate>,
+) -> Result<Json<AutopayStatus>, StripeHttpError> {
+    let Some(stripe) = ctx.config.stripe.as_ref() else {
+        return Err(StripeHttpError::BillingUnavailable);
+    };
+    if update.enabled {
+        let (Some(threshold), Some(topup)) = (update.threshold_usd, update.topup_usd) else {
+            return Err(StripeHttpError::MalformedEvent);
+        };
+        // The top-up buys credits exactly like a manual checkout, so it
+        // lives inside the same bounds; the threshold only needs to be a
+        // sane non-negative trigger below the ceiling.
+        validate_checkout_amount(topup, stripe).map_err(|_| StripeHttpError::MalformedEvent)?;
+        if threshold < Decimal::ZERO || threshold > stripe.checkout_max_usd {
+            return Err(StripeHttpError::MalformedEvent);
+        }
+        let updated = sqlx::query(
+            r#"
+            UPDATE users
+            SET autopay_enabled = TRUE,
+                autopay_threshold_usd = $2,
+                autopay_topup_usd = $3,
+                autopay_consecutive_failures = 0
+            WHERE id = $1 AND stripe_customer_id IS NOT NULL
+            "#,
+        )
+        .bind(user.user_id)
+        .bind(threshold)
+        .bind(topup)
+        .execute(&ctx.pool)
+        .await
+        .map_err(|_| StripeHttpError::BillingUnavailable)?
+        .rows_affected();
+        if updated == 0 {
+            // No Stripe customer yet: card setup has not even started.
+            return Err(StripeHttpError::MalformedEvent);
+        }
+    } else {
+        sqlx::query("UPDATE users SET autopay_enabled = FALSE WHERE id = $1")
+            .bind(user.user_id)
+            .execute(&ctx.pool)
+            .await
+            .map_err(|_| StripeHttpError::BillingUnavailable)?;
+    }
+    get_autopay(State(ctx), user).await
+}
+
+/// `payment_intent.*` webhook arm. Only intents this router purposed as
+/// autopay are consumed; everything else is acknowledged untouched. The
+/// corroboration bar matches the checkout arm: the credited amount is the
+/// money Stripe says it collected, and metadata must agree with it.
+async fn handle_autopay_intent_event(
+    ctx: &WebCtx,
+    event: &StripeEvent,
+) -> Result<Json<Value>, StripeHttpError> {
+    let object = &event.data.object;
+    let Some(intent_id) = object.get("id").and_then(Value::as_str) else {
+        return Err(StripeHttpError::MalformedEvent);
+    };
+    let metadata = object.get("metadata");
+    let purposed = metadata
+        .and_then(|metadata| metadata.get("purpose"))
+        .and_then(Value::as_str)
+        == Some(AUTOPAY_PURPOSE);
+    if !purposed {
+        return Ok(received());
+    }
+
+    if event.event_type == "payment_intent.payment_failed" {
+        let handled = billing::fail_autopay_intent(&ctx.pool, intent_id)
+            .await
+            .map_err(|_| StripeHttpError::BillingUnavailable)?;
+        tracing::warn!(payment_intent = %intent_id, handled, "autopay charge failed");
+        return Ok(received());
+    }
+
+    // payment_intent.succeeded
+    let user_id = metadata
+        .and_then(|metadata| metadata.get("user_id"))
+        .and_then(Value::as_str)
+        .and_then(|raw| Uuid::parse_str(raw).ok());
+    let credit_usd = metadata
+        .and_then(|metadata| metadata.get("credit_usd"))
+        .and_then(Value::as_str)
+        .and_then(|raw| raw.parse::<Decimal>().ok());
+    let amount_received = object.get("amount_received").and_then(Value::as_i64);
+    let currency = object
+        .get("currency")
+        .and_then(Value::as_str)
+        .map(str::to_ascii_lowercase);
+    let (Some(user_id), Some(credit_usd), Some(amount_received), Some(currency)) =
+        (user_id, credit_usd, amount_received, currency)
+    else {
+        tracing::warn!(payment_intent = %intent_id, "autopay success event missing corroboration fields");
+        return Err(StripeHttpError::MalformedEvent);
+    };
+    let Some(claimed_cents) = usd_to_cents(credit_usd) else {
+        return Err(StripeHttpError::MalformedEvent);
+    };
+    if claimed_cents != amount_received || currency != CHECKOUT_CURRENCY {
+        tracing::error!(
+            payment_intent = %intent_id,
+            metadata_user_id = %user_id,
+            claimed_cents,
+            amount_received,
+            %currency,
+            "autopay success event does not corroborate its metadata; crediting nothing"
+        );
+        return Err(StripeHttpError::AmountMismatch);
+    }
+    let outcome = billing::settle_autopay_intent(&ctx.pool, intent_id, Some((user_id, credit_usd)))
+        .await
+        .map_err(|_| StripeHttpError::BillingUnavailable)?;
+    tracing::info!(payment_intent = %intent_id, ?outcome, "autopay charge settled");
+    Ok(received())
+}
+
+/// One sweep pass: find users under their threshold and charge their saved
+/// card off-session. Public and synchronous so tests drive the exact code
+/// production loops; the loop itself is `RouterState::spawn_autopay_sweep`.
+pub async fn run_autopay_sweep_once(pool: &crate::sqlx::PgPool, settings: &StripeSettings) {
+    let candidates = match billing::autopay_candidates(pool, AUTOPAY_SWEEP_BATCH).await {
+        Ok(candidates) => candidates,
+        Err(error) => {
+            tracing::warn!(%error, "autopay sweep could not list candidates");
+            return;
+        }
+    };
+    for candidate in candidates {
+        if let Err(error) = charge_candidate(pool, settings, &candidate).await {
+            tracing::warn!(
+                user_id = %candidate.user_id,
+                %error,
+                "autopay charge attempt failed"
+            );
+        }
+    }
+}
+
+async fn charge_candidate(
+    pool: &crate::sqlx::PgPool,
+    settings: &StripeSettings,
+    candidate: &billing::AutopayCandidate,
+) -> anyhow::Result<()> {
+    let client = stripe_client().map_err(|_| anyhow::anyhow!("stripe client"))?;
+    // The saved card: newest attached card payment method.
+    let response = client
+        .get(format!(
+            "{}/v1/customers/{}/payment_methods",
+            settings.api_base, candidate.stripe_customer_id
+        ))
+        .query(&[("type", "card"), ("limit", "1")])
+        .bearer_auth(&settings.secret_key)
+        .send()
+        .await?;
+    let methods: Value = response.json().await?;
+    let Some(payment_method) = methods
+        .get("data")
+        .and_then(Value::as_array)
+        .and_then(|data| data.first())
+        .and_then(|method| method.get("id"))
+        .and_then(Value::as_str)
+    else {
+        // Enabled but no card saved (setup session abandoned): count it as
+        // a failed attempt so three sweeps disable autopay instead of
+        // probing Stripe forever.
+        billing::bump_autopay_failure(pool, candidate.user_id).await?;
+        anyhow::bail!("no saved card payment method");
+    };
+
+    let Some(amount_cents) = usd_to_cents(candidate.topup_usd) else {
+        billing::bump_autopay_failure(pool, candidate.user_id).await?;
+        anyhow::bail!("top-up amount is not a whole cent");
+    };
+    let amount = amount_cents.to_string();
+    let user_id = candidate.user_id.to_string();
+    let credit_usd = candidate.topup_usd.to_string();
+    let idempotency_key = Uuid::new_v4().to_string();
+    let form: [(&str, &str); 8] = [
+        ("amount", &amount),
+        ("currency", CHECKOUT_CURRENCY),
+        ("customer", &candidate.stripe_customer_id),
+        ("payment_method", payment_method),
+        ("off_session", "true"),
+        ("confirm", "true"),
+        ("metadata[purpose]", AUTOPAY_PURPOSE),
+        ("metadata[user_id]", &user_id),
+    ];
+    let mut form: Vec<(&str, &str)> = form.to_vec();
+    form.push(("metadata[credit_usd]", &credit_usd));
+    let response = client
+        .post(format!("{}/v1/payment_intents", settings.api_base))
+        .header("Idempotency-Key", &idempotency_key)
+        .bearer_auth(&settings.secret_key)
+        .form(&form)
+        .send()
+        .await?;
+    let status = response.status();
+    let body: Value = response.json().await.unwrap_or_default();
+
+    if status.is_success() {
+        let intent_id = body
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("payment intent response missing id"))?;
+        billing::record_autopay_intent(pool, intent_id, candidate.user_id, candidate.topup_usd)
+            .await?;
+        // A synchronously succeeded card charge is credited immediately;
+        // the webhook's replay lands on AlreadySettled. Any other status
+        // (processing) stays pending for the webhook to settle.
+        if body.get("status").and_then(Value::as_str) == Some("succeeded") {
+            billing::settle_autopay_intent(
+                pool,
+                intent_id,
+                Some((candidate.user_id, candidate.topup_usd)),
+            )
+            .await?;
+        }
+        return Ok(());
+    }
+
+    // Declines arrive as an error carrying the created (failed) intent.
+    // Record it and mark it failed so the failure counter moves and the
+    // pending-guard never wedges.
+    if let Some(intent_id) = body
+        .get("error")
+        .and_then(|error| error.get("payment_intent"))
+        .and_then(|intent| intent.get("id"))
+        .and_then(Value::as_str)
+    {
+        billing::record_autopay_intent(pool, intent_id, candidate.user_id, candidate.topup_usd)
+            .await?;
+        billing::fail_autopay_intent(pool, intent_id).await?;
+    } else {
+        billing::bump_autopay_failure(pool, candidate.user_id).await?;
+    }
+    anyhow::bail!("stripe declined the off-session charge (HTTP {status})");
 }
