@@ -176,9 +176,9 @@ async fn models_are_materialized_from_tiers_toml() {
         .expect("models response should contain a data array");
 
     assert_eq!(json["object"], "list");
-    // 6 tier ids + 14 concrete candidates (5 low-cost, 4 balanced, 2
-    // high-end, 3 pass-through).
-    assert_eq!(data.len(), 20);
+    // 8 tier ids + 16 concrete candidates (5 low-cost, 4 balanced, 2
+    // high-end, 5 pass-through).
+    assert_eq!(data.len(), 24);
     assert!(data.iter().all(|model| model["object"] == "model"));
     assert!(data.iter().any(|model| model["id"] == "zero/balanced"));
     assert!(
@@ -209,7 +209,7 @@ async fn models_are_materialized_from_tiers_toml() {
     );
     assert!(
         data.iter()
-            .any(|model| model["id"] == "openai/gpt-4.1-mini")
+            .any(|model| model["id"] == "openai/gpt-5.6-luna")
     );
 }
 
@@ -564,10 +564,12 @@ async fn sonnet_intro_pricing_expiry_withholds_high_end_and_nothing_else() {
         catalog.tiers.keys().map(String::as_str).collect::<Vec<_>>(),
         [
             "zero/balanced",
+            "zero/codex",
             "zero/fable-5",
             "zero/haiku-4-5",
             "zero/low-cost",
-            "zero/opus-5"
+            "zero/opus-5",
+            "zero/sol"
         ]
     );
     for model in [
@@ -612,7 +614,7 @@ async fn sonnet_intro_pricing_expiry_withholds_high_end_and_nothing_else() {
     // five surviving tier ids plus their twelve candidates, with no sonnet
     // row.
     let listed = listed_model_ids(RouterState::new(path)).await;
-    assert_eq!(listed.len(), 17);
+    assert_eq!(listed.len(), 21);
     assert!(listed.iter().any(|id| id == "zero/low-cost"));
     assert!(listed.iter().any(|id| id == "zero/balanced"));
     assert!(
@@ -637,13 +639,19 @@ async fn the_shipped_catalog_withholds_no_tier_today() {
         "the shipped catalog withholds {:?}",
         catalog.unavailable.keys().collect::<Vec<_>>()
     );
-    assert_eq!(catalog.tiers.len(), 6);
+    assert_eq!(catalog.tiers.len(), 8);
 }
 
 /// The routed tiers vs the pass-through tiers, told apart explicitly so
 /// each keeps its own structural promise (the test below enforces them).
 const ROUTED_TIERS: [&str; 3] = ["zero/low-cost", "zero/balanced", "zero/high-end"];
-const PASS_THROUGH_TIERS: [&str; 3] = ["zero/opus-5", "zero/fable-5", "zero/haiku-4-5"];
+const PASS_THROUGH_TIERS: [&str; 5] = [
+    "zero/opus-5",
+    "zero/fable-5",
+    "zero/haiku-4-5",
+    "zero/sol",
+    "zero/codex",
+];
 
 #[tokio::test]
 async fn every_shipped_tier_keeps_its_structural_promise() {
@@ -683,11 +691,16 @@ async fn every_shipped_tier_keeps_its_structural_promise() {
             assert_eq!(
                 (
                     candidate.rates.input_per_mtok,
+                    candidate.rates.cached_input_per_mtok,
                     candidate.rates.output_per_mtok
                 ),
-                (tier.rates.input_per_mtok, tier.rates.output_per_mtok),
-                "{tier_id} must sell at list (flagship shape): margin is \
-                 volume discounts, never markup"
+                (
+                    tier.rates.input_per_mtok,
+                    tier.rates.cached_input_per_mtok,
+                    tier.rates.output_per_mtok
+                ),
+                "{tier_id} must sell at list on EVERY dimension (cached \
+                 input included): margin is volume discounts, never markup"
             );
         } else {
             panic!("{tier_id} is neither routed nor pass-through — decide");

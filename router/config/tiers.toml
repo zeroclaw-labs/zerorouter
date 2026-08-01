@@ -103,30 +103,22 @@ input_per_mtok = 1.30
 cached_input_per_mtok = 0.10
 output_per_mtok = 2.60
 
-# OpenAI first-party. gpt-4.1-mini and not a gpt-5.x, after a three-layer
-# live investigation (2026-07-31): the chat-completions wire rejects
-# gpt-5.x over `max_tokens`; the pinned OpenAiModelProvider is a hybrid
-# whose non-streaming path IS that chat wire (captured on a local sink);
-# and the pinned OpenAiResponsesModelProvider speaks the right wire on both
-# paths but hardcodes `usage: None` — which this router's
-# metered-actuals-only policy correctly refuses to bill
-# (`metering_unavailable`, observed live). The unlock is upstream in
-# zeroclaw-providers: parse the Responses API usage object into
-# `TokenUsage`. When that lands and the pin advances, swap this rung to
-# gpt-5.6-luna (price-verified 0.20/0.02/1.20 — newer and cheaper) on an
-# `openai_responses` adapter arm (15 lines: OpenAiResponsesModelProvider
-# with credential/max_tokens/timeout, api_url when base_url is set — it was
-# built and live-tested during this investigation but deliberately not
-# committed while unmeterable). Inert until OPENAI_API_KEY is set.
+# OpenAI first-party on ZeroRouter's OWN Responses wire client
+# (`src/wire.rs`, the owned-wire decision): the pinned adapters cannot
+# serve gpt-5.x — the chat wire rejects the family and the pinned Responses
+# provider discards usage (the three-layer investigation of 2026-07-31,
+# preserved in this file's history). gpt-5.6-luna is the 5.6 family's small
+# tier, price-verified 2026-07-31 (0.20/0.02/1.20): newer AND cheaper than
+# the gpt-4.1-mini rung it replaces. Inert until OPENAI_API_KEY is set.
 [[tiers."zero/balanced".candidates]]
-id = "openai/gpt-4.1-mini"
+id = "openai/gpt-5.6-luna"
 provider = "openai"
-model = "gpt-4.1-mini"
+model = "gpt-5.6-luna"
 
 [tiers."zero/balanced".candidates.rates]
-input_per_mtok = 0.40
-cached_input_per_mtok = 0.10
-output_per_mtok = 1.60
+input_per_mtok = 0.20
+cached_input_per_mtok = 0.02
+output_per_mtok = 1.20
 
 # Bedrock-only private-beta fallback. This is priced at the canonical Bedrock
 # us-east-1 on-demand rate while the tier keeps its existing sell rate.
@@ -216,6 +208,34 @@ model = "claude-fable-5"
 input_per_mtok = 10.00
 cached_input_per_mtok = 1.00
 output_per_mtok = 50.00
+
+[tiers."zero/sol"]
+[tiers."zero/sol".rates]
+input_per_mtok = 5.00
+cached_input_per_mtok = 0.50
+output_per_mtok = 30.00
+[[tiers."zero/sol".candidates]]
+id = "openai/gpt-5.6-sol"
+provider = "openai"
+model = "gpt-5.6-sol"
+[tiers."zero/sol".candidates.rates]
+input_per_mtok = 5.00
+cached_input_per_mtok = 0.50
+output_per_mtok = 30.00
+
+[tiers."zero/codex"]
+[tiers."zero/codex".rates]
+input_per_mtok = 1.75
+cached_input_per_mtok = 0.175
+output_per_mtok = 14.00
+[[tiers."zero/codex".candidates]]
+id = "openai/gpt-5.3-codex"
+provider = "openai"
+model = "gpt-5.3-codex"
+[tiers."zero/codex".candidates.rates]
+input_per_mtok = 1.75
+cached_input_per_mtok = 0.175
+output_per_mtok = 14.00
 
 [tiers."zero/haiku-4-5"]
 [tiers."zero/haiku-4-5".rates]

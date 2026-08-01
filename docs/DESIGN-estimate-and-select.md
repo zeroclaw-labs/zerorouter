@@ -1098,6 +1098,20 @@ is real again.)
 | 7 | 7c | **Value fees**: savings-share activation (measured-basis rows only) and, after its own shadow period, per-request per-success (migration 0007). Gated per segment: decayed n ≥ 500 and fleet ≥ 5k settled priority-mode requests; trailing-30d p90 reservation coverage in [0.85, 0.97]; trailing-30d clamp-loss < $10/segment **and** hit-rate < 0.5%; reference calibration coverage ≥ 80% of fee-eligible rows; savings-statement spot-audit clean | yes |
 | ∥ | 5, 8 | ZC preset + device-flow client (v0.9.0 milestone); upstream asks (`StreamEvent` finish-reason payload — retires the heuristic and flips `finish_reason_source`; publishable `zeroclaw-api`). None block the sequence | no |
 
+> **Decision (2026-08-01): ZeroRouter owns its upstream wire layer.** The
+> founding assumption — reuse zeroclaw-providers' adapters via the git pin —
+> is reversed, incrementally. The pin's correctness bar is agent-grade
+> (usage optional; the pinned Responses provider hardcodes `usage: None`);
+> this router's bar is billing-grade, and the recorded costs of the mismatch
+> (unmeterable gpt-5.x/codex, synthesized `finish_reason`, unobservable
+> `content_filter` — all standing "upstream asks" above) were structural,
+> not incidental. `router/src/wire.rs` holds ZR-owned clients scoped to
+> ZR's own traffic shapes; the first is the OpenAI Responses wire, live-
+> verified metering the whole gpt-5.x line. Adapters migrate one at a time
+> behind the inventory enum; the pin shrinks with each and the upstream-ask
+> list dies with it. Never bill a tokenizer estimate remains absolute: own
+> the wire, bill the provider's own usage report from it.
+
 ## Risks & mitigations
 
 1. **Estimate gaming / adverse selection.** Signatures, estimator cells,

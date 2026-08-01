@@ -35,10 +35,9 @@
     },
     {
       "key": "openai",
-      "adapter": "openai_compatible",
+      "adapter": "openai_responses",
       "credential_env": "OPENAI_API_KEY",
-      "secret_name": "openai-api-key",
-      "base_url": "https://api.openai.com/v1"
+      "secret_name": "openai-api-key"
     },
     {
       "key": "minimax",

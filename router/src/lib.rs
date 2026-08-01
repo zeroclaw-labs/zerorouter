@@ -21,6 +21,7 @@ pub mod stripe;
 #[cfg(feature = "testing")]
 pub mod testing;
 pub mod web;
+pub mod wire;
 
 pub use api::{RouterState, app};
 pub use config::{DEFAULT_TIER_CONFIG_PATH, TIER_CONFIG_PATH_ENV, TierCatalog, load_tier_catalog};
