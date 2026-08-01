@@ -85,6 +85,20 @@ export interface CheckoutSession {
   url: string
 }
 
+export interface AutopayStatus {
+  enabled: boolean
+  threshold_usd: string | null
+  topup_usd: string | null
+  consecutive_failures: number
+  card_setup_started: boolean
+}
+
+export interface AutopayUpdate {
+  enabled: boolean
+  threshold_usd?: string
+  topup_usd?: string
+}
+
 export interface DeviceLookup {
   client_id: string
   key_name: string
@@ -158,6 +172,10 @@ export const api = {
   ledger: (limit: number) => request<LedgerEntry[]>('GET', `/api/billing/ledger?limit=${limit}`),
   checkout: (amountUsd: string) =>
     request<CheckoutSession>('POST', '/api/billing/checkout', { amount_usd: amountUsd }),
+  autopay: () => request<AutopayStatus>('GET', '/api/billing/autopay'),
+  putAutopay: (update: AutopayUpdate) =>
+    request<AutopayStatus>('PUT', '/api/billing/autopay', update),
+  autopaySetup: () => request<CheckoutSession>('POST', '/api/billing/autopay/setup'),
   deviceLookup: (userCode: string) =>
     request<DeviceLookup>('POST', '/api/device/lookup', { user_code: userCode }),
   deviceApprove: (userCode: string) =>

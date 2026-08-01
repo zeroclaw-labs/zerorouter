@@ -34,6 +34,19 @@ function normalizeAmount(raw: string): string | null {
   return `${int}.${frac}`
 }
 
+/**
+ * Like `normalizeAmount`, but for the autopay threshold: any non-negative
+ * amount is a valid trigger, including $0.00 (top up only once exhausted).
+ */
+function normalizeThreshold(raw: string): string | null {
+  const cleaned = raw.trim().replace(/^\$/, '').replace(/,/g, '')
+  const match = /^(\d{1,6})(?:\.(\d{1,2}))?$/.exec(cleaned)
+  if (match === null) return null
+  const int = match[1].replace(/^0+(?=\d)/, '')
+  const frac = (match[2] ?? '').padEnd(2, '0')
+  return `${int}.${frac}`
+}
+
 export function Credits() {
   const user = useUser()
   const { refresh } = useAuth()
@@ -41,6 +54,7 @@ export function Credits() {
   const [searchParams, setSearchParams] = useSearchParams()
 
   const ledger = useLoad(() => api.ledger(50), [])
+  const autopay = useLoad(() => api.autopay(), [])
   const [notice, setNotice] = useState<'success' | 'cancelled' | null>(null)
   const [preset, setPreset] = useState<string | null>('25.00')
   const [custom, setCustom] = useState('')
@@ -48,21 +62,44 @@ export function Credits() {
   const [submitting, setSubmitting] = useState(false)
   const [unavailable, setUnavailable] = useState(false)
 
-  // Absorb the ?checkout=success|cancelled return from Stripe exactly once.
+  const [autopayNotice, setAutopayNotice] = useState<'saved' | 'cancelled' | null>(null)
+  const [threshold, setThreshold] = useState('')
+  const [topup, setTopup] = useState('')
+  const [autopayError, setAutopayError] = useState<string | null>(null)
+  const [autopaySubmitting, setAutopaySubmitting] = useState(false)
+  const [cardSubmitting, setCardSubmitting] = useState(false)
+
+  // Absorb the ?checkout=success|cancelled and ?autopay=saved|cancelled
+  // returns from Stripe exactly once.
   useEffect(() => {
-    const flag = searchParams.get('checkout')
-    if (flag === 'success' || flag === 'cancelled') {
-      setNotice(flag)
-      const next = new URLSearchParams(searchParams)
-      next.delete('checkout')
-      setSearchParams(next, { replace: true })
-      if (flag === 'success') {
+    const checkout = searchParams.get('checkout')
+    const card = searchParams.get('autopay')
+    if (checkout === null && card === null) return
+    const next = new URLSearchParams(searchParams)
+    if (checkout === 'success' || checkout === 'cancelled') {
+      setNotice(checkout)
+      if (checkout === 'success') {
         void refresh()
         ledger.reload()
       }
     }
+    next.delete('checkout')
+    if (card === 'saved' || card === 'cancelled') {
+      setAutopayNotice(card)
+      if (card === 'saved') autopay.reload()
+    }
+    next.delete('autopay')
+    setSearchParams(next, { replace: true })
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [searchParams])
+
+  // Seed the autopay form from the saved settings whenever they (re)load.
+  useEffect(() => {
+    if (autopay.data !== null) {
+      setThreshold(autopay.data.threshold_usd ?? '')
+      setTopup(autopay.data.topup_usd ?? '')
+    }
+  }, [autopay.data])
 
   if (user === null) return null
 
@@ -91,6 +128,70 @@ export function Credits() {
     }
   }
 
+  async function saveCard() {
+    setCardSubmitting(true)
+    try {
+      const session = await api.autopaySetup()
+      window.location.assign(session.url)
+    } catch (err) {
+      setCardSubmitting(false)
+      if (err instanceof ApiError && err.code === 'billing_unavailable') {
+        setUnavailable(true)
+      } else {
+        toast(err instanceof Error ? err.message : 'Could not start the card setup.', 'error')
+      }
+    }
+  }
+
+  async function saveAutopay(event: FormEvent) {
+    event.preventDefault()
+    const trigger = normalizeThreshold(threshold)
+    const amount = normalizeAmount(topup)
+    if (trigger === null) {
+      setAutopayError('Enter a threshold of $0.00 or more, with up to two decimals.')
+      return
+    }
+    if (amount === null) {
+      setAutopayError('Enter a top-up of at least $5.00, with up to two decimals.')
+      return
+    }
+    setAutopayError(null)
+    setAutopaySubmitting(true)
+    try {
+      await api.putAutopay({ enabled: true, threshold_usd: trigger, topup_usd: amount })
+      toast('Autopay is on.', 'success')
+      autopay.reload()
+    } catch (err) {
+      if (err instanceof ApiError && err.code === 'billing_unavailable') {
+        setUnavailable(true)
+      } else if (err instanceof ApiError && err.status === 400) {
+        // The server refuses to arm autopay without a saved card or with
+        // out-of-bounds amounts; its generic 400 reads badly here, so name
+        // the two real causes.
+        setAutopayError(
+          'Autopay needs a saved card and in-bounds amounts — save a card first, then check the threshold and top-up.',
+        )
+      } else {
+        toast(err instanceof Error ? err.message : 'Could not update autopay.', 'error')
+      }
+    } finally {
+      setAutopaySubmitting(false)
+    }
+  }
+
+  async function disableAutopay() {
+    setAutopaySubmitting(true)
+    try {
+      await api.putAutopay({ enabled: false })
+      toast('Autopay is off.')
+      autopay.reload()
+    } catch (err) {
+      toast(err instanceof Error ? err.message : 'Could not update autopay.', 'error')
+    } finally {
+      setAutopaySubmitting(false)
+    }
+  }
+
   return (
     <div className="page">
       <header className="page-head">
@@ -106,6 +207,16 @@ export function Credits() {
       {notice === 'cancelled' && (
         <Banner kind="info" onDismiss={() => setNotice(null)}>
           Checkout cancelled — you have not been charged.
+        </Banner>
+      )}
+      {autopayNotice === 'saved' && (
+        <Banner kind="success" onDismiss={() => setAutopayNotice(null)}>
+          Card saved. Turn on autopay below to put it to work.
+        </Banner>
+      )}
+      {autopayNotice === 'cancelled' && (
+        <Banner kind="info" onDismiss={() => setAutopayNotice(null)}>
+          Card setup cancelled — nothing was saved.
         </Banner>
       )}
 
@@ -164,6 +275,120 @@ export function Credits() {
                   : 'Buy credits'}
             </button>
           </form>
+        )}
+      </section>
+
+      <section className="panel">
+        <div className="panel-head">
+          <h2>Autopay</h2>
+          {autopay.data !== null && (
+            <Badge tone={autopay.data.enabled ? 'good' : 'neutral'}>
+              {autopay.data.enabled ? 'on' : 'off'}
+            </Badge>
+          )}
+        </div>
+        {unavailable ? (
+          <div className="panel-body">
+            <Banner kind="info">Billing is not enabled on this deployment.</Banner>
+          </div>
+        ) : autopay.loading ? (
+          <Loading />
+        ) : autopay.error !== null ? (
+          <div className="panel-body">
+            <Banner kind="error">{autopay.error}</Banner>
+          </div>
+        ) : autopay.data === null ? null : (
+          <div className="panel-body autopay-body">
+            <p className="field-hint">
+              When your balance falls below the threshold, ZeroRouter charges your saved card for
+              the top-up and adds it as credits — same rates, no interruption. Three failed charges
+              in a row turn autopay off.
+            </p>
+            <div className="card-row">
+              <span className="dim">
+                {autopay.data.card_setup_started
+                  ? 'A card setup has been started or completed with Stripe.'
+                  : 'No card on file yet.'}
+              </span>
+              <button
+                className="btn btn-ghost"
+                type="button"
+                onClick={saveCard}
+                disabled={cardSubmitting}
+              >
+                {cardSubmitting
+                  ? 'Redirecting to Stripe…'
+                  : autopay.data.card_setup_started
+                    ? 'Replace card'
+                    : 'Save a card'}
+              </button>
+            </div>
+            {autopay.data.consecutive_failures >= 3 && !autopay.data.enabled && (
+              <Banner kind="error">
+                Autopay turned itself off after three failed charges. Replace the card, then turn
+                it back on.
+              </Banner>
+            )}
+            {autopay.data.consecutive_failures > 0 && autopay.data.enabled && (
+              <Banner kind="info">
+                {autopay.data.consecutive_failures} failed charge
+                {autopay.data.consecutive_failures === 1 ? '' : 's'} so far — autopay turns itself
+                off after three in a row.
+              </Banner>
+            )}
+            <form className="autopay-form" onSubmit={saveAutopay}>
+              <div className="autopay-amounts">
+                <label>
+                  Top up when the balance falls below
+                  <input
+                    className="field"
+                    inputMode="decimal"
+                    placeholder="10.00"
+                    aria-label="Autopay threshold in dollars"
+                    value={threshold}
+                    onChange={(e) => {
+                      setThreshold(e.target.value)
+                      setAutopayError(null)
+                    }}
+                  />
+                </label>
+                <label>
+                  Top-up amount
+                  <input
+                    className="field"
+                    inputMode="decimal"
+                    placeholder="25.00"
+                    aria-label="Autopay top-up in dollars"
+                    value={topup}
+                    onChange={(e) => {
+                      setTopup(e.target.value)
+                      setAutopayError(null)
+                    }}
+                  />
+                </label>
+              </div>
+              {autopayError !== null && <Banner kind="error">{autopayError}</Banner>}
+              <div className="autopay-actions">
+                <button className="btn btn-primary" type="submit" disabled={autopaySubmitting}>
+                  {autopaySubmitting
+                    ? 'Saving…'
+                    : autopay.data.enabled
+                      ? 'Save changes'
+                      : 'Turn on autopay'}
+                </button>
+                {autopay.data.enabled && (
+                  <button
+                    className="btn btn-ghost"
+                    type="button"
+                    onClick={disableAutopay}
+                    disabled={autopaySubmitting}
+                  >
+                    Turn off
+                  </button>
+                )}
+              </div>
+            </form>
+          </div>
         )}
       </section>
 
