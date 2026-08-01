@@ -32,6 +32,20 @@
       "credential_env": "TOGETHER_API_KEY",
       "secret_name": "together-api-key",
       "base_url": "https://api.together.ai/v1"
+    },
+    {
+      "key": "openai",
+      "adapter": "openai_compatible",
+      "credential_env": "OPENAI_API_KEY",
+      "secret_name": "openai-api-key",
+      "base_url": "https://api.openai.com/v1"
+    },
+    {
+      "key": "minimax",
+      "adapter": "openai_compatible",
+      "credential_env": "MINIMAX_API_KEY",
+      "secret_name": "minimax-api-key",
+      "base_url": "https://api.minimax.io/v1"
     }
   ]
 }
