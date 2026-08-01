@@ -458,6 +458,16 @@ async fn unpaid_session_is_acknowledged_without_crediting() {
 
 /// A `payment_intent.*` event with independently controllable money fields,
 /// exactly like the checkout fixture above.
+/// The provenance mark the sweep stamps into metadata: an HMAC over the
+/// money-bearing fields keyed by the webhook secret — computed here exactly
+/// as `stripe::autopay_provenance` computes it, because a fixture that
+/// cannot produce it is what the forgery test below relies on.
+fn provenance_mark(user_id: Uuid, credit_usd: &str) -> String {
+    let mut mac = Hmac::<Sha256>::new_from_slice(SECRET.as_bytes()).expect("hmac accepts any key");
+    mac.update(format!("zerorouter_autopay|{user_id}|{credit_usd}").as_bytes());
+    hex::encode(mac.finalize().into_bytes())
+}
+
 fn autopay_intent_event(
     event_type: &str,
     intent_id: &str,
@@ -465,6 +475,27 @@ fn autopay_intent_event(
     metadata_credit_usd: &str,
     amount_received: i64,
     currency: &str,
+) -> String {
+    autopay_intent_event_with_mark(
+        event_type,
+        intent_id,
+        user_id,
+        metadata_credit_usd,
+        amount_received,
+        currency,
+        &provenance_mark(user_id, metadata_credit_usd),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn autopay_intent_event_with_mark(
+    event_type: &str,
+    intent_id: &str,
+    user_id: Uuid,
+    metadata_credit_usd: &str,
+    amount_received: i64,
+    currency: &str,
+    provenance: &str,
 ) -> String {
     json!({
         "id": "evt_test",
@@ -479,6 +510,7 @@ fn autopay_intent_event(
                     "purpose": "zerorouter_autopay",
                     "user_id": user_id.to_string(),
                     "credit_usd": metadata_credit_usd,
+                    "provenance": provenance,
                 },
             }
         }
@@ -618,6 +650,44 @@ async fn three_consecutive_failures_disable_autopay() {
     .expect("user must query");
     assert_eq!(failures, 3);
     assert!(!enabled, "the third strike disables autopay");
+}
+
+/// The co-tenant forgery pin: another integration in the same Stripe
+/// account can write our metadata SHAPE, but not our HMAC — a purposed
+/// event without valid provenance is acknowledged untouched: no credit, no
+/// intent row, no strike.
+#[tokio::test]
+async fn a_purposed_event_without_provenance_mints_nothing() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let user_id = create_user(&pool, "autopay-cotenant").await;
+    enable_autopay(&pool, user_id).await;
+    let intent_id = format!("pi_test_{}", Uuid::new_v4().simple());
+    let payload = autopay_intent_event_with_mark(
+        "payment_intent.succeeded",
+        &intent_id,
+        user_id,
+        "25",
+        2500,
+        "usd",
+        "deadbeef00000000000000000000000000000000000000000000000000000000",
+    );
+    let (status, _) = post_webhook(&pool, &payload).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "acknowledged so Stripe stops retrying"
+    );
+    assert_eq!(balance_of(&pool, user_id).await, Decimal::ZERO);
+    let rows = query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM stripe_autopay_intents WHERE payment_intent_id = $1",
+    )
+    .bind(&intent_id)
+    .fetch_one(&pool)
+    .await
+    .expect("intents must query");
+    assert_eq!(rows, 0, "an unproven event leaves no record at all");
 }
 
 /// Foreign payment intents — no autopay purpose — are acknowledged and

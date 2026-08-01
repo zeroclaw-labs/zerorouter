@@ -2325,6 +2325,10 @@ pub struct ProviderCogs {
     pub walk_cogs_usd: Decimal,
     pub served_requests: i64,
     pub unpriced_rows: i64,
+    /// Attempt rows whose basis is a token-count floor rather than a
+    /// provider usage report: included in `walk_cogs_usd`, counted here so
+    /// the sum reads as the labeled lower bound it is.
+    pub estimated_rows: i64,
 }
 
 /// The treasury view's substrate: per-provider spend over a trailing
@@ -2345,11 +2349,18 @@ pub async fn provider_cogs(pool: &PgPool, days: i32) -> Result<Vec<ProviderCogs>
     .bind(days)
     .fetch_all(pool)
     .await?;
-    let walk = sqlx::query_as::<_, (String, Decimal, i64)>(
+    // Window caveat, documented rather than hidden: settled rows window on
+    // settle time, attempt rows on (backdated) attempt-start time, so a
+    // request spanning the cutoff splits its two sides across adjacent
+    // windows. Provider invoices bucket on their own clocks anyway; this
+    // view reconciles to the dollar over any window materially wider than
+    // one request's lifetime.
+    let walk = sqlx::query_as::<_, (String, Decimal, i64, i64)>(
         r#"
         SELECT upstream_provider,
                COALESCE(SUM(cost_basis_usd), 0),
-               COUNT(*) FILTER (WHERE cost_basis_usd IS NULL)
+               COUNT(*) FILTER (WHERE cost_basis_usd IS NULL),
+               COUNT(*) FILTER (WHERE tokens_estimated)
         FROM request_attempts
         WHERE NOT served AND ts >= NOW() - ($1 * INTERVAL '1 day')
         GROUP BY upstream_provider
@@ -2369,11 +2380,12 @@ pub async fn provider_cogs(pool: &PgPool, days: i32) -> Result<Vec<ProviderCogs>
                     walk_cogs_usd: Decimal::ZERO,
                     served_requests,
                     unpriced_rows: unpriced,
+                    estimated_rows: 0,
                 },
             )
         })
         .collect();
-    for (provider, walk_cogs_usd, unpriced) in walk {
+    for (provider, walk_cogs_usd, unpriced, estimated) in walk {
         let entry = by_provider
             .entry(provider.clone())
             .or_insert_with(|| ProviderCogs {
@@ -2382,9 +2394,11 @@ pub async fn provider_cogs(pool: &PgPool, days: i32) -> Result<Vec<ProviderCogs>
                 walk_cogs_usd: Decimal::ZERO,
                 served_requests: 0,
                 unpriced_rows: 0,
+                estimated_rows: 0,
             });
         entry.walk_cogs_usd = walk_cogs_usd;
         entry.unpriced_rows += unpriced;
+        entry.estimated_rows = estimated;
     }
     Ok(by_provider.into_values().collect())
 }

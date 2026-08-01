@@ -53,6 +53,12 @@ fn mock_stripe(decline: bool) -> (Router, Arc<AtomicUsize>) {
             }),
         )
         .route(
+            "/v1/payment_intents/{intent}",
+            get(|Path(intent): Path<String>| async move {
+                axum::Json(json!({"id": intent, "status": "succeeded"}))
+            }),
+        )
+        .route(
             "/v1/payment_intents",
             post(|State(state): State<MockStripe>, body: String| async move {
                 state.charges.fetch_add(1, Ordering::SeqCst);
@@ -230,4 +236,53 @@ async fn the_sweep_charges_credits_and_strikes_out() {
         3,
         "a struck-out user is never charged again"
     );
+}
+
+/// The reconciliation pass: a pending intent whose terminal webhook never
+/// arrived is queried at Stripe by the next sweep and settled by what
+/// actually happened — one lost message can no longer wedge the user's
+/// charge slot forever.
+#[tokio::test]
+async fn a_stale_pending_intent_is_reconciled_from_stripe() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    disarm_all_autopay(&pool).await;
+    let (app, charges) = mock_stripe(false);
+    let base = serve(app).await;
+    let user_id = autopay_user(&pool, "reconcile", 10, 25).await;
+
+    // A real-id pending intent, backdated past the reconciliation cutoff —
+    // the state a lost webhook leaves behind. It also occupies the
+    // one-pending slot, so the sweep must NOT create a second charge.
+    let intent_id = format!("pi_mock_stale_{}", Uuid::new_v4().simple());
+    query(
+        r#"
+        INSERT INTO stripe_autopay_intents
+            (payment_intent_id, user_id, amount_usd, created_at)
+        VALUES ($1, $2, 25, NOW() - INTERVAL '45 minutes')
+        "#,
+    )
+    .bind(&intent_id)
+    .bind(user_id)
+    .execute(&pool)
+    .await
+    .expect("stale intent must insert");
+
+    run_autopay_sweep_once(&pool, &settings(&base)).await;
+
+    assert_eq!(
+        charges.load(Ordering::SeqCst),
+        0,
+        "reconciliation settles the existing charge; it never creates one"
+    );
+    assert_eq!(balance_of(&pool, user_id).await, Decimal::from(25));
+    let status = query_scalar::<_, String>(
+        "SELECT status FROM stripe_autopay_intents WHERE payment_intent_id = $1",
+    )
+    .bind(&intent_id)
+    .fetch_one(&pool)
+    .await
+    .expect("intent must query");
+    assert_eq!(status, "succeeded");
 }

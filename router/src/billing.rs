@@ -384,28 +384,88 @@ pub async fn autopay_candidates(
         .collect())
 }
 
-/// Record a freshly created PaymentIntent. `ON CONFLICT DO NOTHING`: the
-/// webhook's metadata-recovery path may have raced us and inserted first,
-/// and the PK is the exactly-once guard either way.
-pub async fn record_autopay_intent(
+/// Claim a user for one charge attempt BEFORE any money moves, by
+/// inserting the pending row under a local id carrying the Stripe
+/// idempotency key (`local_<key>`). The one-pending-per-user partial
+/// unique index makes the claim exclusive: a racing sweep's claim fails
+/// and that sweep skips the user, so two sweeps can never charge the same
+/// user twice — and because the idempotency key survives in the row, a
+/// lost Stripe response is retried with the SAME key and lands on the same
+/// PaymentIntent rather than a second charge.
+pub async fn claim_autopay_attempt(
     pool: &PgPool,
-    payment_intent_id: &str,
     user_id: Uuid,
     amount_usd: Decimal,
-) -> Result<(), sqlx::Error> {
-    sqlx::query(
+    idempotency_key: &str,
+) -> Result<bool, sqlx::Error> {
+    let claimed = sqlx::query(
         r#"
         INSERT INTO stripe_autopay_intents (payment_intent_id, user_id, amount_usd)
         VALUES ($1, $2, $3)
-        ON CONFLICT (payment_intent_id) DO NOTHING
+        ON CONFLICT DO NOTHING
         "#,
     )
-    .bind(payment_intent_id)
+    .bind(format!("local_{idempotency_key}"))
     .bind(user_id)
     .bind(amount_usd)
     .execute(pool)
-    .await?;
+    .await?
+    .rows_affected();
+    Ok(claimed > 0)
+}
+
+/// Attach the real PaymentIntent id to a claim once Stripe has answered.
+/// If the webhook's recovery path already inserted the real id (it raced
+/// the rename), the local claim is dropped in its favor.
+pub async fn attach_autopay_intent(
+    pool: &PgPool,
+    idempotency_key: &str,
+    payment_intent_id: &str,
+) -> Result<(), sqlx::Error> {
+    let renamed = sqlx::query(
+        r#"
+        UPDATE stripe_autopay_intents
+        SET payment_intent_id = $2, updated_at = NOW()
+        WHERE payment_intent_id = $1
+          AND NOT EXISTS (
+              SELECT 1 FROM stripe_autopay_intents WHERE payment_intent_id = $2
+          )
+        "#,
+    )
+    .bind(format!("local_{idempotency_key}"))
+    .bind(payment_intent_id)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    if renamed == 0 {
+        sqlx::query("DELETE FROM stripe_autopay_intents WHERE payment_intent_id = $1")
+            .bind(format!("local_{idempotency_key}"))
+            .execute(pool)
+            .await?;
+    }
     Ok(())
+}
+
+/// Pending intents older than the cutoff, for the sweep's reconciliation
+/// pass: local claims whose Stripe response was lost (retried by
+/// idempotency key) and real intents whose terminal webhook never arrived
+/// (queried by id). Without this, one lost webhook wedges a user's
+/// one-pending-per-user slot forever — the review's finding.
+pub async fn stale_autopay_intents(
+    pool: &PgPool,
+    older_than_minutes: i32,
+) -> Result<Vec<(String, Uuid, Decimal)>, sqlx::Error> {
+    sqlx::query_as::<_, (String, Uuid, Decimal)>(
+        r#"
+        SELECT payment_intent_id, user_id, amount_usd
+        FROM stripe_autopay_intents
+        WHERE status = 'pending'
+          AND created_at < NOW() - ($1 * INTERVAL '1 minute')
+        "#,
+    )
+    .bind(older_than_minutes)
+    .fetch_all(pool)
+    .await
 }
 
 /// What settling an autopay charge did.
@@ -450,6 +510,34 @@ pub async fn settle_autopay_intent(
         .bind(amount_usd)
         .execute(&mut *transaction)
         .await?;
+        // The stored row is what will be credited; if it disagrees with
+        // what the webhook corroborated Stripe actually collected, refuse
+        // to credit rather than pick a side — a mismatch is either a
+        // partial capture or tampering, and both deserve eyes, not money
+        // movement (review finding: the stored $100 must not be credited
+        // on a $1 collection).
+        let stored = sqlx::query_as::<_, (Uuid, Decimal)>(
+            "SELECT user_id, amount_usd FROM stripe_autopay_intents WHERE payment_intent_id = $1",
+        )
+        .bind(payment_intent_id)
+        .fetch_one(&mut *transaction)
+        .await?;
+        if stored != (user_id, amount_usd) {
+            sqlx::query(
+                r#"
+                UPDATE stripe_autopay_intents
+                SET status = 'failed', updated_at = NOW()
+                WHERE payment_intent_id = $1 AND status = 'pending'
+                "#,
+            )
+            .bind(payment_intent_id)
+            .execute(&mut *transaction)
+            .await?;
+            transaction.commit().await?;
+            return Err(sqlx::Error::Protocol(format!(
+                "autopay intent {payment_intent_id} stored amount disagrees with the                  corroborated collection; refusing to credit"
+            )));
+        }
     }
 
     let Some((user_id, amount_usd)) = sqlx::query_as::<_, (Uuid, Decimal)>(
@@ -564,6 +652,32 @@ pub async fn bump_autopay_failure(pool: &PgPool, user_id: Uuid) -> Result<(), sq
         "#,
     )
     .bind(user_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Insert a terminal-bound charge record recovered from a webhook (used by
+/// the failed arm when the sweep-side record was lost). Idempotent on the
+/// intent id; the one-pending-per-user index may reject it while a local
+/// claim still holds the slot, in which case reconciliation resolves the
+/// claim first and the webhook retry lands cleanly.
+pub async fn record_autopay_charge(
+    pool: &PgPool,
+    payment_intent_id: &str,
+    user_id: Uuid,
+    amount_usd: Decimal,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"
+        INSERT INTO stripe_autopay_intents (payment_intent_id, user_id, amount_usd)
+        VALUES ($1, $2, $3)
+        ON CONFLICT DO NOTHING
+        "#,
+    )
+    .bind(payment_intent_id)
+    .bind(user_id)
+    .bind(amount_usd)
     .execute(pool)
     .await?;
     Ok(())

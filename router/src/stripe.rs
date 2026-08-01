@@ -838,6 +838,33 @@ mod tests {
 
 const AUTOPAY_PURPOSE: &str = "zerorouter_autopay";
 const AUTOPAY_SWEEP_BATCH: i64 = 16;
+/// Pending intents older than this are reconciled against Stripe directly.
+const AUTOPAY_RECONCILE_AFTER_MINUTES: i32 = 30;
+
+/// Provenance mark carried in PaymentIntent metadata: an HMAC over the
+/// money-bearing fields, keyed by the webhook secret. The webhook's
+/// metadata-recovery path only trusts events that carry it, so another
+/// integration in the same Stripe account writing our metadata SHAPE
+/// cannot mint credits — it does not hold the key (review finding).
+/// Length-guarded constant-time comparison, same shape as
+/// `auth::constant_time_eq`: XOR-fold every byte so a mismatch position is
+/// not observable through timing.
+fn constant_time_str_eq(left: &str, right: &str) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.bytes()
+        .zip(right.bytes())
+        .fold(0u8, |acc, (l, r)| acc | (l ^ r))
+        == 0
+}
+
+fn autopay_provenance(settings: &StripeSettings, user_id: Uuid, credit_usd: &str) -> String {
+    let mut mac = Hmac::<sha2::Sha256>::new_from_slice(settings.webhook_secret.as_bytes())
+        .expect("HMAC accepts any key length");
+    mac.update(format!("{AUTOPAY_PURPOSE}|{user_id}|{credit_usd}").as_bytes());
+    hex::encode(mac.finalize().into_bytes())
+}
 
 /// Ensure the user has a Stripe Customer, creating one on first use. The
 /// stored id wins any race: a concurrent creation that loses the UPDATE
@@ -1012,6 +1039,41 @@ async fn put_autopay(
         if threshold < Decimal::ZERO || threshold > stripe.checkout_max_usd {
             return Err(StripeHttpError::MalformedEvent);
         }
+        // A Stripe customer exists the moment setup STARTS; only a saved
+        // card proves it finished. Enabling without one would burn the
+        // three-strikes budget on a card that was never there (review
+        // finding), so verify against Stripe at enable time.
+        let customer = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT stripe_customer_id FROM users WHERE id = $1",
+        )
+        .bind(user.user_id)
+        .fetch_one(&ctx.pool)
+        .await
+        .map_err(|_| StripeHttpError::BillingUnavailable)?;
+        let Some(customer) = customer else {
+            return Err(StripeHttpError::MalformedEvent);
+        };
+        let client = stripe_client()?;
+        let methods: Value = client
+            .get(format!(
+                "{}/v1/customers/{customer}/payment_methods",
+                stripe.api_base
+            ))
+            .query(&[("type", "card"), ("limit", "1")])
+            .bearer_auth(&stripe.secret_key)
+            .send()
+            .await
+            .map_err(|_| StripeHttpError::BillingUnavailable)?
+            .json()
+            .await
+            .map_err(|_| StripeHttpError::BillingUnavailable)?;
+        let has_card = methods
+            .get("data")
+            .and_then(Value::as_array)
+            .is_some_and(|data| !data.is_empty());
+        if !has_card {
+            return Err(StripeHttpError::MalformedEvent);
+        }
         let updated = sqlx::query(
             r#"
             UPDATE users
@@ -1064,7 +1126,45 @@ async fn handle_autopay_intent_event(
         return Ok(received());
     }
 
+    let stripe = ctx
+        .config
+        .stripe
+        .as_ref()
+        .ok_or(StripeHttpError::BillingUnavailable)?;
+    let user_id_raw = metadata
+        .and_then(|metadata| metadata.get("user_id"))
+        .and_then(Value::as_str);
+    let credit_usd_raw = metadata
+        .and_then(|metadata| metadata.get("credit_usd"))
+        .and_then(Value::as_str);
+    let provenance = metadata
+        .and_then(|metadata| metadata.get("provenance"))
+        .and_then(Value::as_str);
+    let provenance_ok = match (user_id_raw, credit_usd_raw, provenance) {
+        (Some(user), Some(credit), Some(mark)) => Uuid::parse_str(user).is_ok_and(|user| {
+            constant_time_str_eq(mark, &autopay_provenance(stripe, user, credit))
+        }),
+        _ => false,
+    };
+    if !provenance_ok {
+        // Purposed like ours but not provably ours: acknowledged untouched.
+        // Metadata is writable by any integration sharing the Stripe
+        // account; the HMAC is not.
+        tracing::warn!(payment_intent = %intent_id, "autopay-shaped event without valid provenance; ignoring");
+        return Ok(received());
+    }
+
     if event.event_type == "payment_intent.payment_failed" {
+        // Recovery applies to failures too: a decline whose sweep-side
+        // record was lost must still exist as a terminal row, or the claim
+        // slot and strike ledger drift from Stripe's reality.
+        let user_id = user_id_raw.and_then(|raw| Uuid::parse_str(raw).ok());
+        let credit_usd = credit_usd_raw.and_then(|raw| raw.parse::<Decimal>().ok());
+        if let (Some(user_id), Some(credit_usd)) = (user_id, credit_usd) {
+            billing::record_autopay_charge(&ctx.pool, intent_id, user_id, credit_usd)
+                .await
+                .map_err(|_| StripeHttpError::BillingUnavailable)?;
+        }
         let handled = billing::fail_autopay_intent(&ctx.pool, intent_id)
             .await
             .map_err(|_| StripeHttpError::BillingUnavailable)?;
@@ -1073,14 +1173,8 @@ async fn handle_autopay_intent_event(
     }
 
     // payment_intent.succeeded
-    let user_id = metadata
-        .and_then(|metadata| metadata.get("user_id"))
-        .and_then(Value::as_str)
-        .and_then(|raw| Uuid::parse_str(raw).ok());
-    let credit_usd = metadata
-        .and_then(|metadata| metadata.get("credit_usd"))
-        .and_then(Value::as_str)
-        .and_then(|raw| raw.parse::<Decimal>().ok());
+    let user_id = user_id_raw.and_then(|raw| Uuid::parse_str(raw).ok());
+    let credit_usd = credit_usd_raw.and_then(|raw| raw.parse::<Decimal>().ok());
     let amount_received = object.get("amount_received").and_then(Value::as_i64);
     let currency = object
         .get("currency")
@@ -1113,10 +1207,11 @@ async fn handle_autopay_intent_event(
     Ok(received())
 }
 
-/// One sweep pass: find users under their threshold and charge their saved
-/// card off-session. Public and synchronous so tests drive the exact code
-/// production loops; the loop itself is `RouterState::spawn_autopay_sweep`.
+/// One sweep pass: reconcile stale pending charges, then find users under
+/// their threshold and charge their saved card off-session. Public and
+/// synchronous so tests drive the exact code production loops.
 pub async fn run_autopay_sweep_once(pool: &crate::sqlx::PgPool, settings: &StripeSettings) {
+    reconcile_stale_intents(pool, settings).await;
     let candidates = match billing::autopay_candidates(pool, AUTOPAY_SWEEP_BATCH).await {
         Ok(candidates) => candidates,
         Err(error) => {
@@ -1135,17 +1230,120 @@ pub async fn run_autopay_sweep_once(pool: &crate::sqlx::PgPool, settings: &Strip
     }
 }
 
+/// Pending rows older than the cutoff mean a webhook or a Stripe response
+/// was lost. Local claims are retried against Stripe under their original
+/// idempotency key (the same PaymentIntent answers, never a second
+/// charge); real intents are queried by id and settled or failed by what
+/// Stripe says actually happened. Without this pass, one lost message
+/// wedges the user's one-pending-per-user slot forever.
+async fn reconcile_stale_intents(pool: &crate::sqlx::PgPool, settings: &StripeSettings) {
+    let stale = match billing::stale_autopay_intents(pool, AUTOPAY_RECONCILE_AFTER_MINUTES).await {
+        Ok(stale) => stale,
+        Err(error) => {
+            tracing::warn!(%error, "autopay reconciliation could not list stale intents");
+            return;
+        }
+    };
+    for (intent_id, user_id, amount_usd) in stale {
+        let outcome = if let Some(idempotency_key) = intent_id.strip_prefix("local_") {
+            replay_charge(pool, settings, user_id, amount_usd, idempotency_key).await
+        } else {
+            reconcile_real_intent(pool, settings, &intent_id, user_id, amount_usd).await
+        };
+        if let Err(error) = outcome {
+            tracing::warn!(payment_intent = %intent_id, %error, "autopay reconciliation failed");
+        }
+    }
+}
+
+async fn reconcile_real_intent(
+    pool: &crate::sqlx::PgPool,
+    settings: &StripeSettings,
+    intent_id: &str,
+    user_id: Uuid,
+    amount_usd: Decimal,
+) -> anyhow::Result<()> {
+    let client = stripe_client().map_err(|_| anyhow::anyhow!("stripe client"))?;
+    let response = client
+        .get(format!(
+            "{}/v1/payment_intents/{intent_id}",
+            settings.api_base
+        ))
+        .bearer_auth(&settings.secret_key)
+        .send()
+        .await?;
+    if !response.status().is_success() {
+        anyhow::bail!("stripe lookup rejected (HTTP {})", response.status());
+    }
+    let body: Value = response.json().await?;
+    match body.get("status").and_then(Value::as_str) {
+        Some("succeeded") => {
+            billing::settle_autopay_intent(pool, intent_id, Some((user_id, amount_usd))).await?;
+        }
+        Some("processing") => {}
+        _ => {
+            billing::fail_autopay_intent(pool, intent_id).await?;
+        }
+    }
+    Ok(())
+}
+
 async fn charge_candidate(
     pool: &crate::sqlx::PgPool,
     settings: &StripeSettings,
     candidate: &billing::AutopayCandidate,
 ) -> anyhow::Result<()> {
+    // Claim BEFORE any money can move: the one-pending-per-user index makes
+    // this exclusive, so overlapping sweeps cannot double-charge, and the
+    // idempotency key survives in the claim row so a lost response is
+    // replayed against the SAME PaymentIntent (review findings).
+    let idempotency_key = Uuid::new_v4().simple().to_string();
+    if !billing::claim_autopay_attempt(
+        pool,
+        candidate.user_id,
+        candidate.topup_usd,
+        &idempotency_key,
+    )
+    .await?
+    {
+        anyhow::bail!("user already has a charge in flight");
+    }
+    replay_charge(
+        pool,
+        settings,
+        candidate.user_id,
+        candidate.topup_usd,
+        &idempotency_key,
+    )
+    .await
+}
+
+/// Create (or idempotently re-create) the off-session charge for a claim.
+/// Shared by the first attempt and reconciliation replays; Stripe's
+/// idempotency layer guarantees both paths observe one PaymentIntent.
+async fn replay_charge(
+    pool: &crate::sqlx::PgPool,
+    settings: &StripeSettings,
+    user_id: Uuid,
+    topup_usd: Decimal,
+    idempotency_key: &str,
+) -> anyhow::Result<()> {
     let client = stripe_client().map_err(|_| anyhow::anyhow!("stripe client"))?;
-    // The saved card: newest attached card payment method.
+    let Some(customer) = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT stripe_customer_id FROM users WHERE id = $1",
+    )
+    .bind(user_id)
+    .fetch_one(pool)
+    .await?
+    else {
+        billing::fail_autopay_intent(pool, &format!("local_{idempotency_key}")).await?;
+        anyhow::bail!("user has no stripe customer");
+    };
+
     let response = client
         .get(format!(
-            "{}/v1/customers/{}/payment_methods",
-            settings.api_base, candidate.stripe_customer_id
+            "{}/v1/customers/{customer}/payment_methods",
+            settings.api_base
         ))
         .query(&[("type", "card"), ("limit", "1")])
         .bearer_auth(&settings.secret_key)
@@ -1159,36 +1357,37 @@ async fn charge_candidate(
         .and_then(|method| method.get("id"))
         .and_then(Value::as_str)
     else {
-        // Enabled but no card saved (setup session abandoned): count it as
-        // a failed attempt so three sweeps disable autopay instead of
-        // probing Stripe forever.
-        billing::bump_autopay_failure(pool, candidate.user_id).await?;
+        // No saved card: the claim itself becomes the terminal failed
+        // intent, which both counts the strike and releases the slot —
+        // exactly once even under racing sweeps, because only the claim
+        // holder reaches here.
+        billing::fail_autopay_intent(pool, &format!("local_{idempotency_key}")).await?;
         anyhow::bail!("no saved card payment method");
     };
 
-    let Some(amount_cents) = usd_to_cents(candidate.topup_usd) else {
-        billing::bump_autopay_failure(pool, candidate.user_id).await?;
+    let Some(amount_cents) = usd_to_cents(topup_usd) else {
+        billing::fail_autopay_intent(pool, &format!("local_{idempotency_key}")).await?;
         anyhow::bail!("top-up amount is not a whole cent");
     };
     let amount = amount_cents.to_string();
-    let user_id = candidate.user_id.to_string();
-    let credit_usd = candidate.topup_usd.to_string();
-    let idempotency_key = Uuid::new_v4().to_string();
-    let form: [(&str, &str); 8] = [
+    let user_id_text = user_id.to_string();
+    let credit_usd = topup_usd.to_string();
+    let provenance = autopay_provenance(settings, user_id, &credit_usd);
+    let form: Vec<(&str, &str)> = vec![
         ("amount", &amount),
         ("currency", CHECKOUT_CURRENCY),
-        ("customer", &candidate.stripe_customer_id),
+        ("customer", &customer),
         ("payment_method", payment_method),
         ("off_session", "true"),
         ("confirm", "true"),
         ("metadata[purpose]", AUTOPAY_PURPOSE),
-        ("metadata[user_id]", &user_id),
+        ("metadata[user_id]", &user_id_text),
+        ("metadata[credit_usd]", &credit_usd),
+        ("metadata[provenance]", &provenance),
     ];
-    let mut form: Vec<(&str, &str)> = form.to_vec();
-    form.push(("metadata[credit_usd]", &credit_usd));
     let response = client
         .post(format!("{}/v1/payment_intents", settings.api_base))
-        .header("Idempotency-Key", &idempotency_key)
+        .header("Idempotency-Key", idempotency_key)
         .bearer_auth(&settings.secret_key)
         .form(&form)
         .send()
@@ -1201,36 +1400,26 @@ async fn charge_candidate(
             .get("id")
             .and_then(Value::as_str)
             .ok_or_else(|| anyhow::anyhow!("payment intent response missing id"))?;
-        billing::record_autopay_intent(pool, intent_id, candidate.user_id, candidate.topup_usd)
-            .await?;
-        // A synchronously succeeded card charge is credited immediately;
-        // the webhook's replay lands on AlreadySettled. Any other status
-        // (processing) stays pending for the webhook to settle.
+        billing::attach_autopay_intent(pool, idempotency_key, intent_id).await?;
         if body.get("status").and_then(Value::as_str) == Some("succeeded") {
-            billing::settle_autopay_intent(
-                pool,
-                intent_id,
-                Some((candidate.user_id, candidate.topup_usd)),
-            )
-            .await?;
+            billing::settle_autopay_intent(pool, intent_id, Some((user_id, topup_usd))).await?;
         }
         return Ok(());
     }
 
-    // Declines arrive as an error carrying the created (failed) intent.
-    // Record it and mark it failed so the failure counter moves and the
-    // pending-guard never wedges.
+    // Declines arrive as an error carrying the created (failed) intent:
+    // attach it to the claim and mark it failed, so the strike counts and
+    // the slot frees.
     if let Some(intent_id) = body
         .get("error")
         .and_then(|error| error.get("payment_intent"))
         .and_then(|intent| intent.get("id"))
         .and_then(Value::as_str)
     {
-        billing::record_autopay_intent(pool, intent_id, candidate.user_id, candidate.topup_usd)
-            .await?;
+        billing::attach_autopay_intent(pool, idempotency_key, intent_id).await?;
         billing::fail_autopay_intent(pool, intent_id).await?;
     } else {
-        billing::bump_autopay_failure(pool, candidate.user_id).await?;
+        billing::fail_autopay_intent(pool, &format!("local_{idempotency_key}")).await?;
     }
-    anyhow::bail!("stripe declined the off-session charge (HTTP {status})");
+    anyhow::bail!("stripe declined the off-session charge (HTTP {status})")
 }
