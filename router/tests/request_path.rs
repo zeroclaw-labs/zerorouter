@@ -846,6 +846,11 @@ async fn non_streaming_timeout_releases_the_reservation_without_charge() {
     assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
     let body = json_body(response).await;
     state.wait_for_background_tasks().await;
+    // Back to real time before the DB assertions: sqlx arms its acquire
+    // timeout around every checkout, and under a paused clock any park on the
+    // Postgres socket auto-advances straight into that timer — a PoolTimedOut
+    // flake with two warm connections sitting free.
+    tokio::time::resume();
     assert_eq!(body["error"]["code"], "upstream_timeout");
 
     // The non-streaming deadline releases the reservation at zero cost, and so
@@ -1337,6 +1342,9 @@ async fn streaming_timeout_releases_the_reservation_without_charge() {
     assert_eq!(response.status(), StatusCode::OK);
     let chunks = sse_chunks(response).await;
     state.wait_for_background_tasks().await;
+    // Real time for the DB assertions — see
+    // `non_streaming_timeout_releases_the_reservation_without_charge` for why.
+    tokio::time::resume();
 
     assert_eq!(chunks.len(), 1, "only the error chunk reaches the client");
     assert_eq!(chunks[0]["error"]["code"], "upstream_timeout");
@@ -2190,6 +2198,11 @@ async fn non_streaming_backoff_is_spent_between_retries() {
         .expect("completion request should complete");
     assert_eq!(response.status(), StatusCode::OK);
     state.wait_for_background_tasks().await;
+    // Real time for the DB assertion below — see
+    // `non_streaming_timeout_releases_the_reservation_without_charge` for why.
+    // Elapsed only grows from here, and the bound is a floor, so measuring
+    // after the resume stays sound.
+    tokio::time::resume();
 
     assert_eq!(primary.call_count(), 3);
     assert!(
@@ -2510,6 +2523,9 @@ async fn non_streaming_deadline_ends_the_walk_instead_of_falling_through() {
     assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
     let body = json_body(response).await;
     state.wait_for_background_tasks().await;
+    // Real time for the DB assertions — see
+    // `non_streaming_timeout_releases_the_reservation_without_charge` for why.
+    tokio::time::resume();
     assert_eq!(body["error"]["code"], "upstream_timeout");
 
     assert_eq!(primary.call_count(), 1);
@@ -2755,6 +2771,9 @@ async fn non_streaming_each_candidate_starts_its_backoff_schedule_over() {
         .expect("completion request should complete");
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     state.wait_for_background_tasks().await;
+    // Real time for the DB assertion below — see
+    // `non_streaming_timeout_releases_the_reservation_without_charge` for why.
+    tokio::time::resume();
 
     assert_eq!(primary.call_count(), 3);
     assert_eq!(secondary.call_count(), 3);
