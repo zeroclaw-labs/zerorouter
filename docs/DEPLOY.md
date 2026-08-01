@@ -36,9 +36,13 @@ defines it:
   `DB_PASSWORD` plus `DB_SSL_ROOT_CERT`; this path always connects with
   `verify-full` TLS against the checksum-pinned RDS CA bundle shipped in
   the image at `/etc/zerorouter/rds-global-bundle.pem`.
-- **Provider keys** (`ANTHROPIC_API_KEY`, `BEDROCK_API_KEY`, …) are injected
-  from AWS Secrets Manager via task-definition `secrets`, never plain env in
-  Terraform or the task definition.
+- **Provider keys** are injected from AWS Secrets Manager via
+  task-definition `secrets`, never plain env in Terraform or the task
+  definition. The full set the shipped `providers.json` can consume:
+  `ANTHROPIC_API_KEY`, `BEDROCK_API_KEY`, `DEEPINFRA_API_KEY`,
+  `FIREWORKS_API_KEY`, `TOGETHER_API_KEY`, `OPENAI_API_KEY`,
+  `MINIMAX_API_KEY`. A provider whose key is absent is simply not a
+  candidate — set only what the catalog actually routes to.
 - **Platform**: ARM64 on Fargate; the workflow builds `linux/arm64` only.
 
 The deploy workflow re-registers the task-definition family's latest ACTIVE
@@ -109,6 +113,30 @@ The beta environment currently deploys from the old TypeScript-era
 >   beta only.
 >
 > Treat the HTTPS listener as a blocker for any external user traffic.
+
+## Autopay: what deployment must provide
+
+Autopay ships enabled in the binary — there is no feature flag. What it
+needs from the environment:
+
+- **The same Stripe secrets as checkout** (`STRIPE_SECRET_KEY`,
+  `STRIPE_WEBHOOK_SECRET`). No new variables. (`STRIPE_API_BASE` exists as
+  an override for pointing the client at a mock in tests; leave it unset in
+  any real deployment.)
+- **Webhook event subscriptions.** The Stripe webhook endpoint must be
+  subscribed to **`payment_intent.succeeded`** and
+  **`payment_intent.payment_failed`** in addition to the checkout events
+  (`checkout.session.completed`,
+  `checkout.session.async_payment_succeeded`). Without the payment-intent
+  pair, autopay charges settle only through the 30-minute reconciliation
+  sweep — credits still arrive exactly once, just late.
+- **A single serving deployment per database** is assumed by the sweep's
+  claim rows (one pending intent per user); the ECS service already runs
+  one task. Scaling out is safe for correctness (claims are DB-enforced)
+  but will multiply Stripe list/read traffic.
+
+The sweep itself (charge candidates, reconcile stale intents, three-strikes
+disable) starts with serve mode and needs no configuration.
 
 ## Credit enforcement is on by default
 
