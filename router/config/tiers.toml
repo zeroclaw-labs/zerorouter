@@ -175,3 +175,58 @@ model = "us.anthropic.claude-sonnet-5"
 input_per_mtok = 2.00
 cached_input_per_mtok = 0.20
 output_per_mtok = 10.00
+
+# ---------------------------------------------------------------------------
+# Pass-through catalog: one single-candidate tier per model, sell = verified
+# provider list price (flagship shape, 0% markup — legal by the margin rule).
+# This is the second pricing model beside the routed zero/* tiers: customers
+# who want a SPECIFIC newest model select it here at list; margin on these
+# rows arrives when provider volume discounts lower our basis below the
+# unchanged sell, with no schema change — the per-row
+# cost_usd − cost_basis_usd ledger shows exactly when that flips. Routed
+# tiers remain the premium abstraction (margin from routing; later, fees).
+# Prices verified 2026-07-31 on platform.claude.com/docs pricing; cache-read
+# rates are the provider's "cache hits" column (0.1 × input).
+# ---------------------------------------------------------------------------
+
+[tiers."zero/opus-5"]
+[tiers."zero/opus-5".rates]
+input_per_mtok = 5.00
+cached_input_per_mtok = 0.50
+output_per_mtok = 25.00
+[[tiers."zero/opus-5".candidates]]
+id = "anthropic/claude-opus-5"
+provider = "anthropic"
+model = "claude-opus-5"
+[tiers."zero/opus-5".candidates.rates]
+input_per_mtok = 5.00
+cached_input_per_mtok = 0.50
+output_per_mtok = 25.00
+
+[tiers."zero/fable-5"]
+[tiers."zero/fable-5".rates]
+input_per_mtok = 10.00
+cached_input_per_mtok = 1.00
+output_per_mtok = 50.00
+[[tiers."zero/fable-5".candidates]]
+id = "anthropic/claude-fable-5"
+provider = "anthropic"
+model = "claude-fable-5"
+[tiers."zero/fable-5".candidates.rates]
+input_per_mtok = 10.00
+cached_input_per_mtok = 1.00
+output_per_mtok = 50.00
+
+[tiers."zero/haiku-4-5"]
+[tiers."zero/haiku-4-5".rates]
+input_per_mtok = 1.00
+cached_input_per_mtok = 0.10
+output_per_mtok = 5.00
+[[tiers."zero/haiku-4-5".candidates]]
+id = "anthropic/claude-haiku-4-5"
+provider = "anthropic"
+model = "claude-haiku-4-5-20251001"
+[tiers."zero/haiku-4-5".candidates.rates]
+input_per_mtok = 1.00
+cached_input_per_mtok = 0.10
+output_per_mtok = 5.00

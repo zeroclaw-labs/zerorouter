@@ -176,8 +176,9 @@ async fn models_are_materialized_from_tiers_toml() {
         .expect("models response should contain a data array");
 
     assert_eq!(json["object"], "list");
-    // 3 tier ids + 11 concrete candidates (5 low-cost, 4 balanced, 2 high-end).
-    assert_eq!(data.len(), 14);
+    // 6 tier ids + 14 concrete candidates (5 low-cost, 4 balanced, 2
+    // high-end, 3 pass-through).
+    assert_eq!(data.len(), 20);
     assert!(data.iter().all(|model| model["object"] == "model"));
     assert!(data.iter().any(|model| model["id"] == "zero/balanced"));
     assert!(
@@ -197,6 +198,15 @@ async fn models_are_materialized_from_tiers_toml() {
             .any(|model| model["id"] == "bedrock/deepseek.v3.2")
     );
     assert!(data.iter().any(|model| model["id"] == "minimax/MiniMax-M3"));
+    assert!(data.iter().any(|model| model["id"] == "zero/opus-5"));
+    assert!(
+        data.iter()
+            .any(|model| model["id"] == "anthropic/claude-fable-5")
+    );
+    assert!(
+        data.iter()
+            .any(|model| model["id"] == "anthropic/claude-haiku-4-5")
+    );
     assert!(
         data.iter()
             .any(|model| model["id"] == "openai/gpt-4.1-mini")
@@ -552,7 +562,13 @@ async fn sonnet_intro_pricing_expiry_withholds_high_end_and_nothing_else() {
     // through their tier ids and through their pinned candidates alike.
     assert_eq!(
         catalog.tiers.keys().map(String::as_str).collect::<Vec<_>>(),
-        ["zero/balanced", "zero/low-cost"]
+        [
+            "zero/balanced",
+            "zero/fable-5",
+            "zero/haiku-4-5",
+            "zero/low-cost",
+            "zero/opus-5"
+        ]
     );
     for model in [
         "zero/low-cost",
@@ -592,10 +608,11 @@ async fn sonnet_intro_pricing_expiry_withholds_high_end_and_nothing_else() {
     assert_eq!(sell.input_per_mtok, Some(2.00));
     assert_eq!(sell.output_per_mtok, Some(10.00));
 
-    // And the public catalog stops advertising what it cannot serve: the two
-    // surviving tier ids plus their nine candidates, with no sonnet row.
+    // And the public catalog stops advertising what it cannot serve: the
+    // five surviving tier ids plus their twelve candidates, with no sonnet
+    // row.
     let listed = listed_model_ids(RouterState::new(path)).await;
-    assert_eq!(listed.len(), 11);
+    assert_eq!(listed.len(), 17);
     assert!(listed.iter().any(|id| id == "zero/low-cost"));
     assert!(listed.iter().any(|id| id == "zero/balanced"));
     assert!(
@@ -620,29 +637,60 @@ async fn the_shipped_catalog_withholds_no_tier_today() {
         "the shipped catalog withholds {:?}",
         catalog.unavailable.keys().collect::<Vec<_>>()
     );
-    assert_eq!(catalog.tiers.len(), 3);
+    assert_eq!(catalog.tiers.len(), 6);
 }
 
+/// The routed tiers vs the pass-through tiers, told apart explicitly so
+/// each keeps its own structural promise (the test below enforces them).
+const ROUTED_TIERS: [&str; 3] = ["zero/low-cost", "zero/balanced", "zero/high-end"];
+const PASS_THROUGH_TIERS: [&str; 3] = ["zero/opus-5", "zero/fable-5", "zero/haiku-4-5"];
+
 #[tokio::test]
-async fn every_shipped_tier_keeps_two_candidates_across_two_providers() {
-    // Availability floor for the removal above: a tier with one rung, or two
-    // rungs behind a single provider credential, has no fallback when that
-    // upstream is down.
+async fn every_shipped_tier_keeps_its_structural_promise() {
+    // Two deliberate shapes, each pinned. ROUTED tiers keep the
+    // availability floor: at least two rungs across at least two providers,
+    // so no single upstream outage silences a tier. PASS-THROUGH tiers are
+    // the opposite promise — the customer asked for one specific model at
+    // list price, so exactly one candidate, priced at the flagship shape
+    // (basis == sell on every dimension): the margin on these rows is
+    // volume discounts, never markup or routing. Every shipped tier must be
+    // one shape or the other — a tier in neither list is a policy decision
+    // nobody made.
     let catalog = load_tier_catalog(&tier_config_path())
         .await
         .expect("bundled tier catalog must load");
 
     for (tier_id, tier) in &catalog.tiers {
-        let providers = tier
-            .candidates
-            .iter()
-            .map(|candidate| candidate.provider.as_str())
-            .collect::<std::collections::BTreeSet<_>>();
-        assert!(
-            tier.candidates.len() >= 2 && providers.len() >= 2,
-            "{tier_id} has {} candidate(s) across {} provider(s)",
-            tier.candidates.len(),
-            providers.len()
-        );
+        if ROUTED_TIERS.contains(&tier_id.as_str()) {
+            let providers = tier
+                .candidates
+                .iter()
+                .map(|candidate| candidate.provider.as_str())
+                .collect::<std::collections::BTreeSet<_>>();
+            assert!(
+                tier.candidates.len() >= 2 && providers.len() >= 2,
+                "{tier_id} has {} candidate(s) across {} provider(s)",
+                tier.candidates.len(),
+                providers.len()
+            );
+        } else if PASS_THROUGH_TIERS.contains(&tier_id.as_str()) {
+            assert_eq!(
+                tier.candidates.len(),
+                1,
+                "{tier_id} is pass-through: one model, one rung"
+            );
+            let candidate = &tier.candidates[0];
+            assert_eq!(
+                (
+                    candidate.rates.input_per_mtok,
+                    candidate.rates.output_per_mtok
+                ),
+                (tier.rates.input_per_mtok, tier.rates.output_per_mtok),
+                "{tier_id} must sell at list (flagship shape): margin is \
+                 volume discounts, never markup"
+            );
+        } else {
+            panic!("{tier_id} is neither routed nor pass-through — decide");
+        }
     }
 }
