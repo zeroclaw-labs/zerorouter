@@ -27,6 +27,20 @@
 //! upstream body verbatim (sanitized downstream by the retention layer), so
 //! `retry::classify`'s status/heuristic taxonomy reads them exactly as it
 //! reads the pinned adapters' errors.
+//!
+//! Increment 2: the Anthropic Messages wire (`/v1/messages`), replacing the
+//! pinned Anthropic adapter on first-party traffic. The billing-grade
+//! difference is usage NORMALIZATION, not just extraction: Anthropic's
+//! `usage.input_tokens` EXCLUDES cache reads and cache writes, while
+//! ZeroRouter's cost function (`openai::usage_cost`) prices `cached` as a
+//! subset of `input` — the OpenAI convention every other wire reports in.
+//! This client folds `cache_read_input_tokens` and
+//! `cache_creation_input_tokens` back into the input total and reports the
+//! read subset as `cached_input_tokens`, so an Anthropic response meters on
+//! the same axes as everything else. (Cache WRITES bill at full input rate
+//! here; Anthropic charges 1.25× for them, a COGS rounding this router
+//! accepts — ZeroRouter's compat layer never emits `cache_control`, so the
+//! subset is zero on today's traffic.)
 
 use std::time::Duration;
 
@@ -597,6 +611,655 @@ impl ModelProvider for OpenAiResponsesWire {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Anthropic Messages wire
+// ---------------------------------------------------------------------------
+
+/// Default endpoint for the Anthropic Messages API.
+const MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages";
+
+/// The Messages API version this wire speaks. Anthropic versions by header,
+/// not by URL; bump deliberately, with the parser.
+const ANTHROPIC_VERSION: &str = "2023-06-01";
+
+/// ZeroRouter's own Messages-API client: chat and streaming both on
+/// `/v1/messages`, usage lifted and normalized on both paths.
+pub struct AnthropicWire {
+    alias: String,
+    api_url: String,
+    credential: String,
+    /// Required by the Messages API on every request, so not optional here.
+    max_tokens: u32,
+    http: reqwest::Client,
+}
+
+impl AnthropicWire {
+    #[must_use]
+    pub fn new(
+        alias: &str,
+        credential: &str,
+        api_url: Option<&str>,
+        max_tokens: u32,
+        timeout_secs: u64,
+    ) -> Self {
+        Self {
+            alias: alias.to_owned(),
+            api_url: api_url
+                .map(|url| url.trim_end_matches('/').to_owned())
+                .unwrap_or_else(|| MESSAGES_URL.to_owned()),
+            credential: credential.to_owned(),
+            max_tokens,
+            http: reqwest::Client::builder()
+                .timeout(Duration::from_secs(timeout_secs))
+                .build()
+                .unwrap_or_default(),
+        }
+    }
+
+    fn request_body(
+        &self,
+        model: &str,
+        messages: &[ChatMessage],
+        tools: Option<&[zeroclaw_api::tool::ToolSpec]>,
+        temperature: Option<f64>,
+        stream: bool,
+    ) -> Value {
+        let (system, turns) = build_anthropic_messages(messages);
+        let mut body = json!({
+            "model": model,
+            "messages": turns,
+            "max_tokens": self.max_tokens,
+            "stream": stream,
+        });
+        if !system.is_empty() {
+            body["system"] = json!(system);
+        }
+        if let Some(tools) = tools.filter(|tools| !tools.is_empty()) {
+            body["tools"] = json!(
+                tools
+                    .iter()
+                    .map(|tool| {
+                        json!({
+                            "name": tool.name,
+                            "description": tool.description,
+                            "input_schema": tool.parameters,
+                        })
+                    })
+                    .collect::<Vec<Value>>()
+            );
+        }
+        if let Some(temperature) = temperature {
+            body["temperature"] = json!(temperature);
+        }
+        body
+    }
+}
+
+/// Append a content block to the last turn if it has `role`, else open a new
+/// turn. The Messages API requires strict user/assistant alternation, and
+/// ZR's packing legitimately produces runs — parallel tool results pack as
+/// consecutive `tool` messages that must land in ONE user turn.
+fn push_anthropic_block(turns: &mut Vec<Value>, role: &str, block: Value) {
+    if let Some(last) = turns.last_mut()
+        && last["role"] == role
+        && let Some(content) = last["content"].as_array_mut()
+    {
+        content.push(block);
+        return;
+    }
+    turns.push(json!({ "role": role, "content": [block] }));
+}
+
+/// Build `(system, messages)` from ZeroRouter's packed provider messages —
+/// the same five shapes `openai::to_provider_message` emits. Tool results
+/// map to `tool_result` blocks in USER turns (the Messages API's shape for
+/// them); `reasoning_content` from packed envelopes is dropped, matching the
+/// Responses wire's no-round-trip rule.
+fn build_anthropic_messages(messages: &[ChatMessage]) -> (String, Vec<Value>) {
+    let mut system_parts: Vec<&str> = Vec::new();
+    let mut turns = Vec::new();
+
+    for message in messages {
+        match message.role.as_str() {
+            "system" => system_parts.push(&message.content),
+            "user" => push_anthropic_block(
+                &mut turns,
+                "user",
+                json!({ "type": "text", "text": message.content }),
+            ),
+            "assistant" => {
+                // Same envelope rule as the Responses wire: only ZR's own
+                // packing markers make an envelope; a model that merely
+                // answered in JSON round-trips as plain text.
+                if let Ok(envelope) = serde_json::from_str::<Value>(&message.content)
+                    && envelope.is_object()
+                    && (envelope.get("tool_calls").is_some()
+                        || envelope.get("reasoning_content").is_some())
+                {
+                    if let Some(text) = envelope
+                        .get("content")
+                        .and_then(Value::as_str)
+                        .filter(|text| !text.trim().is_empty())
+                    {
+                        push_anthropic_block(
+                            &mut turns,
+                            "assistant",
+                            json!({ "type": "text", "text": text }),
+                        );
+                    }
+                    if let Some(calls) = envelope.get("tool_calls").and_then(Value::as_array) {
+                        for call in calls {
+                            let id = call.get("id").and_then(Value::as_str).unwrap_or_default();
+                            let name = call.get("name").and_then(Value::as_str).unwrap_or_default();
+                            // ZR packs arguments as a JSON STRING; the
+                            // Messages API wants `input` as an object.
+                            let input = call
+                                .get("arguments")
+                                .and_then(Value::as_str)
+                                .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+                                .filter(Value::is_object)
+                                .unwrap_or_else(|| json!({}));
+                            push_anthropic_block(
+                                &mut turns,
+                                "assistant",
+                                json!({
+                                    "type": "tool_use",
+                                    "id": id,
+                                    "name": name,
+                                    "input": input,
+                                }),
+                            );
+                        }
+                    }
+                } else {
+                    push_anthropic_block(
+                        &mut turns,
+                        "assistant",
+                        json!({ "type": "text", "text": message.content }),
+                    );
+                }
+            }
+            "tool" => {
+                // ZR packs tool results as {tool_call_id, name, content}.
+                let (call_id, output) = serde_json::from_str::<Value>(&message.content)
+                    .ok()
+                    .and_then(|envelope| {
+                        let call_id = envelope
+                            .get("tool_call_id")
+                            .and_then(Value::as_str)?
+                            .to_owned();
+                        let output = envelope
+                            .get("content")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_owned();
+                        Some((call_id, output))
+                    })
+                    .unwrap_or_else(|| (String::new(), message.content.clone()));
+                push_anthropic_block(
+                    &mut turns,
+                    "user",
+                    json!({
+                        "type": "tool_result",
+                        "tool_use_id": call_id,
+                        "content": output,
+                    }),
+                );
+            }
+            _ => {}
+        }
+    }
+
+    (system_parts.join("\n\n"), turns)
+}
+
+/// Anthropic's usage block, as reported: `input_tokens` EXCLUDES the cache
+/// dimensions. `into_token_usage` is where the convention conversion
+/// happens — see the module doc.
+#[derive(Default, Deserialize)]
+struct AnthropicUsage {
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+    #[serde(default)]
+    cache_read_input_tokens: Option<u64>,
+    #[serde(default)]
+    cache_creation_input_tokens: Option<u64>,
+}
+
+impl AnthropicUsage {
+    fn into_token_usage(self) -> TokenUsage {
+        let cache_read = self.cache_read_input_tokens.unwrap_or(0);
+        let cache_creation = self.cache_creation_input_tokens.unwrap_or(0);
+        TokenUsage {
+            // Absent input stays None (the missing-usage path downstream);
+            // present input becomes the OpenAI-convention TOTAL.
+            input_tokens: self.input_tokens.map(|input| {
+                input
+                    .saturating_add(cache_read)
+                    .saturating_add(cache_creation)
+            }),
+            output_tokens: self.output_tokens,
+            cached_input_tokens: (cache_read > 0).then_some(cache_read),
+        }
+    }
+}
+
+/// The Messages envelope fields billing needs.
+#[derive(Deserialize)]
+struct MessagesEnvelope {
+    #[serde(default)]
+    content: Vec<Value>,
+    #[serde(default)]
+    usage: Option<AnthropicUsage>,
+}
+
+fn parse_messages_envelope(envelope: MessagesEnvelope) -> ChatResponse {
+    let mut text_parts: Vec<String> = Vec::new();
+    let mut tool_calls = Vec::new();
+    for block in &envelope.content {
+        match block.get("type").and_then(Value::as_str) {
+            Some("text") => {
+                if let Some(text) = block.get("text").and_then(Value::as_str) {
+                    text_parts.push(text.to_owned());
+                }
+            }
+            Some("tool_use") => {
+                tool_calls.push(ToolCall {
+                    id: block
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                    name: block
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                    // Back to ZR's convention: arguments as a JSON string.
+                    arguments: block
+                        .get("input")
+                        .map_or_else(|| "{}".to_owned(), Value::to_string),
+                    extra_content: None,
+                });
+            }
+            _ => {}
+        }
+    }
+    let text = if text_parts.is_empty() {
+        None
+    } else {
+        Some(text_parts.join(""))
+    };
+    ChatResponse {
+        text,
+        tool_calls,
+        usage: envelope.usage.map(AnthropicUsage::into_token_usage),
+        reasoning_content: None,
+    }
+}
+
+fn anthropic_upstream_error(alias: &str, status: reqwest::StatusCode, body: &str) -> anyhow::Error {
+    anyhow!(
+        "{alias} messages API error: HTTP {} {}: {body}",
+        status.as_u16(),
+        status.canonical_reason().unwrap_or("error"),
+    )
+}
+
+/// A tool call under assembly across `input_json_delta` events.
+struct PendingAnthropicTool {
+    id: String,
+    name: String,
+    json: String,
+}
+
+/// The per-event state machine behind `AnthropicWire::stream_chat`, factored
+/// out of the socket loop so the event grammar is unit-testable without a
+/// server: text deltas stream through, tool inputs accumulate until their
+/// block closes, usage assembles from `message_start` + `message_delta`, and
+/// `message_stop` is the only terminal.
+#[derive(Default)]
+struct AnthropicStreamMachine {
+    usage: AnthropicUsage,
+    open_tools: std::collections::BTreeMap<u64, PendingAnthropicTool>,
+    count_tokens: bool,
+    finished: bool,
+}
+
+impl AnthropicStreamMachine {
+    fn new(count_tokens: bool) -> Self {
+        Self {
+            count_tokens,
+            ..Self::default()
+        }
+    }
+
+    fn absorb_usage(&mut self, value: Option<&Value>) {
+        let Some(usage) = value else { return };
+        // Field-by-field: `message_delta` carries cumulative output tokens
+        // (and sometimes more) without repeating what `message_start` said —
+        // absent fields must not erase known ones.
+        if let Some(tokens) = usage.get("input_tokens").and_then(Value::as_u64) {
+            self.usage.input_tokens = Some(tokens);
+        }
+        if let Some(tokens) = usage.get("output_tokens").and_then(Value::as_u64) {
+            self.usage.output_tokens = Some(tokens);
+        }
+        if let Some(tokens) = usage.get("cache_read_input_tokens").and_then(Value::as_u64) {
+            self.usage.cache_read_input_tokens = Some(tokens);
+        }
+        if let Some(tokens) = usage
+            .get("cache_creation_input_tokens")
+            .and_then(Value::as_u64)
+        {
+            self.usage.cache_creation_input_tokens = Some(tokens);
+        }
+    }
+
+    fn handle(&mut self, alias: &str, value: &Value) -> Result<Vec<StreamEvent>, StreamError> {
+        let mut events = Vec::new();
+        match value.get("type").and_then(Value::as_str) {
+            Some("message_start") => {
+                self.absorb_usage(
+                    value
+                        .get("message")
+                        .and_then(|message| message.get("usage")),
+                );
+            }
+            Some("content_block_start") => {
+                if let Some(block) = value.get("content_block")
+                    && block.get("type").and_then(Value::as_str) == Some("tool_use")
+                    && let Some(index) = value.get("index").and_then(Value::as_u64)
+                {
+                    self.open_tools.insert(
+                        index,
+                        PendingAnthropicTool {
+                            id: block
+                                .get("id")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_owned(),
+                            name: block
+                                .get("name")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_owned(),
+                            json: String::new(),
+                        },
+                    );
+                }
+            }
+            Some("content_block_delta") => {
+                let index = value.get("index").and_then(Value::as_u64);
+                match value
+                    .get("delta")
+                    .and_then(|delta| delta.get("type"))
+                    .and_then(Value::as_str)
+                {
+                    Some("text_delta") => {
+                        if let Some(text) = value
+                            .get("delta")
+                            .and_then(|delta| delta.get("text"))
+                            .and_then(Value::as_str)
+                        {
+                            let mut chunk = StreamChunk::delta(text);
+                            if self.count_tokens {
+                                // The ZR-documented per-chunk floor
+                                // convention: len()/4, a labeled lower
+                                // bound, never billing.
+                                chunk.token_count = text.len() / 4;
+                            }
+                            events.push(StreamEvent::TextDelta(chunk));
+                        }
+                    }
+                    Some("input_json_delta") => {
+                        if let Some(partial) = value
+                            .get("delta")
+                            .and_then(|delta| delta.get("partial_json"))
+                            .and_then(Value::as_str)
+                            && let Some(index) = index
+                            && let Some(pending) = self.open_tools.get_mut(&index)
+                        {
+                            pending.json.push_str(partial);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Some("content_block_stop") => {
+                if let Some(index) = value.get("index").and_then(Value::as_u64)
+                    && let Some(pending) = self.open_tools.remove(&index)
+                {
+                    events.push(StreamEvent::ToolCall(ToolCall {
+                        id: pending.id,
+                        name: pending.name,
+                        arguments: if pending.json.is_empty() {
+                            "{}".to_owned()
+                        } else {
+                            pending.json
+                        },
+                        extra_content: None,
+                    }));
+                }
+            }
+            Some("message_delta") => {
+                self.absorb_usage(value.get("usage"));
+            }
+            Some("message_stop") => {
+                let usage = std::mem::take(&mut self.usage).into_token_usage();
+                if usage.input_tokens.is_some() || usage.output_tokens.is_some() {
+                    events.push(StreamEvent::Usage(usage));
+                }
+                self.finished = true;
+                events.push(StreamEvent::Final);
+            }
+            Some("error") => {
+                let error = value.get("error");
+                let kind = error
+                    .and_then(|error| error.get("type"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let detail = error.map_or_else(|| value.to_string(), Value::to_string);
+                // Same rule as the Responses wire: in-band errors carry no
+                // HTTP status, so restore the digits for the shapes the
+                // classifier must route — a rate limit feeds the health
+                // cooldown. `overloaded_error` (Anthropic's 529) stays
+                // digit-free: it classifies Retryable by default, which is
+                // the correct walk behavior for it.
+                let prefix = if kind == "rate_limit_error" {
+                    "429 Too Many Requests: "
+                } else {
+                    ""
+                };
+                return Err(StreamError::ModelProvider(format!(
+                    "{alias} messages stream failed: {prefix}{detail}"
+                )));
+            }
+            // `ping` and future event types: ignored by design.
+            _ => {}
+        }
+        Ok(events)
+    }
+}
+
+impl zeroclaw_api::attribution::Attributable for AnthropicWire {
+    fn role(&self) -> zeroclaw_api::attribution::Role {
+        zeroclaw_api::attribution::Role::Provider(zeroclaw_api::attribution::ProviderKind::Model(
+            zeroclaw_api::attribution::ModelProviderKind::Anthropic,
+        ))
+    }
+
+    fn alias(&self) -> &str {
+        &self.alias
+    }
+}
+
+#[async_trait]
+impl ModelProvider for AnthropicWire {
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            native_tool_calling: true,
+            vision: false,
+            prompt_caching: true,
+            // The models can think; ZR's compat surface has nowhere to carry
+            // it, so this wire does not request it.
+            extended_thinking: false,
+        }
+    }
+
+    fn default_base_url(&self) -> Option<&str> {
+        Some(&self.api_url)
+    }
+
+    fn supports_native_tools(&self) -> bool {
+        true
+    }
+
+    fn supports_streaming(&self) -> bool {
+        true
+    }
+
+    fn supports_streaming_tool_events(&self) -> bool {
+        true
+    }
+
+    async fn chat_with_system(
+        &self,
+        system: Option<&str>,
+        message: &str,
+        model: &str,
+        temperature: Option<f64>,
+    ) -> anyhow::Result<String> {
+        let mut messages = Vec::new();
+        if let Some(system) = system {
+            messages.push(ChatMessage::system(system));
+        }
+        messages.push(ChatMessage::user(message));
+        let request = ChatRequest {
+            messages: &messages,
+            tools: None,
+            thinking: None,
+        };
+        let response = self.chat(request, model, temperature).await?;
+        Ok(response.text.unwrap_or_default())
+    }
+
+    async fn chat(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+    ) -> anyhow::Result<ChatResponse> {
+        let body = self.request_body(model, request.messages, request.tools, temperature, false);
+        let response = self
+            .http
+            .post(&self.api_url)
+            .header("x-api-key", &self.credential)
+            .header("anthropic-version", ANTHROPIC_VERSION)
+            .json(&body)
+            .send()
+            .await?;
+        let status = response.status();
+        let text = response.text().await?;
+        if !status.is_success() {
+            return Err(anthropic_upstream_error(&self.alias, status, &text));
+        }
+        let envelope: MessagesEnvelope = serde_json::from_str(&text).map_err(|error| {
+            anyhow!(
+                "{} messages API returned unparseable JSON: {error}",
+                self.alias
+            )
+        })?;
+        Ok(parse_messages_envelope(envelope))
+    }
+
+    fn stream_chat(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+        options: StreamOptions,
+    ) -> futures_util::stream::BoxStream<'static, StreamResult<StreamEvent>> {
+        let body = self.request_body(model, request.messages, request.tools, temperature, true);
+        let http = self.http.clone();
+        let api_url = self.api_url.clone();
+        let credential = self.credential.clone();
+        let alias = self.alias.clone();
+        let count_tokens = options.count_tokens;
+
+        let stream = async_stream::try_stream! {
+            let response = http
+                .post(&api_url)
+                .header("x-api-key", &credential)
+                .header("anthropic-version", ANTHROPIC_VERSION)
+                .json(&body)
+                .send()
+                .await
+                .map_err(|error| StreamError::Http(error.to_string()))?;
+            let status = response.status();
+            if !status.is_success() {
+                let text = response.text().await.unwrap_or_default();
+                Err(StreamError::Http(
+                    anthropic_upstream_error(&alias, status, &text).to_string(),
+                ))?;
+                return;
+            }
+
+            let mut bytes = response.bytes_stream();
+            // Same byte-accurate UTF-8 buffering as the Responses wire: a
+            // multibyte character split across network chunks must never
+            // become a replacement character in a customer's stream.
+            let mut raw_buffer: Vec<u8> = Vec::new();
+            let mut buffer = String::new();
+            let mut machine = AnthropicStreamMachine::new(count_tokens);
+            while let Some(chunk) = bytes.next().await {
+                let chunk = chunk.map_err(|error| StreamError::Http(error.to_string()))?;
+                raw_buffer.extend_from_slice(&chunk);
+                let valid_up_to = match std::str::from_utf8(&raw_buffer) {
+                    Ok(_) => raw_buffer.len(),
+                    Err(error) => error.valid_up_to(),
+                };
+                buffer.push_str(
+                    std::str::from_utf8(&raw_buffer[..valid_up_to])
+                        .expect("prefix was just validated"),
+                );
+                raw_buffer.drain(..valid_up_to);
+
+                while let Some((boundary, delimiter_len)) = find_event_boundary(&buffer) {
+                    let raw = buffer[..boundary].to_owned();
+                    buffer.drain(..boundary + delimiter_len);
+                    let data = raw
+                        .lines()
+                        .map(|line| line.strip_suffix('\r').unwrap_or(line))
+                        .filter_map(|line| line.strip_prefix("data:"))
+                        .map(str::trim_start)
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    if data.is_empty() {
+                        continue;
+                    }
+                    let value: Value = serde_json::from_str(&data)
+                        .map_err(StreamError::Json)?;
+                    for event in machine.handle(&alias, &value)? {
+                        yield event;
+                    }
+                }
+                if machine.finished {
+                    break;
+                }
+            }
+            if !machine.finished {
+                // The upstream closed without `message_stop`: surface it
+                // rather than synthesizing a Final the wire never sent.
+                Err(StreamError::InvalidSse(format!(
+                    "{alias} messages stream ended without completion"
+                )))?;
+            }
+        };
+        Box::pin(stream)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -784,5 +1447,230 @@ mod review_fix_tests {
             r#"{"code":"rate_limit_exceeded","message":"Rate limit reached"}"#
         );
         assert!(crate::retry::is_rate_limited(&error));
+    }
+}
+
+#[cfg(test)]
+mod anthropic_tests {
+    use super::*;
+
+    #[test]
+    fn message_builder_handles_every_zr_packing_shape() {
+        let messages = vec![
+            ChatMessage::system("be terse"),
+            ChatMessage::user("run pwd"),
+            ChatMessage::assistant(
+                r#"{"content":"running it","tool_calls":[{"id":"toolu_1","name":"shell","arguments":"{\"command\":\"pwd\"}"}],"reasoning_content":null}"#,
+            ),
+            ChatMessage::tool(r#"{"tool_call_id":"toolu_1","name":"shell","content":"/home"}"#),
+            ChatMessage::assistant("done: /home"),
+        ];
+        let (system, turns) = build_anthropic_messages(&messages);
+        assert_eq!(system, "be terse");
+        let roles: Vec<&str> = turns
+            .iter()
+            .map(|turn| turn["role"].as_str().unwrap())
+            .collect();
+        assert_eq!(roles, ["user", "assistant", "user", "assistant"]);
+        // The assistant envelope turn carries text AND the tool_use block.
+        assert_eq!(turns[1]["content"][0]["type"], "text");
+        assert_eq!(turns[1]["content"][0]["text"], "running it");
+        assert_eq!(turns[1]["content"][1]["type"], "tool_use");
+        assert_eq!(turns[1]["content"][1]["id"], "toolu_1");
+        // Arguments arrive as a JSON STRING and must land as an OBJECT.
+        assert_eq!(turns[1]["content"][1]["input"]["command"], "pwd");
+        // The tool result is a tool_result block in a USER turn.
+        assert_eq!(turns[2]["content"][0]["type"], "tool_result");
+        assert_eq!(turns[2]["content"][0]["tool_use_id"], "toolu_1");
+        assert_eq!(turns[2]["content"][0]["content"], "/home");
+    }
+
+    #[test]
+    fn parallel_tool_results_merge_into_one_user_turn() {
+        // The Messages API requires strict role alternation; two consecutive
+        // packed tool results must become two blocks in ONE user turn, not
+        // two user turns.
+        let messages = vec![
+            ChatMessage::user("run both"),
+            ChatMessage::assistant(
+                r#"{"content":null,"tool_calls":[{"id":"a","name":"x","arguments":"{}"},{"id":"b","name":"y","arguments":"{}"}]}"#,
+            ),
+            ChatMessage::tool(r#"{"tool_call_id":"a","name":"x","content":"one"}"#),
+            ChatMessage::tool(r#"{"tool_call_id":"b","name":"y","content":"two"}"#),
+        ];
+        let (_, turns) = build_anthropic_messages(&messages);
+        let roles: Vec<&str> = turns
+            .iter()
+            .map(|turn| turn["role"].as_str().unwrap())
+            .collect();
+        assert_eq!(roles, ["user", "assistant", "user"]);
+        assert_eq!(turns[1]["content"].as_array().unwrap().len(), 2);
+        let results = turns[2]["content"].as_array().unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0]["tool_use_id"], "a");
+        assert_eq!(results[1]["tool_use_id"], "b");
+    }
+
+    #[test]
+    fn a_json_object_assistant_reply_is_not_swallowed() {
+        let messages = vec![ChatMessage::assistant(r#"{"answer":42}"#)];
+        let (_, turns) = build_anthropic_messages(&messages);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0]["content"][0]["type"], "text");
+        assert_eq!(turns[0]["content"][0]["text"], r#"{"answer":42}"#);
+    }
+
+    #[test]
+    fn envelope_parse_normalizes_usage_to_the_openai_convention() {
+        // THE reason this wire exists: Anthropic's input_tokens excludes the
+        // cache dimensions; ZR prices cached as a subset of input. 100 raw +
+        // 30 cache-read + 10 cache-write must meter as input=140, cached=30.
+        let envelope: MessagesEnvelope = serde_json::from_value(json!({
+            "content": [
+                {"type": "text", "text": "hello "},
+                {"type": "text", "text": "world"},
+                {"type": "tool_use", "id": "toolu_9", "name": "shell",
+                 "input": {"command": "pwd"}}
+            ],
+            "stop_reason": "tool_use",
+            "usage": {"input_tokens": 100, "output_tokens": 9,
+                       "cache_read_input_tokens": 30,
+                       "cache_creation_input_tokens": 10}
+        }))
+        .expect("envelope parses");
+        let response = parse_messages_envelope(envelope);
+        assert_eq!(response.text.as_deref(), Some("hello world"));
+        assert_eq!(response.tool_calls.len(), 1);
+        assert_eq!(response.tool_calls[0].id, "toolu_9");
+        let arguments: Value =
+            serde_json::from_str(&response.tool_calls[0].arguments).expect("arguments are JSON");
+        assert_eq!(arguments["command"], "pwd");
+        let usage = response.usage.expect("usage is the point of this module");
+        assert_eq!(usage.input_tokens, Some(140));
+        assert_eq!(usage.output_tokens, Some(9));
+        assert_eq!(usage.cached_input_tokens, Some(30));
+    }
+
+    #[test]
+    fn missing_usage_stays_none_never_zero() {
+        let envelope: MessagesEnvelope =
+            serde_json::from_value(json!({"content": []})).expect("envelope parses");
+        assert!(parse_messages_envelope(envelope).usage.is_none());
+    }
+
+    #[test]
+    fn stream_machine_assembles_the_documented_event_grammar() {
+        let mut machine = AnthropicStreamMachine::new(false);
+        let sequence = [
+            json!({"type": "message_start", "message": {"usage": {
+                "input_tokens": 100, "output_tokens": 1,
+                "cache_read_input_tokens": 30}}}),
+            json!({"type": "ping"}),
+            json!({"type": "content_block_start", "index": 0,
+                   "content_block": {"type": "text"}}),
+            json!({"type": "content_block_delta", "index": 0,
+                   "delta": {"type": "text_delta", "text": "hel"}}),
+            json!({"type": "content_block_delta", "index": 0,
+                   "delta": {"type": "text_delta", "text": "lo"}}),
+            json!({"type": "content_block_stop", "index": 0}),
+            json!({"type": "content_block_start", "index": 1,
+                   "content_block": {"type": "tool_use", "id": "toolu_1",
+                                      "name": "shell"}}),
+            json!({"type": "content_block_delta", "index": 1,
+                   "delta": {"type": "input_json_delta",
+                             "partial_json": "{\"comman"}}),
+            json!({"type": "content_block_delta", "index": 1,
+                   "delta": {"type": "input_json_delta",
+                             "partial_json": "d\":\"pwd\"}"}}),
+            json!({"type": "content_block_stop", "index": 1}),
+            json!({"type": "message_delta", "delta": {"stop_reason": "tool_use"},
+                   "usage": {"output_tokens": 17}}),
+            json!({"type": "message_stop"}),
+        ];
+        let mut text = String::new();
+        let mut tool_calls = Vec::new();
+        let mut usage = None;
+        let mut finals = 0;
+        for value in &sequence {
+            for event in machine
+                .handle("anthropic", value)
+                .expect("no in-band error")
+            {
+                match event {
+                    StreamEvent::TextDelta(chunk) => text.push_str(&chunk.delta),
+                    StreamEvent::ToolCall(call) => tool_calls.push(call),
+                    StreamEvent::Usage(u) => usage = Some(u),
+                    StreamEvent::Final => finals += 1,
+                    _ => {}
+                }
+            }
+        }
+        assert!(machine.finished);
+        assert_eq!(finals, 1, "message_stop is the only terminal");
+        assert_eq!(text, "hello");
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].id, "toolu_1");
+        assert_eq!(tool_calls[0].arguments, r#"{"command":"pwd"}"#);
+        let usage = usage.expect("usage assembled from start + delta");
+        // 100 raw + 30 cache-read, normalized; output from the FINAL delta,
+        // not message_start's placeholder.
+        assert_eq!(usage.input_tokens, Some(130));
+        assert_eq!(usage.cached_input_tokens, Some(30));
+        assert_eq!(usage.output_tokens, Some(17));
+    }
+
+    #[test]
+    fn in_band_rate_limit_classifies_as_429_and_overloaded_stays_retryable() {
+        let mut machine = AnthropicStreamMachine::new(false);
+        let error = machine
+            .handle(
+                "anthropic",
+                &json!({"type": "error",
+                        "error": {"type": "rate_limit_error",
+                                   "message": "Number of requests has exceeded your rate limit"}}),
+            )
+            .expect_err("an in-band error must fail the stream");
+        let error = anyhow!(error.to_string());
+        assert!(crate::retry::is_rate_limited(&error), "{error}");
+
+        let mut machine = AnthropicStreamMachine::new(false);
+        let error = machine
+            .handle(
+                "anthropic",
+                &json!({"type": "error",
+                        "error": {"type": "overloaded_error", "message": "Overloaded"}}),
+            )
+            .expect_err("an in-band error must fail the stream");
+        let error = anyhow!(error.to_string());
+        assert!(
+            matches!(
+                crate::retry::classify(&error, false),
+                crate::retry::FailureClass::Retryable
+            ),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn error_text_speaks_the_classifier_taxonomy() {
+        let error = anthropic_upstream_error(
+            "anthropic",
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            "Number of requests has exceeded your rate limit",
+        );
+        assert!(crate::retry::is_rate_limited(&error), "{error}");
+
+        let error = anthropic_upstream_error(
+            "anthropic",
+            reqwest::StatusCode::BAD_REQUEST,
+            "prompt is too long: 210000 tokens > 200000 maximum",
+        );
+        assert!(
+            matches!(
+                crate::retry::classify(&error, false),
+                crate::retry::FailureClass::ContextWindow { .. }
+            ),
+            "{error}"
+        );
     }
 }
