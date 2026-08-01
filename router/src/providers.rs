@@ -9,13 +9,15 @@ use serde::Deserialize;
 use thiserror::Error;
 use zeroclaw_providers::{
     ProviderDispatch,
-    anthropic::AnthropicModelProvider,
     bedrock::BedrockModelProvider,
     compatible::{AuthStyle, OpenAiCompatibleModelProvider},
     traits::{ChatRequest, ChatResponse, ModelProvider, StreamEvent, StreamOptions, StreamResult},
 };
 
-use crate::{config::TierCandidate, wire::OpenAiResponsesWire};
+use crate::{
+    config::TierCandidate,
+    wire::{AnthropicWire, OpenAiResponsesWire},
+};
 
 const PROVIDER_INVENTORY_JSON: &str = include_str!("../config/providers.json");
 
@@ -387,18 +389,15 @@ fn create_provider(
 ) -> Result<Arc<dyn ModelProvider>, ProviderBuildError> {
     let alias = metadata.key.as_str();
     let provider: Arc<dyn ModelProvider> = match metadata.adapter {
-        ProviderAdapter::Anthropic => {
-            let mut builder = AnthropicModelProvider::builder(alias)
-                .credential(Some(credential))
-                .max_tokens(max_output_tokens)
-                // The pinned adapter hardcoded ~120s; honor ZR's 15-minute
-                // UPSTREAM_REQUEST_TIMEOUT budget (api.rs) instead.
-                .timeout_secs(900);
-            if let Some(base_url) = metadata.base_url.as_deref() {
-                builder = builder.base_url(base_url);
-            }
-            Arc::new(builder.build())
-        }
+        ProviderAdapter::Anthropic => Arc::new(AnthropicWire::new(
+            alias,
+            credential,
+            metadata.base_url.as_deref(),
+            max_output_tokens,
+            // Honor ZR's 15-minute upstream budget (api.rs), not an adapter
+            // default.
+            900,
+        )),
         ProviderAdapter::Bedrock => {
             // `.bearer_token` pins the credential and skips every ambient AWS probe.
             Arc::new(
