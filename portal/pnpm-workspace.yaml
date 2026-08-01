@@ -1,0 +1,11 @@
+# pnpm settings live here, not in package.json: pnpm 11 no longer reads the
+# package.json "pnpm" field (CI installs whatever corepack's current pnpm is).
+#
+# esbuild's postinstall is the only build script we allow; without approval a
+# frozen-lockfile install fails outright with ERR_PNPM_IGNORED_BUILDS. Both
+# spellings on purpose: pnpm 11 reads allowBuilds, pnpm 10 (still common on
+# dev machines) reads onlyBuiltDependencies.
+allowBuilds:
+  esbuild: true
+onlyBuiltDependencies:
+  - esbuild
