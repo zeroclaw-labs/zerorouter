@@ -133,19 +133,18 @@ output_per_mtok = 1.85
 
 [tiers."zero/high-end"]
 
-# Sonnet 5 introductory pricing ends after 2026-08-31. Update this canonical
-# table before customer traffic continues at the standard rate. When the intro
-# basis lapses, both sonnet rows go above these sell rates and the invariant
-# above withholds this tier alone: zero/high-end disappears from /v1/models,
-# and every request for it — or for either sonnet row pinned directly — is
-# refused with `model_unavailable` naming the tier, until the sell rates are
-# raised. zero/low-cost and zero/balanced are unaffected and keep serving.
-# Loud and logged, not a silent margin leak, and not an API-wide outage — but
-# this tier earns nothing for as long as it is withheld. Raise the rates first.
+# SELLS at Sonnet 5's post-intro standard rate (3.00/0.30/15.00, effective
+# upstream 2026-09-01); BASES at the introductory rate we actually pay
+# through 2026-08-31. The gap is deliberate margin for the remainder of the
+# intro window, and it defuses the scheduled cliff this comment used to
+# warn about: on 2026-09-01 the only required edit is raising both sonnet
+# BASIS blocks to 3.00/0.30/15.00 — which equals the sell (flagship shape)
+# and therefore cannot trip the margin withhold no matter when the edit
+# lands relative to the date.
 [tiers."zero/high-end".rates]
-input_per_mtok = 2.00
-cached_input_per_mtok = 0.20
-output_per_mtok = 10.00
+input_per_mtok = 3.00
+cached_input_per_mtok = 0.30
+output_per_mtok = 15.00
 
 [[tiers."zero/high-end".candidates]]
 id = "anthropic/claude-sonnet-5"
