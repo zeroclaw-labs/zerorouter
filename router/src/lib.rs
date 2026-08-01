@@ -6,13 +6,17 @@ pub mod config;
 pub mod db;
 pub mod device;
 pub mod error;
+pub mod logging;
 pub mod oidc;
 pub mod openai;
 pub mod portal;
 pub mod providers;
+pub mod retry;
 pub mod session;
 mod sqlx;
 pub mod stripe;
+#[cfg(feature = "testing")]
+pub mod testing;
 pub mod web;
 
 pub use api::{RouterState, app};

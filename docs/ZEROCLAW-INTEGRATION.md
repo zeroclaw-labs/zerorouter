@@ -70,12 +70,23 @@ agree, since the default exists in both crates.
 
 ### `/v1/models` pricing shape
 
-ZeroRouter's model listing carries per-model pricing in the
-OpenRouter-style shape ZeroClaw's live-pricing filler consumes: a `pricing`
-object of **per-token USD amounts as decimal strings**, keyed `prompt`,
-`completion`, and `input_cache_read`. Tier sell rates come from the
-router's canonical `tiers.toml`; the gateway is the source of truth for its
-own prices, and operator-configured rates always win over live-filled ones.
+Live, as of Stage 0 (`ModelObject`, `router/src/openai.rs`). ZeroRouter's
+model listing carries per-model pricing in the OpenRouter-style shape
+ZeroClaw's live-pricing filler consumes: a `pricing` object of **per-token
+USD amounts as decimal strings**, keyed `prompt`, `completion`, and
+`input_cache_read` — exactly the three fields ZeroClaw's pricing
+normalizer (`normalize_pricing`, `crates/zeroclaw-providers/src/pricing.rs`)
+reads off `ModelPricing`; ZeroRouter never populates `input_cache_write`
+(part of ZeroClaw's wire contract, but unread by that normalizer). Every
+listed id — both tier aliases and concrete candidate ids — carries pricing:
+a candidate's pricing is always its *owning tier's* sell rate, never its own
+cost basis, matching what a request for that id is actually billed
+(`TierCatalog::resolve`'s pinned-candidate rule). Values are derived from
+the router's canonical `tiers.toml` sell rates (per-1M-token) converted to
+per-single-token decimal strings via exact `Decimal` arithmetic — never
+`f64` — so no binary-float artifact reaches the wire. The gateway is the
+source of truth for its own prices, and operator-configured rates always
+win over live-filled ones.
 
 ### TokenUsage convention
 

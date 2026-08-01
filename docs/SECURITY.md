@@ -34,7 +34,8 @@ The startup contract is: **misconfiguration aborts, absence disables.**
 |---|---|
 | Missing/partial database configuration aborts; the `DB_*` path always connects with `verify-full` TLS against a pinned CA bundle | `router/src/db.rs` (`database_pool_from_env`); the Dockerfile ships a checksum-pinned RDS CA bundle |
 | A partially configured web plane, OIDC group, or Stripe group aborts startup | `router/src/web.rs` (`WebConfig::from_env`, `feature_group`) — all-or-nothing per group |
-| An unknown `ZEROROUTER_REQUIRE_CREDITS` value aborts | `router/src/web.rs` (`credits_required_from_env`) — only `true`/`1`/`false`/`0` parse |
+| An unknown `ZEROROUTER_REQUIRE_CREDITS` value aborts; unset or blank requires credits | `router/src/web.rs` (`credits_required_from_env`) — only `true`/`1`/`false`/`0` parse, the default is `true`, and cap-only needs an explicit `false`/`0` that logs what it gives up |
+| A tier candidate priced above its owning tier's sell rate aborts the catalog load | `router/src/config.rs` (`validate_tier_catalog` → `validate_candidate_margin`) — every candidate bills at the tier sell rate, so a higher basis loses money on every request it serves |
 | Auth or database errors during a request yield 401/503, never admission | `router/src/auth.rs` (key auth; malformed tokens are rejected by shape, unknown keys compare against a dummy hash), `router/src/session.rs` (`SessionRejection::{Unauthenticated,DatabaseUnavailable}`) |
 | Mutating portal requests without the CSRF header are rejected before any lookup | `router/src/session.rs` — the `PortalUser` extractor requires `x-zerorouter-portal` on non-GET/HEAD; cross-site form posts cannot set custom headers, and the session cookie is `HttpOnly; SameSite=Lax` |
 | A successful upstream call with missing usage settles the reservation at its conservative bound and the request errors with `metering_unavailable` — an unmetered success is never delivered as a success | `router/src/db.rs` + `router/src/api.rs` (settlement paths) |
@@ -108,11 +109,18 @@ time, so the plaintext exists only in the claiming response.
 - **Provider request/response bodies** — application logs carry
   request/model/provider/token metadata only. Chat messages, tool payloads,
   and completions are never logged.
-- **Upstream error bodies** — the pinned provider dependency includes
-  sanitized upstream response fragments in its own log events, so
-  `router/src/main.rs` force-appends `zeroclaw_log_event=off,zeroclaw_providers=off`
-  to whatever `RUST_LOG` requests. Operators cannot re-enable those targets
-  through the environment.
+- **Upstream error bodies** — an upstream 4xx body is provider-controlled text
+  that routinely echoes the request that provoked it, and the pinned provider
+  dependency includes sanitized fragments of it in its own log events. Those
+  events, and the router's own per-attempt failure detail from the candidate
+  walk, are emitted under targets listed in
+  `logging::RETENTION_PROTECTED_TARGETS` and denied by a filter layer *beneath*
+  the operator's. Because `tracing` composes global filters by conjunction, no
+  `RUST_LOG` value — including a field-qualified directive, which outranks a
+  bare `target=off` on specificity — can re-enable them. Router code that
+  formats a provider body belongs under `logging::UPSTREAM_DETAIL_TARGET`;
+  anything logged under an unlisted target reaches the sink, which is why the
+  boundary is a list to extend rather than a claim to trust.
 - **Secrets in debug output** — `StripeSettings` scrubs its secret fields in
   its `Debug` impl (`router/src/web.rs`).
 

@@ -1,10 +1,17 @@
-//! Prepaid credit accounting: balance reads and the append-only ledger.
+//! Prepaid credit accounting: balance reads, the append-only ledger, and the
+//! server-side record of what each Stripe Checkout Session was priced at.
 //!
 //! Every balance mutation happens inside a transaction that (a) holds the
 //! per-user advisory lock used by admission and settlement in [`crate::db`],
 //! and (b) appends a `credit_ledger` row snapshotting `balance_after_usd`.
 //! Purchases are idempotent by `stripe_session_id`; a replayed webhook is a
 //! no-op reported as [`CreditOutcome::AlreadyApplied`].
+//!
+//! [`CheckoutIntent`] is the other half of the purchase path: it is what
+//! ZeroRouter decided to sell, written before the user is handed to Stripe and
+//! required to exist before [`credit_purchase`] is ever reached. A webhook
+//! HMAC proves Stripe sent the event; only this record proves ZeroRouter
+//! priced it (migration `0005_stripe_checkout_intents.sql`).
 
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
@@ -16,6 +23,125 @@ use crate::sqlx::{self, PgPool};
 pub enum CreditOutcome {
     Applied { balance_after: Decimal },
     AlreadyApplied,
+}
+
+/// What ZeroRouter quoted when it created a Stripe Checkout Session.
+///
+/// The webhook credits [`Self::expected_credit_usd`] to [`Self::user_id`] —
+/// the event's `metadata` only has to agree with these fields, it is never the
+/// source of truth for either.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CheckoutIntent {
+    pub stripe_session_id: String,
+    pub user_id: Uuid,
+    /// The `unit_amount` quoted to Stripe, in the smallest currency unit
+    /// (cents for USD), for comparison against the event's `amount_total`.
+    pub expected_amount_cents: i64,
+    /// The decimal-dollar credit this session buys. Equal to
+    /// `expected_amount_cents / 100` by a database CHECK.
+    pub expected_credit_usd: Decimal,
+    /// Lowercase ISO-4217 code the session was priced in.
+    pub currency: String,
+    /// Stamped once the purchase has been credited; `None` while the session
+    /// is unpaid, abandoned, or paid but not yet delivered.
+    pub settled_at: Option<DateTime<Utc>>,
+}
+
+/// Record what a freshly created Checkout Session is worth, before the user is
+/// sent to Stripe to pay it.
+///
+/// Fails on a duplicate `stripe_session_id`: Stripe session ids are unique, so
+/// a collision means something other than this code path wrote the row.
+pub async fn record_checkout_intent(
+    pool: &PgPool,
+    stripe_session_id: &str,
+    user_id: Uuid,
+    expected_amount_cents: i64,
+    expected_credit_usd: Decimal,
+    currency: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"
+        INSERT INTO stripe_checkout_intents (
+            stripe_session_id,
+            user_id,
+            expected_amount_cents,
+            expected_credit_usd,
+            currency
+        )
+        VALUES ($1, $2, $3, $4, $5)
+        "#,
+    )
+    .bind(stripe_session_id)
+    .bind(user_id)
+    .bind(expected_amount_cents)
+    .bind(expected_credit_usd)
+    .bind(currency)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// The pending-purchase record for a Stripe session, if ZeroRouter created it.
+///
+/// `None` is the fail-closed signal the webhook acts on: a paid session with
+/// no record here was not priced by this deployment.
+pub async fn checkout_intent(
+    pool: &PgPool,
+    stripe_session_id: &str,
+) -> Result<Option<CheckoutIntent>, sqlx::Error> {
+    let row = sqlx::query_as::<_, (String, Uuid, i64, Decimal, String, Option<DateTime<Utc>>)>(
+        r#"
+        SELECT stripe_session_id, user_id, expected_amount_cents, expected_credit_usd,
+               currency, settled_at
+        FROM stripe_checkout_intents
+        WHERE stripe_session_id = $1
+        "#,
+    )
+    .bind(stripe_session_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(
+        |(
+            stripe_session_id,
+            user_id,
+            expected_amount_cents,
+            expected_credit_usd,
+            currency,
+            settled_at,
+        )| CheckoutIntent {
+            stripe_session_id,
+            user_id,
+            expected_amount_cents,
+            expected_credit_usd,
+            currency,
+            settled_at,
+        },
+    ))
+}
+
+/// Mark a pending purchase delivered, after its credit has committed.
+///
+/// A reconciliation marker, not a lock: idempotence of crediting belongs to
+/// the unique index on `credit_ledger.stripe_session_id`, so this is safe to
+/// call on a replay (it updates no rows) and safe to lose (the money is
+/// already right). Returns whether this call was the one that stamped it.
+pub async fn settle_checkout_intent(
+    pool: &PgPool,
+    stripe_session_id: &str,
+) -> Result<bool, sqlx::Error> {
+    let settled = sqlx::query(
+        r#"
+        UPDATE stripe_checkout_intents
+        SET settled_at = NOW()
+        WHERE stripe_session_id = $1 AND settled_at IS NULL
+        "#,
+    )
+    .bind(stripe_session_id)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(settled > 0)
 }
 
 /// Apply a completed Stripe Checkout purchase to the user's balance.

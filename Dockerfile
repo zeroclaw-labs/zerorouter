@@ -47,7 +47,7 @@ ENV COREPACK_ENABLE_DOWNLOAD_PROMPT=0
 RUN corepack enable
 
 WORKDIR /portal
-COPY portal/package.json portal/pnpm-lock.yaml ./
+COPY portal/package.json portal/pnpm-lock.yaml portal/pnpm-workspace.yaml ./
 RUN pnpm install --frozen-lockfile
 COPY portal ./
 RUN pnpm build

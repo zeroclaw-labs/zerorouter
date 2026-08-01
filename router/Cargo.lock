@@ -3765,8 +3765,8 @@ dependencies = [
 
 [[package]]
 name = "zeroclaw-api"
-version = "0.8.2"
-source = "git+https://github.com/zeroclaw-labs/zeroclaw.git?rev=2c2edecbe59a85a60e026a5e2094fed7e863776e#2c2edecbe59a85a60e026a5e2094fed7e863776e"
+version = "0.8.3"
+source = "git+https://github.com/zeroclaw-labs/zeroclaw.git?rev=f4b297e93e6bc64ede951ade59347486baf7f85f#f4b297e93e6bc64ede951ade59347486baf7f85f"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3783,8 +3783,8 @@ dependencies = [
 
 [[package]]
 name = "zeroclaw-config"
-version = "0.8.2"
-source = "git+https://github.com/zeroclaw-labs/zeroclaw.git?rev=2c2edecbe59a85a60e026a5e2094fed7e863776e#2c2edecbe59a85a60e026a5e2094fed7e863776e"
+version = "0.8.3"
+source = "git+https://github.com/zeroclaw-labs/zeroclaw.git?rev=f4b297e93e6bc64ede951ade59347486baf7f85f#f4b297e93e6bc64ede951ade59347486baf7f85f"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3822,8 +3822,8 @@ dependencies = [
 
 [[package]]
 name = "zeroclaw-log"
-version = "0.8.2"
-source = "git+https://github.com/zeroclaw-labs/zeroclaw.git?rev=2c2edecbe59a85a60e026a5e2094fed7e863776e#2c2edecbe59a85a60e026a5e2094fed7e863776e"
+version = "0.8.3"
+source = "git+https://github.com/zeroclaw-labs/zeroclaw.git?rev=f4b297e93e6bc64ede951ade59347486baf7f85f#f4b297e93e6bc64ede951ade59347486baf7f85f"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3842,8 +3842,8 @@ dependencies = [
 
 [[package]]
 name = "zeroclaw-macros"
-version = "0.8.2"
-source = "git+https://github.com/zeroclaw-labs/zeroclaw.git?rev=2c2edecbe59a85a60e026a5e2094fed7e863776e#2c2edecbe59a85a60e026a5e2094fed7e863776e"
+version = "0.8.3"
+source = "git+https://github.com/zeroclaw-labs/zeroclaw.git?rev=f4b297e93e6bc64ede951ade59347486baf7f85f#f4b297e93e6bc64ede951ade59347486baf7f85f"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -3852,8 +3852,8 @@ dependencies = [
 
 [[package]]
 name = "zeroclaw-providers"
-version = "0.8.2"
-source = "git+https://github.com/zeroclaw-labs/zeroclaw.git?rev=2c2edecbe59a85a60e026a5e2094fed7e863776e#2c2edecbe59a85a60e026a5e2094fed7e863776e"
+version = "0.8.3"
+source = "git+https://github.com/zeroclaw-labs/zeroclaw.git?rev=f4b297e93e6bc64ede951ade59347486baf7f85f#f4b297e93e6bc64ede951ade59347486baf7f85f"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3885,8 +3885,8 @@ dependencies = [
 
 [[package]]
 name = "zeroclaw-spawn"
-version = "0.8.2"
-source = "git+https://github.com/zeroclaw-labs/zeroclaw.git?rev=2c2edecbe59a85a60e026a5e2094fed7e863776e#2c2edecbe59a85a60e026a5e2094fed7e863776e"
+version = "0.8.3"
+source = "git+https://github.com/zeroclaw-labs/zeroclaw.git?rev=f4b297e93e6bc64ede951ade59347486baf7f85f#f4b297e93e6bc64ede951ade59347486baf7f85f"
 dependencies = [
  "serde_json",
  "tokio",
@@ -3946,6 +3946,7 @@ name = "zerorouter"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum",
  "chrono",
  "clap",
@@ -3974,6 +3975,7 @@ dependencies = [
  "uuid",
  "zeroclaw-api",
  "zeroclaw-providers",
+ "zerorouter",
 ]
 
 [[package]]

@@ -68,6 +68,9 @@ The beta environment currently deploys from the old TypeScript-era
 3. **Task definition (Terraform)** — add the new web-plane configuration:
    - plain environment: `ZEROROUTER_PUBLIC_BASE_URL`,
      `ZEROROUTER_REQUIRE_CREDITS`, `ZEROROUTER_SIGNUP_CREDIT_USD`;
+     **`ZEROROUTER_REQUIRE_CREDITS` now defaults to `true`** — see
+     [Credit enforcement is on by default](#credit-enforcement-is-on-by-default)
+     below before deploying a task definition that omits it;
    - new Secrets Manager containers, following the existing
      `<name>/providers/<secret>` naming convention, wired as task-definition
      `secrets`: `OIDC_CLIENT_SECRET`, `STRIPE_SECRET_KEY`,
@@ -106,6 +109,37 @@ The beta environment currently deploys from the old TypeScript-era
 >   beta only.
 >
 > Treat the HTTPS listener as a blocker for any external user traffic.
+
+## Credit enforcement is on by default
+
+`ZEROROUTER_REQUIRE_CREDITS` **defaults to `true`**. It previously defaulted
+to `false`, so this is a deliberate behavior change for any deployment that
+left the variable unset.
+
+**Why it changed.** Credits are the only ceiling backed by money. With
+enforcement off, nothing verifies that spend is funded: the per-key and
+derived per-user spend/velocity caps on `api_keys` are the sole limit on what
+a user can consume, and those caps are **self-service** — the portal lets a
+user raise a key's own `spend_cap_usd`. A deployment that never set the
+variable was therefore running with no enforced ceiling at all, which is not
+a state anyone chooses on purpose. Unconfigured now lands on the safe side.
+
+| value | behavior |
+|---|---|
+| unset, or set to a blank/whitespace string | credits **required** (the default) |
+| `true` / `1` | credits required |
+| `false` / `0` | cap-only; logs a startup warning naming what it gives up |
+| anything else | **startup aborts** — never a silent fallback in either direction |
+
+**Opting out.** Cap-only remains a supported shape for self-hosted
+deployments that deliberately run without billing. Set
+`ZEROROUTER_REQUIRE_CREDITS=false` (or `0`) explicitly. Do this knowing the
+only remaining ceiling is a cap the user can raise themselves.
+
+**Before deploying.** A task definition that omits the variable now runs with
+credits required, so inference is refused for users with no funded balance.
+Either fund balances / set `ZEROROUTER_SIGNUP_CREDIT_USD`, or set
+`ZEROROUTER_REQUIRE_CREDITS=false` explicitly if cap-only is what you want.
 
 ## Rollback
 

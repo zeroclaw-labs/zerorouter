@@ -3,13 +3,12 @@ use std::{env, net::SocketAddr, path::PathBuf};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use tower_http::services::{ServeDir, ServeFile};
-use tracing_subscriber::EnvFilter;
 use zerorouter::{
     DEFAULT_TIER_CONFIG_PATH, RouterState, TIER_CONFIG_PATH_ENV,
     admin::{self, AdminArgs},
     app,
     db::{database_pool_from_env, migrate},
-    device, oidc, portal, stripe,
+    device, logging, oidc, portal, stripe,
     web::{WebConfig, WebCtx, credits_required_from_env},
 };
 
@@ -34,17 +33,13 @@ enum Command {
 #[tokio::main]
 async fn main() -> Result<()> {
     let requested_filter = env::var("RUST_LOG").unwrap_or_else(|_| "info".to_owned());
-    // The pinned provider dependency includes sanitized upstream error bodies
-    // in its own events. Disable those targets because ZeroRouter's retention
-    // contract permits metadata only, never provider bodies.
-    let log_filter = EnvFilter::new(format!(
-        "{requested_filter},zeroclaw_log_event=off,zeroclaw_providers=off"
-    ));
-    tracing_subscriber::fmt()
-        .json()
-        .with_writer(std::io::stderr)
-        .with_env_filter(log_filter)
-        .init();
+    // The operator's filter selects among what may be logged; it does not decide
+    // what may be logged. The pinned provider dependency includes sanitized
+    // upstream bodies in its own events, and ZeroRouter's retention contract
+    // permits metadata only — so those targets are denied by a separate layer
+    // that no `RUST_LOG` value can reach. See `zerorouter::logging` for why the
+    // appended `zeroclaw_log_event=off` this replaced was not a guarantee.
+    logging::init(&requested_filter);
 
     match Cli::parse().command {
         Some(Command::Admin(args)) => admin::run(args).await,
@@ -75,6 +70,10 @@ async fn serve() -> Result<()> {
         "ZeroRouter listening"
     );
     let state = RouterState::with_database(tier_config_path, pool.clone(), require_credits);
+    // The durable backstop for settlements that failed in-request: replays the
+    // intent persisted on the reservation row (migration 0006) so delivered
+    // inference cannot go unbilled because one transaction lost a connection.
+    state.spawn_settlement_recovery();
     let mut router = app(state.clone());
     if let Some(config) = web_config {
         let portal_dist = config.portal_dist_path.clone();

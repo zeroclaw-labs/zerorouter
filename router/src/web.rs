@@ -197,14 +197,48 @@ impl WebConfig {
 
 /// Whether inference admission additionally requires a positive prepaid
 /// credit balance. Independent of the web plane so that self-hosted
-/// deployments can run cap-only without any billing configuration.
+/// deployments can still run cap-only without any billing configuration.
+///
+/// The default is `true`, and the absent case is the reason why: credits are
+/// the only ceiling backed by money. With enforcement off, the per-key and
+/// derived per-user spend/velocity caps on `api_keys` are the sole limit on
+/// what a user can consume, and those caps are self-service — the portal lets
+/// a user raise a key's own `spend_cap_usd`. Unconfigured must therefore land
+/// on the safe side, and so must a value that is *present but empty*, which
+/// [`optional_env`] normalizes to absent: a blank setting is not a deployment
+/// decision, so it cannot be read as one.
+///
+/// Cap-only stays a supported deployment shape via an explicit `false`/`0`;
+/// that opt-out is announced once at startup rather than left silent — see
+/// [`warn_cap_only_opt_out`]. A value that is neither recognized nor blank
+/// aborts startup instead of falling back in either direction.
 pub fn credits_required_from_env() -> Result<bool> {
-    match optional_env(REQUIRE_CREDITS_ENV).as_deref() {
-        None => Ok(false),
-        Some("true" | "1") => Ok(true),
-        Some("false" | "0") => Ok(false),
+    let required = match optional_env(REQUIRE_CREDITS_ENV).as_deref() {
+        None => true,
+        Some("true" | "1") => true,
+        Some("false" | "0") => false,
         Some(other) => bail!("{REQUIRE_CREDITS_ENV} must be true or false, got {other:?}"),
+    };
+    warn_cap_only_opt_out(required);
+    Ok(required)
+}
+
+/// Name the exposure the cap-only opt-out accepts, once, at startup.
+///
+/// This fires only on the explicit opt-out now that requiring credits is the
+/// default — reaching it means an operator deliberately turned off the one
+/// ceiling that verifies spend is backed by money.
+fn warn_cap_only_opt_out(required: bool) {
+    if required {
+        return;
     }
+    tracing::warn!(
+        setting = REQUIRE_CREDITS_ENV,
+        "credit enforcement has been explicitly DISABLED: no prepaid balance is required or \
+         debited, so inference is bounded only by the per-key and derived per-user \
+         spend/velocity caps on api_keys — caps users can raise themselves from the portal. \
+         Unset ZEROROUTER_REQUIRE_CREDITS to restore the default of requiring a funded balance"
+    );
 }
 
 /// Shared state for every web-plane router.
@@ -288,5 +322,60 @@ mod tests {
         .expect("group should be present");
         assert_eq!(full, ["1".to_owned(), "2".to_owned()]);
         assert!(feature_group("t", [("A", Some("1".to_owned())), ("B", None)]).is_err());
+    }
+
+    #[test]
+    fn credit_enforcement_defaults_to_required_and_opts_out_only_explicitly() {
+        // One test rather than four: the variable is process-global, so the
+        // cases have to run in sequence to be meaningful.
+        let restore = env::var(REQUIRE_CREDITS_ENV).ok();
+        let set = |value: Option<&str>| match value {
+            // SAFETY: no other test in this binary reads or writes
+            // REQUIRE_CREDITS_ENV, and the cases below run in sequence.
+            Some(value) => unsafe { env::set_var(REQUIRE_CREDITS_ENV, value) },
+            None => unsafe { env::remove_var(REQUIRE_CREDITS_ENV) },
+        };
+
+        // Unconfigured must fail safe. Off, the only ceiling is a cap the user
+        // can raise from their own portal.
+        set(None);
+        assert!(
+            credits_required_from_env().expect("an unset variable must not error"),
+            "credits must be required by default"
+        );
+
+        // Present but blank is not a deployment decision — it must land on the
+        // safe side too, not on the old default.
+        set(Some("   "));
+        assert!(
+            credits_required_from_env().expect("a blank value must not error"),
+            "a blank value must not read as an opt-out"
+        );
+
+        for value in ["true", "1"] {
+            set(Some(value));
+            assert!(credits_required_from_env().expect("an explicit true must parse"));
+        }
+
+        // The cap-only opt-out stays supported for self-hosted deployments.
+        for value in ["false", "0"] {
+            set(Some(value));
+            assert!(
+                !credits_required_from_env().expect("an explicit false must parse"),
+                "{value} must still disable credit enforcement"
+            );
+        }
+
+        // ...but a value we cannot read is a hard startup error, never a
+        // silent fallback in either direction.
+        set(Some("yes"));
+        let error =
+            credits_required_from_env().expect_err("an unparseable value must abort startup");
+        assert!(
+            error.to_string().contains(REQUIRE_CREDITS_ENV),
+            "the error must name the variable: {error}"
+        );
+
+        set(restore.as_deref());
     }
 }

@@ -8,8 +8,17 @@ publish = false
 [workspace]
 resolver = "2"
 
+[features]
+# Test-only upstream substitution: the scriptable fakes in `src/testing.rs`
+# plus the constructors that put one behind a candidate or a router. Never
+# enabled by `cargo build` — a binary that moves money must not carry a way to
+# swap an upstream. `router/tests` turns it on through the self dev-dependency
+# below, which Cargo's v2 resolver keeps out of non-test builds.
+testing = ["dep:async-trait"]
+
 [dependencies]
 anyhow = "1.0"
+async-trait = { version = "0.1", optional = true }
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "query", "form"] }
 chrono = { version = "0.4", features = ["clock", "serde"] }
 clap = { version = "4.5", features = ["derive"] }
@@ -34,9 +43,11 @@ tower-http = { version = "0.6", features = ["fs"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 uuid = { version = "1.22", features = ["serde", "v4"] }
-zeroclaw-api = { git = "https://github.com/zeroclaw-labs/zeroclaw.git", rev = "2c2edecbe59a85a60e026a5e2094fed7e863776e" }
-zeroclaw-providers = { git = "https://github.com/zeroclaw-labs/zeroclaw.git", rev = "2c2edecbe59a85a60e026a5e2094fed7e863776e" }
+zeroclaw-api = { git = "https://github.com/zeroclaw-labs/zeroclaw.git", rev = "f4b297e93e6bc64ede951ade59347486baf7f85f" }
+zeroclaw-providers = { git = "https://github.com/zeroclaw-labs/zeroclaw.git", rev = "f4b297e93e6bc64ede951ade59347486baf7f85f" }
 
 [dev-dependencies]
 http-body-util = "0.1"
+tokio = { version = "1.50", features = ["test-util"] }
 tower = { version = "0.5", features = ["util"] }
+zerorouter = { path = ".", features = ["testing"] }

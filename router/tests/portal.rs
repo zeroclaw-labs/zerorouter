@@ -375,6 +375,10 @@ async fn portal_api_is_scoped_to_the_session_user() {
     assert_eq!(status, StatusCode::NOT_FOUND);
 
     // The 21st active key is rejected. A has 1 active key (alpha); add 19.
+    // Two limits now stand behind `key_limit_reached` — the active-key cap and
+    // the trailing-window creation throttle that counts disabled keys (A has
+    // also created and disabled `minted` above). Both are tripped here; which
+    // one bites first is exercised separately in `tests/caps.rs`.
     for index in 0..19 {
         seed_key(&pool, user_a, &format!("bulk-{index}")).await;
     }

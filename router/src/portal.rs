@@ -7,6 +7,11 @@
 //! Plaintext API keys are returned exactly once at mint time — only their
 //! SHA-256 digests are stored — and keys are disabled, never deleted, because
 //! usage history references them.
+//!
+//! Because disabling is only a flag flip, key CREATION is throttled rather than
+//! only key liveness: [`crate::db::admit_key_mint`] counts disabled keys
+//! against a trailing window, and the same check guards the device-claim mint
+//! path, so neither surface can be used to churn keys past a quota.
 
 use axum::{
     Json, Router,
@@ -24,13 +29,13 @@ use uuid::Uuid;
 use crate::{
     auth::{generate_api_key, hash_api_key},
     billing::{self, LedgerEntry},
+    db::{KeyMintAdmission, admit_key_mint},
     session::PortalUser,
     sqlx,
     web::WebCtx,
 };
 
 const MAX_KEY_NAME_CHARS: usize = 100;
-const MAX_ACTIVE_KEYS_PER_USER: i64 = 20;
 const MAX_SPEND_CAP_USD: u32 = 10_000;
 const MAX_VELOCITY_CAP_TOKENS_PER_MIN: i32 = 2_000_000;
 const DEFAULT_USAGE_DAYS: i64 = 30;
@@ -82,7 +87,9 @@ impl IntoResponse for PortalError {
             Self::InvalidRequest(message) => (StatusCode::BAD_REQUEST, message, "invalid_request"),
             Self::KeyLimitReached => (
                 StatusCode::CONFLICT,
-                "This account has reached the maximum number of active API keys.",
+                "This account has reached its API key limit — either too many active keys, \
+                 or too many keys created recently. Disabling a key does not raise the \
+                 creation limit; wait for the window to pass.",
                 "key_limit_reached",
             ),
             Self::KeyNotFound => (
@@ -273,19 +280,21 @@ async fn create_key(
     let validated = validate_new_key(&request)?;
 
     let mut transaction = ctx.pool.begin().await?;
-    // Serialize concurrent mints for this user so the active-key cap cannot be
-    // exceeded by a race between two counting transactions.
+    // Serialize concurrent mints for this user so neither the active-key cap
+    // nor the creation throttle can be exceeded by a race between two counting
+    // transactions.
     sqlx::query_scalar::<_, Uuid>("SELECT id FROM users WHERE id = $1 FOR UPDATE")
         .bind(user.user_id)
         .fetch_one(&mut *transaction)
         .await?;
-    let active_keys = sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*) FROM api_keys WHERE user_id = $1 AND NOT disabled",
-    )
-    .bind(user.user_id)
-    .fetch_one(&mut *transaction)
-    .await?;
-    if active_keys >= MAX_ACTIVE_KEYS_PER_USER {
+    // Shared with the device-claim mint path (`crate::device`), so a device
+    // grant can no longer mint past a limit the portal enforces. Counts
+    // disabled keys against a trailing creation window, which is what makes
+    // disable-and-remint stop resetting the limit.
+    if matches!(
+        admit_key_mint(&mut transaction, user.user_id).await?,
+        KeyMintAdmission::LimitReached
+    ) {
         return Err(PortalError::KeyLimitReached);
     }
 
@@ -355,6 +364,24 @@ async fn disable_key(
     // Keys are disabled, never deleted: usage_events rows reference them. The
     // user_id predicate makes a foreign key id indistinguishable from a
     // missing one.
+    //
+    // The 204 this returns is a promise that no further request can dispatch on
+    // the key, and the row lock this UPDATE takes is what keeps it. Admission
+    // ([`crate::db::begin_usage_session`]) re-checks `NOT disabled` inside its
+    // own conditional UPDATE against the same row, so the two serialize: either
+    // this commits first and the racing admission re-evaluates its predicate
+    // against `disabled = TRUE` and refuses, or admission commits first and this
+    // statement waits behind it — the operator is not told the key is revoked
+    // until the request that beat them has already been admitted. No explicit
+    // lock is needed here beyond the one the UPDATE already takes; adding the
+    // per-user advisory lock would only invert this crate's advisory-then-row
+    // ordering and create a deadlock cycle with admission.
+    //
+    // What this does NOT promise: a request already dispatched upstream keeps
+    // running, and [`crate::auth`]'s 30-second key cache means a revoked key can
+    // still pass authentication (and reach endpoints that never admit, such as
+    // model listing) until its cache entry expires. Revocation is immediate for
+    // *dispatch*, which is what costs money, not for every byte of the surface.
     let result = sqlx::query(
         "UPDATE api_keys SET disabled = TRUE WHERE id = $1 AND user_id = $2 AND NOT disabled",
     )

@@ -6,7 +6,10 @@ use uuid::Uuid;
 
 use crate::{
     auth::{generate_api_key, hash_api_key},
-    db::{database_pool_from_env, migrate, parse_decimal},
+    db::{
+        database_pool_from_env, migrate, parse_decimal, quarantined_settlements,
+        recover_owed_settlements,
+    },
     sqlx::{self, PgPool},
 };
 
@@ -24,6 +27,12 @@ pub enum AdminCommand {
     RevokeKey(RevokeKeyArgs),
     /// List key metadata without hashes or plaintext credentials.
     ListKeys(ListKeysArgs),
+    /// List settlements that could not be recorded and are awaiting
+    /// reconciliation (migration 0006).
+    OwedSettlements(OwedSettlementsArgs),
+    /// Replay settlements that were recorded as owed and never committed. Safe
+    /// to run at any time and safe to run twice: the settle is idempotent.
+    SettleOwed(SettleOwedArgs),
 }
 
 #[derive(Debug, Args)]
@@ -48,6 +57,18 @@ pub struct RevokeKeyArgs {
 pub struct ListKeysArgs {
     #[arg(long)]
     pub email: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct OwedSettlementsArgs {
+    #[arg(long, default_value_t = 100)]
+    pub limit: i64,
+}
+
+#[derive(Debug, Args)]
+pub struct SettleOwedArgs {
+    #[arg(long, default_value_t = 100)]
+    pub limit: i64,
 }
 
 #[derive(Serialize)]
@@ -76,7 +97,27 @@ pub async fn run(args: AdminArgs) -> Result<()> {
         AdminCommand::MintKey(args) => mint_key(&pool, args).await,
         AdminCommand::RevokeKey(args) => revoke_key(&pool, args).await,
         AdminCommand::ListKeys(args) => list_keys(&pool, args).await,
+        AdminCommand::OwedSettlements(args) => owed_settlements(&pool, args).await,
+        AdminCommand::SettleOwed(args) => settle_owed(&pool, args).await,
     }
+}
+
+/// The reconciliation queue: delivered inference whose settlement could not be
+/// recorded automatically. An empty list is the healthy state.
+async fn owed_settlements(pool: &PgPool, args: OwedSettlementsArgs) -> Result<()> {
+    let rows = quarantined_settlements(pool, args.limit)
+        .await
+        .context("failed to list quarantined settlements")?;
+    println!("{}", serde_json::to_string_pretty(&rows)?);
+    Ok(())
+}
+
+async fn settle_owed(pool: &PgPool, args: SettleOwedArgs) -> Result<()> {
+    let summary = recover_owed_settlements(pool, args.limit)
+        .await
+        .context("failed to recover owed settlements")?;
+    println!("{}", serde_json::to_string_pretty(&summary)?);
+    Ok(())
 }
 
 async fn mint_key(pool: &PgPool, args: MintKeyArgs) -> Result<()> {
