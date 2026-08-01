@@ -527,14 +527,16 @@ input_per_mtok = 9.00"#,
 }
 
 #[tokio::test]
-async fn sonnet_intro_pricing_expiry_withholds_high_end_and_nothing_else() {
-    // The scheduled outage this whole mechanism exists for, simulated against
-    // the *shipped* table. `config/tiers.toml` records that Sonnet 5's
-    // introductory pricing ends after 2026-08-31; when it lapses both sonnet
-    // rows go above zero/high-end's sell rates. Here the two candidate bases
-    // (and only they — the tier's own sell rates are left exactly as shipped)
-    // are raised to the post-intro standard rate, and the catalog must lose
-    // zero/high-end alone while zero/low-cost and zero/balanced keep serving.
+async fn a_basis_hike_above_sell_withholds_high_end_and_nothing_else() {
+    // The withhold mechanism, pinned against the *shipped* table with a
+    // hypothetical future basis hike. (The originally scheduled version of
+    // this event — Sonnet 5's intro pricing lapsing on 2026-09-01 — was
+    // defused by raising the sells to the standard rate ahead of time, so
+    // the real Sept 1 basis flip lands exactly AT sell and cannot withhold.
+    // This test keeps the mechanism honest for whatever repricing comes
+    // next.) Both high-end candidate bases (and only they — the tier's
+    // sells stay exactly as shipped) are raised above sell, and the catalog
+    // must lose zero/high-end alone while every other tier keeps serving.
     let shipped = tokio::fs::read_to_string(tier_config_path())
         .await
         .expect("shipped catalog should read");
@@ -545,12 +547,12 @@ async fn sonnet_intro_pricing_expiry_withholds_high_end_and_nothing_else() {
     let lapsed = format!(
         "{head}{}",
         candidates
-            .replace("input_per_mtok = 2.00", "input_per_mtok = 3.00")
+            .replace("input_per_mtok = 2.00", "input_per_mtok = 4.00")
             .replace(
                 "cached_input_per_mtok = 0.20",
-                "cached_input_per_mtok = 0.30"
+                "cached_input_per_mtok = 0.40"
             )
-            .replace("output_per_mtok = 10.00", "output_per_mtok = 15.00")
+            .replace("output_per_mtok = 10.00", "output_per_mtok = 20.00")
     );
     let path = catalog_fixture("sonnet_intro_lapsed", &lapsed).await;
 
@@ -599,7 +601,7 @@ async fn sonnet_intro_pricing_expiry_withholds_high_end_and_nothing_else() {
         assert!(
             withheld
                 .reason
-                .contains("cost basis 3 exceeds tier sell rate 2"),
+                .contains("cost basis 4 exceeds tier sell rate 3"),
             "{}",
             withheld.reason
         );
@@ -607,8 +609,8 @@ async fn sonnet_intro_pricing_expiry_withholds_high_end_and_nothing_else() {
     // The tier's own sell rates are untouched — only the cost basis moved,
     // which is exactly what the calendar does to this table.
     let sell = catalog.unavailable["zero/high-end"].definition.rates;
-    assert_eq!(sell.input_per_mtok, Some(2.00));
-    assert_eq!(sell.output_per_mtok, Some(10.00));
+    assert_eq!(sell.input_per_mtok, Some(3.00));
+    assert_eq!(sell.output_per_mtok, Some(15.00));
 
     // And the public catalog stops advertising what it cannot serve: the
     // five surviving tier ids plus their twelve candidates, with no sonnet
