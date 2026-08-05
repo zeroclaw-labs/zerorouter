@@ -27,6 +27,11 @@ pub enum AdminCommand {
     /// Per-provider trailing-window COGS: what each upstream account is
     /// owed, for invoice reconciliation and deposit sizing.
     Treasury(TreasuryArgs),
+    /// Grant promo credits to an existing user, atomically: the same
+    /// transactional path Stripe purchases use, with entry type 'promo'.
+    /// The user must already exist (mint-key creates one) — a typo'd email
+    /// must fail loudly, never mint a funded ghost account.
+    GrantCredit(GrantCreditArgs),
     /// Disable an existing key.
     RevokeKey(RevokeKeyArgs),
     /// List key metadata without hashes or plaintext credentials.
@@ -53,6 +58,18 @@ pub struct MintKeyArgs {
     /// omitted means NULL, which reads as balanced.
     #[arg(long, value_parser = parse_priority)]
     pub default_priority: Option<Priority>,
+}
+
+#[derive(Debug, Args)]
+pub struct GrantCreditArgs {
+    #[arg(long)]
+    pub email: String,
+    /// Credit amount in USD, e.g. 5 or 5.00. Positive, at most 10000.
+    #[arg(long)]
+    pub amount_usd: String,
+    /// Ledger note recorded with the grant.
+    #[arg(long, default_value = "beta promo credit")]
+    pub note: String,
 }
 
 fn parse_priority(value: &str) -> Result<Priority, String> {
@@ -116,6 +133,7 @@ pub async fn run(args: AdminArgs) -> Result<()> {
 
     match args.command {
         AdminCommand::MintKey(args) => mint_key(&pool, args).await,
+        AdminCommand::GrantCredit(args) => grant_credit(&pool, args).await,
         AdminCommand::Treasury(args) => treasury(&pool, args).await,
         AdminCommand::RevokeKey(args) => revoke_key(&pool, args).await,
         AdminCommand::ListKeys(args) => list_keys(&pool, args).await,
@@ -154,6 +172,45 @@ async fn treasury(pool: &PgPool, args: TreasuryArgs) -> Result<()> {
         serde_json::to_string_pretty(&serde_json::json!({
             "window_days": args.days,
             "providers": rows,
+        }))?
+    );
+    Ok(())
+}
+
+async fn grant_credit(pool: &PgPool, args: GrantCreditArgs) -> Result<()> {
+    let email = args.email.trim().to_lowercase();
+    if email.is_empty() || !email.contains('@') {
+        bail!("email must be a non-empty email address")
+    }
+    let amount = parse_decimal(&args.amount_usd, "amount-usd")?;
+    if amount <= Decimal::ZERO {
+        bail!("amount-usd must be positive")
+    }
+    // Fat-finger guard, not a policy knob: a beta promo grant should never
+    // be five digits. Run twice for more.
+    if amount > Decimal::from(10_000) {
+        bail!("amount-usd must be at most 10000")
+    }
+    let Some(user_id) = sqlx::query_scalar::<_, Uuid>("SELECT id FROM users WHERE email = $1")
+        .bind(&email)
+        .fetch_optional(pool)
+        .await
+        .context("failed to resolve user")?
+    else {
+        bail!("no user with email {email}; mint-key creates one")
+    };
+    crate::billing::grant_promo(pool, user_id, amount, args.note.trim())
+        .await
+        .context("failed to grant credit")?;
+    let balance = crate::billing::balance(pool, user_id)
+        .await
+        .context("failed to read balance")?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "user_id": user_id,
+            "granted_usd": amount,
+            "balance_usd": balance,
         }))?
     );
     Ok(())

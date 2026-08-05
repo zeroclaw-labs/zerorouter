@@ -150,3 +150,77 @@ async fn admin_cli_mints_lists_and_revokes_user_keys_without_storing_plaintext()
         .await
         .expect("second test key should cleanly disable");
 }
+
+#[tokio::test]
+async fn admin_cli_grants_promo_credit_to_existing_users_only() {
+    let Ok(database_url) = std::env::var("DATABASE_URL") else {
+        return;
+    };
+    let options = PgConnectOptions::from_str(&database_url).expect("test database URL must parse");
+    let pool = PgPoolOptions::new()
+        .max_connections(5)
+        .connect_with(options)
+        .await
+        .expect("test database must connect");
+    migrate(&pool).await.expect("migration must succeed");
+
+    let identity = Uuid::new_v4();
+    let email = format!("grant-smoke-{identity}@example.invalid");
+
+    // A typo'd email must fail loudly, never mint a funded ghost account.
+    let missing = run_admin(
+        &database_url,
+        &["grant-credit", "--email", &email, "--amount-usd", "5"],
+    );
+    assert!(!missing.status.success());
+    assert!(
+        String::from_utf8_lossy(&missing.stderr).contains("no user with email"),
+        "unknown user is refused"
+    );
+
+    run_admin(
+        &database_url,
+        &["mint-key", "--email", &email, "--name", "seed"],
+    );
+
+    let granted = run_admin(
+        &database_url,
+        &["grant-credit", "--email", &email, "--amount-usd", "5.25"],
+    );
+    assert!(granted.status.success());
+    let output: Value = serde_json::from_slice(&granted.stdout).expect("grant output is JSON");
+    assert_eq!(output["granted_usd"], "5.25");
+    assert_eq!(output["balance_usd"], "5.25");
+
+    // The grant is the same money path purchases use: a 'promo' ledger row
+    // snapshotting balance_after, and the users balance moved with it.
+    let user_id = Uuid::parse_str(output["user_id"].as_str().unwrap()).unwrap();
+    let (entry_type, amount, after): (String, rust_decimal::Decimal, rust_decimal::Decimal) =
+        query_as_row(&pool, user_id).await;
+    assert_eq!(entry_type, "promo");
+    assert_eq!(amount.to_string(), "5.25");
+    assert_eq!(after.to_string(), "5.25");
+
+    // Zero and negative amounts are refused at the CLI boundary.
+    for bad in ["0", "-3"] {
+        let refused = run_admin(
+            &database_url,
+            &["grant-credit", "--email", &email, "--amount-usd", bad],
+        );
+        assert!(!refused.status.success(), "amount {bad} must be refused");
+    }
+}
+
+async fn query_as_row(
+    pool: &sqlx_postgres::PgPool,
+    user_id: Uuid,
+) -> (String, rust_decimal::Decimal, rust_decimal::Decimal) {
+    query_scalar::<_, (String, rust_decimal::Decimal, rust_decimal::Decimal)>(
+        "SELECT (entry_type, amount_usd, balance_after_usd) FROM credit_ledger \
+         WHERE user_id = $1 AND entry_type = 'promo' ORDER BY id DESC LIMIT 1",
+    )
+    .bind(user_id)
+    .fetch_one(pool)
+    .await
+    .expect("promo ledger row exists")
+}
