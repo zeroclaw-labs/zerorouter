@@ -300,10 +300,19 @@ async fn callback(
 
     let id_token = token_response.id_token().ok_or(OidcError::IdTokenInvalid)?;
     let expected_nonce = Nonce::new(stored_nonce);
+    // Zitadel (and the Keycloak family) append the PROJECT id to `aud`
+    // alongside the client id, and the crate's default verifier rejects any
+    // token carrying audiences it was not told about. Accepting the extras
+    // is safe: the verifier still requires OUR client id to be present in
+    // `aud`, so a token minted for a different application can never pass —
+    // the additional entries are informational.
+    let verifier = client
+        .id_token_verifier()
+        .set_other_audience_verifier_fn(|_| true);
     let claims = id_token
-        .claims(&client.id_token_verifier(), &expected_nonce)
-        .map_err(|_| {
-            tracing::warn!("OIDC identity token verification failed");
+        .claims(&verifier, &expected_nonce)
+        .map_err(|error| {
+            tracing::warn!(error = %error, "OIDC identity token verification failed");
             OidcError::IdTokenInvalid
         })?;
 
