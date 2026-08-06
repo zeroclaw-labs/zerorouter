@@ -1702,35 +1702,68 @@ pub struct SettlementRecovery {
 /// this cannot collide with a request still working through its own retries;
 /// and even a collision would be harmless, since both paths serialize on the
 /// per-user advisory lock and the loser sees `AlreadySettled`.
-pub async fn recover_owed_settlements(
-    pool: &PgPool,
-    limit: i64,
-) -> Result<SettlementRecovery, sqlx::Error> {
-    recover_owed_settlements_inner(pool, limit, false).await
-}
-
-/// [`recover_owed_settlements`], but also replaying settlements that were
-/// QUARANTINED after exhausting their automatic attempts.
+/// Collect ONE settlement an operator has inspected, even if it is
+/// quarantined.
 ///
 /// Quarantine deliberately ends automatic retry: eight failures means
 /// something is wrong that retrying will not fix, and a hot loop against a
 /// poisoned row helps nobody. But it left the operator with no way to
 /// finish the job — the money is owed, the intent is stored, and nothing
-/// could collect it. This is that path, and it is opt-in precisely because
-/// a human should look at `admin owed-settlements` first. The replay itself
-/// is the same idempotent settle every other caller uses: a row that
-/// somehow did settle comes back `AlreadySettled` and moves no balance.
-pub async fn recover_quarantined_settlements(
+/// could collect it. This is that path, and it is deliberately
+/// single-row: an operator reads `admin owed-settlements`, decides about a
+/// specific debt, and collects exactly that one. A blunt "settle every
+/// parked row" sweep would act on rows nobody looked at.
+///
+/// The replay is the same idempotent settle every other caller uses, so a
+/// row that somehow did settle comes back `AlreadySettled` and moves no
+/// balance.
+pub async fn recover_quarantined_settlement(
     pool: &PgPool,
-    limit: i64,
+    request_id: Uuid,
 ) -> Result<SettlementRecovery, sqlx::Error> {
-    recover_owed_settlements_inner(pool, limit, true).await
+    let owed = sqlx::query_as::<_, (Uuid, Uuid, String)>(
+        r#"
+        SELECT id, api_key_id, settlement_intent::TEXT
+        FROM usage_reservations
+        WHERE id = $1 AND settlement_intent IS NOT NULL
+        "#,
+    )
+    .bind(request_id)
+    .fetch_optional(pool)
+    .await?;
+    let mut summary = SettlementRecovery::default();
+    let Some((reservation_id, api_key_id, payload)) = owed else {
+        return Ok(summary);
+    };
+    let Ok(intent) = serde_json::from_str::<SettlementIntent>(&payload) else {
+        summary.failed += 1;
+        return Ok(summary);
+    };
+    if intent.version != SETTLEMENT_INTENT_VERSION {
+        summary.failed += 1;
+        return Ok(summary);
+    }
+    match settle_once(pool, reservation_id, api_key_id, &intent).await {
+        Ok(SettleOutcome::Settled) => {
+            tracing::info!(request_id = %reservation_id, "quarantined settlement collected");
+            summary.settled += 1;
+        }
+        Ok(SettleOutcome::AlreadySettled) => summary.already_settled += 1,
+        Err(error) => {
+            tracing::error!(
+                request_id = %reservation_id,
+                error = %error,
+                "operator collection of a quarantined settlement failed"
+            );
+            summary.failed += 1;
+        }
+    }
+    Ok(summary)
 }
 
-async fn recover_owed_settlements_inner(
+pub async fn recover_owed_settlements(
     pool: &PgPool,
     limit: i64,
-    include_quarantined: bool,
 ) -> Result<SettlementRecovery, sqlx::Error> {
     let grace_seconds = i64::try_from(SETTLEMENT_RECOVERY_GRACE.as_secs()).unwrap_or(i64::MAX);
     let owed = sqlx::query_as::<_, (Uuid, Uuid, String)>(
@@ -1738,7 +1771,7 @@ async fn recover_owed_settlements_inner(
         SELECT id, api_key_id, settlement_intent::TEXT
         FROM usage_reservations
         WHERE settlement_intent IS NOT NULL
-          AND ($3 OR quarantined_at IS NULL)
+          AND quarantined_at IS NULL
           AND settlement_intent_at <= NOW() - ($2 * INTERVAL '1 second')
         ORDER BY settlement_intent_at
         LIMIT $1
@@ -1746,7 +1779,6 @@ async fn recover_owed_settlements_inner(
     )
     .bind(limit.max(0))
     .bind(grace_seconds)
-    .bind(include_quarantined)
     .fetch_all(pool)
     .await?;
 

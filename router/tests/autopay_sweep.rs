@@ -156,6 +156,15 @@ async fn balance_of(pool: &PgPool, user_id: Uuid) -> Decimal {
 /// Neutralize residue from earlier runs and other suites: the sweep is
 /// global, so any enabled user in the shared test database would be charged
 /// against this test's mock and poison its counters.
+/// Serializes the sweep tests. `run_autopay_sweep_once` is GLOBAL by
+/// design — production runs one sweep for every armed user — so two tests
+/// running side by side charge each other's users and each other's
+/// assertions. `disarm_all_autopay` narrows the window at setup but cannot
+/// close it: the other test arms its user immediately afterwards. Holding
+/// this for the whole test body is what makes the sweep observable.
+static SWEEP_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+
 async fn disarm_all_autopay(pool: &PgPool) {
     query("UPDATE users SET autopay_enabled = FALSE WHERE autopay_enabled")
         .execute(pool)
@@ -171,6 +180,7 @@ async fn the_sweep_charges_credits_and_strikes_out() {
     let Some(pool) = connect().await else {
         return;
     };
+    let _sweep_guard = SWEEP_LOCK.lock().await;
     disarm_all_autopay(&pool).await;
 
     // --- Phase 1: the happy loop --------------------------------------
@@ -247,6 +257,7 @@ async fn a_stale_pending_intent_is_reconciled_from_stripe() {
     let Some(pool) = connect().await else {
         return;
     };
+    let _sweep_guard = SWEEP_LOCK.lock().await;
     disarm_all_autopay(&pool).await;
     let (app, charges) = mock_stripe(false);
     let base = serve(app).await;
