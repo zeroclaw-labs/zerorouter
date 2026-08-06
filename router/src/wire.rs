@@ -67,6 +67,66 @@ use zeroclaw_providers::traits::ChatMessage;
 /// sends nothing until the model finishes.
 const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// Ceiling on a non-streaming upstream response body, and on the excerpt
+/// kept from an error body. Nothing legitimate approaches it: a maximal
+/// completion is a few megabytes of JSON. Without it a hostile upstream can
+/// stream a multi-gigabyte body inside the request budget and exhaust the
+/// process with a single request.
+const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+
+/// Ceiling on tool-call assembly within one stream: how many tool blocks
+/// may be open at once, and how many bytes of arguments may accumulate
+/// across all of them. The per-event cap bounds a single SSE frame; these
+/// bound the total a stream can accrete across legitimately terminated
+/// frames.
+const MAX_OPEN_TOOL_BLOCKS: usize = 64;
+const MAX_TOOL_ARGUMENT_BYTES: usize = 4 * 1024 * 1024;
+
+/// Largest token count either wire will believe. Postgres stores usage as
+/// INTEGER, so anything at or above this both overcharges and — once it
+/// exceeds the column — makes every settlement attempt fail permanently,
+/// which is a denial of settlement rather than a billing error.
+const MAX_BELIEVABLE_TOKENS: u64 = i32::MAX as u64;
+
+/// Read an upstream body with a ceiling. Returns what arrived, and whether
+/// it was truncated — the caller decides whether truncation is fatal (a
+/// success body must parse; an error body only needs to be legible).
+async fn bounded_body(response: reqwest::Response) -> (String, bool) {
+    let mut stream = response.bytes_stream();
+    let mut collected: Vec<u8> = Vec::new();
+    let mut truncated = false;
+    while let Some(chunk) = stream.next().await {
+        let Ok(chunk) = chunk else {
+            break;
+        };
+        let remaining = MAX_RESPONSE_BYTES.saturating_sub(collected.len());
+        if chunk.len() > remaining {
+            collected.extend_from_slice(&chunk[..remaining]);
+            truncated = true;
+            break;
+        }
+        collected.extend_from_slice(&chunk);
+    }
+    (String::from_utf8_lossy(&collected).into_owned(), truncated)
+}
+
+/// Refuse token counts an upstream could not honestly report. A count that
+/// exceeds what the database can store would fail every settlement forever;
+/// treating the usage as absent instead routes the request through the
+/// missing-usage path, which is a known, handled state.
+fn believable(usage: TokenUsage) -> Option<TokenUsage> {
+    let over = |value: Option<u64>| value.is_some_and(|tokens| tokens > MAX_BELIEVABLE_TOKENS);
+    if over(usage.input_tokens) || over(usage.output_tokens) || over(usage.cached_input_tokens) {
+        tracing::warn!(
+            input = ?usage.input_tokens,
+            output = ?usage.output_tokens,
+            "upstream reported implausible token counts; treating usage as absent"
+        );
+        return None;
+    }
+    Some(usage)
+}
+
 /// Default endpoint for the OpenAI Responses API.
 const RESPONSES_URL: &str = "https://api.openai.com/v1/responses";
 
@@ -347,15 +407,17 @@ struct ResponsesInputDetails {
 
 impl ResponsesUsage {
     /// The billing-grade lift this module exists for: input, output, and
-    /// the cached-input subset, straight from the wire.
-    fn into_token_usage(self) -> TokenUsage {
-        TokenUsage {
+    /// the cached-input subset, straight from the wire — subject to
+    /// [`believable`], because "straight from the wire" must not mean
+    /// "whatever the upstream says".
+    fn into_token_usage(self) -> Option<TokenUsage> {
+        believable(TokenUsage {
             input_tokens: self.input_tokens,
             output_tokens: self.output_tokens,
             cached_input_tokens: self
                 .input_tokens_details
                 .and_then(|details| details.cached_tokens),
-        }
+        })
     }
 }
 
@@ -407,7 +469,7 @@ fn parse_envelope(envelope: ResponsesEnvelope) -> ChatResponse {
     ChatResponse {
         text,
         tool_calls,
-        usage: envelope.usage.map(ResponsesUsage::into_token_usage),
+        usage: envelope.usage.and_then(ResponsesUsage::into_token_usage),
         reasoning_content: None,
     }
 }
@@ -502,13 +564,17 @@ impl ModelProvider for OpenAiResponsesWire {
         let status = response.status();
         // Same rule as the Anthropic wire: the status is already known, so a
         // failed body read must not erase it into a retryable-looking
-        // transport error.
-        let text = response
-            .text()
-            .await
-            .unwrap_or_else(|error| format!("<body unreadable: {error}>"));
+        // transport error. Bounded, because a hostile upstream can otherwise
+        // stream a body until the process dies.
+        let (text, truncated) = bounded_body(response).await;
         if !status.is_success() {
             return Err(upstream_error(&self.alias, status, &text));
+        }
+        if truncated {
+            return Err(anyhow!(
+                "{} responses API body exceeded {MAX_RESPONSE_BYTES} bytes",
+                self.alias
+            ));
         }
         let envelope: ResponsesEnvelope = serde_json::from_str(&text).map_err(|error| {
             anyhow!(
@@ -543,7 +609,7 @@ impl ModelProvider for OpenAiResponsesWire {
                 .map_err(|error| StreamError::Http(error.to_string()))?;
             let status = response.status();
             if !status.is_success() {
-                let text = response.text().await.unwrap_or_default();
+                let (text, _) = bounded_body(response).await;
                 Err(StreamError::Http(
                     upstream_error(&alias, status, &text).to_string(),
                 ))?;
@@ -621,8 +687,9 @@ impl ModelProvider for OpenAiResponsesWire {
                                 .and_then(|response| response.get("usage"))
                                 && let Ok(usage) =
                                     serde_json::from_value::<ResponsesUsage>(usage.clone())
+                                && let Some(usage) = usage.into_token_usage()
                             {
-                                yield StreamEvent::Usage(usage.into_token_usage());
+                                yield StreamEvent::Usage(usage);
                             }
                             finished = true;
                             yield StreamEvent::Final;
@@ -1016,10 +1083,10 @@ struct AnthropicUsage {
 }
 
 impl AnthropicUsage {
-    fn into_token_usage(self) -> TokenUsage {
+    fn into_token_usage(self) -> Option<TokenUsage> {
         let cache_read = self.cache_read_input_tokens.unwrap_or(0);
         let cache_creation = self.cache_creation_input_tokens.unwrap_or(0);
-        TokenUsage {
+        believable(TokenUsage {
             // Absent input stays None (the missing-usage path downstream);
             // present input becomes the OpenAI-convention TOTAL.
             input_tokens: self.input_tokens.map(|input| {
@@ -1029,7 +1096,7 @@ impl AnthropicUsage {
             }),
             output_tokens: self.output_tokens,
             cached_input_tokens: (cache_read > 0).then_some(cache_read),
-        }
+        })
     }
 }
 
@@ -1082,7 +1149,7 @@ fn parse_messages_envelope(envelope: MessagesEnvelope) -> ChatResponse {
     ChatResponse {
         text,
         tool_calls,
-        usage: envelope.usage.map(AnthropicUsage::into_token_usage),
+        usage: envelope.usage.and_then(AnthropicUsage::into_token_usage),
         reasoning_content: None,
     }
 }
@@ -1111,6 +1178,8 @@ struct PendingAnthropicTool {
 struct AnthropicStreamMachine {
     usage: AnthropicUsage,
     open_tools: std::collections::BTreeMap<u64, PendingAnthropicTool>,
+    /// Cumulative tool-argument bytes across the whole stream.
+    tool_argument_bytes: usize,
     count_tokens: bool,
     finished: bool,
 }
@@ -1130,7 +1199,7 @@ impl AnthropicStreamMachine {
     /// usage would charge zero for delivered output (sol review). The caller
     /// emits this before surfacing the stream error.
     fn partial_usage(&mut self) -> Option<TokenUsage> {
-        let usage = std::mem::take(&mut self.usage).into_token_usage();
+        let usage = std::mem::take(&mut self.usage).into_token_usage()?;
         (usage.input_tokens.is_some() || usage.output_tokens.is_some()).then_some(usage)
     }
 
@@ -1139,21 +1208,25 @@ impl AnthropicStreamMachine {
         // Field-by-field: `message_delta` carries cumulative output tokens
         // (and sometimes more) without repeating what `message_start` said —
         // absent fields must not erase known ones.
-        if let Some(tokens) = usage.get("input_tokens").and_then(Value::as_u64) {
-            self.usage.input_tokens = Some(tokens);
-        }
-        if let Some(tokens) = usage.get("output_tokens").and_then(Value::as_u64) {
-            self.usage.output_tokens = Some(tokens);
-        }
-        if let Some(tokens) = usage.get("cache_read_input_tokens").and_then(Value::as_u64) {
-            self.usage.cache_read_input_tokens = Some(tokens);
-        }
-        if let Some(tokens) = usage
-            .get("cache_creation_input_tokens")
-            .and_then(Value::as_u64)
-        {
-            self.usage.cache_creation_input_tokens = Some(tokens);
-        }
+        // Anthropic's counters are CUMULATIVE, so they may only rise. Taking
+        // the maximum rather than the latest value means a stale or replayed
+        // frame reporting `output_tokens: 1` after 10_000 cannot shrink the
+        // bill — or, just as bad, shrink the velocity window (sol review).
+        let raise = |slot: &mut Option<u64>, field: &str| {
+            if let Some(tokens) = usage.get(field).and_then(Value::as_u64) {
+                *slot = Some(slot.map_or(tokens, |seen: u64| seen.max(tokens)));
+            }
+        };
+        raise(&mut self.usage.input_tokens, "input_tokens");
+        raise(&mut self.usage.output_tokens, "output_tokens");
+        raise(
+            &mut self.usage.cache_read_input_tokens,
+            "cache_read_input_tokens",
+        );
+        raise(
+            &mut self.usage.cache_creation_input_tokens,
+            "cache_creation_input_tokens",
+        );
     }
 
     fn handle(&mut self, alias: &str, value: &Value) -> Result<Vec<StreamEvent>, StreamError> {
@@ -1171,6 +1244,14 @@ impl AnthropicStreamMachine {
                     && block.get("type").and_then(Value::as_str) == Some("tool_use")
                     && let Some(index) = value.get("index").and_then(Value::as_u64)
                 {
+                    // The per-event cap bounds one frame; this bounds what a
+                    // stream can accrete across legitimately terminated
+                    // frames by never closing its blocks (sol review).
+                    if self.open_tools.len() >= MAX_OPEN_TOOL_BLOCKS {
+                        return Err(StreamError::InvalidSse(format!(
+                            "{alias} opened more than {MAX_OPEN_TOOL_BLOCKS} concurrent tool blocks"
+                        )));
+                    }
                     self.open_tools.insert(
                         index,
                         PendingAnthropicTool {
@@ -1218,9 +1299,19 @@ impl AnthropicStreamMachine {
                             .and_then(|delta| delta.get("partial_json"))
                             .and_then(Value::as_str)
                             && let Some(index) = index
-                            && let Some(pending) = self.open_tools.get_mut(&index)
                         {
-                            pending.json.push_str(partial);
+                            // Cumulative across every open block: a stream
+                            // that appends forever must not grow the process.
+                            self.tool_argument_bytes =
+                                self.tool_argument_bytes.saturating_add(partial.len());
+                            if self.tool_argument_bytes > MAX_TOOL_ARGUMENT_BYTES {
+                                return Err(StreamError::InvalidSse(format!(
+                                    "{alias} tool arguments exceeded {MAX_TOOL_ARGUMENT_BYTES} bytes"
+                                )));
+                            }
+                            if let Some(pending) = self.open_tools.get_mut(&index) {
+                                pending.json.push_str(partial);
+                            }
                         }
                     }
                     _ => {}
@@ -1254,8 +1345,9 @@ impl AnthropicStreamMachine {
                 if self.finished {
                     return Ok(events);
                 }
-                let usage = std::mem::take(&mut self.usage).into_token_usage();
-                if usage.input_tokens.is_some() || usage.output_tokens.is_some() {
+                if let Some(usage) = std::mem::take(&mut self.usage).into_token_usage()
+                    && (usage.input_tokens.is_some() || usage.output_tokens.is_some())
+                {
                     events.push(StreamEvent::Usage(usage));
                 }
                 self.finished = true;
@@ -1372,13 +1464,17 @@ impl ModelProvider for AnthropicWire {
         let status = response.status();
         // The body read happens under the already-known status: a truncated
         // 401/429 body must not surface as a status-less transport error the
-        // classifier would happily retry (sol review).
-        let text = response
-            .text()
-            .await
-            .unwrap_or_else(|error| format!("<body unreadable: {error}>"));
+        // classifier would happily retry (sol review). Bounded for the same
+        // reason as its Responses sibling.
+        let (text, truncated) = bounded_body(response).await;
         if !status.is_success() {
             return Err(anthropic_upstream_error(&self.alias, status, &text));
+        }
+        if truncated {
+            return Err(anyhow!(
+                "{} messages API body exceeded {MAX_RESPONSE_BYTES} bytes",
+                self.alias
+            ));
         }
         let envelope: MessagesEnvelope = serde_json::from_str(&text).map_err(|error| {
             anyhow!(
@@ -1414,7 +1510,7 @@ impl ModelProvider for AnthropicWire {
                 .map_err(|error| StreamError::Http(error.to_string()))?;
             let status = response.status();
             if !status.is_success() {
-                let text = response.text().await.unwrap_or_default();
+                let (text, _) = bounded_body(response).await;
                 Err(StreamError::Http(
                     anthropic_upstream_error(&alias, status, &text).to_string(),
                 ))?;
@@ -1429,10 +1525,41 @@ impl ModelProvider for AnthropicWire {
             let mut buffer = String::new();
             let mut machine = AnthropicStreamMachine::new(count_tokens);
             while let Some(chunk) = bytes.next().await {
-                let chunk = chunk.map_err(|error| StreamError::Http(error.to_string()))?;
-                for data in drain_sse_payloads(&mut raw_buffer, &mut buffer, &chunk)? {
-                    let value: Value = serde_json::from_str(&data)
-                        .map_err(StreamError::Json)?;
+                let chunk = match chunk {
+                    Ok(chunk) => chunk,
+                    Err(error) => {
+                        if let Some(usage) = machine.partial_usage() {
+                            yield StreamEvent::Usage(usage);
+                        }
+                        Err(StreamError::Http(error.to_string()))?;
+                        return;
+                    }
+                };
+                let payloads = match drain_sse_payloads(&mut raw_buffer, &mut buffer, &chunk) {
+                    Ok(payloads) => payloads,
+                    Err(error) => {
+                        if let Some(usage) = machine.partial_usage() {
+                            yield StreamEvent::Usage(usage);
+                        }
+                        Err(error)?;
+                        return;
+                    }
+                };
+                for data in payloads {
+                    // A decode failure is an abnormal exit like any other:
+                    // usage the upstream already reported is billable, and
+                    // leaving through `?` here would settle delivered output
+                    // at zero (sol review).
+                    let value: Value = match serde_json::from_str::<Value>(&data) {
+                        Ok(value) => value,
+                        Err(error) => {
+                            if let Some(usage) = machine.partial_usage() {
+                                yield StreamEvent::Usage(usage);
+                            }
+                            Err(StreamError::Json(error))?;
+                            return;
+                        }
+                    };
                     match machine.handle(&alias, &value) {
                         Ok(events) => {
                             for event in events {
@@ -1440,10 +1567,7 @@ impl ModelProvider for AnthropicWire {
                             }
                         }
                         Err(error) => {
-                            // Usage the wire already reported is billable
-                            // even though the stream is failing — emit it
-                            // ahead of the error so the settle path meters
-                            // it instead of charging zero.
+                            // Same rule for an in-band error event.
                             if let Some(usage) = machine.partial_usage() {
                                 yield StreamEvent::Usage(usage);
                             }
@@ -2333,5 +2457,120 @@ mod wire_property_tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod hostile_upstream_tests {
+    //! The upstream is not trusted infrastructure — it is a network peer
+    //! whose numbers become customer charges. These pin the bounds a
+    //! deep-review pass identified as missing.
+
+    use super::*;
+
+    #[test]
+    fn implausible_token_counts_are_refused_rather_than_billed() {
+        // Above what the usage columns can store, every settlement would
+        // fail forever — a denial of settlement, not a billing error. Treat
+        // the usage as absent so the request takes the known missing-usage
+        // path instead.
+        let absurd = AnthropicUsage {
+            input_tokens: Some(u64::from(u32::MAX)),
+            output_tokens: Some(10),
+            cache_read_input_tokens: None,
+            cache_creation_input_tokens: None,
+        };
+        assert!(absurd.into_token_usage().is_none());
+
+        let believable_usage = AnthropicUsage {
+            input_tokens: Some(1_000),
+            output_tokens: Some(10),
+            cache_read_input_tokens: Some(400),
+            cache_creation_input_tokens: None,
+        };
+        let usage = believable_usage
+            .into_token_usage()
+            .expect("ordinary counts are believed");
+        assert_eq!(usage.input_tokens, Some(1_400));
+    }
+
+    #[test]
+    fn cumulative_counters_never_move_backwards() {
+        // Anthropic's counters are cumulative. A stale or replayed frame
+        // reporting less than an earlier one must not shrink the bill — or
+        // the velocity window.
+        let mut machine = AnthropicStreamMachine::new(false);
+        machine
+            .handle(
+                "anthropic",
+                &json!({"type": "message_delta", "usage": {"output_tokens": 10_000}}),
+            )
+            .expect("first delta");
+        machine
+            .handle(
+                "anthropic",
+                &json!({"type": "message_delta", "usage": {"output_tokens": 1}}),
+            )
+            .expect("stale delta");
+        let events = machine
+            .handle("anthropic", &json!({"type": "message_stop"}))
+            .expect("terminal");
+        let usage = events
+            .iter()
+            .find_map(|event| match event {
+                StreamEvent::Usage(usage) => Some(usage),
+                _ => None,
+            })
+            .expect("the terminal carries usage");
+        assert_eq!(
+            usage.output_tokens,
+            Some(10_000),
+            "the high-water mark survives a stale frame"
+        );
+    }
+
+    #[test]
+    fn tool_assembly_is_bounded_across_events() {
+        // The per-event cap bounds one frame; a stream that opens blocks or
+        // appends arguments forever must still be cut off.
+        let mut machine = AnthropicStreamMachine::new(false);
+        let mut refused = false;
+        for index in 0..(MAX_OPEN_TOOL_BLOCKS + 8) {
+            let opened = machine.handle(
+                "anthropic",
+                &json!({"type": "content_block_start", "index": index,
+                        "content_block": {"type": "tool_use", "id": "t", "name": "x"}}),
+            );
+            if opened.is_err() {
+                refused = true;
+                break;
+            }
+        }
+        assert!(refused, "concurrent tool blocks are capped");
+
+        let mut machine = AnthropicStreamMachine::new(false);
+        machine
+            .handle(
+                "anthropic",
+                &json!({"type": "content_block_start", "index": 0,
+                        "content_block": {"type": "tool_use", "id": "t", "name": "x"}}),
+            )
+            .expect("one block opens");
+        let chunk = "x".repeat(64 * 1024);
+        let mut refused = false;
+        for _ in 0..(MAX_TOOL_ARGUMENT_BYTES / chunk.len() + 4) {
+            if machine
+                .handle(
+                    "anthropic",
+                    &json!({"type": "content_block_delta", "index": 0,
+                            "delta": {"type": "input_json_delta", "partial_json": chunk}}),
+                )
+                .is_err()
+            {
+                refused = true;
+                break;
+            }
+        }
+        assert!(refused, "cumulative tool arguments are capped");
     }
 }
