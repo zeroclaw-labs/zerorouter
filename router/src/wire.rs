@@ -234,6 +234,64 @@ fn build_responses_input(messages: &[ChatMessage]) -> (String, Vec<Value>) {
     (system_parts.join("\n\n"), input)
 }
 
+/// Ceiling on a single un-terminated SSE event. A stream that never emits a
+/// blank line would otherwise grow the decode buffer without bound — an
+/// upstream (or anything that can impersonate one) could exhaust the
+/// router's memory with one request. Real events are kilobytes; this is
+/// four megabytes of slack before the stream is declared malformed.
+const MAX_SSE_EVENT_BYTES: usize = 4 * 1024 * 1024;
+
+/// Feed one network chunk into the SSE decoder and return every complete
+/// event's `data:` payload, in order.
+///
+/// Shared verbatim by both wires. Two properties it exists to hold: bytes
+/// are only decoded at valid UTF-8 boundaries, so a multibyte character
+/// split across chunks never becomes a replacement character in a
+/// customer's stream; and the buffer cannot grow without bound on an
+/// upstream that never terminates an event.
+fn drain_sse_payloads(
+    raw_buffer: &mut Vec<u8>,
+    buffer: &mut String,
+    chunk: &[u8],
+) -> Result<Vec<String>, StreamError> {
+    raw_buffer.extend_from_slice(chunk);
+    let valid_up_to = match std::str::from_utf8(raw_buffer) {
+        Ok(_) => raw_buffer.len(),
+        Err(error) => error.valid_up_to(),
+    };
+    buffer.push_str(
+        std::str::from_utf8(&raw_buffer[..valid_up_to]).expect("prefix was just validated"),
+    );
+    raw_buffer.drain(..valid_up_to);
+
+    let mut payloads = Vec::new();
+    // SSE events are separated by a blank line — LF or CRLF framing are
+    // both legal; `data:` lines strip a trailing CR.
+    while let Some((boundary, delimiter_len)) = find_event_boundary(buffer) {
+        let raw = buffer[..boundary].to_owned();
+        buffer.drain(..boundary + delimiter_len);
+        let data = raw
+            .lines()
+            .map(|line| line.strip_suffix('\r').unwrap_or(line))
+            .filter_map(|line| line.strip_prefix("data:"))
+            .map(str::trim_start)
+            .collect::<Vec<_>>()
+            .join("\n");
+        if data.is_empty() {
+            continue;
+        }
+        payloads.push(data);
+    }
+    // Checked AFTER draining: a chunk that completes several events and
+    // leaves a large tail is fine; only an unterminated tail is fatal.
+    if buffer.len() + raw_buffer.len() > MAX_SSE_EVENT_BYTES {
+        return Err(StreamError::InvalidSse(format!(
+            "upstream SSE event exceeded {MAX_SSE_EVENT_BYTES} bytes without terminating"
+        )));
+    }
+    Ok(payloads)
+}
+
 /// The next SSE event boundary: LF-LF or CRLF-CRLF, whichever comes first.
 fn find_event_boundary(buffer: &str) -> Option<(usize, usize)> {
     let lf = buffer.find("\n\n").map(|at| (at, 2));
@@ -501,32 +559,7 @@ impl ModelProvider for OpenAiResponsesWire {
             let mut finished = false;
             while let Some(chunk) = bytes.next().await {
                 let chunk = chunk.map_err(|error| StreamError::Http(error.to_string()))?;
-                raw_buffer.extend_from_slice(&chunk);
-                let valid_up_to = match std::str::from_utf8(&raw_buffer) {
-                    Ok(_) => raw_buffer.len(),
-                    Err(error) => error.valid_up_to(),
-                };
-                buffer.push_str(
-                    std::str::from_utf8(&raw_buffer[..valid_up_to])
-                        .expect("prefix was just validated"),
-                );
-                raw_buffer.drain(..valid_up_to);
-
-                // SSE events are separated by a blank line — LF or CRLF
-                // framing are both legal; `data:` lines strip a trailing CR.
-                while let Some((boundary, delimiter_len)) = find_event_boundary(&buffer) {
-                    let raw = buffer[..boundary].to_owned();
-                    buffer.drain(..boundary + delimiter_len);
-                    let data = raw
-                        .lines()
-                        .map(|line| line.strip_suffix('\r').unwrap_or(line))
-                        .filter_map(|line| line.strip_prefix("data:"))
-                        .map(str::trim_start)
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    if data.is_empty() {
-                        continue;
-                    }
+                for data in drain_sse_payloads(&mut raw_buffer, &mut buffer, &chunk)? {
                     let value: Value = serde_json::from_str(&data)
                         .map_err(StreamError::Json)?;
                     match value.get("type").and_then(Value::as_str) {
@@ -576,6 +609,13 @@ impl ModelProvider for OpenAiResponsesWire {
                         // terminal would deliver the clipped output and then
                         // settle it unbilled (codex-sol review finding).
                         Some("response.completed" | "response.incomplete") => {
+                            // Idempotent terminal, same rule as the
+                            // Anthropic machine: a repeated terminal inside
+                            // one chunk must not emit a second Final or a
+                            // second Usage.
+                            if finished {
+                                continue;
+                            }
                             if let Some(usage) = value
                                 .get("response")
                                 .and_then(|response| response.get("usage"))
@@ -1206,6 +1246,14 @@ impl AnthropicStreamMachine {
                 self.absorb_usage(value.get("usage"));
             }
             Some("message_stop") => {
+                // Idempotent terminal: a chunk carrying two message_stop
+                // events (upstream bug, or anything able to impersonate
+                // one) must not yield two Finals — and must not yield a
+                // second Usage that metering could read as authoritative.
+                // Found by the event-order property test.
+                if self.finished {
+                    return Ok(events);
+                }
                 let usage = std::mem::take(&mut self.usage).into_token_usage();
                 if usage.input_tokens.is_some() || usage.output_tokens.is_some() {
                     events.push(StreamEvent::Usage(usage));
@@ -1382,30 +1430,7 @@ impl ModelProvider for AnthropicWire {
             let mut machine = AnthropicStreamMachine::new(count_tokens);
             while let Some(chunk) = bytes.next().await {
                 let chunk = chunk.map_err(|error| StreamError::Http(error.to_string()))?;
-                raw_buffer.extend_from_slice(&chunk);
-                let valid_up_to = match std::str::from_utf8(&raw_buffer) {
-                    Ok(_) => raw_buffer.len(),
-                    Err(error) => error.valid_up_to(),
-                };
-                buffer.push_str(
-                    std::str::from_utf8(&raw_buffer[..valid_up_to])
-                        .expect("prefix was just validated"),
-                );
-                raw_buffer.drain(..valid_up_to);
-
-                while let Some((boundary, delimiter_len)) = find_event_boundary(&buffer) {
-                    let raw = buffer[..boundary].to_owned();
-                    buffer.drain(..boundary + delimiter_len);
-                    let data = raw
-                        .lines()
-                        .map(|line| line.strip_suffix('\r').unwrap_or(line))
-                        .filter_map(|line| line.strip_prefix("data:"))
-                        .map(str::trim_start)
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    if data.is_empty() {
-                        continue;
-                    }
+                for data in drain_sse_payloads(&mut raw_buffer, &mut buffer, &chunk)? {
                     let value: Value = serde_json::from_str(&data)
                         .map_err(StreamError::Json)?;
                     match machine.handle(&alias, &value) {
@@ -2064,5 +2089,249 @@ mod anthropic_review_fix_tests {
             .filter_map(|block| block["text"].as_str())
             .collect();
         assert_eq!(joined, "broken [IMAGE:no-close");
+    }
+}
+
+#[cfg(test)]
+mod wire_property_tests {
+    //! Property tests over the wire decoders, driven by a deterministic
+    //! PRNG so a failure is reproducible from its seed alone (no external
+    //! fuzzing dependency, and CI stays hermetic). These target the layer
+    //! where adversarial bytes meet money: everything here runs on data an
+    //! upstream — or anything able to impersonate one — fully controls.
+
+    use super::*;
+
+    /// xorshift64*: tiny, deterministic, good enough to shuffle chunk
+    /// boundaries and event shapes.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            self.0.wrapping_mul(0x2545_f491_4f6c_dd1d)
+        }
+
+        fn below(&mut self, bound: usize) -> usize {
+            if bound == 0 {
+                0
+            } else {
+                usize::try_from(self.next() % bound as u64).unwrap_or(0)
+            }
+        }
+    }
+
+    /// Feed `bytes` through the decoder in randomly sized chunks.
+    fn decode_in_random_chunks(bytes: &[u8], rng: &mut Rng) -> Result<Vec<String>, StreamError> {
+        let mut raw_buffer = Vec::new();
+        let mut buffer = String::new();
+        let mut payloads = Vec::new();
+        let mut at = 0;
+        while at < bytes.len() {
+            let take = 1 + rng.below(bytes.len() - at);
+            payloads.extend(drain_sse_payloads(
+                &mut raw_buffer,
+                &mut buffer,
+                &bytes[at..at + take],
+            )?);
+            at += take;
+        }
+        Ok(payloads)
+    }
+
+    #[test]
+    fn chunk_boundaries_never_change_what_the_decoder_sees() {
+        // The property that matters for billing: how the network happened
+        // to split the bytes cannot change the events — including when the
+        // split lands mid-multibyte-character or mid-delimiter.
+        let events = [
+            r#"{"type":"response.output_text.delta","delta":"naïve — 日本語 🎉"}"#,
+            r#"{"type":"response.output_text.delta","delta":"second"}"#,
+            r#"{"type":"response.completed","response":{"usage":{"input_tokens":40,"output_tokens":9}}}"#,
+        ];
+        let mut wire = String::new();
+        for (index, event) in events.iter().enumerate() {
+            // Alternate LF and CRLF framing; both are legal.
+            wire.push_str(&format!(
+                "data: {event}{}",
+                if index % 2 == 0 { "\n\n" } else { "\r\n\r\n" }
+            ));
+        }
+        let expected: Vec<String> = events.iter().map(|event| (*event).to_owned()).collect();
+
+        let mut rng = Rng(0x5eed_1234_abcd_0001);
+        for _ in 0..2_000 {
+            let decoded = decode_in_random_chunks(wire.as_bytes(), &mut rng)
+                .expect("a well-formed stream decodes under any chunking");
+            assert_eq!(decoded, expected, "chunking changed the decoded events");
+        }
+    }
+
+    #[test]
+    fn arbitrary_bytes_never_panic_the_decoder() {
+        // Anything an upstream can put on the wire: random bytes, stray
+        // delimiters, `data:` lines with no payload, invalid UTF-8.
+        let mut rng = Rng(0x5eed_1234_abcd_0002);
+        for _ in 0..3_000 {
+            let length = 1 + rng.below(512);
+            let mut noise = Vec::with_capacity(length);
+            for _ in 0..length {
+                noise.push(match rng.below(8) {
+                    0 => b'\n',
+                    1 => b'\r',
+                    2 => b':',
+                    3 => b'd',
+                    // Lone continuation bytes: never valid UTF-8 on their own.
+                    4 => 0x80 | u8::try_from(rng.below(64)).unwrap_or(0),
+                    _ => u8::try_from(rng.below(256)).unwrap_or(0),
+                });
+            }
+            // The contract is "no panic and no corruption", not "no error":
+            // a malformed stream is allowed to be rejected.
+            let mut raw_buffer = Vec::new();
+            let mut buffer = String::new();
+            let _ = drain_sse_payloads(&mut raw_buffer, &mut buffer, &noise);
+            // Whatever survived must still be valid UTF-8 by construction.
+            assert!(std::str::from_utf8(buffer.as_bytes()).is_ok());
+        }
+    }
+
+    #[test]
+    fn an_unterminated_event_cannot_grow_the_buffer_without_bound() {
+        // Memory-exhaustion guard: an upstream that opens an event and
+        // never closes it must be cut off, not buffered forever.
+        let mut raw_buffer = Vec::new();
+        let mut buffer = String::new();
+        let filler = vec![b'x'; 256 * 1024];
+        let mut error = None;
+        for _ in 0..64 {
+            if let Err(hit) = drain_sse_payloads(&mut raw_buffer, &mut buffer, &filler) {
+                error = Some(hit);
+                break;
+            }
+        }
+        let error = error.expect("an unterminated event must eventually be refused");
+        assert!(
+            matches!(error, StreamError::InvalidSse(_)),
+            "the refusal is a malformed-stream error"
+        );
+        assert!(
+            buffer.len() <= MAX_SSE_EVENT_BYTES + filler.len(),
+            "the buffer stopped growing at the ceiling"
+        );
+    }
+
+    #[test]
+    fn the_anthropic_machine_survives_arbitrary_event_orders() {
+        // Events out of documented order, repeated, or truncated: the
+        // machine must never panic, never emit more than one Final, and
+        // never report usage it was not told.
+        let shapes = [
+            json!({"type": "message_start", "message": {"usage": {"input_tokens": 10}}}),
+            json!({"type": "content_block_start", "index": 0, "content_block": {"type": "tool_use", "id": "t", "name": "x"}}),
+            json!({"type": "content_block_delta", "index": 0, "delta": {"type": "input_json_delta", "partial_json": "{}"}}),
+            json!({"type": "content_block_delta", "index": 9, "delta": {"type": "text_delta", "text": "hi"}}),
+            json!({"type": "content_block_stop", "index": 0}),
+            json!({"type": "content_block_stop", "index": 7}),
+            json!({"type": "message_delta", "usage": {"output_tokens": 3}}),
+            json!({"type": "message_stop"}),
+            json!({"type": "ping"}),
+            json!({"type": "unknown_future_event", "whatever": [1, 2, 3]}),
+            json!({"type": "message_start"}),
+            json!(null),
+            json!([1, 2, 3]),
+        ];
+        let mut rng = Rng(0x5eed_1234_abcd_0003);
+        for _ in 0..2_000 {
+            let mut machine = AnthropicStreamMachine::new(rng.below(2) == 0);
+            let mut finals = 0;
+            for _ in 0..1 + rng.below(12) {
+                let value = &shapes[rng.below(shapes.len())];
+                match machine.handle("anthropic", value) {
+                    Ok(events) => {
+                        for event in events {
+                            if matches!(event, StreamEvent::Final) {
+                                finals += 1;
+                            }
+                            if let StreamEvent::Usage(usage) = event {
+                                // Anthropic's own numbers are folded into
+                                // ZR's convention; cached can never exceed
+                                // the input total it was added into.
+                                assert!(
+                                    usage.cached_input_tokens.unwrap_or(0)
+                                        <= usage.input_tokens.unwrap_or(0),
+                                    "cached must stay a subset of input"
+                                );
+                            }
+                        }
+                    }
+                    // In-band errors are a legal outcome, not a panic.
+                    Err(_) => break,
+                }
+            }
+            assert!(finals <= 1, "at most one terminal event per stream");
+        }
+    }
+
+    #[test]
+    fn a_repeated_terminal_in_one_chunk_yields_one_final_and_one_usage() {
+        // The defect the order property found: both wires processed every
+        // event in a chunk before checking `finished`, so a doubled
+        // terminal emitted two Finals — and a second Usage that metering
+        // would have read as authoritative.
+        let mut machine = AnthropicStreamMachine::new(false);
+        machine
+            .handle(
+                "anthropic",
+                &json!({"type": "message_start", "message": {"usage": {"input_tokens": 10, "output_tokens": 1}}}),
+            )
+            .expect("message_start is not an error");
+        let first = machine
+            .handle("anthropic", &json!({"type": "message_stop"}))
+            .expect("first terminal");
+        let second = machine
+            .handle(
+                "anthropic",
+                &json!({"type": "message_stop", "usage": {"output_tokens": 999_999}}),
+            )
+            .expect("a repeated terminal is ignored, not an error");
+        assert_eq!(
+            first
+                .iter()
+                .filter(|event| matches!(event, StreamEvent::Final))
+                .count(),
+            1
+        );
+        assert!(
+            second.is_empty(),
+            "the repeated terminal emits nothing at all"
+        );
+    }
+
+    #[test]
+    fn lying_usage_cannot_produce_a_negative_or_inflated_charge() {
+        // An upstream reporting cached > input (or absurd magnitudes) must
+        // not manufacture a credit or an overflow: the billing view clamps
+        // cached to input, and the cost function is checked arithmetic.
+        for (input, output, cached) in [
+            (10_u64, 5_u64, 1_000_u64),
+            (0, 0, u64::MAX),
+            (u64::MAX, u64::MAX, u64::MAX),
+            (1, 0, u64::MAX),
+        ] {
+            let usage = TokenUsage {
+                input_tokens: Some(input),
+                output_tokens: Some(output),
+                cached_input_tokens: Some(cached),
+            };
+            if let Some(view) = crate::openai::OpenAiUsage::try_from_provider(Some(&usage)) {
+                assert!(
+                    view.cached_input_tokens() <= view.prompt_tokens,
+                    "cached is clamped to the prompt total"
+                );
+            }
+        }
     }
 }
