@@ -398,10 +398,21 @@ pub async fn claim_autopay_attempt(
     amount_usd: Decimal,
     idempotency_key: &str,
 ) -> Result<bool, sqlx::Error> {
+    // The candidate list is an unlocked snapshot taken before this call, so
+    // the user may have turned autopay off — and had that request return
+    // successfully — between the SELECT and here. Re-reading the flag inside
+    // the claim closes that window: a disable that commits first makes the
+    // INSERT ... SELECT match nothing, and no charge follows (sol review).
+    // The amount is re-read from the row for the same reason, so a topup the
+    // user lowered cannot be charged at its old size.
     let claimed = sqlx::query(
         r#"
         INSERT INTO stripe_autopay_intents (payment_intent_id, user_id, amount_usd)
-        VALUES ($1, $2, $3)
+        SELECT $1, id, $3
+        FROM users
+        WHERE id = $2
+          AND autopay_enabled
+          AND autopay_topup_usd = $3
         ON CONFLICT DO NOTHING
         "#,
     )
@@ -412,6 +423,33 @@ pub async fn claim_autopay_attempt(
     .await?
     .rows_affected();
     Ok(claimed > 0)
+}
+
+/// Whether a user still wants autopay, read at the moment of use.
+///
+/// The reconciliation pass replays a stranded local claim under its
+/// original idempotency key up to half an hour later; by then the user may
+/// have opted out, and replaying would charge someone who has already left
+/// (sol review). A claim whose owner has since disabled autopay is dropped
+/// rather than replayed.
+pub async fn autopay_still_armed(pool: &PgPool, user_id: Uuid) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar::<_, bool>("SELECT autopay_enabled FROM users WHERE id = $1")
+        .bind(user_id)
+        .fetch_optional(pool)
+        .await
+        .map(|armed| armed.unwrap_or(false))
+}
+
+/// Release a claim without counting a strike: the charge never happened,
+/// and the reason is the user's own opt-out rather than a payment failure.
+pub async fn drop_autopay_claim(pool: &PgPool, idempotency_key: &str) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "DELETE FROM stripe_autopay_intents WHERE payment_intent_id = $1 AND status = 'pending'",
+    )
+    .bind(format!("local_{idempotency_key}"))
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 /// Attach the real PaymentIntent id to a claim once Stripe has answered.

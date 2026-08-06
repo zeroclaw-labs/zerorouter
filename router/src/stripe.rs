@@ -1311,7 +1311,25 @@ async fn reconcile_stale_intents(pool: &crate::sqlx::PgPool, settings: &StripeSe
     };
     for (intent_id, user_id, amount_usd) in stale {
         let outcome = if let Some(idempotency_key) = intent_id.strip_prefix("local_") {
-            replay_charge(pool, settings, user_id, amount_usd, idempotency_key).await
+            // Up to half an hour has passed since the claim was taken. If
+            // the user has turned autopay off in the meantime, the claim is
+            // released rather than replayed: nobody who has opted out gets
+            // charged by a message we lost (sol review).
+            match billing::autopay_still_armed(pool, user_id).await {
+                Ok(false) => {
+                    tracing::info!(
+                        %user_id,
+                        "dropping a stranded autopay claim: the user has opted out"
+                    );
+                    billing::drop_autopay_claim(pool, idempotency_key)
+                        .await
+                        .map_err(anyhow::Error::from)
+                }
+                Ok(true) => {
+                    replay_charge(pool, settings, user_id, amount_usd, idempotency_key).await
+                }
+                Err(error) => Err(anyhow::Error::from(error)),
+            }
         } else {
             reconcile_real_intent(pool, settings, &intent_id, user_id, amount_usd).await
         };
@@ -1483,8 +1501,27 @@ async fn replay_charge(
     {
         billing::attach_autopay_intent(pool, idempotency_key, intent_id).await?;
         billing::fail_autopay_intent(pool, intent_id).await?;
-    } else {
-        billing::fail_autopay_intent(pool, &format!("local_{idempotency_key}")).await?;
+        anyhow::bail!("stripe declined the off-session charge (HTTP {status})")
     }
-    anyhow::bail!("stripe declined the off-session charge (HTTP {status})")
+
+    // No intent in the error body: Stripe either rejected the request
+    // outright or never told us what it did. Only the first is terminal.
+    //
+    // Releasing the claim on an AMBIGUOUS outcome — a 5xx from an edge, a
+    // 429, a body we could not read — is how a double charge happens: if
+    // Stripe executed the charge before the connection broke, the next
+    // sweep would mint a FRESH idempotency key and charge again. Keeping
+    // the claim means the reconciliation pass retries under the ORIGINAL
+    // key, and Stripe answers with the same PaymentIntent rather than a
+    // second one (sol review).
+    let definitive_rejection = status.is_client_error() && status != StatusCode::TOO_MANY_REQUESTS;
+    if definitive_rejection {
+        billing::fail_autopay_intent(pool, &format!("local_{idempotency_key}")).await?;
+        anyhow::bail!("stripe rejected the off-session charge (HTTP {status})")
+    }
+    tracing::warn!(
+        %status,
+        "autopay charge outcome is ambiguous; the claim is held for reconciliation"
+    );
+    anyhow::bail!("stripe returned an ambiguous autopay outcome (HTTP {status})")
 }
