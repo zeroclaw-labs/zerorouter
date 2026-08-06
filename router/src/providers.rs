@@ -382,17 +382,38 @@ fn read_credential(name: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+/// Test seam, `STRIPE_API_BASE`-shaped: `ZEROROUTER_PROVIDER_BASE_URL_<KEY>`
+/// (key uppercased) overrides a provider's endpoint so a failure-injection
+/// harness can stand a misbehaving upstream in front of a REAL router
+/// process — half-open sockets, mid-stream drops, 429 storms are not
+/// reachable from the in-process fakes. Leave unset in any real deployment;
+/// an override is logged loudly at startup so it can never hide in one.
+fn base_url_override(key: &str) -> Option<String> {
+    let variable = format!(
+        "ZEROROUTER_PROVIDER_BASE_URL_{}",
+        key.to_ascii_uppercase().replace('-', "_")
+    );
+    let value = env::var(&variable).ok()?.trim().to_owned();
+    if value.is_empty() {
+        return None;
+    }
+    tracing::warn!(provider = key, %variable, "provider base URL overridden — test seam active");
+    Some(value)
+}
+
 fn create_provider(
     metadata: &ProviderMetadata,
     credential: &str,
     max_output_tokens: u32,
 ) -> Result<Arc<dyn ModelProvider>, ProviderBuildError> {
     let alias = metadata.key.as_str();
+    let override_url = base_url_override(alias);
+    let effective_base_url = override_url.as_deref().or(metadata.base_url.as_deref());
     let provider: Arc<dyn ModelProvider> = match metadata.adapter {
         ProviderAdapter::Anthropic => Arc::new(AnthropicWire::new(
             alias,
             credential,
-            metadata.base_url.as_deref(),
+            effective_base_url,
             max_output_tokens,
             // Honor ZR's 15-minute upstream budget (api.rs), not an adapter
             // default.
@@ -410,14 +431,14 @@ fn create_provider(
         ProviderAdapter::OpenAiResponses => Arc::new(OpenAiResponsesWire::new(
             alias,
             credential,
-            metadata.base_url.as_deref(),
+            effective_base_url,
             Some(max_output_tokens),
             // Same budget note as the Anthropic arm: honor ZR's 15-minute
             // upstream budget, not an adapter default.
             900,
         )),
         ProviderAdapter::OpenAiCompatible => {
-            let Some(base_url) = metadata.base_url.as_deref() else {
+            let Some(base_url) = effective_base_url else {
                 return Err(ProviderBuildError::InvalidInventory {
                     detail: format!(
                         "OpenAI-compatible provider {} requires base_url",
