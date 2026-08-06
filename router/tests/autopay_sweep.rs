@@ -33,17 +33,34 @@ async fn connect() -> Option<PgPool> {
     Some(pool)
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum MockOutcome {
+    Succeed,
+    Decline,
+    /// A 5xx with no PaymentIntent in the body: Stripe may or may not have
+    /// executed the charge. The router must not treat this as terminal.
+    Ambiguous,
+}
+
 #[derive(Clone)]
 struct MockStripe {
     charges: Arc<AtomicUsize>,
-    decline: bool,
+    outcome: MockOutcome,
 }
 
 fn mock_stripe(decline: bool) -> (Router, Arc<AtomicUsize>) {
+    mock_stripe_with(if decline {
+        MockOutcome::Decline
+    } else {
+        MockOutcome::Succeed
+    })
+}
+
+fn mock_stripe_with(outcome: MockOutcome) -> (Router, Arc<AtomicUsize>) {
     let charges = Arc::new(AtomicUsize::new(0));
     let state = MockStripe {
         charges: charges.clone(),
-        decline,
+        outcome,
     };
     let app = Router::new()
         .route(
@@ -75,7 +92,13 @@ fn mock_stripe(decline: bool) -> (Router, Arc<AtomicUsize>) {
                     })
                     .collect();
                 let id = format!("pi_mock_{}", Uuid::new_v4().simple());
-                if state.decline {
+                if state.outcome == MockOutcome::Ambiguous {
+                    return (
+                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                        axum::Json(json!({"error": {"message": "edge exploded"}})),
+                    );
+                }
+                if state.outcome == MockOutcome::Decline {
                     (
                         axum::http::StatusCode::PAYMENT_REQUIRED,
                         axum::Json(json!({"error": {
@@ -296,4 +319,97 @@ async fn a_stale_pending_intent_is_reconciled_from_stripe() {
     .await
     .expect("intent must query");
     assert_eq!(status, "succeeded");
+}
+
+/// An ambiguous Stripe answer must not release the claim. If Stripe
+/// executed the charge before an edge returned a 500, releasing the slot
+/// would let the next sweep mint a FRESH idempotency key and charge the
+/// card a second time. Holding the claim means reconciliation retries under
+/// the ORIGINAL key, which Stripe answers with the same PaymentIntent.
+#[tokio::test]
+async fn an_ambiguous_stripe_answer_holds_the_claim_instead_of_recharging() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let _sweep_guard = SWEEP_LOCK.lock().await;
+    disarm_all_autopay(&pool).await;
+
+    let (app, charges) = mock_stripe_with(MockOutcome::Ambiguous);
+    let base = serve(app).await;
+    let user_id = autopay_user(&pool, "ambiguous", 10, 25).await;
+
+    run_autopay_sweep_once(&pool, &settings(&base)).await;
+    assert_eq!(charges.load(Ordering::SeqCst), 1, "one charge is attempted");
+    assert_eq!(
+        balance_of(&pool, user_id).await,
+        Decimal::ZERO,
+        "an unconfirmed charge credits nothing"
+    );
+
+    // The pending claim survives, so the slot is still held and the next
+    // sweep cannot start a second, differently-keyed charge.
+    let pending = query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM stripe_autopay_intents \
+         WHERE user_id = $1 AND status = 'pending'",
+    )
+    .bind(user_id)
+    .fetch_one(&pool)
+    .await
+    .expect("claim state must query");
+    assert_eq!(pending, 1, "the ambiguous claim is held for reconciliation");
+
+    run_autopay_sweep_once(&pool, &settings(&base)).await;
+    assert_eq!(
+        charges.load(Ordering::SeqCst),
+        1,
+        "a second sweep must not charge again while the claim stands"
+    );
+
+    // No strike is counted either: nothing is known to have failed.
+    let failures =
+        query_scalar::<_, i32>("SELECT autopay_consecutive_failures FROM users WHERE id = $1")
+            .bind(user_id)
+            .fetch_one(&pool)
+            .await
+            .expect("failure count must query");
+    assert_eq!(failures, 0, "an unknown outcome is not a failure");
+
+    query("UPDATE users SET autopay_enabled = FALSE WHERE id = $1")
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .expect("teardown disarm");
+}
+
+/// Opting out is honored at the moment of charge, not at the moment of
+/// candidate selection. The sweep reads candidates in an unlocked snapshot;
+/// a user who disables autopay after that read — and whose request returned
+/// successfully — must not then be charged.
+#[tokio::test]
+async fn a_user_who_opts_out_before_the_claim_is_not_charged() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let _sweep_guard = SWEEP_LOCK.lock().await;
+    disarm_all_autopay(&pool).await;
+
+    let (app, charges) = mock_stripe(false);
+    let base = serve(app).await;
+    let user_id = autopay_user(&pool, "optout", 10, 25).await;
+
+    // The opt-out lands between selection and claim; the claim re-reads the
+    // flag, so it matches nothing and no charge follows.
+    query("UPDATE users SET autopay_enabled = FALSE WHERE id = $1")
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .expect("opt-out must apply");
+
+    run_autopay_sweep_once(&pool, &settings(&base)).await;
+    assert_eq!(
+        charges.load(Ordering::SeqCst),
+        0,
+        "a user who opted out is not charged"
+    );
+    assert_eq!(balance_of(&pool, user_id).await, Decimal::ZERO);
 }

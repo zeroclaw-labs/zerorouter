@@ -905,6 +905,11 @@ const AUTOPAY_PURPOSE: &str = "zerorouter_autopay";
 const AUTOPAY_SWEEP_BATCH: i64 = 16;
 /// Pending intents older than this are reconciled against Stripe directly.
 const AUTOPAY_RECONCILE_AFTER_MINUTES: i32 = 30;
+/// Oldest claim the sweep will replay. Stripe caches an idempotency key's
+/// result for at least 24 hours and may prune it afterwards; a "replay"
+/// past that window is a new request to Stripe, which means a second
+/// charge. Twenty hours keeps a margin inside the guarantee (sol review).
+const AUTOPAY_REPLAY_MAX_AGE_MINUTES: i32 = 20 * 60;
 
 /// Provenance mark carried in PaymentIntent metadata: an HMAC over the
 /// money-bearing fields, keyed by the webhook secret. The webhook's
@@ -1302,7 +1307,23 @@ pub async fn run_autopay_sweep_once(pool: &crate::sqlx::PgPool, settings: &Strip
 /// Stripe says actually happened. Without this pass, one lost message
 /// wedges the user's one-pending-per-user slot forever.
 async fn reconcile_stale_intents(pool: &crate::sqlx::PgPool, settings: &StripeSettings) {
-    let stale = match billing::stale_autopay_intents(pool, AUTOPAY_RECONCILE_AFTER_MINUTES).await {
+    // Claims too old to replay safely are money in an unknown state: logged
+    // loudly for an operator, never retried automatically.
+    match billing::overdue_autopay_intents(pool, AUTOPAY_REPLAY_MAX_AGE_MINUTES).await {
+        Ok(overdue) if !overdue.is_empty() => tracing::error!(
+            count = overdue.len(),
+            "autopay claims are older than the idempotency-retention window and need operator reconciliation"
+        ),
+        Ok(_) => {}
+        Err(error) => tracing::warn!(%error, "could not list overdue autopay claims"),
+    }
+    let stale = match billing::stale_autopay_intents(
+        pool,
+        AUTOPAY_RECONCILE_AFTER_MINUTES,
+        AUTOPAY_REPLAY_MAX_AGE_MINUTES,
+    )
+    .await
+    {
         Ok(stale) => stale,
         Err(error) => {
             tracing::warn!(%error, "autopay reconciliation could not list stale intents");
@@ -1311,7 +1332,28 @@ async fn reconcile_stale_intents(pool: &crate::sqlx::PgPool, settings: &StripeSe
     };
     for (intent_id, user_id, amount_usd) in stale {
         let outcome = if let Some(idempotency_key) = intent_id.strip_prefix("local_") {
-            replay_charge(pool, settings, user_id, amount_usd, idempotency_key).await
+            // Up to half an hour has passed since the claim was taken. If
+            // the user has turned autopay off in the meantime, the claim is
+            // released rather than replayed: nobody who has opted out gets
+            // charged by a message we lost (sol review).
+            match billing::autopay_still_armed(pool, user_id).await {
+                Ok(false) => {
+                    // Deliberately NOT deleted: a stranded claim may already
+                    // have been charged, and its key is the only durable
+                    // handle on that charge. Dropping it would lose the
+                    // credit and free the slot for a second one (sol
+                    // review). Stop replaying; leave it for reconciliation.
+                    tracing::warn!(
+                        %user_id,
+                        "not replaying a stranded autopay claim: the user has opted out (the claim is kept — it may already have been charged)"
+                    );
+                    Ok(())
+                }
+                Ok(true) => {
+                    replay_charge(pool, settings, user_id, amount_usd, idempotency_key).await
+                }
+                Err(error) => Err(anyhow::Error::from(error)),
+            }
         } else {
             reconcile_real_intent(pool, settings, &intent_id, user_id, amount_usd).await
         };
@@ -1414,6 +1456,15 @@ async fn replay_charge(
         .bearer_auth(&settings.secret_key)
         .send()
         .await?;
+    // A non-2xx here is Stripe failing to answer, NOT the user having no
+    // card. Reading it as "no saved card" terminal-failed the claim and
+    // freed the slot on a transient blip (sol review).
+    if !response.status().is_success() {
+        anyhow::bail!(
+            "stripe could not list payment methods (HTTP {}); holding the claim",
+            response.status()
+        );
+    }
     let methods: Value = response.json().await?;
     let Some(payment_method) = methods
         .get("data")
@@ -1472,19 +1523,50 @@ async fn replay_charge(
         return Ok(());
     }
 
-    // Declines arrive as an error carrying the created (failed) intent:
-    // attach it to the claim and mark it failed, so the strike counts and
-    // the slot frees.
-    if let Some(intent_id) = body
+    // Whether the outcome is KNOWN is decided before anything is marked
+    // failed — including when the body names a PaymentIntent.
+    //
+    // Stripe documents 5xx outcomes as indeterminate: a 500 naming an intent
+    // may still be reported succeeded later, so failing that row leaves the
+    // eventual webhook unable to credit it AND frees the slot for a second
+    // charge. A 409 means a concurrent replay of the same idempotency key is
+    // executing right now — the peer may be charging. Neither is terminal
+    // (sol review of the first version of this fix, which got both wrong).
+    let named_intent = body
         .get("error")
         .and_then(|error| error.get("payment_intent"))
         .and_then(|intent| intent.get("id"))
-        .and_then(Value::as_str)
-    {
+        .and_then(Value::as_str);
+    let indeterminate = status.is_server_error()
+        || status == StatusCode::TOO_MANY_REQUESTS
+        || status == StatusCode::CONFLICT;
+    if indeterminate {
+        // Attaching a named intent is still worth doing: its id is what lets
+        // reconciliation ask Stripe what actually happened. The row stays
+        // pending, so the slot stays held.
+        if let Some(intent_id) = named_intent {
+            billing::attach_autopay_intent(pool, idempotency_key, intent_id).await?;
+        }
+        tracing::warn!(
+            %status,
+            attached = named_intent.is_some(),
+            "autopay charge outcome is indeterminate; the claim is held for reconciliation"
+        );
+        anyhow::bail!("stripe returned an indeterminate autopay outcome (HTTP {status})")
+    }
+
+    // A definitive rejection: Stripe understood the request and refused it.
+    // Declines carry the created (failed) intent, so the strike counts
+    // against a real intent and the slot frees.
+    if let Some(intent_id) = named_intent {
         billing::attach_autopay_intent(pool, idempotency_key, intent_id).await?;
         billing::fail_autopay_intent(pool, intent_id).await?;
-    } else {
-        billing::fail_autopay_intent(pool, &format!("local_{idempotency_key}")).await?;
+        anyhow::bail!("stripe declined the off-session charge (HTTP {status})")
     }
-    anyhow::bail!("stripe declined the off-session charge (HTTP {status})")
+
+    // Rejected with no intent named: nothing was created, so the claim
+    // itself becomes the terminal failure — the strike counts and the slot
+    // frees.
+    billing::fail_autopay_intent(pool, &format!("local_{idempotency_key}")).await?;
+    anyhow::bail!("stripe rejected the off-session charge (HTTP {status})")
 }
