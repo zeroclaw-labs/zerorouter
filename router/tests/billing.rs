@@ -20,6 +20,7 @@ use zerorouter::{
     db::{
         RequestTelemetry, ReservationBasis, UsageAdmission, UsageRecord, UsageSession,
         begin_usage_session, migrate, quarantined_settlements, recover_owed_settlements,
+        recover_quarantined_settlements,
     },
     openai::{OpenAiUsage, TASK_SIGNATURE_SCHEME, TaskSignature, tool_names_digest},
     priority::Priority,
@@ -1072,4 +1073,80 @@ fn request_uuid(session: &UsageSession) -> Uuid {
             .expect("request id should carry the reservation"),
     )
     .expect("request id should be a uuid")
+}
+
+/// Quarantine must not be a money grave. After eight failed attempts a
+/// settlement stops being retried automatically — correct, since retrying a
+/// poisoned row helps nobody — but the customer already received that
+/// inference, so an operator needs a path from "parked" to "collected".
+/// Before this, `recover_owed_settlements` filtered quarantined rows out and
+/// nothing else could settle them: the debt was visible and uncollectable.
+#[tokio::test]
+async fn a_quarantined_settlement_is_collectable_by_an_operator_exactly_once() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let user_id = create_user(&pool, "quarantine-recovery").await;
+    let key = create_key(&pool, user_id).await;
+    credit_purchase(&pool, user_id, Decimal::TEN, &unique_session_id(), None)
+        .await
+        .expect("funding purchase must apply");
+
+    let session = admit(&pool, &key, true).await;
+    let request_id = request_uuid(&session);
+    // Fail every attempt, permanently, until the row is parked.
+    let fault = SettleFault::install(&pool, request_id, i64::MAX, "P0001").await;
+    assert!(session.record(&usage_record(Decimal::ONE)).await.is_err());
+    age_settlement_intent(&pool, key.id).await;
+    for _ in 0..12 {
+        recover_owed_settlements(&pool, 100)
+            .await
+            .expect("recovery must query");
+        age_settlement_intent(&pool, key.id).await;
+    }
+    let (_, _, quarantined, _) = reservation_state(&pool, key.id).await;
+    assert_eq!(quarantined, 1, "repeated failure parks the settlement");
+    assert_eq!(
+        balance(&pool, user_id).await.expect("balance must query"),
+        Decimal::TEN,
+        "nothing has been billed yet"
+    );
+
+    // The automatic sweep must keep its hands off: quarantine means stop.
+    recover_owed_settlements(&pool, 100)
+        .await
+        .expect("automatic recovery must query");
+    assert_eq!(
+        reservation_state(&pool, key.id).await.2,
+        1,
+        "the automatic sweep never revives a quarantined row"
+    );
+
+    // With the fault cleared, the operator path collects it.
+    fault.remove(&pool).await;
+    recover_quarantined_settlements(&pool, 100)
+        .await
+        .expect("operator recovery must query");
+    let after = balance(&pool, user_id).await.expect("balance must query");
+    assert_eq!(
+        Decimal::TEN - after,
+        Decimal::ONE,
+        "the customer is charged exactly what the stored intent owed"
+    );
+    assert_eq!(settled_rows(&pool, key.id).await, 1);
+    assert_eq!(
+        reservation_state(&pool, key.id).await.0,
+        0,
+        "a collected settlement leaves the queue"
+    );
+
+    // Exactly once: a second operator run finds nothing and moves nothing.
+    recover_quarantined_settlements(&pool, 100)
+        .await
+        .expect("replay must query");
+    assert_eq!(
+        balance(&pool, user_id).await.expect("balance must query"),
+        after,
+        "replay is a no-op"
+    );
 }

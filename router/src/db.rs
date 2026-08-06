@@ -1706,13 +1706,39 @@ pub async fn recover_owed_settlements(
     pool: &PgPool,
     limit: i64,
 ) -> Result<SettlementRecovery, sqlx::Error> {
+    recover_owed_settlements_inner(pool, limit, false).await
+}
+
+/// [`recover_owed_settlements`], but also replaying settlements that were
+/// QUARANTINED after exhausting their automatic attempts.
+///
+/// Quarantine deliberately ends automatic retry: eight failures means
+/// something is wrong that retrying will not fix, and a hot loop against a
+/// poisoned row helps nobody. But it left the operator with no way to
+/// finish the job — the money is owed, the intent is stored, and nothing
+/// could collect it. This is that path, and it is opt-in precisely because
+/// a human should look at `admin owed-settlements` first. The replay itself
+/// is the same idempotent settle every other caller uses: a row that
+/// somehow did settle comes back `AlreadySettled` and moves no balance.
+pub async fn recover_quarantined_settlements(
+    pool: &PgPool,
+    limit: i64,
+) -> Result<SettlementRecovery, sqlx::Error> {
+    recover_owed_settlements_inner(pool, limit, true).await
+}
+
+async fn recover_owed_settlements_inner(
+    pool: &PgPool,
+    limit: i64,
+    include_quarantined: bool,
+) -> Result<SettlementRecovery, sqlx::Error> {
     let grace_seconds = i64::try_from(SETTLEMENT_RECOVERY_GRACE.as_secs()).unwrap_or(i64::MAX);
     let owed = sqlx::query_as::<_, (Uuid, Uuid, String)>(
         r#"
         SELECT id, api_key_id, settlement_intent::TEXT
         FROM usage_reservations
         WHERE settlement_intent IS NOT NULL
-          AND quarantined_at IS NULL
+          AND ($3 OR quarantined_at IS NULL)
           AND settlement_intent_at <= NOW() - ($2 * INTERVAL '1 second')
         ORDER BY settlement_intent_at
         LIMIT $1
@@ -1720,6 +1746,7 @@ pub async fn recover_owed_settlements(
     )
     .bind(limit.max(0))
     .bind(grace_seconds)
+    .bind(include_quarantined)
     .fetch_all(pool)
     .await?;
 

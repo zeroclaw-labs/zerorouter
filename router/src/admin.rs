@@ -8,7 +8,7 @@ use crate::{
     auth::{generate_api_key, hash_api_key},
     db::{
         database_pool_from_env, migrate, parse_decimal, provider_cogs, quarantined_settlements,
-        recover_owed_settlements,
+        recover_owed_settlements, recover_quarantined_settlements,
     },
     priority::Priority,
     sqlx::{self, PgPool},
@@ -106,6 +106,12 @@ pub struct OwedSettlementsArgs {
 pub struct SettleOwedArgs {
     #[arg(long, default_value_t = 100)]
     pub limit: i64,
+    /// Also replay settlements that were QUARANTINED after exhausting
+    /// their automatic attempts. Opt-in on purpose: quarantine means a
+    /// human should read `owed-settlements` first. The replay is the same
+    /// idempotent settle, so a row that did land moves no balance.
+    #[arg(long)]
+    pub include_quarantined: bool,
 }
 
 #[derive(Serialize)]
@@ -153,9 +159,15 @@ async fn owed_settlements(pool: &PgPool, args: OwedSettlementsArgs) -> Result<()
 }
 
 async fn settle_owed(pool: &PgPool, args: SettleOwedArgs) -> Result<()> {
-    let summary = recover_owed_settlements(pool, args.limit)
-        .await
-        .context("failed to recover owed settlements")?;
+    let summary = if args.include_quarantined {
+        recover_quarantined_settlements(pool, args.limit)
+            .await
+            .context("failed to recover quarantined settlements")?
+    } else {
+        recover_owed_settlements(pool, args.limit)
+            .await
+            .context("failed to recover owed settlements")?
+    };
     println!("{}", serde_json::to_string_pretty(&summary)?);
     Ok(())
 }
