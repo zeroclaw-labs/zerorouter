@@ -13,6 +13,7 @@ pub mod oidc;
 pub mod openai;
 pub mod portal;
 pub mod priority;
+pub mod provider;
 pub mod providers;
 pub mod retry;
 pub mod session;
