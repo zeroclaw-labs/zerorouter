@@ -33,7 +33,9 @@ use zerorouter::{
         UsageAdmission, UsageRecord, begin_usage_session, migrate,
     },
     device,
-    openai::{OpenAiUsage, TASK_SIGNATURE_SCHEME, TaskSignature, tool_names_digest},
+    openai::{
+        OpenAiUsage, PromptTokenDetails, TASK_SIGNATURE_SCHEME, TaskSignature, tool_names_digest,
+    },
     portal,
     priority::Priority,
     session::{CSRF_HEADER, SESSION_COOKIE, create_session},
@@ -867,4 +869,74 @@ async fn default_priority_rides_mint_list_and_the_key_patch() {
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+}
+
+/// Velocity counts uncached work. An agent loop re-sends its whole history
+/// every turn and prompt caching makes ~97% of that input cache reads — a
+/// settled cached-heavy row must charge the window only its fresh tokens,
+/// while a fully-uncached row of the same size still counts whole. Pinned
+/// here because the dogfooded ZeroClaw loop (17.6k input/turn, ~17.2k
+/// cached) tripped a 100k/min key on its second task under raw accounting.
+#[tokio::test]
+async fn velocity_counts_uncached_tokens_only() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let cached_heavy = |cost: Decimal| UsageRecord {
+        usage: OpenAiUsage {
+            prompt_tokens: 2_000,
+            completion_tokens: 25,
+            total_tokens: 2_025,
+            prompt_tokens_details: Some(PromptTokenDetails {
+                cached_tokens: 1_950,
+            }),
+        },
+        ..usage_record(cost)
+    };
+
+    // Cache-friendly half: 2k of input settles, but only 75 uncached tokens
+    // (50 fresh input + 25 output) charge the window — the next reservation
+    // fits comfortably under the 1000/min cap.
+    let user_id = create_user(&pool, "velocity-cached").await;
+    let key = create_key(&pool, user_id, Decimal::from(1_000), 1_000).await;
+    let UsageAdmission::Allowed(session) = admit(&pool, &key, 100, Decimal::ZERO).await else {
+        panic!("first reservation should be admitted");
+    };
+    session
+        .record(&cached_heavy(Decimal::ZERO))
+        .await
+        .expect("cached-heavy settlement must succeed");
+    assert!(
+        matches!(
+            admit(&pool, &key, 800, Decimal::ZERO).await,
+            UsageAdmission::Allowed(_)
+        ),
+        "cache reads must not consume the velocity window"
+    );
+
+    // Uncacheable half: the same 2k settles fully fresh and the window is
+    // spent — identical follow-up is refused.
+    let user_id = create_user(&pool, "velocity-uncached").await;
+    let key = create_key(&pool, user_id, Decimal::from(1_000), 1_000).await;
+    let UsageAdmission::Allowed(session) = admit(&pool, &key, 100, Decimal::ZERO).await else {
+        panic!("first reservation should be admitted");
+    };
+    let mut fresh = usage_record(Decimal::ZERO);
+    fresh.usage = OpenAiUsage {
+        prompt_tokens: 2_000,
+        completion_tokens: 25,
+        total_tokens: 2_025,
+        prompt_tokens_details: None,
+    };
+    session
+        .record(&fresh)
+        .await
+        .expect("fresh settlement must succeed");
+    assert!(
+        matches!(
+            admit(&pool, &key, 800, Decimal::ZERO).await,
+            UsageAdmission::VelocityExceeded
+        ),
+        "a fully-uncached row still meets the whole cap"
+    );
 }
