@@ -27,6 +27,10 @@ pub enum AdminCommand {
     /// Per-provider trailing-window COGS: what each upstream account is
     /// owed, for invoice reconciliation and deposit sizing.
     Treasury(TreasuryArgs),
+    /// What an operator needs to answer "did this customer's money land?"
+    /// — balance, recent ledger, key count — without shell access to the
+    /// database. Read-only.
+    UserStatus(UserStatusArgs),
     /// Grant promo credits to an existing user, atomically: the same
     /// transactional path Stripe purchases use, with entry type 'promo'.
     /// The user must already exist (mint-key creates one) — a typo'd email
@@ -58,6 +62,15 @@ pub struct MintKeyArgs {
     /// omitted means NULL, which reads as balanced.
     #[arg(long, value_parser = parse_priority)]
     pub default_priority: Option<Priority>,
+}
+
+#[derive(Debug, Args)]
+pub struct UserStatusArgs {
+    #[arg(long)]
+    pub email: String,
+    /// Ledger entries to show, newest first.
+    #[arg(long, default_value_t = 10)]
+    pub entries: i64,
 }
 
 #[derive(Debug, Args)]
@@ -139,6 +152,7 @@ pub async fn run(args: AdminArgs) -> Result<()> {
 
     match args.command {
         AdminCommand::MintKey(args) => mint_key(&pool, args).await,
+        AdminCommand::UserStatus(args) => user_status(&pool, args).await,
         AdminCommand::GrantCredit(args) => grant_credit(&pool, args).await,
         AdminCommand::Treasury(args) => treasury(&pool, args).await,
         AdminCommand::RevokeKey(args) => revoke_key(&pool, args).await,
@@ -184,6 +198,54 @@ async fn treasury(pool: &PgPool, args: TreasuryArgs) -> Result<()> {
         serde_json::to_string_pretty(&serde_json::json!({
             "window_days": args.days,
             "providers": rows,
+        }))?
+    );
+    Ok(())
+}
+
+async fn user_status(pool: &PgPool, args: UserStatusArgs) -> Result<()> {
+    let email = args.email.trim().to_lowercase();
+    if email.is_empty() || !email.contains('@') {
+        bail!("email must be a non-empty email address")
+    }
+    let Some((user_id, balance)) = sqlx::query_as::<_, (Uuid, Decimal)>(
+        "SELECT id, credit_balance_usd FROM users WHERE email = $1",
+    )
+    .bind(&email)
+    .fetch_optional(pool)
+    .await
+    .context("failed to resolve user")?
+    else {
+        bail!("no user with email {email}")
+    };
+    let entries = crate::billing::ledger_entries(pool, user_id, args.entries.max(1))
+        .await
+        .context("failed to read the ledger")?;
+    let (live_keys, spent) = sqlx::query_as::<_, (i64, Decimal)>(
+        r#"
+        SELECT
+            (SELECT COUNT(*) FROM api_keys WHERE user_id = $1 AND NOT disabled),
+            COALESCE((
+                SELECT SUM(usage_events.cost_usd)
+                FROM usage_events
+                JOIN api_keys ON api_keys.id = usage_events.api_key_id
+                WHERE api_keys.user_id = $1
+            ), 0)
+        "#,
+    )
+    .bind(user_id)
+    .fetch_one(pool)
+    .await
+    .context("failed to summarize usage")?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "user_id": user_id,
+            "email": email,
+            "balance_usd": balance,
+            "lifetime_spend_usd": spent,
+            "live_keys": live_keys,
+            "ledger": entries,
         }))?
     );
     Ok(())
