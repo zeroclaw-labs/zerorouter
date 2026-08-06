@@ -439,6 +439,23 @@ const CANDIDATE_RETRIES: u32 = 2;
 const CANDIDATE_BACKOFF_MS: u64 = 500;
 const MAX_REQUEST_BODY_BYTES: usize = 8 * 1024 * 1024;
 
+/// How long a client may take to deliver its request body. Authentication
+/// happens BEFORE the body is read, so without a deadline a valid key can
+/// hold buffers open indefinitely by trickling bytes — no reservation is
+/// taken and no cap is consumed while it does, which is what makes it free
+/// (sol review). Thirty seconds is generous for 8 MiB on a poor link.
+const BODY_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How many request bodies this process will buffer at once. Bounds the
+/// pre-admission memory a caller can command to
+/// `MAX_CONCURRENT_BODY_READS * MAX_REQUEST_BODY_BYTES`; beyond it the
+/// router sheds load rather than queueing unboundedly and dying with
+/// everyone's request in flight.
+const MAX_CONCURRENT_BODY_READS: usize = 64;
+
+static BODY_READ_SLOTS: std::sync::LazyLock<tokio::sync::Semaphore> =
+    std::sync::LazyLock::new(|| tokio::sync::Semaphore::new(MAX_CONCURRENT_BODY_READS));
+
 /// Supplies the per-request [`ProviderRoute`] the walk runs over, standing in
 /// for the credential-built one. Test-only, so a production binary has no way
 /// to substitute an upstream; the arguments are exactly what the production
@@ -888,8 +905,16 @@ async fn chat_completions(
         .await
         .map_err(authentication_error)?;
 
-    let payload = to_bytes(body, MAX_REQUEST_BODY_BYTES)
+    // Bounded, and bounded in time: the slot caps how much the process can
+    // be holding at once, and the deadline caps how long any one caller can
+    // hold theirs. `try_acquire` rather than a wait, so a saturated router
+    // answers immediately instead of growing a queue of its own.
+    let _slot = BODY_READ_SLOTS
+        .try_acquire()
+        .map_err(|_| ApiError::Overloaded)?;
+    let payload = tokio::time::timeout(BODY_READ_TIMEOUT, to_bytes(body, MAX_REQUEST_BODY_BYTES))
         .await
+        .map_err(|_| ApiError::RequestTimeout)?
         .map_err(|_| ApiError::PayloadTooLarge)?;
     let mut request = serde_json::from_slice::<ChatCompletionRequest>(&payload)
         .map_err(|_| ApiError::InvalidRequest)?;

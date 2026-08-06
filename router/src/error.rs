@@ -17,6 +17,12 @@ pub enum ApiError {
     PriorityConflict,
     CacheControlUnsupported,
     PayloadTooLarge,
+    /// The router is already buffering as many request bodies as it will
+    /// hold. Shedding here is deliberate: the alternative is queueing
+    /// unboundedly and dying with everyone's request in flight.
+    Overloaded,
+    /// The client did not finish sending its request body in time.
+    RequestTimeout,
     UnsupportedRequestFields,
     Unauthorized,
     SpendCapExceeded,
@@ -96,6 +102,20 @@ impl ApiError {
                 "invalid_request_error",
                 None,
                 "request_too_large",
+            ),
+            Self::Overloaded => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Cow::Borrowed("The router is at capacity for in-flight requests; retry shortly."),
+                "server_error",
+                None,
+                "server_overloaded",
+            ),
+            Self::RequestTimeout => (
+                StatusCode::REQUEST_TIMEOUT,
+                Cow::Borrowed("The request body was not delivered in time."),
+                "invalid_request_error",
+                None,
+                "request_timeout",
             ),
             Self::UnsupportedRequestFields => (
                 StatusCode::BAD_REQUEST,
@@ -248,4 +268,24 @@ pub fn streaming_error_json(error: &ApiError) -> String {
         }
     })
     .to_string()
+}
+
+#[cfg(test)]
+mod pre_admission_tests {
+    use super::*;
+
+    /// The two shed responses a caller can meet before any billing check:
+    /// both must be honest about being the router's limit rather than the
+    /// caller's mistake, so a client can retry intelligently.
+    #[test]
+    fn overload_and_body_timeout_report_retryable_server_conditions() {
+        let (status, _, kind, _, code) = ApiError::Overloaded.response_parts();
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(kind, "server_error");
+        assert_eq!(code, "server_overloaded");
+
+        let (status, _, _, _, code) = ApiError::RequestTimeout.response_parts();
+        assert_eq!(status, StatusCode::REQUEST_TIMEOUT);
+        assert_eq!(code, "request_timeout");
+    }
 }
