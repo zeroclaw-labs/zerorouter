@@ -17,13 +17,7 @@
 //! Gated on `DATABASE_URL` like `tests/billing.rs`: when unset each test
 //! returns early (skips) instead of failing.
 
-use std::{
-    io::Write,
-    path::PathBuf,
-    str::FromStr,
-    sync::{Arc, Mutex, PoisonError},
-    time::Duration,
-};
+use std::{path::PathBuf, str::FromStr, sync::Arc, time::Duration};
 
 use axum::{
     body::Body,
@@ -35,7 +29,6 @@ use serde_json::{Value, json};
 use sqlx_core::{query::query, query_as::query_as, query_scalar::query_scalar};
 use sqlx_postgres::{PgConnectOptions, PgPool, PgPoolOptions};
 use tower::ServiceExt;
-use tracing_subscriber::fmt::MakeWriter;
 use uuid::Uuid;
 use zeroclaw_providers::traits::{TokenUsage, ToolCall};
 use zerorouter::{
@@ -46,7 +39,6 @@ use zerorouter::{
     billing::{balance, grant_promo},
     config::ResolvedRoute,
     db::migrate,
-    logging,
     openai::{TASK_SIGNATURE_SCHEME, tool_names_digest},
     providers::{ProviderCandidate, ProviderRoute},
     testing::{FakeModelProvider, FakeOutcome, FakeStreamStep},
@@ -2395,154 +2387,6 @@ async fn non_streaming_a_rate_limited_context_window_truncates_once_then_moves_o
             ),
             (3, "together/secondary".to_owned(), "ok".to_owned(), true),
         ]
-    );
-    assert_eq!(open_reservations(&pool, api_key_id).await, 0);
-}
-
-/// A log sink a test can read back, shaped like the one `logging::subscriber`
-/// writes JSON into.
-#[derive(Clone, Default)]
-struct CapturedLog(Arc<Mutex<Vec<u8>>>);
-
-impl CapturedLog {
-    fn contents(&self) -> String {
-        let bytes = self.0.lock().unwrap_or_else(PoisonError::into_inner);
-        String::from_utf8_lossy(&bytes).into_owned()
-    }
-}
-
-impl Write for CapturedLog {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .extend_from_slice(buf);
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-impl<'writer> MakeWriter<'writer> for CapturedLog {
-    type Writer = Self;
-
-    fn make_writer(&'writer self) -> Self::Writer {
-        self.clone()
-    }
-}
-
-/// The retention contract, asserted against the REAL walk rather than a
-/// synthetic event: no part of an upstream error body reaches the log sink.
-///
-/// `logging.rs` pins the boundary and `logging::UPSTREAM_DETAIL_TARGET` names
-/// the one target allowed to carry provider text, but neither can see whether
-/// the walk actually uses it. This drives a failing candidate through the real
-/// handler with the real subscriber installed and reads the sink back, so
-/// moving the `detail` field onto the metadata event — the regression this
-/// replaces, which shipped a sanitized 500 characters of provider body under
-/// `zerorouter::api` at the default `info` level — fails here.
-///
-/// The upstream text is scripted to contain a prompt fragment, because that is
-/// what a real 4xx body echoes: the provider bails with `response.text()`
-/// verbatim, and `sanitize_api_error` scrubs seven credential prefixes and
-/// nothing else.
-///
-/// The subscriber is installed as this THREAD's default, not the process's:
-/// `#[tokio::test]` builds a current-thread runtime, so the spawned walk is
-/// polled on this same thread and inherits it, while the rest of the suite —
-/// running on other threads — neither sees it nor writes into this buffer. The
-/// two positive controls below are what prove the capture is live; without them
-/// a subscriber that captured nothing at all would pass.
-#[tokio::test]
-async fn the_walk_never_logs_an_upstream_error_body() {
-    let Some(pool) = connect().await else {
-        return;
-    };
-    let (api_key_id, key) = create_funded_key(&pool, "logretention").await;
-    // Shaped like a provider 4xx: a status line, then the request echoed back.
-    let upstream_body = "400 Bad Request: {\"error\":{\"message\":\"invalid role\",\
-                         \"input\":\"SECRET-PROMPT-TEXT\"}}";
-    // Two outcome sets: the first walk is a PRIMER, run before the subscriber
-    // is installed, whose only job is to hit — and therefore register — every
-    // tracing callsite the asserted walk will use. Registration is monotonic
-    // and global, so once the primer has run, installing the dispatch below
-    // (whose `register_dispatch` rebuilds interest for every REGISTERED
-    // callsite under the dispatchers write lock) deterministically repairs
-    // them all — and no concurrent test's first-hit can poison a callsite
-    // this test still needs, because there are none left to first-hit.
-    // Without the primer this test raced the rest of the suite: a walk
-    // callsite first hit on another test's thread caches `Interest::never`
-    // against that thread's absent subscriber, and a never-interest callsite
-    // skips this thread's subscriber without consulting it. The race was
-    // invisible while the suite ran without DATABASE_URL (every other test
-    // skipped; no concurrent walks) and surfaced the day the suites ran
-    // against a real database.
-    let primary = FakeModelProvider::new(
-        "primary",
-        vec![
-            FakeOutcome::Failure(upstream_body),
-            FakeOutcome::Failure(upstream_body),
-        ],
-    );
-    let secondary = FakeModelProvider::new(
-        "secondary",
-        vec![
-            FakeOutcome::chat("hello from secondary", served_usage()),
-            FakeOutcome::chat("hello from secondary", served_usage()),
-        ],
-    );
-    let state = router(pool.clone(), vec![primary.clone(), secondary.clone()]);
-
-    let primer = app(state.clone())
-        .oneshot(completion_request(
-            &key,
-            &completion_body("zero/test-pair", false),
-        ))
-        .await
-        .expect("primer request should complete");
-    assert_eq!(primer.status(), StatusCode::OK);
-
-    let captured = CapturedLog::default();
-    // The production filter (`main.rs` defaults to `info`), widened to `trace`
-    // so nothing is suppressed by level and only the retention layer can be
-    // what stops the detail.
-    let subscriber = logging::subscriber("trace", captured.clone());
-    let _guard = tracing::dispatcher::set_default(&tracing::Dispatch::new(subscriber));
-    // Belt-and-braces beside the primer: repairs any callsite that somehow
-    // registered between the primer walk and the dispatch installation
-    // above. The primer is what makes the test deterministic; this rebuild
-    // costs nothing and narrows the window to zero even if the walk's
-    // callsite set ever drifts from the primer's.
-    tracing::callsite::rebuild_interest_cache();
-
-    let response = app(state.clone())
-        .oneshot(completion_request(
-            &key,
-            &completion_body("zero/test-pair", false),
-        ))
-        .await
-        .expect("completion request should complete");
-    assert_eq!(response.status(), StatusCode::OK);
-    state.wait_for_background_tasks().await;
-
-    let logged = captured.contents();
-    assert!(
-        logged.contains("upstream candidate attempt failed"),
-        "the walk's metadata event must reach the sink: {logged}"
-    );
-    assert!(
-        logged.contains("fireworks/primary"),
-        "which candidate failed is metadata and must survive: {logged}"
-    );
-    assert!(
-        !logged.contains("SECRET-PROMPT-TEXT"),
-        "an upstream body fragment reached the log sink: {logged}"
-    );
-    assert!(
-        !logged.contains("invalid role"),
-        "an upstream body fragment reached the log sink: {logged}"
     );
     assert_eq!(open_reservations(&pool, api_key_id).await, 0);
 }

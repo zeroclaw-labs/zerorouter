@@ -18,6 +18,9 @@ which is what ZeroRouter's owned wire sends.
                          (fixed by the wire's idle ceiling)
     MODE=storm-429       every request rate-limited, with Retry-After
     MODE=malformed       200 OK carrying neither JSON nor SSE
+    MODE=slow            healthy, but delays SLOW_SECONDS (default 6)
+                         before answering — the window a database-outage
+                         injection needs to land mid-request
 
 Usage:
     MODE=drop-midstream PORT=9500 python3 scripts/chaos-upstream.py
@@ -49,6 +52,8 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(payload)
             return
+        if MODE == "slow":
+            time.sleep(float(os.environ.get("SLOW_SECONDS", "6")))
         if MODE == "malformed":
             garbage = b"<<<this is not json or sse>>>"
             self.send_response(200)

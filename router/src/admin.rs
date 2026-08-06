@@ -8,7 +8,7 @@ use crate::{
     auth::{generate_api_key, hash_api_key},
     db::{
         database_pool_from_env, migrate, parse_decimal, provider_cogs, quarantined_settlements,
-        recover_owed_settlements,
+        recover_owed_settlements, recover_quarantined_settlement,
     },
     priority::Priority,
     sqlx::{self, PgPool},
@@ -106,6 +106,12 @@ pub struct OwedSettlementsArgs {
 pub struct SettleOwedArgs {
     #[arg(long, default_value_t = 100)]
     pub limit: i64,
+    /// Collect ONE settlement by request id, even if it is quarantined.
+    /// Quarantine ends automatic retry; this is the operator's path from
+    /// "parked" to "collected", single-row on purpose — you read
+    /// `owed-settlements`, you decide about that debt, you collect it.
+    #[arg(long)]
+    pub request_id: Option<Uuid>,
 }
 
 #[derive(Serialize)]
@@ -153,9 +159,15 @@ async fn owed_settlements(pool: &PgPool, args: OwedSettlementsArgs) -> Result<()
 }
 
 async fn settle_owed(pool: &PgPool, args: SettleOwedArgs) -> Result<()> {
-    let summary = recover_owed_settlements(pool, args.limit)
-        .await
-        .context("failed to recover owed settlements")?;
+    let summary = if let Some(request_id) = args.request_id {
+        recover_quarantined_settlement(pool, request_id)
+            .await
+            .context("failed to collect the quarantined settlement")?
+    } else {
+        recover_owed_settlements(pool, args.limit)
+            .await
+            .context("failed to recover owed settlements")?
+    };
     println!("{}", serde_json::to_string_pretty(&summary)?);
     Ok(())
 }

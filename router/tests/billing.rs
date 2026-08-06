@@ -20,6 +20,7 @@ use zerorouter::{
     db::{
         RequestTelemetry, ReservationBasis, UsageAdmission, UsageRecord, UsageSession,
         begin_usage_session, migrate, quarantined_settlements, recover_owed_settlements,
+        recover_quarantined_settlement,
     },
     openai::{OpenAiUsage, TASK_SIGNATURE_SCHEME, TaskSignature, tool_names_digest},
     priority::Priority,
@@ -613,6 +614,14 @@ struct SettleFault {
     name: String,
 }
 
+/// Serializes the fault harness. `SettleFault` installs and drops a TRIGGER
+/// on the shared `usage_events` table, and concurrent DDL there contends for
+/// an ACCESS EXCLUSIVE lock — two fault-using tests running side by side
+/// made each other's teardown fail. Every fault user holds this for the
+/// lifetime of its fault.
+static FAULT_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+
 impl SettleFault {
     /// Fail the first `failures` settle INSERTs for `request_id` with
     /// `errcode`, then let them through.
@@ -779,6 +788,7 @@ async fn a_transiently_failing_settlement_is_retried_and_bills_exactly_once() {
     let request_id = request_uuid(&session);
     // 40001 (serialization_failure) is in the transient set, so the settle is
     // retried rather than abandoned.
+    let _fault_guard = FAULT_LOCK.lock().await;
     let fault = SettleFault::install(&pool, request_id, 1, "40001").await;
     let outcome = session.record(&usage_record(Decimal::ONE)).await;
     let insert_attempts = fault.insert_attempts(&pool).await;
@@ -916,6 +926,7 @@ async fn a_permanently_failing_settlement_is_recoverable_and_bills_once() {
     let request_id = request_uuid(&session);
     // P0001 is a plain `RAISE EXCEPTION`: nothing about it clears on a retry,
     // which is exactly how a CHECK violation or a trigger rejection presents.
+    let _fault_guard = FAULT_LOCK.lock().await;
     let fault = SettleFault::install(&pool, request_id, i64::MAX, "P0001").await;
     assert!(
         session.record(&usage_record(Decimal::ONE)).await.is_err(),
@@ -1006,6 +1017,7 @@ async fn an_expired_reservation_owing_a_settlement_is_quarantined_not_deleted() 
     // One reservation that owes a settlement...
     let session = admit(&pool, &owed_key, true).await;
     let request_id = request_uuid(&session);
+    let _fault_guard = FAULT_LOCK.lock().await;
     let fault = SettleFault::install(&pool, request_id, i64::MAX, "P0001").await;
     assert!(session.record(&usage_record(Decimal::ONE)).await.is_err());
     fault.remove(&pool).await;
@@ -1072,4 +1084,89 @@ fn request_uuid(session: &UsageSession) -> Uuid {
             .expect("request id should carry the reservation"),
     )
     .expect("request id should be a uuid")
+}
+
+/// Quarantine must not be a money grave. After eight failed attempts a
+/// settlement stops being retried automatically — correct, since retrying a
+/// poisoned row helps nobody — but the customer already received that
+/// inference, so an operator needs a path from "parked" to "collected".
+/// Before this, `recover_owed_settlements` filtered quarantined rows out by
+/// construction and nothing else could settle them: the debt was visible
+/// and uncollectable. The collection is single-row on purpose, which is
+/// also why this test can assert on its own row while other tests run
+/// beside it.
+#[tokio::test]
+async fn a_quarantined_settlement_is_collectable_by_an_operator_exactly_once() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let user_id = create_user(&pool, "quarantine-recovery").await;
+    let key = create_key(&pool, user_id).await;
+    credit_purchase(&pool, user_id, Decimal::TEN, &unique_session_id(), None)
+        .await
+        .expect("funding purchase must apply");
+
+    let session = admit(&pool, &key, true).await;
+    let request_id = request_uuid(&session);
+    // A permanent fault, so the in-request settle stores its intent and
+    // gives up; the row is then parked exactly as eight failures would
+    // leave it.
+    let _fault_guard = FAULT_LOCK.lock().await;
+    let fault = SettleFault::install(&pool, request_id, i64::MAX, "P0001").await;
+    assert!(session.record(&usage_record(Decimal::ONE)).await.is_err());
+    query(
+        "UPDATE usage_reservations
+         SET quarantined_at = NOW(), settle_attempts = 8
+         WHERE id = $1",
+    )
+    .bind(request_id)
+    .execute(&pool)
+    .await
+    .expect("quarantine must apply");
+    age_settlement_intent(&pool, key.id).await;
+
+    // The automatic sweep must keep its hands off: quarantine means stop.
+    recover_owed_settlements(&pool, 100)
+        .await
+        .expect("automatic recovery must query");
+    assert_eq!(
+        reservation_state(&pool, key.id).await,
+        (1, 1, 1, 8),
+        "the automatic sweep never revives a quarantined row"
+    );
+    assert_eq!(
+        balance(&pool, user_id).await.expect("balance must query"),
+        Decimal::TEN,
+        "and nothing is billed while it sits"
+    );
+
+    // With the fault cleared, the operator collects that one debt.
+    fault.remove(&pool).await;
+    let collected = recover_quarantined_settlement(&pool, request_id)
+        .await
+        .expect("operator collection must query");
+    assert_eq!(collected.settled, 1);
+    let after = balance(&pool, user_id).await.expect("balance must query");
+    assert_eq!(
+        Decimal::TEN - after,
+        Decimal::ONE,
+        "the customer is charged exactly what the stored intent owed"
+    );
+    assert_eq!(settled_rows(&pool, key.id).await, 1);
+    assert_eq!(
+        reservation_state(&pool, key.id).await.0,
+        0,
+        "a collected settlement leaves the queue"
+    );
+
+    // Exactly once: collecting again finds nothing and moves nothing.
+    let replay = recover_quarantined_settlement(&pool, request_id)
+        .await
+        .expect("replay must query");
+    assert_eq!(replay.settled, 0);
+    assert_eq!(
+        balance(&pool, user_id).await.expect("balance must query"),
+        after,
+        "replay is a no-op"
+    );
 }
