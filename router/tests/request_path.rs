@@ -5041,3 +5041,64 @@ async fn soak_concurrent_mixed_traffic_conserves_money() {
         );
     }
 }
+
+/// A client that walks away mid-stream is not billed for output it never
+/// received. The distinction this pins is the subtle one: an EMPTY answer
+/// still bills (the model produced nothing, the customer received exactly
+/// that — see
+/// `a_stream_that_emitted_nothing_is_not_rescued_by_reported_output_tokens`),
+/// while output that bounced off a closed channel does not. Before this,
+/// the live streaming path passed the upstream's usage straight to the
+/// ledger and charged in full for both.
+#[tokio::test]
+async fn a_client_that_disconnects_mid_stream_is_not_billed_for_lost_output() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let (api_key_id, key) = create_funded_key(&pool, "abandoned").await;
+    let solo = FakeModelProvider::new(
+        "solo",
+        vec![FakeOutcome::Stream(vec![
+            FakeStreamStep::text("output the client will never read"),
+            FakeStreamStep::Usage(served_usage()),
+            FakeStreamStep::Final,
+        ])],
+    );
+    let state = router(pool.clone(), vec![solo.clone()]);
+
+    // Take the response and drop it without reading the body: the channel
+    // closes, so every model-output frame is produced but none is accepted.
+    let response = app(state.clone())
+        .oneshot(completion_request(
+            &key,
+            &completion_body("zero/test-solo", true),
+        ))
+        .await
+        .expect("stream request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    drop(response);
+    state.wait_for_background_tasks().await;
+
+    let (_, _, input_tokens, output_tokens, cost_usd, status) =
+        settled_event(&pool, api_key_id).await;
+    assert_eq!(
+        (input_tokens, output_tokens, cost_usd),
+        (0, 0, Decimal::ZERO),
+        "output that never reached the client is not billed"
+    );
+    assert_eq!(
+        status, 499,
+        "the settled row records the client having closed the request"
+    );
+    assert_eq!(
+        balance(&pool, user_of(&pool, api_key_id).await)
+            .await
+            .expect("balance must query"),
+        Decimal::from(50),
+        "the balance is untouched"
+    );
+    assert_eq!(open_reservations(&pool, api_key_id).await, 0);
+    // A disconnect settles through the client-closed terminal, which does
+    // not carry the walk ledger — the billing fact this test pins is the
+    // zero charge above.
+}

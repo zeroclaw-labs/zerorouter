@@ -322,6 +322,13 @@ enum Frame {
 #[derive(Clone, Copy, Default)]
 struct StreamDelivery {
     model_output_sent: bool,
+    /// Whether the model produced output at all, regardless of whether the
+    /// client was still there to take it. The pair distinguishes two states
+    /// that `model_output_sent` alone cannot: a model that answered with
+    /// nothing (a complete, valid, empty response — the customer got what
+    /// the upstream produced) from a client that vanished mid-answer (the
+    /// customer got nothing that was meant for them).
+    model_output_attempted: bool,
 }
 
 impl StreamDelivery {
@@ -329,8 +336,16 @@ impl StreamDelivery {
     /// output. Returns whether the channel accepted the frame.
     async fn send(&mut self, sender: &mpsc::Sender<Event>, data: String, frame: Frame) -> bool {
         let accepted = send_data(sender, data).await;
+        self.model_output_attempted |= frame == Frame::ModelOutput;
         self.model_output_sent |= accepted && frame == Frame::ModelOutput;
         accepted
+    }
+
+    /// Whether output the model produced failed to reach the client. This is
+    /// the abandoned-stream case, and the only one where a usage report
+    /// exists for output nobody received.
+    fn abandoned_by_client(self) -> bool {
+        self.model_output_attempted && !self.model_output_sent
     }
 
     /// Emit the role primer once, if it has not been emitted yet.
@@ -2854,17 +2869,45 @@ async fn finish_successful_stream(
     // and a stream that emitted nothing while reporting output tokens must
     // label as the empty response it was.
     let shape_label = shape_ok(emitted, tool_args_ok, synthesized_finish);
+    // The attempt records what the UPSTREAM reported: we owe the provider for
+    // the tokens it burned whether or not the customer stayed to read them,
+    // and that is what COGS and the treasury measure. `served` is the
+    // customer-side fact and must therefore follow the delivery, not a
+    // hardcoded true.
     attempts.push(build_attempt(
         attempt_no,
         candidate.definition(),
         "ok",
-        true,
+        delivery.model_output_sent,
         attempt_started,
         AttemptTokens::measured(usage),
         false,
         Some(synthesized_finish),
         None,
     ));
+    // A client that walked away is not billed for output it never received
+    // (sol review): this path passed `usage` straight through, so a stream
+    // whose deltas all bounced off a closed channel still charged in full.
+    // An EMPTY answer is a different thing and still bills — the model
+    // produced nothing, the customer received exactly that, and the
+    // provider burned tokens either way (see
+    // `a_stream_that_emitted_nothing_is_not_rescued_by_reported_output_tokens`).
+    // COGS is unaffected in both cases: the attempt row above records what
+    // the upstream reported.
+    let billable = if delivery.abandoned_by_client() {
+        OpenAiUsage::default()
+    } else {
+        usage
+    };
+    if delivery.abandoned_by_client() {
+        log_metering_gap(
+            &metadata.request_id,
+            resolved,
+            Some(candidate.definition()),
+            false,
+            "stream_final_abandoned",
+        );
+    }
     // Read before the settle drains the ledger — same rule as the buffered
     // serve site.
     let zerorouter = zerorouter_block(features, &attempts);
@@ -2874,7 +2917,7 @@ async fn finish_successful_stream(
         &candidate.definition().provider,
         &candidate.definition().model,
         Some(candidate.definition()),
-        usage,
+        billable,
         resolved.sell_rates,
         features,
         Some(synthesized_finish),
