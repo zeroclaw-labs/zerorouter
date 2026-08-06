@@ -517,6 +517,18 @@ fn rates_snapshot(rates: &ModelRates) -> String {
 ///
 /// # Quota model
 ///
+/// Velocity counts UNCACHED work: settled rows contribute
+/// `input - cached_input + output`, never raw input. Agent traffic re-sends
+/// its whole history every tool-loop turn, and with provider prompt caching
+/// ~97% of that input is cache reads costing a tenth of fresh tokens — the
+/// dogfooded ZeroClaw loop measured 17.6k input/turn of which ~17.2k was
+/// cached, so raw accounting capped a 100k/min key at five turns a minute.
+/// Uncached accounting gives cache-friendly loops their real headroom while
+/// an uncacheable blast still meets the full cap. In-flight reservations
+/// still count at their requested size: cached-ness is unknowable until the
+/// upstream answers, so flight stays conservative and settlement corrects
+/// to truth (`cached_input_tokens` is clamped to `input_tokens` at write).
+///
 /// Spend and velocity are enforced at TWO scopes and the tighter one wins:
 ///
 /// * **per key** — the presenting key's own settled + in-flight usage against
@@ -893,7 +905,11 @@ pub async fn begin_usage_session(
                 0
             ) AS user_monthly_spend,
             COALESCE(
-                SUM(usage_events.input_tokens::BIGINT + usage_events.output_tokens::BIGINT) FILTER (
+                SUM(
+                    usage_events.input_tokens::BIGINT
+                        - usage_events.cached_input_tokens::BIGINT
+                        + usage_events.output_tokens::BIGINT
+                ) FILTER (
                     WHERE usage_events.ts >= NOW() - INTERVAL '1 minute'
                 ),
                 0
@@ -907,7 +923,11 @@ pub async fn begin_usage_session(
                 0
             ) AS monthly_spend,
             COALESCE(
-                SUM(usage_events.input_tokens::BIGINT + usage_events.output_tokens::BIGINT) FILTER (
+                SUM(
+                    usage_events.input_tokens::BIGINT
+                        - usage_events.cached_input_tokens::BIGINT
+                        + usage_events.output_tokens::BIGINT
+                ) FILTER (
                     WHERE usage_events.api_key_id = $2
                       AND usage_events.ts >= NOW() - INTERVAL '1 minute'
                 ),
