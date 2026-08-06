@@ -859,9 +859,14 @@ pub async fn begin_usage_session(
     // trace that either was owed. Those are quarantined instead — parked for
     // reconciliation and readable through [`quarantined_settlements`].
     //
-    // Quarantining rather than deleting cannot loosen any cap: every
-    // cap/credit aggregate below filters `expires_at > NOW()`, so a row that
-    // survives here is invisible to admission exactly as a deleted one was.
+    // A quarantined row stays VISIBLE to the aggregates below, and that is
+    // the point: it represents money the customer received and ZeroRouter
+    // has not collected, so it must keep encumbering the balance and the
+    // caps until it is settled or written off. (This comment previously
+    // claimed the opposite — that surviving rows were invisible to
+    // admission "exactly as a deleted one was" — which is precisely the
+    // hole: the same balance could fund a second request while the first
+    // debt stood.)
     sqlx::query(
         "DELETE FROM usage_reservations WHERE expires_at <= NOW() AND settlement_intent IS NULL",
     )
@@ -974,7 +979,17 @@ pub async fn begin_usage_session(
         FROM usage_reservations
         INNER JOIN api_keys ON api_keys.id = usage_reservations.api_key_id
         WHERE api_keys.user_id = $1
-          AND usage_reservations.expires_at > NOW()
+          AND (
+              usage_reservations.expires_at > NOW()
+              -- A row carrying a settlement intent is money the customer
+              -- already received and ZeroRouter has not yet collected. It
+              -- must keep encumbering the balance no matter how old it is:
+              -- releasing it at expiry let the SAME dollar admit a second
+              -- request, and the first one could then never be collected
+              -- (sol review). Expiry only frees reservations that owe
+              -- nothing — which is exactly what the reclaim sweep deletes.
+              OR usage_reservations.settlement_intent IS NOT NULL
+          )
         "#,
     )
     .bind(key.user_id)
@@ -1033,7 +1048,15 @@ pub async fn begin_usage_session(
             FROM usage_reservations
             INNER JOIN api_keys ON api_keys.id = usage_reservations.api_key_id
             WHERE api_keys.user_id = $1
-              AND usage_reservations.expires_at > NOW()
+              AND (
+                  usage_reservations.expires_at > NOW()
+                  -- The prepaid half of the same rule as the cap aggregate
+                  -- above: a row carrying a settlement intent is money the
+                  -- customer already received. Releasing it at expiry let
+                  -- the SAME balance fund a second request while the first
+                  -- debt was still uncollected (sol review).
+                  OR usage_reservations.settlement_intent IS NOT NULL
+              )
             "#,
         )
         .bind(key.user_id)

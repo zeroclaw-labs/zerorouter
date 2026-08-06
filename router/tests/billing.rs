@@ -1216,3 +1216,73 @@ async fn a_transient_intent_write_failure_still_leaves_a_replayable_payload() {
         "the replayed charge is exactly what the intent recorded"
     );
 }
+
+/// Money the customer already received must keep encumbering their balance
+/// until it is collected or written off. Before this, in-flight cost was
+/// counted only while `expires_at > NOW()`, so an owed-but-expired
+/// reservation quietly released the dollars it represented: the SAME dollar
+/// could admit a second request, and the first debt then had nothing left
+/// to collect from. Expiry may only free reservations that owe nothing.
+#[tokio::test]
+async fn an_owed_reservation_keeps_encumbering_the_balance_after_it_expires() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let _fault_guard = FAULT_LOCK.lock().await;
+    let user_id = create_user(&pool, "owed-encumbrance").await;
+    let key = create_key(&pool, user_id).await;
+    // Exactly one reservation's worth ($2, the helper's size), so a second
+    // admission is possible only if the first one's debt stopped counting.
+    credit_purchase(&pool, user_id, Decimal::from(2), &unique_session_id(), None)
+        .await
+        .expect("funding purchase must apply");
+
+    let session = admit(&pool, &key, true).await;
+    let fault = SettleFault::install(&pool, request_uuid(&session), i64::MAX, "P0001").await;
+    // Delivered, then unsettleable: the row now carries an intent — a debt.
+    assert!(session.record(&usage_record(Decimal::ONE)).await.is_err());
+    fault.remove(&pool).await;
+
+    // Age it past its TTL. The reclaim sweep must not take it (it owes), and
+    // the balance it represents must stay spoken for.
+    // Both timestamps move: a CHECK constraint requires the expiry to
+    // follow creation, which is also what makes this a realistic old row.
+    query(
+        "UPDATE usage_reservations
+         SET created_at = created_at - INTERVAL '2 hours',
+             expires_at = expires_at - INTERVAL '2 hours'
+         WHERE api_key_id = $1",
+    )
+    .bind(key.id)
+    .execute(&pool)
+    .await
+    .expect("ageing must apply");
+
+    let second = begin_usage_session(
+        &pool,
+        &key,
+        1_000,
+        500,
+        Decimal::from(2),
+        test_signature(),
+        ReservationBasis::Cold,
+        true,
+    )
+    .await
+    .expect("admission must query");
+    assert!(
+        matches!(second, UsageAdmission::InsufficientCredits),
+        "the expired debt still holds the credit it owes; a second request cannot spend it again"
+    );
+
+    // And the debt is still collectable, which is the whole point of holding it.
+    age_settlement_intent(&pool, key.id).await;
+    recover_owed_settlements(&pool, 100)
+        .await
+        .expect("recovery must query");
+    assert_eq!(
+        balance(&pool, user_id).await.expect("balance must query"),
+        Decimal::ONE,
+        "collecting the debt charges exactly what it recorded ($1 of the $2 funded)"
+    );
+}
