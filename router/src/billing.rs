@@ -413,6 +413,11 @@ pub async fn claim_autopay_attempt(
         WHERE id = $2
           AND autopay_enabled
           AND autopay_topup_usd = $3
+          -- The whole eligibility test, not just the flag: a manual credit
+          -- or a raised threshold between selection and claim must stop the
+          -- charge too (sol review).
+          AND autopay_threshold_usd IS NOT NULL
+          AND credit_balance_usd < autopay_threshold_usd
         ON CONFLICT DO NOTHING
         "#,
     )
@@ -438,18 +443,6 @@ pub async fn autopay_still_armed(pool: &PgPool, user_id: Uuid) -> Result<bool, s
         .fetch_optional(pool)
         .await
         .map(|armed| armed.unwrap_or(false))
-}
-
-/// Release a claim without counting a strike: the charge never happened,
-/// and the reason is the user's own opt-out rather than a payment failure.
-pub async fn drop_autopay_claim(pool: &PgPool, idempotency_key: &str) -> Result<(), sqlx::Error> {
-    sqlx::query(
-        "DELETE FROM stripe_autopay_intents WHERE payment_intent_id = $1 AND status = 'pending'",
-    )
-    .bind(format!("local_{idempotency_key}"))
-    .execute(pool)
-    .await?;
-    Ok(())
 }
 
 /// Attach the real PaymentIntent id to a claim once Stripe has answered.
@@ -492,6 +485,36 @@ pub async fn attach_autopay_intent(
 pub async fn stale_autopay_intents(
     pool: &PgPool,
     older_than_minutes: i32,
+    replayable_within_minutes: i32,
+) -> Result<Vec<(String, Uuid, Decimal)>, sqlx::Error> {
+    // Bounded at BOTH ends. The lower bound is the reconciliation delay; the
+    // upper bound is Stripe's idempotency-key retention. Replaying past that
+    // window stops being a replay and becomes a second charge, because
+    // Stripe may have pruned the key and will treat the request as new (sol
+    // review). Rows past it are surfaced by `overdue_autopay_intents`
+    // instead of being retried forever.
+    sqlx::query_as::<_, (String, Uuid, Decimal)>(
+        r#"
+        SELECT payment_intent_id, user_id, amount_usd
+        FROM stripe_autopay_intents
+        WHERE status = 'pending'
+          AND created_at < NOW() - ($1 * INTERVAL '1 minute')
+          AND created_at >= NOW() - ($2 * INTERVAL '1 minute')
+        ORDER BY created_at
+        "#,
+    )
+    .bind(older_than_minutes)
+    .bind(replayable_within_minutes)
+    .fetch_all(pool)
+    .await
+}
+
+/// Pending claims too old to replay safely. These are money in an unknown
+/// state that no automation may touch: an operator has to ask Stripe what
+/// happened and settle or release them deliberately.
+pub async fn overdue_autopay_intents(
+    pool: &PgPool,
+    older_than_minutes: i32,
 ) -> Result<Vec<(String, Uuid, Decimal)>, sqlx::Error> {
     sqlx::query_as::<_, (String, Uuid, Decimal)>(
         r#"
@@ -499,6 +522,7 @@ pub async fn stale_autopay_intents(
         FROM stripe_autopay_intents
         WHERE status = 'pending'
           AND created_at < NOW() - ($1 * INTERVAL '1 minute')
+        ORDER BY created_at
         "#,
     )
     .bind(older_than_minutes)
