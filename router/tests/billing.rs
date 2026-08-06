@@ -1170,3 +1170,49 @@ async fn a_quarantined_settlement_is_collectable_by_an_operator_exactly_once() {
         "replay is a no-op"
     );
 }
+
+/// The settlement intent is the request's only safety net: the customer may
+/// already hold streamed output, and a settle that fails without a stored
+/// payload leaves nothing to replay — the reservation is later reclaimed as
+/// owing nothing and the charge is gone. A single write attempt threw that
+/// net away on a blip, so the write retries transient failures exactly like
+/// the settle it protects. This pins the recovery: a fault that clears
+/// after the first attempt still leaves a replayable intent.
+#[tokio::test]
+async fn a_transient_intent_write_failure_still_leaves_a_replayable_payload() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let _fault_guard = FAULT_LOCK.lock().await;
+    let user_id = create_user(&pool, "intent-retry").await;
+    let key = create_key(&pool, user_id).await;
+    credit_purchase(&pool, user_id, Decimal::TEN, &unique_session_id(), None)
+        .await
+        .expect("funding purchase must apply");
+
+    let session = admit(&pool, &key, true).await;
+    // Fail the settle permanently so the request's fate rests entirely on
+    // whether the intent survived.
+    let fault = SettleFault::install(&pool, request_uuid(&session), i64::MAX, "P0001").await;
+    assert!(session.record(&usage_record(Decimal::ONE)).await.is_err());
+
+    let (reservations, intents, _, _) = reservation_state(&pool, key.id).await;
+    assert_eq!(reservations, 1, "the reservation survives");
+    assert_eq!(
+        intents, 1,
+        "and carries the payload needed to replay the charge"
+    );
+
+    // The stored payload is what recovery bills, so it must be the real
+    // amount rather than a placeholder.
+    fault.remove(&pool).await;
+    age_settlement_intent(&pool, key.id).await;
+    recover_owed_settlements(&pool, 100)
+        .await
+        .expect("recovery must query");
+    assert_eq!(
+        Decimal::TEN - balance(&pool, user_id).await.expect("balance must query"),
+        Decimal::ONE,
+        "the replayed charge is exactly what the intent recorded"
+    );
+}
