@@ -1119,15 +1119,34 @@ impl UsageSession {
     /// any failure after that point returned an error with the payload gone.
     pub async fn record(&self, record: &UsageRecord) -> Result<(), sqlx::Error> {
         let intent = SettlementIntent::new(self, record);
-        if let Err(error) = self.persist_intent(&intent).await {
-            // Not fatal on its own — the settle below may still succeed — but
-            // it means this request has lost its safety net, so it is reported
-            // at the same level as a lost charge.
-            tracing::error!(
-                request_id = %self.reservation_id,
-                error = %error,
-                "settlement intent could not be persisted; a failed settle for this request would not be recoverable"
-            );
+        // The intent is this request's only safety net: the customer may
+        // already hold streamed output, and without a stored payload a
+        // failed settle leaves nothing to replay — the reservation is later
+        // reclaimed as owing nothing and the charge is gone (sol review).
+        // A single attempt threw that net away on a blip, so the write is
+        // retried on transient errors exactly like the settle it protects.
+        let mut backoff = SETTLEMENT_RETRY_BACKOFF;
+        for attempt in 1..=SETTLEMENT_ATTEMPTS {
+            match self.persist_intent(&intent).await {
+                Ok(()) => break,
+                Err(error) => {
+                    let transient = is_transient(&error);
+                    if !transient || attempt == SETTLEMENT_ATTEMPTS {
+                        // Reported at the level of a lost charge, because
+                        // that is what it may become.
+                        tracing::error!(
+                            request_id = %self.reservation_id,
+                            attempt,
+                            transient,
+                            error = %error,
+                            "settlement intent could not be persisted; a failed settle for this request would not be recoverable"
+                        );
+                        break;
+                    }
+                    tokio::time::sleep(backoff).await;
+                    backoff = backoff.saturating_mul(2);
+                }
+            }
         }
         settle_with_retry(&self.pool, self.reservation_id, self.api_key_id, &intent).await
     }
