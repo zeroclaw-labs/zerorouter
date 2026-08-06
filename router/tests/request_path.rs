@@ -200,6 +200,35 @@ fn router(pool: PgPool, fakes: Vec<Arc<FakeModelProvider>>) -> RouterState {
     router_with_catalog(pool, fakes, tier_config_path())
 }
 
+/// [`router`], but matching fakes to candidates by alias (the candidate id's
+/// suffix) instead of positionally — one state can then serve tiers with
+/// different candidate counts at once, which the soak needs.
+fn router_matching_aliases(pool: PgPool, fakes: Vec<Arc<FakeModelProvider>>) -> RouterState {
+    let route: InjectedRoute = Arc::new(move |resolved: &ResolvedRoute, _max_output_tokens| {
+        ProviderRoute::from_candidates(
+            resolved
+                .candidates
+                .iter()
+                .cloned()
+                .map(|definition| {
+                    let alias = definition.id.split('/').next_back().unwrap_or_default();
+                    let fake = fakes
+                        .iter()
+                        .find(|fake| {
+                            zeroclaw_api::attribution::Attributable::alias(fake.as_ref()) == alias
+                        })
+                        .unwrap_or_else(|| {
+                            panic!("no scripted fake for candidate {}", definition.id)
+                        })
+                        .clone();
+                    ProviderCandidate::with_provider(definition, fake)
+                })
+                .collect(),
+        )
+    });
+    RouterState::with_injected_route(tier_config_path(), pool, true, route)
+}
+
 /// [`router`], reading a caller-chosen catalog.
 fn router_with_catalog(
     pool: PgPool,
@@ -5049,4 +5078,122 @@ async fn standing_evidence_outside_the_trigger_window_still_reverts() {
         "aged-but-standing evidence re-derives the revert on a fresh registry"
     );
     assert_eq!(basis.as_deref(), Some("cold"));
+}
+
+/// The money-conservation soak: many users racing mixed-outcome traffic —
+/// successes, transport retries, rate limits, hard failures, real streams,
+/// synthetic streams — and afterwards the books must balance exactly. For
+/// every user, credits spent equals the sum of that user's settled usage
+/// costs to the micro-dollar, no reservation is left open anywhere, and no
+/// balance went negative. This is the invariant that lets ZeroClaw adopt
+/// the router as a provider: agent workloads are exactly this shape of
+/// concurrent, failure-riddled traffic.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn soak_concurrent_mixed_traffic_conserves_money() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    const USERS: usize = 10;
+    const REQUESTS_PER_USER: usize = 24;
+
+    // Oversized repeating scripts: outcome order across racing requests is
+    // nondeterministic, and retries consume extra entries — conservation
+    // must hold regardless of which request drew which outcome.
+    let mut primary_script = Vec::new();
+    let mut secondary_script = Vec::new();
+    let mut solo_script = Vec::new();
+    for index in 0..(USERS * REQUESTS_PER_USER * 4) {
+        primary_script.push(match index % 6 {
+            0 | 1 => FakeOutcome::chat("soak answer", served_usage()),
+            2 => FakeOutcome::Transport,
+            3 => FakeOutcome::RateLimited,
+            4 => FakeOutcome::Stream(vec![
+                FakeStreamStep::text("soak "),
+                FakeStreamStep::text("stream"),
+                FakeStreamStep::Usage(served_usage()),
+                FakeStreamStep::Final,
+            ]),
+            _ => FakeOutcome::Failure("upstream exploded"),
+        });
+        // The failover rung answers everything, so a walk that abandons the
+        // primary still settles deterministically.
+        secondary_script.push(FakeOutcome::chat("failover answer", served_usage()));
+        solo_script.push(match index % 3 {
+            0 => FakeOutcome::chat("solo answer", served_usage()),
+            1 => FakeOutcome::Stream(vec![
+                FakeStreamStep::text("solo stream"),
+                FakeStreamStep::Usage(served_usage()),
+                FakeStreamStep::Final,
+            ]),
+            _ => FakeOutcome::RateLimited,
+        });
+    }
+    let primary = FakeModelProvider::new("primary", primary_script);
+    let secondary = FakeModelProvider::new("secondary", secondary_script);
+    // No native streaming: streaming requests against zero/test-solo also
+    // exercise the synthetic-stream path under the same storm.
+    let solo = FakeModelProvider::without_streaming("solo", solo_script);
+    let state = router_matching_aliases(
+        pool.clone(),
+        vec![primary.clone(), secondary.clone(), solo.clone()],
+    );
+
+    let mut keys = Vec::new();
+    for user in 0..USERS {
+        keys.push(create_funded_key(&pool, &format!("soak-{user}")).await);
+    }
+
+    let mut workers = Vec::new();
+    for (api_key_id, key) in keys.clone() {
+        let state = state.clone();
+        workers.push(tokio::spawn(async move {
+            for request in 0..REQUESTS_PER_USER {
+                let streaming = request % 2 == 0;
+                let model = if request % 3 == 0 {
+                    "zero/test-solo"
+                } else {
+                    "zero/test-pair"
+                };
+                let response = app(state.clone())
+                    .oneshot(completion_request(&key, &completion_body(model, streaming)))
+                    .await
+                    .expect("soak request must complete");
+                if streaming && response.status() == StatusCode::OK {
+                    // Drain the stream so settlement happens.
+                    let _ = sse_chunks(response).await;
+                }
+            }
+            api_key_id
+        }));
+    }
+    for worker in workers {
+        worker.await.expect("soak worker must not panic");
+    }
+    state.wait_for_background_tasks().await;
+
+    for (api_key_id, _) in &keys {
+        let user_id = user_of(&pool, *api_key_id).await;
+        let spent = query_scalar::<_, Decimal>(
+            "SELECT COALESCE(SUM(cost_usd), 0) FROM usage_events WHERE api_key_id = $1",
+        )
+        .bind(api_key_id)
+        .fetch_one(&pool)
+        .await
+        .expect("usage sum must query");
+        let balance = balance(&pool, user_id).await.expect("balance must query");
+        assert_eq!(
+            Decimal::from(50) - balance,
+            spent,
+            "user {user_id}: every debited micro-dollar must be a settled usage row"
+        );
+        assert!(
+            balance >= Decimal::ZERO,
+            "user {user_id}: balance must never go negative"
+        );
+        assert_eq!(
+            open_reservations(&pool, *api_key_id).await,
+            0,
+            "user {user_id}: the storm must leave no reservation open"
+        );
+    }
 }
