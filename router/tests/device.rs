@@ -507,3 +507,34 @@ async fn device_endpoints_validate_client_grant_and_csrf() {
     assert_eq!(status, StatusCode::FORBIDDEN);
     assert_eq!(body["error"]["code"], "csrf_rejected");
 }
+
+/// The device-code endpoint is unauthenticated, so anything it stores is
+/// storage an anonymous caller controls. A key label is truncated to the
+/// portal's own bound rather than kept whole: without it, a caller can park
+/// a quarter-megabyte of incompressible text per request — retained until
+/// 24 hours after the grant expires — and grow the database for free.
+#[tokio::test]
+async fn an_oversized_device_key_name_is_truncated_before_storage() {
+    let Ok(database_url) = std::env::var("DATABASE_URL") else {
+        return;
+    };
+    let pool = connect(&database_url).await;
+    let router = web_router(pool.clone());
+
+    let huge = "n".repeat(200_000);
+    let (_, user_code) = start_authorization(&router, Some(&huge)).await;
+
+    let stored = query_scalar::<_, Option<String>>(
+        "SELECT key_name FROM device_authorizations WHERE user_code = $1",
+    )
+    .bind(&user_code)
+    .fetch_one(&pool)
+    .await
+    .expect("stored grant must query")
+    .expect("the grant carries a key name");
+    assert!(
+        stored.chars().count() <= 100,
+        "the stored label is bounded, saw {} chars",
+        stored.chars().count()
+    );
+}

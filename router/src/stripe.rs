@@ -127,23 +127,32 @@ pub fn verify_webhook_signature(
     if now_unix.abs_diff(parsed.timestamp) > tolerance.as_secs() {
         return Err(WebhookVerifyError::TimestampOutOfTolerance);
     }
+    // The digest depends only on the timestamp and the payload, so it is
+    // computed ONCE and compared against each candidate. Rebuilding it per
+    // candidate let an unauthenticated caller — the webhook endpoint is
+    // public by necessity — force arbitrary hashing work: a few thousand
+    // `v1=` fields against a large body is hundreds of megabytes of SHA-256
+    // before anything is rejected (sol review).
+    //
+    // HMAC-SHA256 accepts keys of any length, so construction cannot fail;
+    // if it somehow does, fail closed.
+    let Ok(mut mac) = HmacSha256::new_from_slice(secret.as_bytes()) else {
+        return Err(WebhookVerifyError::SignatureMismatch);
+    };
+    // Sign the exact timestamp string from the header, not a re-rendered
+    // integer, so byte-level oddities cannot desynchronize the digest.
+    mac.update(parsed.timestamp_raw.as_bytes());
+    mac.update(b".");
+    mac.update(payload);
+    let expected = mac.finalize().into_bytes();
     for candidate in parsed.candidates {
         // A non-hex candidate can never match; skip it rather than abort so a
         // valid sibling signature (e.g. during secret rotation) still passes.
         let Ok(candidate_bytes) = hex::decode(candidate) else {
             continue;
         };
-        // HMAC-SHA256 accepts keys of any length, so construction cannot
-        // fail; if it somehow does, fail closed.
-        let Ok(mut mac) = HmacSha256::new_from_slice(secret.as_bytes()) else {
-            return Err(WebhookVerifyError::SignatureMismatch);
-        };
-        // Sign the exact timestamp string from the header, not a re-rendered
-        // integer, so byte-level oddities cannot desynchronize the digest.
-        mac.update(parsed.timestamp_raw.as_bytes());
-        mac.update(b".");
-        mac.update(payload);
-        if mac.verify_slice(&candidate_bytes).is_ok() {
+        if candidate_bytes.len() == expected.len() && constant_time_eq(&candidate_bytes, &expected)
+        {
             return Ok(());
         }
     }
@@ -156,6 +165,25 @@ struct ParsedSignatureHeader<'a> {
     candidates: Vec<&'a str>,
 }
 
+/// Signatures Stripe can plausibly send at once: the current secret plus
+/// one being rotated in leaves room to spare. Anything beyond this is an
+/// attempt to make the endpoint do work, not to authenticate.
+const MAX_SIGNATURE_CANDIDATES: usize = 8;
+
+/// Length of a hex-encoded SHA-256 digest. A candidate of any other length
+/// cannot match, so it is not worth decoding.
+const SIGNATURE_HEX_LEN: usize = 64;
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.iter()
+        .zip(right)
+        .fold(0_u8, |diff, (a, b)| diff | (a ^ b))
+        == 0
+}
+
 fn parse_signature_header(header: &str) -> Result<ParsedSignatureHeader<'_>, WebhookVerifyError> {
     let mut timestamp_raw = None;
     let mut candidates = Vec::new();
@@ -165,7 +193,14 @@ fn parse_signature_header(header: &str) -> Result<ParsedSignatureHeader<'_>, Web
         };
         match key.trim() {
             "t" => timestamp_raw = Some(value.trim()),
-            "v1" => candidates.push(value.trim()),
+            "v1" => {
+                let value = value.trim();
+                // Only well-formed candidates are kept, and only a few: an
+                // unbounded list is a work amplifier, not a signature.
+                if value.len() == SIGNATURE_HEX_LEN && candidates.len() < MAX_SIGNATURE_CANDIDATES {
+                    candidates.push(value);
+                }
+            }
             // v0 (legacy) and future schemes are ignored, per Stripe's docs.
             _ => {}
         }
@@ -817,14 +852,44 @@ mod tests {
 
     #[test]
     fn signature_headers_parse_strictly() {
-        let parsed = parse_signature_header("t=1700000000,v1=aa,v0=bb,v1=cc")
-            .expect("well-formed header must parse");
+        // Candidates must be the length of a hex SHA-256 digest; anything
+        // else cannot match, so it is dropped rather than decoded.
+        let first = "a".repeat(SIGNATURE_HEX_LEN);
+        let second = "c".repeat(SIGNATURE_HEX_LEN);
+        let header = format!("t=1700000000,v1={first},v0=bb,v1={second},v1=tooshort");
+        let parsed = parse_signature_header(&header).expect("well-formed header must parse");
         assert_eq!(parsed.timestamp, 1_700_000_000);
         assert_eq!(parsed.timestamp_raw, "1700000000");
-        assert_eq!(parsed.candidates, vec!["aa", "cc"]);
-        for header in ["", "garbage", "t=notanumber,v1=aa", "v1=aa", "t=1700000000"] {
+        assert_eq!(
+            parsed.candidates,
+            vec![first.as_str(), second.as_str()],
+            "v0 and malformed-length candidates are ignored"
+        );
+
+        // An unbounded candidate list is a work amplifier: the endpoint is
+        // public, and every extra candidate used to mean another full HMAC
+        // over the whole body. Both the count and the per-candidate cost are
+        // now capped (the digest is computed once).
+        let flood = std::iter::repeat_n(format!("v1={first}"), 5_000)
+            .collect::<Vec<_>>()
+            .join(",");
+        let flooded_header = format!("t=1700000000,{flood}");
+        let parsed =
+            parse_signature_header(&flooded_header).expect("a flooded header still parses");
+        assert_eq!(parsed.candidates.len(), MAX_SIGNATURE_CANDIDATES);
+
+        let valid = "a".repeat(SIGNATURE_HEX_LEN);
+        for header in [
+            String::new(),
+            "garbage".to_owned(),
+            format!("t=notanumber,v1={valid}"),
+            format!("v1={valid}"),
+            "t=1700000000".to_owned(),
+            // Present but unusable: every candidate is the wrong length.
+            "t=1700000000,v1=aa,v1=bb".to_owned(),
+        ] {
             assert_eq!(
-                parse_signature_header(header).err(),
+                parse_signature_header(&header).err(),
                 Some(WebhookVerifyError::MalformedHeader),
                 "{header:?} should be malformed"
             );
