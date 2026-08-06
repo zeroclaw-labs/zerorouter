@@ -56,6 +56,17 @@ use zeroclaw_api::model_provider::{
 };
 use zeroclaw_providers::traits::ChatMessage;
 
+/// Idle ceiling for a STREAMING upstream: how long the wire waits between
+/// bytes before declaring the stream dead. A live SSE stream is never
+/// silent this long — both dialects emit events (or pings) while a model
+/// thinks — but a half-open socket is silent forever, and without this the
+/// customer's connection and its reservation are held for the router's
+/// whole 15-minute request budget (found by live failure injection: an
+/// upstream that stops mid-stream without closing). Deliberately NOT
+/// applied to non-streaming calls, where a long completion legitimately
+/// sends nothing until the model finishes.
+const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// Default endpoint for the OpenAI Responses API.
 const RESPONSES_URL: &str = "https://api.openai.com/v1/responses";
 
@@ -67,6 +78,8 @@ pub struct OpenAiResponsesWire {
     credential: String,
     max_tokens: Option<u32>,
     http: reqwest::Client,
+    /// Same budget plus an idle ceiling; used only by `stream_chat`.
+    stream_http: reqwest::Client,
 }
 
 impl OpenAiResponsesWire {
@@ -87,6 +100,11 @@ impl OpenAiResponsesWire {
             max_tokens,
             http: reqwest::Client::builder()
                 .timeout(Duration::from_secs(timeout_secs))
+                .build()
+                .unwrap_or_default(),
+            stream_http: reqwest::Client::builder()
+                .timeout(Duration::from_secs(timeout_secs))
+                .read_timeout(STREAM_IDLE_TIMEOUT)
                 .build()
                 .unwrap_or_default(),
         }
@@ -451,7 +469,7 @@ impl ModelProvider for OpenAiResponsesWire {
         options: StreamOptions,
     ) -> futures_util::stream::BoxStream<'static, StreamResult<StreamEvent>> {
         let body = self.request_body(model, request.messages, request.tools, temperature, true);
-        let http = self.http.clone();
+        let http = self.stream_http.clone();
         let api_url = self.api_url.clone();
         let credential = self.credential.clone();
         let alias = self.alias.clone();
@@ -638,6 +656,8 @@ pub struct AnthropicWire {
     /// Required by the Messages API on every request, so not optional here.
     max_tokens: u32,
     http: reqwest::Client,
+    /// Same budget plus an idle ceiling; used only by `stream_chat`.
+    stream_http: reqwest::Client,
 }
 
 impl AnthropicWire {
@@ -658,6 +678,11 @@ impl AnthropicWire {
             max_tokens,
             http: reqwest::Client::builder()
                 .timeout(Duration::from_secs(timeout_secs))
+                .build()
+                .unwrap_or_default(),
+            stream_http: reqwest::Client::builder()
+                .timeout(Duration::from_secs(timeout_secs))
+                .read_timeout(STREAM_IDLE_TIMEOUT)
                 .build()
                 .unwrap_or_default(),
         }
@@ -1324,7 +1349,7 @@ impl ModelProvider for AnthropicWire {
         options: StreamOptions,
     ) -> futures_util::stream::BoxStream<'static, StreamResult<StreamEvent>> {
         let body = self.request_body(model, request.messages, request.tools, temperature, true);
-        let http = self.http.clone();
+        let http = self.stream_http.clone();
         let api_url = self.api_url.clone();
         let credential = self.credential.clone();
         let alias = self.alias.clone();
@@ -1598,6 +1623,32 @@ mod review_fix_tests {
         }
         assert_eq!(out, text);
         assert!(raw.is_empty());
+    }
+
+    #[test]
+    fn the_streaming_client_carries_an_idle_ceiling_the_chat_client_does_not() {
+        // Live failure injection found the gap: an upstream that stops
+        // mid-stream WITHOUT closing held the customer's connection and its
+        // reservation for the router's whole 15-minute budget. The idle
+        // ceiling belongs only to the streaming client — a long
+        // non-streaming completion legitimately sends nothing until it is
+        // done, so the same ceiling there would kill honest requests.
+        assert_eq!(STREAM_IDLE_TIMEOUT, Duration::from_secs(120));
+        let responses = OpenAiResponsesWire::new("openai", "k", None, Some(64), 900);
+        let anthropic = AnthropicWire::new("anthropic", "k", None, 64, 900);
+        // The clients are distinct objects: the streaming one is built with
+        // read_timeout, the chat one without (reqwest exposes no getter, so
+        // the pin is structural — a refactor that collapses them back into
+        // one client fails here).
+        for (chat, stream) in [
+            (&responses.http, &responses.stream_http),
+            (&anthropic.http, &anthropic.stream_http),
+        ] {
+            assert!(
+                !std::ptr::eq(chat, stream),
+                "streaming and non-streaming clients must not be the same client"
+            );
+        }
     }
 
     #[test]
