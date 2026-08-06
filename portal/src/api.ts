@@ -165,11 +165,18 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
 
 export const api = {
   me: () => request<Me>('GET', '/api/me'),
-  keys: () => request<ApiKey[]>('GET', '/api/keys'),
+  // The server wraps list responses in envelopes; unwrap here so pages
+  // consume bare arrays (first caught live: the SPA's data pages were
+  // untestable in a browser until OIDC existed).
+  keys: () => request<{ keys: ApiKey[] }>('GET', '/api/keys').then((r) => r.keys),
   createKey: (name: string) => request<CreatedKey>('POST', '/api/keys', { name }),
   deleteKey: (id: string) => request<void>('DELETE', `/api/keys/${encodeURIComponent(id)}`),
   usage: (days: number) => request<Usage>('GET', `/api/usage?days=${days}`),
-  ledger: (limit: number) => request<LedgerEntry[]>('GET', `/api/billing/ledger?limit=${limit}`),
+  ledger: (limit: number) =>
+    request<{ limit: number; entries: LedgerEntry[] }>(
+      'GET',
+      `/api/billing/ledger?limit=${limit}`,
+    ).then((r) => r.entries),
   checkout: (amountUsd: string) =>
     request<CheckoutSession>('POST', '/api/billing/checkout', { amount_usd: amountUsd }),
   autopay: () => request<AutopayStatus>('GET', '/api/billing/autopay'),
