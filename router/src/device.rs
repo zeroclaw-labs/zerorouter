@@ -649,10 +649,18 @@ fn normalize_user_code(raw: &str) -> Option<String> {
     ))
 }
 
+/// Longest device-supplied key label that is stored. The portal holds
+/// self-service names to the same bound; this endpoint is UNAUTHENTICATED,
+/// so without it a caller can park a quarter-megabyte of incompressible
+/// text per request — retained until 24 hours after the grant expires —
+/// and grow the database indefinitely for free (sol review). Truncating
+/// rather than rejecting keeps an honest long hostname working.
+const MAX_KEY_NAME_CHARS: usize = 100;
+
 fn normalized_key_name(raw: Option<&str>) -> Option<String> {
     raw.map(str::trim)
         .filter(|name| !name.is_empty())
-        .map(str::to_owned)
+        .map(|name| name.chars().take(MAX_KEY_NAME_CHARS).collect())
 }
 
 fn sha256_hex(value: &str) -> String {
