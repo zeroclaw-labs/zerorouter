@@ -17,8 +17,8 @@ cached_input_per_mtok = 0.60
 output_per_mtok = 6.00
 
 [[tiers."zero/test-pair".candidates]]
-id = "fireworks/primary"
-provider = "fireworks"
+id = "openai/primary"
+provider = "openai"
 model = "upstream/primary"
 
 [tiers."zero/test-pair".candidates.rates]
@@ -27,8 +27,8 @@ cached_input_per_mtok = 0.20
 output_per_mtok = 2.00
 
 [[tiers."zero/test-pair".candidates]]
-id = "together/secondary"
-provider = "together"
+id = "anthropic/secondary"
+provider = "anthropic"
 model = "upstream/secondary"
 
 [tiers."zero/test-pair".candidates.rates]
@@ -44,8 +44,8 @@ cached_input_per_mtok = 0.60
 output_per_mtok = 6.00
 
 [[tiers."zero/test-solo".candidates]]
-id = "deepinfra/solo"
-provider = "deepinfra"
+id = "openai/solo"
+provider = "openai"
 model = "upstream/solo"
 
 [tiers."zero/test-solo".candidates.rates]
@@ -65,8 +65,8 @@ cached_input_per_mtok = 0.60
 output_per_mtok = 6.00
 
 [[tiers."zero/test-pricier-first".candidates]]
-id = "fireworks/pricier"
-provider = "fireworks"
+id = "openai/pricier"
+provider = "openai"
 model = "upstream/pricier"
 
 [tiers."zero/test-pricier-first".candidates.rates]
@@ -75,8 +75,8 @@ cached_input_per_mtok = 0.40
 output_per_mtok = 4.00
 
 [[tiers."zero/test-pricier-first".candidates]]
-id = "together/cheaper"
-provider = "together"
+id = "anthropic/cheaper"
+provider = "anthropic"
 model = "upstream/cheaper"
 
 [tiers."zero/test-pricier-first".candidates.rates]

@@ -1,15 +1,12 @@
 use std::collections::BTreeMap;
 
+use crate::provider::ToolSpec;
+use crate::provider::{ChatMessage, ChatResponse, ModelRates, TokenUsage, ToolCall};
 use chrono::Utc;
 use rust_decimal::{Decimal, prelude::FromPrimitive};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
-use zeroclaw_api::tool::ToolSpec;
-use zeroclaw_providers::{
-    pricing::ModelRates,
-    traits::{ChatMessage, ChatResponse, TokenUsage, ToolCall},
-};
 
 use crate::priority::Priority;
 
@@ -202,12 +199,10 @@ impl ChatCompletionRequest {
     pub fn provider_tools(&self) -> Vec<ToolSpec> {
         self.tools
             .iter()
-            .map(|tool| {
-                ToolSpec::new(
-                    tool.function.name.clone(),
-                    tool.function.description.clone(),
-                    tool.function.parameters.clone(),
-                )
+            .map(|tool| ToolSpec {
+                name: tool.function.name.clone(),
+                description: tool.function.description.clone(),
+                parameters: tool.function.parameters.clone(),
             })
             .collect()
     }

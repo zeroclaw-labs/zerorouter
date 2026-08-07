@@ -47,7 +47,7 @@ use sqlx_postgres::{PgConnectOptions, PgPool, PgPoolOptions};
 use tower::ServiceExt;
 use tracing_subscriber::fmt::MakeWriter;
 use uuid::Uuid;
-use zeroclaw_providers::traits::TokenUsage;
+use zerorouter::provider::TokenUsage;
 use zerorouter::{
     RouterState,
     api::InjectedRoute,
@@ -339,7 +339,7 @@ async fn the_walk_never_logs_an_upstream_error_body() {
         "the walk's metadata event must reach the sink: {logged}"
     );
     assert!(
-        logged.contains("fireworks/primary"),
+        logged.contains("openai/primary"),
         "which candidate failed is metadata and must survive: {logged}"
     );
     assert!(

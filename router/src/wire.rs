@@ -45,16 +45,16 @@
 
 use std::time::Duration;
 
+use crate::provider::ChatMessage;
+use crate::provider::{
+    ChatRequest, ChatResponse, ModelProvider, ProviderCapabilities, StreamChunk, StreamError,
+    StreamEvent, StreamOptions, StreamResult, TokenUsage, ToolCall,
+};
 use anyhow::anyhow;
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use zeroclaw_api::model_provider::{
-    ChatRequest, ChatResponse, ModelProvider, ProviderCapabilities, StreamChunk, StreamError,
-    StreamEvent, StreamOptions, StreamResult, TokenUsage, ToolCall,
-};
-use zeroclaw_providers::traits::ChatMessage;
 
 /// Idle ceiling for a STREAMING upstream: how long the wire waits between
 /// bytes before declaring the stream dead. A live SSE stream is never
@@ -174,7 +174,7 @@ impl OpenAiResponsesWire {
         &self,
         model: &str,
         messages: &[ChatMessage],
-        tools: Option<&[zeroclaw_api::tool::ToolSpec]>,
+        tools: Option<&[crate::provider::ToolSpec]>,
         temperature: Option<f64>,
         stream: bool,
     ) -> Value {
@@ -487,64 +487,22 @@ fn upstream_error(alias: &str, status: reqwest::StatusCode, body: &str) -> anyho
     )
 }
 
-impl zeroclaw_api::attribution::Attributable for OpenAiResponsesWire {
-    fn role(&self) -> zeroclaw_api::attribution::Role {
-        zeroclaw_api::attribution::Role::Provider(zeroclaw_api::attribution::ProviderKind::Model(
-            zeroclaw_api::attribution::ModelProviderKind::OpenAi,
-        ))
-    }
-
-    fn alias(&self) -> &str {
-        &self.alias
-    }
-}
-
 #[async_trait]
 impl ModelProvider for OpenAiResponsesWire {
+    fn alias(&self) -> std::borrow::Cow<'_, str> {
+        std::borrow::Cow::Borrowed(&self.alias)
+    }
+
     fn capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities {
             native_tool_calling: true,
             vision: false,
             prompt_caching: true,
-            extended_thinking: false,
         }
-    }
-
-    fn default_base_url(&self) -> Option<&str> {
-        Some(&self.api_url)
-    }
-
-    fn supports_native_tools(&self) -> bool {
-        true
     }
 
     fn supports_streaming(&self) -> bool {
         true
-    }
-
-    fn supports_streaming_tool_events(&self) -> bool {
-        true
-    }
-
-    async fn chat_with_system(
-        &self,
-        system: Option<&str>,
-        message: &str,
-        model: &str,
-        temperature: Option<f64>,
-    ) -> anyhow::Result<String> {
-        let mut messages = Vec::new();
-        if let Some(system) = system {
-            messages.push(ChatMessage::system(system));
-        }
-        messages.push(ChatMessage::user(message));
-        let request = ChatRequest {
-            messages: &messages,
-            tools: None,
-            thinking: None,
-        };
-        let response = self.chat(request, model, temperature).await?;
-        Ok(response.text.unwrap_or_default())
     }
 
     async fn chat(
@@ -799,7 +757,7 @@ impl AnthropicWire {
         &self,
         model: &str,
         messages: &[ChatMessage],
-        tools: Option<&[zeroclaw_api::tool::ToolSpec]>,
+        tools: Option<&[crate::provider::ToolSpec]>,
         temperature: Option<f64>,
         stream: bool,
     ) -> Value {
@@ -1382,20 +1340,12 @@ impl AnthropicStreamMachine {
     }
 }
 
-impl zeroclaw_api::attribution::Attributable for AnthropicWire {
-    fn role(&self) -> zeroclaw_api::attribution::Role {
-        zeroclaw_api::attribution::Role::Provider(zeroclaw_api::attribution::ProviderKind::Model(
-            zeroclaw_api::attribution::ModelProviderKind::Anthropic,
-        ))
-    }
-
-    fn alias(&self) -> &str {
-        &self.alias
-    }
-}
-
 #[async_trait]
 impl ModelProvider for AnthropicWire {
+    fn alias(&self) -> std::borrow::Cow<'_, str> {
+        std::borrow::Cow::Borrowed(&self.alias)
+    }
+
     fn capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities {
             native_tool_calling: true,
@@ -1403,47 +1353,11 @@ impl ModelProvider for AnthropicWire {
             // wire decodes them back into native image blocks.
             vision: true,
             prompt_caching: true,
-            // The models can think; ZR's compat surface has nowhere to carry
-            // it, so this wire does not request it.
-            extended_thinking: false,
         }
-    }
-
-    fn default_base_url(&self) -> Option<&str> {
-        Some(&self.api_url)
-    }
-
-    fn supports_native_tools(&self) -> bool {
-        true
     }
 
     fn supports_streaming(&self) -> bool {
         true
-    }
-
-    fn supports_streaming_tool_events(&self) -> bool {
-        true
-    }
-
-    async fn chat_with_system(
-        &self,
-        system: Option<&str>,
-        message: &str,
-        model: &str,
-        temperature: Option<f64>,
-    ) -> anyhow::Result<String> {
-        let mut messages = Vec::new();
-        if let Some(system) = system {
-            messages.push(ChatMessage::system(system));
-        }
-        messages.push(ChatMessage::user(message));
-        let request = ChatRequest {
-            messages: &messages,
-            tools: None,
-            thinking: None,
-        };
-        let response = self.chat(request, model, temperature).await?;
-        Ok(response.text.unwrap_or_default())
     }
 
     async fn chat(
@@ -1963,7 +1877,6 @@ mod anthropic_tests {
                     StreamEvent::ToolCall(call) => tool_calls.push(call),
                     StreamEvent::Usage(u) => usage = Some(u),
                     StreamEvent::Final => finals += 1,
-                    _ => {}
                 }
             }
         }
@@ -2087,12 +2000,10 @@ mod anthropic_review_fix_tests {
             ChatMessage::assistant("first answer"),
             ChatMessage::user("second question"),
         ];
-        let spec = |name: &str, description: &str| zeroclaw_api::tool::ToolSpec {
+        let spec = |name: &str, description: &str| crate::provider::ToolSpec {
             name: name.into(),
             description: description.into(),
-            parameters: std::sync::Arc::new(json!({"type": "object"})),
-            output: None,
-            param_domains: std::collections::BTreeMap::new(),
+            parameters: (json!({"type": "object"})),
         };
         let tools = vec![spec("a", "first"), spec("b", "last")];
         let body = wire.request_body("claude-sonnet-5", &messages, Some(&tools), None, false);

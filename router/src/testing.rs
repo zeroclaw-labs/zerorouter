@@ -16,15 +16,14 @@ use std::{
     time::Duration,
 };
 
+use crate::provider::{
+    ChatRequest, ChatResponse, ModelProvider, StreamChunk, StreamError, StreamEvent, StreamOptions,
+    StreamResult, TokenUsage, ToolCall,
+};
 use async_trait::async_trait;
 use futures_util::{
     StreamExt,
     stream::{self, BoxStream},
-};
-use zeroclaw_api::attribution::{Attributable, ModelProviderKind, ProviderKind, Role};
-use zeroclaw_providers::traits::{
-    ChatRequest, ChatResponse, ModelProvider, StreamChunk, StreamError, StreamEvent, StreamOptions,
-    StreamResult, TokenUsage, ToolCall,
 };
 
 /// Failure text a [`FakeOutcome::Transport`] reports. Deliberately free of HTTP
@@ -247,27 +246,12 @@ impl FakeModelProvider {
 
 #[async_trait]
 impl ModelProvider for FakeModelProvider {
+    fn alias(&self) -> std::borrow::Cow<'_, str> {
+        std::borrow::Cow::Borrowed(&self.alias)
+    }
+
     fn supports_streaming(&self) -> bool {
         self.supports_streaming
-    }
-
-    fn supports_streaming_tool_events(&self) -> bool {
-        self.supports_streaming
-    }
-
-    /// The router never dispatches through this rung — it always calls `chat`
-    /// or `stream_chat` — so reaching it means the fake was wired somewhere
-    /// unexpected.
-    async fn chat_with_system(
-        &self,
-        _system_prompt: Option<&str>,
-        _message: &str,
-        _model: &str,
-        _temperature: Option<f64>,
-    ) -> anyhow::Result<String> {
-        Err(anyhow::anyhow!(
-            self.misuse("dispatched through chat_with_system")
-        ))
     }
 
     async fn chat(
@@ -346,17 +330,5 @@ impl ModelProvider for FakeModelProvider {
             }
         })
         .boxed()
-    }
-}
-
-impl Attributable for FakeModelProvider {
-    fn role(&self) -> Role {
-        // The same role the OpenAI-compatible upstream this stands in for
-        // reports, so attribution spans are shaped identically.
-        Role::Provider(ProviderKind::Model(ModelProviderKind::Plugin))
-    }
-
-    fn alias(&self) -> &str {
-        &self.alias
     }
 }

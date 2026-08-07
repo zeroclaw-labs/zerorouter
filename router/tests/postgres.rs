@@ -5,7 +5,7 @@ use rust_decimal::Decimal;
 use sqlx_core::{query::query, query_as::query_as, query_scalar::query_scalar};
 use sqlx_postgres::{PgConnectOptions, PgPool, PgPoolOptions};
 use uuid::Uuid;
-use zeroclaw_providers::pricing::ModelRates;
+use zerorouter::provider::ModelRates;
 use zerorouter::{
     auth::{
         AuthenticatedKey, AuthenticationError, KeyAuthenticator, generate_api_key, hash_api_key,
@@ -347,8 +347,8 @@ async fn settled_row_carries_estimate_and_select_telemetry() {
         AttemptRecord {
             attempt_no: 1,
             started_at: Utc::now(),
-            candidate_id: "fireworks/loser".to_owned(),
-            upstream_provider: "fireworks".to_owned(),
+            candidate_id: "openai/loser".to_owned(),
+            upstream_provider: "openai".to_owned(),
             upstream_model: "loser-model".to_owned(),
             outcome: "upstream_error".to_owned(),
             served: false,
@@ -362,8 +362,8 @@ async fn settled_row_carries_estimate_and_select_telemetry() {
         AttemptRecord {
             attempt_no: 2,
             started_at: Utc::now(),
-            candidate_id: "deepinfra/winner".to_owned(),
-            upstream_provider: "deepinfra".to_owned(),
+            candidate_id: "openai/winner".to_owned(),
+            upstream_provider: "openai".to_owned(),
             upstream_model: "winner-model".to_owned(),
             outcome: "ok".to_owned(),
             served: true,
@@ -381,7 +381,7 @@ async fn settled_row_carries_estimate_and_select_telemetry() {
         prompt_bytes: 4096,
         message_count: 3,
         tool_count: 2,
-        candidate_id: Some("deepinfra/winner".to_owned()),
+        candidate_id: Some("openai/winner".to_owned()),
         basis_rates: Some(basis),
         sell_rates: sell,
         finish_reason: Some("stop".to_owned()),
@@ -391,7 +391,7 @@ async fn settled_row_carries_estimate_and_select_telemetry() {
     session
         .record(&UsageRecord {
             tier: "zero/balanced".to_owned(),
-            upstream_provider: "deepinfra".to_owned(),
+            upstream_provider: "openai".to_owned(),
             upstream_model: "winner-model".to_owned(),
             usage: served_usage,
             cost_usd: usage_cost(sell, served_usage).expect("sell rates must price"),
@@ -448,7 +448,7 @@ async fn settled_row_carries_estimate_and_select_telemetry() {
     assert_eq!(prompt_bytes, 4096);
     assert_eq!(message_count, 3);
     assert_eq!(tool_count, 2);
-    assert_eq!(candidate_id.as_deref(), Some("deepinfra/winner"));
+    assert_eq!(candidate_id.as_deref(), Some("openai/winner"));
     assert_eq!(finish_reason.as_deref(), Some("stop"));
     assert_eq!(finish_reason_source.as_deref(), Some("synthetic"));
     assert_eq!(estimator_basis.as_deref(), Some("cold"));
@@ -574,8 +574,8 @@ async fn a_partly_unknown_attempt_cogs_sum_reports_itself_as_a_lower_bound() {
         AttemptRecord {
             attempt_no,
             started_at: Utc::now(),
-            candidate_id: format!("fireworks/loser-{attempt_no}"),
-            upstream_provider: "fireworks".to_owned(),
+            candidate_id: format!("openai/loser-{attempt_no}"),
+            upstream_provider: "openai".to_owned(),
             upstream_model: "loser-model".to_owned(),
             outcome: "upstream_error".to_owned(),
             served: false,
@@ -597,11 +597,11 @@ async fn a_partly_unknown_attempt_cogs_sum_reports_itself_as_a_lower_bound() {
         let session = admit(pool, &key).await;
         let mut telemetry = sentinel_telemetry();
         telemetry.basis_rates = Some(basis);
-        telemetry.candidate_id = Some("deepinfra/winner".to_owned());
+        telemetry.candidate_id = Some("openai/winner".to_owned());
         session
             .record(&UsageRecord {
                 tier: "zero/balanced".to_owned(),
-                upstream_provider: "deepinfra".to_owned(),
+                upstream_provider: "openai".to_owned(),
                 upstream_model: "winner-model".to_owned(),
                 usage: OpenAiUsage::default(),
                 cost_usd: Decimal::ZERO,
@@ -694,7 +694,7 @@ async fn request_attempts_are_append_only_and_one_served_per_request() {
     session
         .record(&UsageRecord {
             tier: "zero/balanced".to_owned(),
-            upstream_provider: "deepinfra".to_owned(),
+            upstream_provider: "openai".to_owned(),
             upstream_model: "winner-model".to_owned(),
             usage: OpenAiUsage {
                 prompt_tokens: 10,
@@ -709,8 +709,8 @@ async fn request_attempts_are_append_only_and_one_served_per_request() {
             attempts: vec![AttemptRecord {
                 attempt_no: 1,
                 started_at: Utc::now(),
-                candidate_id: "deepinfra/winner".to_owned(),
-                upstream_provider: "deepinfra".to_owned(),
+                candidate_id: "openai/winner".to_owned(),
+                upstream_provider: "openai".to_owned(),
                 upstream_model: "winner-model".to_owned(),
                 outcome: "ok".to_owned(),
                 served: true,
@@ -749,7 +749,7 @@ async fn request_attempts_are_append_only_and_one_served_per_request() {
                 request_id, api_key_id, user_id, attempt_no, candidate_id,
                 upstream_provider, upstream_model, outcome, served, latency_ms
             )
-            VALUES ($1, $2, $3, 9, 'deepinfra/other', 'deepinfra', 'other', 'ok', TRUE, 1)
+            VALUES ($1, $2, $3, 9, 'openai/other', 'deepinfra', 'other', 'ok', TRUE, 1)
             "#,
         )
         .bind(request_id)
@@ -951,7 +951,7 @@ async fn output_percentiles_scan_measures_only_the_cell_it_is_asked_about() {
             key.id,
             signature,
             Some(TASK_SIGNATURE_SCHEME),
-            Some("fireworks/est-a"),
+            Some("openai/est-a"),
             output,
             200,
         )
@@ -965,7 +965,7 @@ async fn output_percentiles_scan_measures_only_the_cell_it_is_asked_about() {
             key.id,
             signature,
             Some(TASK_SIGNATURE_SCHEME),
-            Some("together/est-b"),
+            Some("anthropic/est-b"),
             1_000,
             200,
         )
@@ -979,7 +979,7 @@ async fn output_percentiles_scan_measures_only_the_cell_it_is_asked_about() {
             key.id,
             signature,
             None,
-            Some("fireworks/est-a"),
+            Some("openai/est-a"),
             5_000,
             200,
         )
@@ -989,7 +989,7 @@ async fn output_percentiles_scan_measures_only_the_cell_it_is_asked_about() {
             key.id,
             signature,
             Some(TASK_SIGNATURE_SCHEME),
-            Some("fireworks/est-a"),
+            Some("openai/est-a"),
             7_777,
             502,
         )
@@ -1008,7 +1008,7 @@ async fn output_percentiles_scan_measures_only_the_cell_it_is_asked_about() {
             candidate_id, ts
         )
         VALUES ($1, $2, 'zero/estimator-test', 'fireworks', 'upstream/est',
-                100, 0, 9999, 0.001, 10, 200, $3, $4, 'fireworks/est-a',
+                100, 0, 9999, 0.001, 10, 200, $3, $4, 'openai/est-a',
                 NOW() - INTERVAL '15 days')
         "#,
     )
@@ -1024,7 +1024,7 @@ async fn output_percentiles_scan_measures_only_the_cell_it_is_asked_about() {
         &pool,
         signature,
         TASK_SIGNATURE_SCHEME,
-        Some("fireworks/est-a"),
+        Some("openai/est-a"),
     )
     .await
     .expect("scan must run")
@@ -1039,7 +1039,7 @@ async fn output_percentiles_scan_measures_only_the_cell_it_is_asked_about() {
         &pool,
         signature,
         TASK_SIGNATURE_SCHEME,
-        Some("together/est-b"),
+        Some("anthropic/est-b"),
     )
     .await
     .expect("scan must run")

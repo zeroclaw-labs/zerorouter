@@ -40,8 +40,8 @@ schema_version = 1
 input_per_mtok = 1.00
 output_per_mtok = 2.00
 [[tiers."zero/fixture-healthy".candidates]]
-id = "fireworks/healthy"
-provider = "fireworks"
+id = "openai/healthy"
+provider = "openai"
 model = "upstream/healthy"
 [tiers."zero/fixture-healthy".candidates.rates]
 input_per_mtok = 0.50
@@ -176,28 +176,25 @@ async fn models_are_materialized_from_tiers_toml() {
         .expect("models response should contain a data array");
 
     assert_eq!(json["object"], "list");
-    // 8 tier ids + 16 concrete candidates (5 low-cost, 4 balanced, 2
-    // high-end, 5 pass-through).
-    assert_eq!(data.len(), 24);
+    // 7 tier ids + 7 concrete candidates: the MVP catalog is one upstream
+    // per tier, so every tier contributes exactly one pinned id.
+    assert_eq!(data.len(), 14);
     assert!(data.iter().all(|model| model["object"] == "model"));
-    assert!(data.iter().any(|model| model["id"] == "zero/balanced"));
+    assert!(data.iter().any(|model| model["id"] == "zero/high-end"));
     assert!(
         data.iter()
-            .any(|model| model["id"] == "bedrock/us.anthropic.claude-sonnet-5")
+            .any(|model| model["id"] == "anthropic/claude-sonnet-5"),
+        "the high-end tier's pinned candidate is listed alongside the alias"
     );
     assert!(
         data.iter()
-            .any(|model| model["id"] == "deepinfra/deepseek-ai/DeepSeek-V4-Pro")
+            .any(|model| model["id"] == "anthropic/claude-haiku-4-5")
     );
     assert!(
         data.iter()
-            .any(|model| model["id"] == "bedrock/minimax.minimax-m2.5")
+            .any(|model| model["id"] == "openai/gpt-5.6-luna"),
+        "the low-cost tier's pinned candidate is listed too"
     );
-    assert!(
-        data.iter()
-            .any(|model| model["id"] == "bedrock/deepseek.v3.2")
-    );
-    assert!(data.iter().any(|model| model["id"] == "minimax/MiniMax-M3"));
     assert!(data.iter().any(|model| model["id"] == "zero/opus-5"));
     assert!(
         data.iter()
@@ -256,9 +253,9 @@ async fn model_pricing_matches_zeroclaws_model_pricing_wire_contract() {
             "created": 0,
             "owned_by": "zerorouter",
             "pricing": {
-                "prompt": "0.0000003",
+                "prompt": "0.0000002",
                 "completion": "0.0000012",
-                "input_cache_read": "0.00000006",
+                "input_cache_read": "0.00000002",
             },
         })
     );
@@ -270,19 +267,19 @@ async fn model_pricing_matches_zeroclaws_model_pricing_wire_contract() {
     // tier rate and not the candidate rate.
     let candidate = data
         .iter()
-        .find(|model| model["id"] == "bedrock/minimax.minimax-m2.5")
-        .expect("bedrock/minimax.minimax-m2.5 candidate should be listed");
+        .find(|model| model["id"] == "anthropic/claude-haiku-4-5")
+        .expect("the haiku candidate should be listed");
     assert_eq!(
         *candidate,
         serde_json::json!({
-            "id": "bedrock/minimax.minimax-m2.5",
+            "id": "anthropic/claude-haiku-4-5",
             "object": "model",
             "created": 0,
-            "owned_by": "bedrock",
+            "owned_by": "anthropic",
             "pricing": {
-                "prompt": "0.0000003",
-                "completion": "0.0000012",
-                "input_cache_read": "0.00000006",
+                "prompt": "0.000001",
+                "completion": "0.000005",
+                "input_cache_read": "0.0000001",
             },
         })
     );
@@ -294,58 +291,37 @@ async fn bundled_tier_catalog_has_expected_virtual_models() {
         .await
         .expect("bundled tier catalog should load");
 
-    assert_eq!(catalog.schema_version, 1);
-    assert!(catalog.tiers.contains_key("zero/low-cost"));
-    assert!(catalog.tiers.contains_key("zero/balanced"));
-    assert!(catalog.tiers.contains_key("zero/high-end"));
-
-    let low_cost = catalog
-        .tiers
-        .get("zero/low-cost")
-        .expect("low-cost tier should exist");
-    let low_cost_bedrock = low_cost
-        .candidates
-        .iter()
-        .filter(|candidate| candidate.provider == "bedrock")
-        .map(|candidate| (candidate.id.as_str(), candidate.model.as_str()))
-        .collect::<Vec<_>>();
+    let mut tiers = catalog.tiers.keys().cloned().collect::<Vec<_>>();
+    tiers.sort();
     assert_eq!(
-        low_cost_bedrock,
-        [("bedrock/minimax.minimax-m2.5", "minimax.minimax-m2.5")]
+        tiers,
+        [
+            "zero/codex",
+            "zero/fable-5",
+            "zero/haiku-4-5",
+            "zero/high-end",
+            "zero/low-cost",
+            "zero/opus-5",
+            "zero/sol",
+        ],
+        "the MVP catalog is seven tiers"
     );
 
-    let balanced = catalog
-        .tiers
-        .get("zero/balanced")
-        .expect("balanced tier should exist");
-    let balanced_bedrock = balanced
-        .candidates
-        .iter()
-        .filter(|candidate| candidate.provider == "bedrock")
-        .map(|candidate| (candidate.id.as_str(), candidate.model.as_str()))
-        .collect::<Vec<_>>();
-    assert_eq!(
-        balanced_bedrock,
-        [("bedrock/deepseek.v3.2", "deepseek.v3.2")]
-    );
-
-    let high_end = catalog
-        .tiers
-        .get("zero/high-end")
-        .expect("high-end tier should exist");
-    let bedrock_profiles = high_end
-        .candidates
-        .iter()
-        .filter(|candidate| candidate.provider == "bedrock")
-        .map(|candidate| (candidate.id.as_str(), candidate.model.as_str()))
-        .collect::<Vec<_>>();
-    assert_eq!(
-        bedrock_profiles,
-        [(
-            "bedrock/us.anthropic.claude-sonnet-5",
-            "us.anthropic.claude-sonnet-5"
-        )]
-    );
+    // One upstream each, and only from the two providers ZeroRouter
+    // integrates directly. A tier gaining a second rung is exactly the
+    // change that should have to come back and edit this.
+    for (tier_id, tier) in &catalog.tiers {
+        assert_eq!(
+            tier.candidates.len(),
+            1,
+            "{tier_id} should carry exactly one upstream"
+        );
+        let provider = tier.candidates[0].provider.as_str();
+        assert!(
+            provider == "openai" || provider == "anthropic",
+            "{tier_id} routes to {provider}, which is not in the MVP inventory"
+        );
+    }
 }
 
 #[tokio::test]
@@ -408,7 +384,7 @@ async fn a_below_cost_tier_is_withheld_while_every_other_tier_keeps_serving() {
         ["zero/fixture-healthy"]
     );
     assert!(catalog.resolve("zero/fixture-healthy").is_some());
-    assert!(catalog.resolve("fireworks/healthy").is_some());
+    assert!(catalog.resolve("openai/healthy").is_some());
     assert!(catalog.resolve("zero/fixture-dear").is_none());
 
     let withheld = catalog
@@ -431,7 +407,7 @@ async fn models_omit_a_withheld_tier_and_its_pinned_candidates() {
 
     assert_eq!(
         listed_model_ids(RouterState::new(path)).await,
-        ["fireworks/healthy", "zero/fixture-healthy"]
+        ["openai/healthy", "zero/fixture-healthy"]
     );
 }
 
@@ -477,8 +453,8 @@ async fn a_structural_fault_still_refuses_the_whole_catalog() {
     let source = format!(
         r#"{}
 [[tiers."zero/fixture-dear".candidates]]
-id = "fireworks/healthy"
-provider = "fireworks"
+id = "openai/healthy"
+provider = "openai"
 model = "upstream/healthy"
 [tiers."zero/fixture-dear".candidates.rates]
 input_per_mtok = 0.10
@@ -547,12 +523,12 @@ async fn a_basis_hike_above_sell_withholds_high_end_and_nothing_else() {
     let lapsed = format!(
         "{head}{}",
         candidates
-            .replace("input_per_mtok = 2.00", "input_per_mtok = 4.00")
+            .replace("input_per_mtok = 3.00", "input_per_mtok = 4.00")
             .replace(
-                "cached_input_per_mtok = 0.20",
+                "cached_input_per_mtok = 0.30",
                 "cached_input_per_mtok = 0.40"
             )
-            .replace("output_per_mtok = 10.00", "output_per_mtok = 20.00")
+            .replace("output_per_mtok = 15.00", "output_per_mtok = 20.00")
     );
     let path = catalog_fixture("sonnet_intro_lapsed", &lapsed).await;
 
@@ -565,7 +541,6 @@ async fn a_basis_hike_above_sell_withholds_high_end_and_nothing_else() {
     assert_eq!(
         catalog.tiers.keys().map(String::as_str).collect::<Vec<_>>(),
         [
-            "zero/balanced",
             "zero/codex",
             "zero/fable-5",
             "zero/haiku-4-5",
@@ -576,9 +551,9 @@ async fn a_basis_hike_above_sell_withholds_high_end_and_nothing_else() {
     );
     for model in [
         "zero/low-cost",
-        "zero/balanced",
-        "fireworks/accounts/fireworks/models/minimax-m3",
-        "deepinfra/deepseek-ai/DeepSeek-V4-Pro",
+        "zero/haiku-4-5",
+        "openai/gpt-5.6-luna",
+        "anthropic/claude-haiku-4-5",
     ] {
         assert!(
             catalog.resolve(model).is_some(),
@@ -588,11 +563,7 @@ async fn a_basis_hike_above_sell_withholds_high_end_and_nothing_else() {
 
     // High-end is withheld, and says so for its tier id and for either sonnet
     // row pinned directly.
-    for requested in [
-        "zero/high-end",
-        "anthropic/claude-sonnet-5",
-        "bedrock/us.anthropic.claude-sonnet-5",
-    ] {
+    for requested in ["zero/high-end", "anthropic/claude-sonnet-5"] {
         assert!(catalog.resolve(requested).is_none(), "{requested}");
         let withheld = catalog
             .unavailable_for(requested)
@@ -613,12 +584,12 @@ async fn a_basis_hike_above_sell_withholds_high_end_and_nothing_else() {
     assert_eq!(sell.output_per_mtok, Some(15.00));
 
     // And the public catalog stops advertising what it cannot serve: the
-    // five surviving tier ids plus their twelve candidates, with no sonnet
-    // row.
+    // six surviving tier ids plus their six pinned candidates, with no
+    // sonnet row.
     let listed = listed_model_ids(RouterState::new(path)).await;
-    assert_eq!(listed.len(), 21);
+    assert_eq!(listed.len(), 12);
     assert!(listed.iter().any(|id| id == "zero/low-cost"));
-    assert!(listed.iter().any(|id| id == "zero/balanced"));
+    assert!(listed.iter().any(|id| id == "zero/haiku-4-5"));
     assert!(
         !listed
             .iter()
@@ -641,18 +612,24 @@ async fn the_shipped_catalog_withholds_no_tier_today() {
         "the shipped catalog withholds {:?}",
         catalog.unavailable.keys().collect::<Vec<_>>()
     );
-    assert_eq!(catalog.tiers.len(), 8);
+    assert_eq!(catalog.tiers.len(), 7);
 }
 
 /// The routed tiers vs the pass-through tiers, told apart explicitly so
 /// each keeps its own structural promise (the test below enforces them).
-const ROUTED_TIERS: [&str; 3] = ["zero/low-cost", "zero/balanced", "zero/high-end"];
-const PASS_THROUGH_TIERS: [&str; 5] = [
+// The MVP integrates OpenAI and Anthropic directly, and no model is served
+// by both, so no tier can meet the routed shape's availability floor (>=2
+// rungs across >=2 providers). Every tier is pass-through until a second
+// provider serves a model class again.
+const ROUTED_TIERS: [&str; 0] = [];
+const PASS_THROUGH_TIERS: [&str; 7] = [
+    "zero/low-cost",
+    "zero/haiku-4-5",
+    "zero/codex",
+    "zero/high-end",
+    "zero/sol",
     "zero/opus-5",
     "zero/fable-5",
-    "zero/haiku-4-5",
-    "zero/sol",
-    "zero/codex",
 ];
 
 #[tokio::test]

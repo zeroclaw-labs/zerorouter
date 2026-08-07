@@ -30,7 +30,7 @@ use sqlx_core::{query::query, query_as::query_as, query_scalar::query_scalar};
 use sqlx_postgres::{PgConnectOptions, PgPool, PgPoolOptions};
 use tower::ServiceExt;
 use uuid::Uuid;
-use zeroclaw_providers::traits::{TokenUsage, ToolCall};
+use zerorouter::provider::{TokenUsage, ToolCall};
 use zerorouter::{
     RouterState,
     api::InjectedRoute,
@@ -207,7 +207,7 @@ fn router_matching_aliases(pool: PgPool, fakes: Vec<Arc<FakeModelProvider>>) -> 
                     let fake = fakes
                         .iter()
                         .find(|fake| {
-                            zeroclaw_api::attribution::Attributable::alias(fake.as_ref()) == alias
+                            zerorouter::provider::ModelProvider::alias(fake.as_ref()) == alias
                         })
                         .unwrap_or_else(|| {
                             panic!("no scripted fake for candidate {}", definition.id)
@@ -547,7 +547,7 @@ async fn a_withheld_tier_is_refused_while_a_healthy_tier_in_the_same_catalog_ser
     assert_eq!(
         settled_event(&pool, api_key_id).await,
         (
-            "deepinfra".to_owned(),
+            "openai".to_owned(),
             "upstream/solo".to_owned(),
             1_000,
             20,
@@ -585,7 +585,7 @@ async fn non_streaming_first_candidate_serves_and_settles_its_metered_usage() {
         .await
         .expect("completion request should complete");
     assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(header(&response, "x-zerorouter-provider"), "fireworks");
+    assert_eq!(header(&response, "x-zerorouter-provider"), "openai");
     assert_eq!(header(&response, "x-zerorouter-model"), "upstream/primary");
     let request_id = header(&response, "x-request-id");
     assert!(request_id.starts_with("chatcmpl-"));
@@ -615,7 +615,7 @@ async fn non_streaming_first_candidate_serves_and_settles_its_metered_usage() {
     assert_eq!(
         settled_event(&pool, api_key_id).await,
         (
-            "fireworks".to_owned(),
+            "openai".to_owned(),
             "upstream/primary".to_owned(),
             1_000,
             20,
@@ -625,7 +625,7 @@ async fn non_streaming_first_candidate_serves_and_settles_its_metered_usage() {
     );
     let (candidate_id, cost_basis_usd, attempt_count, finish_reason) =
         settled_provenance(&pool, api_key_id).await;
-    assert_eq!(candidate_id.as_deref(), Some("fireworks/primary"));
+    assert_eq!(candidate_id.as_deref(), Some("openai/primary"));
     // COGS at the candidate's own cost basis: 1000 * $1.00 + 20 * $2.00 per Mtok.
     assert_eq!(cost_basis_usd, Some(decimal("0.00104")));
     assert_eq!(finish_reason.as_deref(), Some("stop"));
@@ -633,7 +633,7 @@ async fn non_streaming_first_candidate_serves_and_settles_its_metered_usage() {
     assert_eq!(attempt_count, Some(1));
     assert_eq!(
         attempt_rows(&pool, api_key_id).await,
-        [(1, "fireworks/primary".to_owned(), "ok".to_owned(), true)]
+        [(1, "openai/primary".to_owned(), "ok".to_owned(), true)]
     );
     // No losing attempts is a genuine zero, not an unknown — the served
     // attempt's COGS is counted once, on `cost_basis_usd` above.
@@ -684,7 +684,7 @@ async fn non_streaming_failover_retries_the_first_candidate_twice_then_bills_the
         .await
         .expect("completion request should complete");
     assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(header(&response, "x-zerorouter-provider"), "together");
+    assert_eq!(header(&response, "x-zerorouter-provider"), "anthropic");
     assert_eq!(
         header(&response, "x-zerorouter-model"),
         "upstream/secondary"
@@ -701,12 +701,12 @@ async fn non_streaming_failover_retries_the_first_candidate_twice_then_bills_the
 
     let (upstream_provider, upstream_model, _, _, cost_usd, status) =
         settled_event(&pool, api_key_id).await;
-    assert_eq!(upstream_provider, "together");
+    assert_eq!(upstream_provider, "anthropic");
     assert_eq!(upstream_model, "upstream/secondary");
     assert_eq!(cost_usd, served_sell_cost(), "the sell rate is the tier's");
     assert_eq!(status, 200);
     let (candidate_id, cost_basis_usd, _, _) = settled_provenance(&pool, api_key_id).await;
-    assert_eq!(candidate_id.as_deref(), Some("together/secondary"));
+    assert_eq!(candidate_id.as_deref(), Some("anthropic/secondary"));
     // COGS moves to the second candidate's basis: 1000 * $1.50 + 20 * $3.00.
     assert_eq!(cost_basis_usd, Some(decimal("0.00156")));
 
@@ -718,23 +718,23 @@ async fn non_streaming_failover_retries_the_first_candidate_twice_then_bills_the
         [
             (
                 1,
-                "fireworks/primary".to_owned(),
+                "openai/primary".to_owned(),
                 "upstream_error".to_owned(),
                 false
             ),
             (
                 2,
-                "fireworks/primary".to_owned(),
+                "openai/primary".to_owned(),
                 "upstream_error".to_owned(),
                 false
             ),
             (
                 3,
-                "fireworks/primary".to_owned(),
+                "openai/primary".to_owned(),
                 "upstream_error".to_owned(),
                 false
             ),
-            (4, "together/secondary".to_owned(), "ok".to_owned(), true),
+            (4, "anthropic/secondary".to_owned(), "ok".to_owned(), true),
         ],
         "one row per dispatched upstream call, ordinals continuing across candidates"
     );
@@ -777,7 +777,7 @@ async fn non_streaming_rate_limited_candidate_moves_on_without_burning_retries()
     assert_eq!(primary.call_count(), 1);
     assert_eq!(secondary.call_count(), 1);
     let (candidate_id, _, _, _) = settled_provenance(&pool, api_key_id).await;
-    assert_eq!(candidate_id.as_deref(), Some("together/secondary"));
+    assert_eq!(candidate_id.as_deref(), Some("anthropic/secondary"));
     // The abandoned 429 is on the record, labelled as the rate limit it was
     // rather than as a generic upstream error — the distinction a health
     // estimator needs and the delegated walk never surfaced.
@@ -786,11 +786,11 @@ async fn non_streaming_rate_limited_candidate_moves_on_without_burning_retries()
         [
             (
                 1,
-                "fireworks/primary".to_owned(),
+                "openai/primary".to_owned(),
                 "rate_limited".to_owned(),
                 false
             ),
-            (2, "together/secondary".to_owned(), "ok".to_owned(), true),
+            (2, "anthropic/secondary".to_owned(), "ok".to_owned(), true),
         ]
     );
     assert_eq!(open_reservations(&pool, api_key_id).await, 0);
@@ -827,7 +827,7 @@ async fn non_streaming_every_candidate_failing_releases_the_reservation_without_
     assert_eq!(
         settled_event(&pool, api_key_id).await,
         (
-            "together".to_owned(),
+            "anthropic".to_owned(),
             "upstream/secondary".to_owned(),
             0,
             0,
@@ -837,7 +837,7 @@ async fn non_streaming_every_candidate_failing_releases_the_reservation_without_
     );
     let (candidate_id, cost_basis_usd, attempt_count, _) =
         settled_provenance(&pool, api_key_id).await;
-    assert_eq!(candidate_id.as_deref(), Some("together/secondary"));
+    assert_eq!(candidate_id.as_deref(), Some("anthropic/secondary"));
     // Zero tokens at a real candidate's basis prices to zero, so margin is
     // `0 - 0 - attempts_cost_basis_usd` — arithmetically the burnt COGS,
     // where it used to be `0 - NULL - NULL`.
@@ -848,13 +848,13 @@ async fn non_streaming_every_candidate_failing_releases_the_reservation_without_
         [
             (
                 1,
-                "fireworks/primary".to_owned(),
+                "openai/primary".to_owned(),
                 "rate_limited".to_owned(),
                 false
             ),
             (
                 2,
-                "together/secondary".to_owned(),
+                "anthropic/secondary".to_owned(),
                 "rate_limited".to_owned(),
                 false
             ),
@@ -912,7 +912,7 @@ async fn non_streaming_timeout_releases_the_reservation_without_charge() {
     assert_eq!(
         settled_event(&pool, api_key_id).await,
         (
-            "deepinfra".to_owned(),
+            "openai".to_owned(),
             "upstream/solo".to_owned(),
             0,
             0,
@@ -922,7 +922,7 @@ async fn non_streaming_timeout_releases_the_reservation_without_charge() {
     );
     assert_eq!(
         attempt_rows(&pool, api_key_id).await,
-        [(1, "deepinfra/solo".to_owned(), "timeout".to_owned(), false)]
+        [(1, "openai/solo".to_owned(), "timeout".to_owned(), false)]
     );
     assert_eq!(
         balance(&pool, user_of(&pool, api_key_id).await)
@@ -991,7 +991,7 @@ async fn streaming_happy_path_emits_deltas_then_usage_and_settles_the_metered_ro
     assert_eq!(
         settled_event(&pool, api_key_id).await,
         (
-            "deepinfra".to_owned(),
+            "openai".to_owned(),
             "upstream/solo".to_owned(),
             i32::try_from(served_usage().input_tokens.expect("metered input")).expect("fits"),
             i32::try_from(served_usage().output_tokens.expect("metered output")).expect("fits"),
@@ -1006,13 +1006,13 @@ async fn streaming_happy_path_emits_deltas_then_usage_and_settles_the_metered_ro
     );
     let (candidate_id, cost_basis_usd, attempt_count, finish_reason) =
         settled_provenance(&pool, api_key_id).await;
-    assert_eq!(candidate_id.as_deref(), Some("deepinfra/solo"));
+    assert_eq!(candidate_id.as_deref(), Some("openai/solo"));
     assert_eq!(cost_basis_usd, Some(decimal("0.00104")));
     assert_eq!(attempt_count, Some(1));
     assert_eq!(finish_reason.as_deref(), Some("stop"));
     assert_eq!(
         attempt_rows(&pool, api_key_id).await,
-        vec![(1, "deepinfra/solo".to_owned(), "ok".to_owned(), true)]
+        vec![(1, "openai/solo".to_owned(), "ok".to_owned(), true)]
     );
     assert_eq!(
         balance(&pool, user_of(&pool, api_key_id).await)
@@ -1064,7 +1064,7 @@ async fn streaming_candidate_failing_before_any_bytes_fails_over_to_the_next() {
     assert_eq!(secondary.call_count(), 1);
 
     let (upstream_provider, _, _, _, cost_usd, status) = settled_event(&pool, api_key_id).await;
-    assert_eq!(upstream_provider, "together");
+    assert_eq!(upstream_provider, "anthropic");
     assert_eq!(cost_usd, served_sell_cost());
     assert_eq!(status, 200);
     assert_eq!(
@@ -1072,11 +1072,11 @@ async fn streaming_candidate_failing_before_any_bytes_fails_over_to_the_next() {
         vec![
             (
                 1,
-                "fireworks/primary".to_owned(),
+                "openai/primary".to_owned(),
                 "stream_error".to_owned(),
                 false
             ),
-            (2, "together/secondary".to_owned(), "ok".to_owned(), true),
+            (2, "anthropic/secondary".to_owned(), "ok".to_owned(), true),
         ]
     );
 }
@@ -1132,7 +1132,7 @@ async fn streaming_success_without_upstream_usage_bills_nothing() {
     assert_eq!(
         settled_event(&pool, api_key_id).await,
         (
-            "deepinfra".to_owned(),
+            "openai".to_owned(),
             "upstream/solo".to_owned(),
             0,
             0,
@@ -1157,7 +1157,7 @@ async fn streaming_success_without_upstream_usage_bills_nothing() {
     assert_eq!(attempt_count, Some(1));
     assert_eq!(
         attempt_rows(&pool, api_key_id).await,
-        vec![(1, "deepinfra/solo".to_owned(), "ok".to_owned(), true)],
+        vec![(1, "openai/solo".to_owned(), "ok".to_owned(), true)],
         "the candidate whose output the client received is still the served one"
     );
     let attempt_tokens = query_as::<_, (Option<i32>, Option<i32>, bool)>(
@@ -1233,7 +1233,7 @@ async fn streaming_error_after_delivered_bytes_bills_nothing() {
     assert_eq!(
         settled_event(&pool, api_key_id).await,
         (
-            "deepinfra".to_owned(),
+            "openai".to_owned(),
             "upstream/solo".to_owned(),
             0,
             0,
@@ -1273,12 +1273,7 @@ async fn streaming_error_after_delivered_bytes_bills_nothing() {
     );
     assert_eq!(
         attempt_rows(&pool, api_key_id).await,
-        vec![(
-            1,
-            "deepinfra/solo".to_owned(),
-            "stream_error".to_owned(),
-            true
-        )],
+        vec![(1, "openai/solo".to_owned(), "stream_error".to_owned(), true)],
         "the broken candidate is still the served one"
     );
     assert_eq!(
@@ -1336,7 +1331,7 @@ async fn streaming_error_after_metered_content_bills_the_metered_usage() {
     assert_eq!(
         settled_event(&pool, api_key_id).await,
         (
-            "deepinfra".to_owned(),
+            "openai".to_owned(),
             "upstream/solo".to_owned(),
             1_000,
             20,
@@ -1353,12 +1348,7 @@ async fn streaming_error_after_metered_content_bills_the_metered_usage() {
     );
     assert_eq!(
         attempt_rows(&pool, api_key_id).await,
-        vec![(
-            1,
-            "deepinfra/solo".to_owned(),
-            "stream_error".to_owned(),
-            true
-        )],
+        vec![(1, "openai/solo".to_owned(), "stream_error".to_owned(), true)],
         "the candidate whose content the client received is the served one"
     );
     assert_eq!(open_reservations(&pool, api_key_id).await, 0);
@@ -1409,7 +1399,7 @@ async fn streaming_timeout_releases_the_reservation_without_charge() {
     assert_eq!(
         settled_event(&pool, api_key_id).await,
         (
-            "deepinfra".to_owned(),
+            "openai".to_owned(),
             "upstream/solo".to_owned(),
             0,
             0,
@@ -1419,7 +1409,7 @@ async fn streaming_timeout_releases_the_reservation_without_charge() {
     );
     assert_eq!(
         attempt_rows(&pool, api_key_id).await,
-        vec![(1, "deepinfra/solo".to_owned(), "timeout".to_owned(), false)],
+        vec![(1, "openai/solo".to_owned(), "timeout".to_owned(), false)],
         "the burnt attempt is still recorded even though nothing is billed"
     );
     assert_eq!(
@@ -1484,7 +1474,7 @@ async fn synthetic_stream_serves_a_candidate_that_cannot_stream() {
     assert_eq!(
         settled_event(&pool, api_key_id).await,
         (
-            "deepinfra".to_owned(),
+            "openai".to_owned(),
             "upstream/solo".to_owned(),
             1_000,
             20,
@@ -1497,7 +1487,7 @@ async fn synthetic_stream_serves_a_candidate_that_cannot_stream() {
     assert_eq!(finish_reason.as_deref(), Some("tool_calls"));
     assert_eq!(
         attempt_rows(&pool, api_key_id).await,
-        vec![(1, "deepinfra/solo".to_owned(), "ok".to_owned(), true)]
+        vec![(1, "openai/solo".to_owned(), "ok".to_owned(), true)]
     );
 }
 
@@ -1543,7 +1533,7 @@ async fn synthetic_stream_without_upstream_usage_bills_nothing() {
     assert_eq!(
         settled_event(&pool, api_key_id).await,
         (
-            "deepinfra".to_owned(),
+            "openai".to_owned(),
             "upstream/solo".to_owned(),
             0,
             0,
@@ -1564,7 +1554,7 @@ async fn synthetic_stream_without_upstream_usage_bills_nothing() {
     // metering gap ZeroRouter ate and one where the customer got the output.
     assert_eq!(
         attempt_rows(&pool, api_key_id).await,
-        vec![(1, "deepinfra/solo".to_owned(), "ok".to_owned(), false)]
+        vec![(1, "openai/solo".to_owned(), "ok".to_owned(), false)]
     );
     assert_eq!(unbilled_served_requests(&pool, api_key_id).await, 0);
 }
@@ -1615,7 +1605,7 @@ async fn streaming_client_disconnect_mid_stream_still_bills_the_metered_usage() 
     assert_eq!(
         settled_event(&pool, api_key_id).await,
         (
-            "deepinfra".to_owned(),
+            "openai".to_owned(),
             "upstream/solo".to_owned(),
             1_000,
             20,
@@ -1777,7 +1767,7 @@ async fn a_stream_that_emitted_nothing_is_not_rescued_by_reported_output_tokens(
     assert_eq!(
         settled_event(&pool, api_key_id).await,
         (
-            "deepinfra".to_owned(),
+            "openai".to_owned(),
             "upstream/solo".to_owned(),
             1_000,
             20,
@@ -1895,7 +1885,7 @@ async fn non_streaming_empty_completion_is_rerolled_within_the_candidate_budget(
         "hello on the third try"
     );
     let (candidate_id, _, _, _) = settled_provenance(&pool, api_key_id).await;
-    assert_eq!(candidate_id.as_deref(), Some("fireworks/primary"));
+    assert_eq!(candidate_id.as_deref(), Some("openai/primary"));
     assert_eq!(settled_shape_ok(&pool, api_key_id).await, Some(true));
     // A re-rolled blank turn is `validation_failed`, not `upstream_error`: the
     // HTTP call succeeded and the RESPONSE was rejected. `validator_kind`
@@ -1906,17 +1896,17 @@ async fn non_streaming_empty_completion_is_rerolled_within_the_candidate_budget(
         [
             (
                 1,
-                "fireworks/primary".to_owned(),
+                "openai/primary".to_owned(),
                 "validation_failed".to_owned(),
                 false
             ),
             (
                 2,
-                "fireworks/primary".to_owned(),
+                "openai/primary".to_owned(),
                 "validation_failed".to_owned(),
                 false
             ),
-            (3, "fireworks/primary".to_owned(), "ok".to_owned(), true),
+            (3, "openai/primary".to_owned(), "ok".to_owned(), true),
         ]
     );
     assert_eq!(
@@ -1984,7 +1974,7 @@ async fn non_streaming_empty_completion_on_the_final_attempt_is_returned_as_a_bl
         "a blank turn returned on the final attempt is a billed turn"
     );
     let (candidate_id, cost_basis_usd, _, _) = settled_provenance(&pool, api_key_id).await;
-    assert_eq!(candidate_id.as_deref(), Some("fireworks/primary"));
+    assert_eq!(candidate_id.as_deref(), Some("openai/primary"));
     assert_eq!(cost_basis_usd, Some(decimal("0.00104")));
     assert_eq!(
         settled_shape_ok(&pool, api_key_id).await,
@@ -1998,17 +1988,17 @@ async fn non_streaming_empty_completion_on_the_final_attempt_is_returned_as_a_bl
         [
             (
                 1,
-                "fireworks/primary".to_owned(),
+                "openai/primary".to_owned(),
                 "validation_failed".to_owned(),
                 false
             ),
             (
                 2,
-                "fireworks/primary".to_owned(),
+                "openai/primary".to_owned(),
                 "validation_failed".to_owned(),
                 false
             ),
-            (3, "fireworks/primary".to_owned(), "ok".to_owned(), true),
+            (3, "openai/primary".to_owned(), "ok".to_owned(), true),
         ]
     );
     assert_eq!(open_reservations(&pool, api_key_id).await, 0);
@@ -2087,7 +2077,7 @@ async fn non_streaming_non_retryable_error_moves_on_without_burning_retries() {
     assert_eq!(primary.call_count(), 1, "a 4xx is not retried");
     assert_eq!(secondary.call_count(), 1);
     let (candidate_id, _, _, _) = settled_provenance(&pool, api_key_id).await;
-    assert_eq!(candidate_id.as_deref(), Some("together/secondary"));
+    assert_eq!(candidate_id.as_deref(), Some("anthropic/secondary"));
     assert_eq!(open_reservations(&pool, api_key_id).await, 0);
 }
 
@@ -2208,7 +2198,7 @@ async fn non_streaming_two_candidates_on_one_provider_each_get_a_full_budget() {
     assert_eq!(twin_a.call_count(), 3);
     assert_eq!(twin_b.call_count(), 1);
     let (candidate_id, _, _, _) = settled_provenance(&pool, api_key_id).await;
-    assert_eq!(candidate_id.as_deref(), Some("together/twin-b"));
+    assert_eq!(candidate_id.as_deref(), Some("anthropic/twin-b"));
     assert_eq!(open_reservations(&pool, api_key_id).await, 0);
 }
 
@@ -2305,7 +2295,7 @@ async fn non_streaming_context_window_error_truncates_and_retries() {
     );
     assert_eq!(secondary.call_count(), 0);
     let (candidate_id, _, _, _) = settled_provenance(&pool, api_key_id).await;
-    assert_eq!(candidate_id.as_deref(), Some("fireworks/primary"));
+    assert_eq!(candidate_id.as_deref(), Some("openai/primary"));
     assert_eq!(open_reservations(&pool, api_key_id).await, 0);
 }
 
@@ -2369,23 +2359,23 @@ async fn non_streaming_a_rate_limited_context_window_truncates_once_then_moves_o
     );
     assert_eq!(secondary.call_count(), 1);
     let (candidate_id, _, _, _) = settled_provenance(&pool, api_key_id).await;
-    assert_eq!(candidate_id.as_deref(), Some("together/secondary"));
+    assert_eq!(candidate_id.as_deref(), Some("anthropic/secondary"));
     assert_eq!(
         attempt_rows(&pool, api_key_id).await,
         [
             (
                 1,
-                "fireworks/primary".to_owned(),
+                "openai/primary".to_owned(),
                 "rate_limited".to_owned(),
                 false
             ),
             (
                 2,
-                "fireworks/primary".to_owned(),
+                "openai/primary".to_owned(),
                 "rate_limited".to_owned(),
                 false
             ),
-            (3, "together/secondary".to_owned(), "ok".to_owned(), true),
+            (3, "anthropic/secondary".to_owned(), "ok".to_owned(), true),
         ]
     );
     assert_eq!(open_reservations(&pool, api_key_id).await, 0);
@@ -2524,7 +2514,7 @@ async fn non_streaming_shutdown_releases_the_reservation_without_charge() {
     assert_eq!(
         settled_event(&pool, api_key_id).await,
         (
-            "deepinfra".to_owned(),
+            "openai".to_owned(),
             "upstream/solo".to_owned(),
             0,
             0,
@@ -2537,7 +2527,7 @@ async fn non_streaming_shutdown_releases_the_reservation_without_charge() {
     // would be no row and the sentinel would still be the honest answer.
     assert_eq!(
         attempt_rows(&pool, api_key_id).await,
-        [(1, "deepinfra/solo".to_owned(), "aborted".to_owned(), false)]
+        [(1, "openai/solo".to_owned(), "aborted".to_owned(), false)]
     );
     assert_eq!(
         balance(&pool, user_of(&pool, api_key_id).await)
@@ -2577,7 +2567,7 @@ async fn non_streaming_attribution_survives_a_retry_on_the_primary() {
         .await
         .expect("completion request should complete");
     assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(header(&response, "x-zerorouter-provider"), "fireworks");
+    assert_eq!(header(&response, "x-zerorouter-provider"), "openai");
     assert_eq!(header(&response, "x-zerorouter-model"), "upstream/primary");
     state.wait_for_background_tasks().await;
 
@@ -2585,12 +2575,12 @@ async fn non_streaming_attribution_survives_a_retry_on_the_primary() {
     assert_eq!(secondary.call_count(), 0);
     let (upstream_provider, upstream_model, _, _, cost_usd, status) =
         settled_event(&pool, api_key_id).await;
-    assert_eq!(upstream_provider, "fireworks");
+    assert_eq!(upstream_provider, "openai");
     assert_eq!(upstream_model, "upstream/primary");
     assert_eq!(cost_usd, served_sell_cost());
     assert_eq!(status, 200);
     let (candidate_id, cost_basis_usd, _, _) = settled_provenance(&pool, api_key_id).await;
-    assert_eq!(candidate_id.as_deref(), Some("fireworks/primary"));
+    assert_eq!(candidate_id.as_deref(), Some("openai/primary"));
     assert_eq!(
         cost_basis_usd,
         Some(decimal("0.00104")),
@@ -2644,7 +2634,7 @@ async fn non_streaming_success_without_upstream_usage_bills_nothing() {
     assert_eq!(
         settled_event(&pool, api_key_id).await,
         (
-            "deepinfra".to_owned(),
+            "openai".to_owned(),
             "upstream/solo".to_owned(),
             0,
             0,
@@ -2667,7 +2657,7 @@ async fn non_streaming_success_without_upstream_usage_bills_nothing() {
     // tracks possession rather than completion.
     assert_eq!(
         attempt_rows(&pool, api_key_id).await,
-        [(1, "deepinfra/solo".to_owned(), "ok".to_owned(), false)]
+        [(1, "openai/solo".to_owned(), "ok".to_owned(), false)]
     );
     // The gap detector stays silent: nothing reached the customer, so no
     // attempt on this request is `served` and the zero-token row is not a
@@ -2787,7 +2777,7 @@ async fn non_streaming_shutdown_during_a_backoff_releases_the_reservation_withou
         attempt_rows(&pool, api_key_id).await,
         [(
             1,
-            "deepinfra/solo".to_owned(),
+            "openai/solo".to_owned(),
             "rate_limited".to_owned(),
             false
         )]
@@ -2842,7 +2832,7 @@ async fn non_streaming_a_rate_limited_rung_sinks_behind_the_healthy_rung_for_the
         .await
         .expect("first completion request should complete");
     assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(header(&response, "x-zerorouter-provider"), "together");
+    assert_eq!(header(&response, "x-zerorouter-provider"), "anthropic");
 
     // The second request walks the same tier through the same router process,
     // inside the rate-limited rung's cooldown window.
@@ -2854,7 +2844,7 @@ async fn non_streaming_a_rate_limited_rung_sinks_behind_the_healthy_rung_for_the
         .await
         .expect("second completion request should complete");
     assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(header(&response, "x-zerorouter-provider"), "together");
+    assert_eq!(header(&response, "x-zerorouter-provider"), "anthropic");
     state.wait_for_background_tasks().await;
 
     assert_eq!(
@@ -2865,7 +2855,7 @@ async fn non_streaming_a_rate_limited_rung_sinks_behind_the_healthy_rung_for_the
     assert_eq!(secondary.call_count(), 2);
     assert_eq!(
         attempt_rows(&pool, second_key_id).await,
-        [(1, "together/secondary".to_owned(), "ok".to_owned(), true)],
+        [(1, "anthropic/secondary".to_owned(), "ok".to_owned(), true)],
         "the demoted rung sank out of the walk entirely: one position, served"
     );
     assert_eq!(open_reservations(&pool, first_key_id).await, 0);
@@ -2925,7 +2915,7 @@ async fn streaming_a_rate_limited_rung_sinks_behind_the_healthy_rung_for_the_nex
     assert_eq!(secondary.call_count(), 2);
     assert_eq!(
         attempt_rows(&pool, second_key_id).await,
-        [(1, "together/secondary".to_owned(), "ok".to_owned(), true)],
+        [(1, "anthropic/secondary".to_owned(), "ok".to_owned(), true)],
         "the demoted rung sank out of the walk entirely: one position, served"
     );
     assert_eq!(open_reservations(&pool, first_key_id).await, 0);
@@ -2973,11 +2963,11 @@ async fn streaming_a_rate_limited_stream_failure_is_labelled_as_the_429_it_was()
         vec![
             (
                 1,
-                "fireworks/primary".to_owned(),
+                "openai/primary".to_owned(),
                 "rate_limited".to_owned(),
                 false
             ),
-            (2, "together/secondary".to_owned(), "ok".to_owned(), true),
+            (2, "anthropic/secondary".to_owned(), "ok".to_owned(), true),
         ]
     );
     assert_eq!(open_reservations(&pool, api_key_id).await, 0);
@@ -3023,11 +3013,11 @@ async fn synthetic_stream_a_rate_limited_chat_failure_is_labelled_as_the_429_it_
         vec![
             (
                 1,
-                "fireworks/primary".to_owned(),
+                "openai/primary".to_owned(),
                 "rate_limited".to_owned(),
                 false
             ),
-            (2, "together/secondary".to_owned(), "ok".to_owned(), true),
+            (2, "anthropic/secondary".to_owned(), "ok".to_owned(), true),
         ]
     );
     assert_eq!(open_reservations(&pool, api_key_id).await, 0);
@@ -3068,7 +3058,7 @@ async fn non_streaming_an_error_heavy_rung_sinks_behind_the_healthy_rung_for_the
         .await
         .expect("first completion request should complete");
     assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(header(&response, "x-zerorouter-provider"), "together");
+    assert_eq!(header(&response, "x-zerorouter-provider"), "anthropic");
 
     let response = app(state.clone())
         .oneshot(completion_request(
@@ -3078,7 +3068,7 @@ async fn non_streaming_an_error_heavy_rung_sinks_behind_the_healthy_rung_for_the
         .await
         .expect("second completion request should complete");
     assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(header(&response, "x-zerorouter-provider"), "together");
+    assert_eq!(header(&response, "x-zerorouter-provider"), "anthropic");
     state.wait_for_background_tasks().await;
 
     assert_eq!(
@@ -3089,7 +3079,7 @@ async fn non_streaming_an_error_heavy_rung_sinks_behind_the_healthy_rung_for_the
     assert_eq!(secondary.call_count(), 2);
     assert_eq!(
         attempt_rows(&pool, second_key_id).await,
-        [(1, "together/secondary".to_owned(), "ok".to_owned(), true)]
+        [(1, "anthropic/secondary".to_owned(), "ok".to_owned(), true)]
     );
     assert_eq!(open_reservations(&pool, first_key_id).await, 0);
     assert_eq!(open_reservations(&pool, second_key_id).await, 0);
@@ -3144,7 +3134,7 @@ async fn non_streaming_a_cooling_solo_rung_is_still_dispatched() {
     );
     assert_eq!(
         attempt_rows(&pool, second_key_id).await,
-        [(1, "deepinfra/solo".to_owned(), "ok".to_owned(), true)],
+        [(1, "openai/solo".to_owned(), "ok".to_owned(), true)],
         "no health_skipped row: the guard dispatched rather than skipped"
     );
     assert_eq!(open_reservations(&pool, first_key_id).await, 0);
@@ -3188,7 +3178,7 @@ async fn non_streaming_a_walk_of_cooling_rungs_still_dispatches_the_last() {
         .await
         .expect("second completion request should complete");
     assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(header(&response, "x-zerorouter-provider"), "together");
+    assert_eq!(header(&response, "x-zerorouter-provider"), "anthropic");
     state.wait_for_background_tasks().await;
 
     assert_eq!(primary.call_count(), 1);
@@ -3198,11 +3188,11 @@ async fn non_streaming_a_walk_of_cooling_rungs_still_dispatches_the_last() {
         [
             (
                 1,
-                "fireworks/primary".to_owned(),
+                "openai/primary".to_owned(),
                 "health_skipped".to_owned(),
                 false
             ),
-            (2, "together/secondary".to_owned(), "ok".to_owned(), true),
+            (2, "anthropic/secondary".to_owned(), "ok".to_owned(), true),
         ],
         "the walk skips what it can afford to and dispatches what it cannot"
     );
@@ -3264,7 +3254,7 @@ async fn non_streaming_a_demoted_rung_does_not_demote_its_provider_mate() {
     assert_eq!(twin_b.call_count(), 2);
     assert_eq!(
         attempt_rows(&pool, second_key_id).await,
-        [(1, "together/twin-b".to_owned(), "ok".to_owned(), true)],
+        [(1, "anthropic/twin-b".to_owned(), "ok".to_owned(), true)],
         "the verdict follows the upstream model, not the provider name"
     );
     assert_eq!(open_reservations(&pool, first_key_id).await, 0);
@@ -3331,7 +3321,7 @@ async fn streaming_a_cooling_solo_rung_is_still_dispatched() {
     );
     assert_eq!(
         attempt_rows(&pool, second_key_id).await,
-        [(1, "deepinfra/solo".to_owned(), "ok".to_owned(), true)],
+        [(1, "openai/solo".to_owned(), "ok".to_owned(), true)],
         "no health_skipped row: the guard dispatched rather than skipped"
     );
     assert_eq!(open_reservations(&pool, first_key_id).await, 0);
@@ -3423,7 +3413,7 @@ async fn a_priority_suffix_is_stripped_carried_and_recorded() {
     assert_eq!(body["zerorouter"]["priority"], "cost");
     assert_eq!(
         body["zerorouter"]["attempts"][0]["candidate"],
-        "deepinfra/solo"
+        "openai/solo"
     );
     assert_eq!(body["zerorouter"]["attempts"][0]["outcome"], "ok");
     assert!(body["zerorouter"]["attempts"][0]["latency_ms"].is_i64());
@@ -3678,7 +3668,7 @@ async fn streaming_carries_the_block_on_the_usage_chunk_and_records_the_priority
     assert_eq!(usage_chunk["zerorouter"]["priority"], "cost");
     assert_eq!(
         usage_chunk["zerorouter"]["attempts"][0]["candidate"],
-        "deepinfra/solo"
+        "openai/solo"
     );
     assert_eq!(usage_chunk["zerorouter"]["attempts"][0]["outcome"], "ok");
     assert!(usage_chunk["zerorouter"]["validated"].is_null());
@@ -3752,20 +3742,20 @@ async fn the_response_block_tells_the_whole_walk_story() {
         .as_array()
         .expect("attempts is an array");
     assert_eq!(attempts.len(), 2);
-    assert_eq!(attempts[0]["candidate"], "fireworks/primary");
+    assert_eq!(attempts[0]["candidate"], "openai/primary");
     assert_eq!(attempts[0]["outcome"], "rate_limited");
-    assert_eq!(attempts[1]["candidate"], "together/secondary");
+    assert_eq!(attempts[1]["candidate"], "anthropic/secondary");
     assert_eq!(attempts[1]["outcome"], "ok");
     assert_eq!(
         attempt_rows(&pool, api_key_id).await,
         [
             (
                 1,
-                "fireworks/primary".to_owned(),
+                "openai/primary".to_owned(),
                 "rate_limited".to_owned(),
                 false
             ),
-            (2, "together/secondary".to_owned(), "ok".to_owned(), true),
+            (2, "anthropic/secondary".to_owned(), "ok".to_owned(), true),
         ],
         "the block and the ledger are the same story"
     );
@@ -3801,7 +3791,7 @@ async fn synthetic_stream_carries_the_block_on_the_usage_chunk() {
     assert_eq!(usage_chunk["zerorouter"]["priority"], "success");
     assert_eq!(
         usage_chunk["zerorouter"]["attempts"][0]["candidate"],
-        "deepinfra/solo"
+        "openai/solo"
     );
     assert_eq!(
         settled_priority(&pool, api_key_id).await,
@@ -3900,7 +3890,7 @@ async fn cost_mode_reorders_by_expected_cost_once_the_segment_warms() {
         .await
         .expect("cold cost request should complete");
     assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(header(&response, "x-zerorouter-provider"), "fireworks");
+    assert_eq!(header(&response, "x-zerorouter-provider"), "openai");
     state.wait_for_background_tasks().await;
 
     // Warm the segment: enough settled rows to clear the n >= 50 gate, then
@@ -3923,7 +3913,7 @@ async fn cost_mode_reorders_by_expected_cost_once_the_segment_warms() {
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
         header(&response, "x-zerorouter-provider"),
-        "together",
+        "anthropic",
         "a warm segment orders cost mode cheapest-first"
     );
     let body = json_body(response).await;
@@ -3944,7 +3934,7 @@ async fn cost_mode_reorders_by_expected_cost_once_the_segment_warms() {
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
         header(&response, "x-zerorouter-provider"),
-        "fireworks",
+        "openai",
         "balanced stays the frozen control group"
     );
     // And the legacy shape survives a WARM cache: byte-stability is pinned
@@ -4014,7 +4004,7 @@ async fn a_stale_segment_falls_back_to_table_order_until_remeasured() {
         .await
         .expect("warm request should complete");
     assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(header(&response, "x-zerorouter-provider"), "together");
+    assert_eq!(header(&response, "x-zerorouter-provider"), "anthropic");
 
     // Cross the TTL without touching the clock: the cells stale out, the
     // next cost request keeps table order, and the lookup re-enqueued the
@@ -4030,7 +4020,7 @@ async fn a_stale_segment_falls_back_to_table_order_until_remeasured() {
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
         header(&response, "x-zerorouter-provider"),
-        "fireworks",
+        "openai",
         "a stale segment is a cold segment"
     );
     // One refresher pass re-measures exactly what the stale lookups
@@ -4047,7 +4037,7 @@ async fn a_stale_segment_falls_back_to_table_order_until_remeasured() {
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
         header(&response, "x-zerorouter-provider"),
-        "together",
+        "anthropic",
         "a re-measured segment reorders again"
     );
     state.wait_for_background_tasks().await;
@@ -4087,26 +4077,19 @@ async fn a_rungs_own_cell_overrides_the_shared_fallback_in_cost_mode() {
         .await
         .expect("cold request should complete");
     assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(header(&response, "x-zerorouter-provider"), "fireworks");
+    assert_eq!(header(&response, "x-zerorouter-provider"), "openai");
     state.wait_for_background_tasks().await;
 
     // Terse history for the pricier-rate rung, verbose for the cheap-rate
     // rung: 100 tokens at 4 $/mtok beats 50k tokens at 2 $/mtok.
     let signature = settled_signature(&pool, api_key_id).await;
     for _ in 0..60 {
+        seed_segment_row(&pool, api_key_id, &signature, Some("openai/pricier"), 100).await;
         seed_segment_row(
             &pool,
             api_key_id,
             &signature,
-            Some("fireworks/pricier"),
-            100,
-        )
-        .await;
-        seed_segment_row(
-            &pool,
-            api_key_id,
-            &signature,
-            Some("together/cheaper"),
+            Some("anthropic/cheaper"),
             50_000,
         )
         .await;
@@ -4133,7 +4116,7 @@ async fn a_rungs_own_cell_overrides_the_shared_fallback_in_cost_mode() {
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
         header(&response, "x-zerorouter-provider"),
-        "fireworks",
+        "openai",
         "the rung's own terse measurement outweighs its pricier rates"
     );
     let body = json_body(response).await;

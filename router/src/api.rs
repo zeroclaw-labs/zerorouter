@@ -8,6 +8,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::provider::BASELINE_MAX_TOKENS;
+use crate::provider::{ChatRequest, ChatResponse, ModelRates, StreamEvent, StreamOptions};
 use axum::{
     Json, Router,
     body::{Body, to_bytes},
@@ -23,11 +25,6 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
-use zeroclaw_api::model_provider::BASELINE_MAX_TOKENS;
-use zeroclaw_providers::{
-    pricing::ModelRates,
-    traits::{ChatRequest, ChatResponse, StreamEvent, StreamOptions},
-};
 
 use crate::{
     auth::{AuthenticatedKey, AuthenticationError, KeyAuthenticator},
@@ -1367,7 +1364,6 @@ async fn run_non_streaming(
             let provider_request = ChatRequest {
                 messages: &effective_messages,
                 tools: (!tools.is_empty()).then_some(tools.as_slice()),
-                thinking: None,
             };
 
             // `biased`, so a drained deploy wins over an upstream that is about
@@ -2056,7 +2052,6 @@ async fn stream_to_channel(
         let provider_request = ChatRequest {
             messages: &messages,
             tools: (!tools.is_empty()).then_some(tools.as_slice()),
-            thinking: None,
         };
         let attempt_started = Instant::now();
         let attempt_no = attempts.len() + 1;
@@ -2192,7 +2187,10 @@ async fn stream_to_channel(
         let mut stream = candidate.stream_chat(
             provider_request,
             request.temperature,
-            StreamOptions::new(true).with_token_count(),
+            StreamOptions {
+                enabled: true,
+                count_tokens: true,
+            },
         );
         last_candidate = Some(candidate.definition());
         let mut role_sent = false;
@@ -2316,8 +2314,6 @@ async fn stream_to_channel(
                     completed = true;
                     break;
                 }
-                Ok(StreamEvent::PreExecutedToolCall { .. })
-                | Ok(StreamEvent::PreExecutedToolResult { .. }) => {}
                 Err(error) => {
                     stream_rate_limited = retry::is_rate_limited(&anyhow::Error::new(error));
                     break;
@@ -3139,9 +3135,9 @@ fn insert_header(response: &mut Response, name: &'static str, value: &str) {
 mod tests {
     use std::str::FromStr;
 
+    use crate::provider::TokenUsage;
     use rust_decimal::Decimal;
     use uuid::Uuid;
-    use zeroclaw_providers::traits::TokenUsage;
 
     use super::*;
     use crate::{
@@ -3254,15 +3250,18 @@ mod tests {
     /// moves on, `/ok` streams one delta plus usage and `[DONE]`. Returns the
     /// two base URLs.
     async fn scripted_upstream() -> (String, String) {
+        // The Responses dialect, because that is what ZeroRouter's owned
+        // OpenAI wire speaks. The dialect is incidental to what this test
+        // asserts (one attempt row per candidate); it just has to be the
+        // one the wire under test parses.
         let stream_body = concat!(
-            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hello\"}}]}\n\n",
-            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],",
-            "\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":5,\"total_tokens\":16}}\n\n",
-            "data: [DONE]\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"usage\":",
+            "{\"input_tokens\":11,\"output_tokens\":5}}}\n\n",
         );
         let app = Router::new()
             .route(
-                "/fail/chat/completions",
+                "/fail",
                 post(|| async {
                     (
                         axum::http::StatusCode::INTERNAL_SERVER_ERROR,
@@ -3271,7 +3270,7 @@ mod tests {
                 }),
             )
             .route(
-                "/ok/chat/completions",
+                "/ok",
                 post(move || async move { ([("content-type", "text/event-stream")], stream_body) }),
             );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -3597,7 +3596,7 @@ mod tests {
             "delivered-then-shutdown",
             vec![FakeOutcome::Stream(vec![
                 FakeStreamStep::text("partial"),
-                FakeStreamStep::Usage(upstream_usage.clone()),
+                FakeStreamStep::Usage(upstream_usage),
                 FakeStreamStep::Stall(Duration::from_secs(600)),
             ])],
         );

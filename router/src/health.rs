@@ -215,8 +215,8 @@ impl WalkLedger {
 
 #[cfg(test)]
 mod tests {
+    use crate::provider::ModelRates;
     use chrono::Utc;
-    use zeroclaw_providers::pricing::ModelRates;
 
     use super::*;
     use crate::db::AttemptTokens;

@@ -52,10 +52,7 @@
 
 use std::time::Duration;
 
-use zeroclaw_providers::{
-    reliable::{is_context_window_exceeded, is_non_retryable},
-    traits::{ChatMessage, ChatResponse},
-};
+use crate::provider::{ChatMessage, ChatResponse};
 
 /// Ceiling on one backoff interval. `reliable.rs:1842` / `reliable.rs:972`.
 const BACKOFF_CAP_MS: u64 = 10_000;
@@ -389,15 +386,190 @@ pub fn truncate_for_context(messages: &mut Vec<ChatMessage>) -> usize {
 /// aggregate failure string that is not replaced by a `request_attempts` row.
 #[must_use]
 pub fn compact_error_detail(err: &anyhow::Error) -> String {
-    zeroclaw_providers::sanitize_api_error(&format!("{err:#}"))
+    sanitize_api_error(&format!("{err:#}"))
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
 }
 
+/// Longest upstream error text ZeroRouter will carry into its own logs and
+/// error bodies.
+const MAX_API_ERROR_CHARS: usize = 500;
+
+fn is_secret_char(c: char) -> bool {
+    // Dots and colons included deliberately: JWT-shaped and namespaced keys
+    // carry them, and stopping at one would redact only a token's first
+    // segment and log the rest.
+    c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':')
+}
+
+fn token_end(input: &str, from: usize) -> usize {
+    let mut end = from;
+    for (index, c) in input[from..].char_indices() {
+        if is_secret_char(c) {
+            end = from + index + c.len_utf8();
+        } else {
+            break;
+        }
+    }
+    end
+}
+
+/// Redact credential-shaped tokens from upstream error text.
+///
+/// Ported from the pinned runtime rather than imported, because it stands
+/// between an upstream's raw error body and ZeroRouter's logs — the
+/// retention contract this router promises is its own to keep, not a
+/// dependency's. An upstream that echoes a request back can echo a key
+/// with it; these are the prefixes worth catching.
+#[must_use]
+pub fn scrub_secret_patterns(input: &str) -> String {
+    const PREFIXES: [&str; 7] = [
+        "sk-",
+        "xoxb-",
+        "xoxp-",
+        "ghp_",
+        "gho_",
+        "ghu_",
+        "github_pat_",
+    ];
+    let mut scrubbed = input.to_string();
+    for prefix in PREFIXES {
+        let mut search_from = 0;
+        while let Some(relative) = scrubbed[search_from..].find(prefix) {
+            let start = search_from + relative;
+            let content_start = start + prefix.len();
+            let end = token_end(&scrubbed, content_start);
+            // A bare prefix is not a token; skip it without stopping the scan.
+            if end == content_start {
+                search_from = content_start;
+                continue;
+            }
+            scrubbed.replace_range(start..end, "[REDACTED]");
+            search_from = start + "[REDACTED]".len();
+        }
+    }
+    scrubbed
+}
+
+/// Scrub, then bound. Both halves matter: the first keeps a credential out
+/// of the logs, the second keeps a hostile upstream from writing a novel
+/// into them.
+#[must_use]
+pub fn sanitize_api_error(input: &str) -> String {
+    let scrubbed = scrub_secret_patterns(input);
+    if scrubbed.chars().count() <= MAX_API_ERROR_CHARS {
+        return scrubbed;
+    }
+    let mut end = MAX_API_ERROR_CHARS;
+    while end > 0 && !scrubbed.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", &scrubbed[..end])
+}
+
+// ---------------------------------------------------------------------------
+// Classifiers, owned
+// ---------------------------------------------------------------------------
+//
+// These were imported from the pinned agent runtime. They are pure string
+// heuristics over an upstream's error text — no state, no I/O — and they
+// decide whether a customer's request is retried, which makes them part of
+// ZeroRouter's own behavior rather than a borrowed detail. Ported verbatim
+// so no request changes class on the day the pin was cut; the fidelity is
+// pinned by the tests that already exercised them through the import.
+
+/// Whether an upstream error means "the prompt does not fit".
+///
+/// The one failure with an in-place repair: the walk drops the oldest half
+/// of the history and retries the SAME candidate.
+#[must_use]
+pub fn is_context_window_exceeded(err: &anyhow::Error) -> bool {
+    let lower = err.to_string().to_lowercase();
+    [
+        "exceeds the context window",
+        "exceeds the available context size",
+        "context window of this model",
+        "maximum context length",
+        "context length exceeded",
+        "too many tokens",
+        "token limit exceeded",
+        "prompt is too long",
+        "input is too long",
+        "prompt exceeds max length",
+    ]
+    .iter()
+    .any(|hint| lower.contains(hint))
+}
+
+/// Tool-schema rejections are recoverable by the upstream adapter's own
+/// fallback, so they must not be classed as terminal.
+fn is_tool_schema_error(err: &anyhow::Error) -> bool {
+    let lower = err.to_string().to_lowercase();
+    [
+        "tool call validation failed",
+        "was not in request",
+        "not found in tool list",
+        "invalid_tool_call",
+    ]
+    .iter()
+    .any(|hint| lower.contains(hint))
+}
+
+/// Whether an error ends this candidate immediately.
+///
+/// 4xx is terminal except 429 (transient rate limit) and 408 (timeout).
+/// Context-window and tool-schema errors are explicitly NOT terminal —
+/// both have repairs. When no HTTP status is available the status digits
+/// are parsed out of the message, then auth and unknown-model phrasings
+/// are matched, because several upstreams report both as prose.
+#[must_use]
+pub fn is_non_retryable(err: &anyhow::Error) -> bool {
+    if is_context_window_exceeded(err) || is_tool_schema_error(err) {
+        return false;
+    }
+    if let Some(reqwest_err) = err.downcast_ref::<reqwest::Error>()
+        && let Some(status) = reqwest_err.status()
+    {
+        let code = status.as_u16();
+        return status.is_client_error() && code != 429 && code != 408;
+    }
+    let msg = err.to_string();
+    for word in msg.split(|c: char| !c.is_ascii_digit()) {
+        if let Ok(code) = word.parse::<u16>()
+            && (400..500).contains(&code)
+        {
+            return code != 429 && code != 408;
+        }
+    }
+    let lower = msg.to_lowercase();
+    let auth_hints = [
+        "invalid api key",
+        "incorrect api key",
+        "missing api key",
+        "api key not set",
+        "authentication failed",
+        "auth failed",
+        "unauthorized",
+        "forbidden",
+        "permission denied",
+        "access denied",
+        "invalid token",
+    ];
+    if auth_hints.iter().any(|hint| lower.contains(hint)) {
+        return true;
+    }
+    lower.contains("model")
+        && (lower.contains("not found")
+            || lower.contains("unknown")
+            || lower.contains("unsupported")
+            || lower.contains("does not exist")
+            || lower.contains("invalid"))
+}
+
 #[cfg(test)]
 mod tests {
-    use zeroclaw_providers::traits::ToolCall;
+    use crate::provider::ToolCall;
 
     use super::*;
 

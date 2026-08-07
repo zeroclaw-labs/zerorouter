@@ -17,9 +17,9 @@
 //! is everything the router never used — the agent-facing helpers, prompt
 //! pruning, capability negotiation, tool conversion, wire-api selection.
 //!
-//! A [`crate::providers::PinnedAdapter`] bridges upstream adapters that
-//! still implement the old trait, so the pin can be deleted one provider at
-//! a time instead of in a single irreversible swap.
+//! The bridge that once wrapped pinned adapters is gone with them: the MVP
+//! integrates OpenAI and Anthropic directly, and both wires implement this
+//! trait natively.
 
 use std::borrow::Cow;
 
@@ -121,6 +121,13 @@ impl ChatResponse {
     pub fn has_tool_calls(&self) -> bool {
         !self.tool_calls.is_empty()
     }
+
+    /// Text content, or empty. Callers that ask "did the model say
+    /// anything?" want the empty string, not an Option dance.
+    #[must_use]
+    pub fn text_or_empty(&self) -> &str {
+        self.text.as_deref().unwrap_or("")
+    }
 }
 
 /// What the router asks an upstream for.
@@ -136,7 +143,7 @@ pub struct StreamChunk {
     pub delta: String,
     pub reasoning: Option<String>,
     pub is_final: bool,
-    /// A LOWER BOUND the provider may supply, never a bill. Billing uses
+    /// A rough estimate the provider may supply, never a bill. Billing uses
     /// metered actuals only (see `StreamDelivery::settled_usage`).
     pub token_count: usize,
 }
@@ -147,6 +154,24 @@ impl StreamChunk {
             delta: text.into(),
             ..Self::default()
         }
+    }
+
+    /// A reasoning-only delta: thinking models emit these with no content.
+    pub fn reasoning(text: impl Into<String>) -> Self {
+        Self {
+            reasoning: Some(text.into()),
+            ..Self::default()
+        }
+    }
+
+    /// Attach the documented per-chunk estimate: bytes over the ~4-chars-per-
+    /// token rule of thumb, rounded up so a short delta still counts as one.
+    /// Observability only, never a bill — and computed over content, which is
+    /// why a reasoning-only chunk contributes nothing.
+    #[must_use]
+    pub fn with_token_estimate(mut self) -> Self {
+        self.token_count = self.delta.len().div_ceil(4);
+        self
     }
 }
 
@@ -190,6 +215,25 @@ pub struct ProviderCapabilities {
     pub prompt_caching: bool,
 }
 
+/// Per-million-token prices for one model, on the three dimensions
+/// ZeroRouter meters. `None` means "not priced here", which the cost
+/// function treats as unknown rather than free.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct ModelRates {
+    pub input_per_mtok: Option<f64>,
+    pub output_per_mtok: Option<f64>,
+    pub cached_input_per_mtok: Option<f64>,
+}
+
+impl ModelRates {
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.input_per_mtok.is_none()
+            && self.output_per_mtok.is_none()
+            && self.cached_input_per_mtok.is_none()
+    }
+}
+
 /// Output ceiling assumed when a request names none.
 pub const BASELINE_MAX_TOKENS: u32 = 4096;
 
@@ -227,191 +271,6 @@ pub trait ModelProvider: Send + Sync {
         temperature: Option<f64>,
         options: StreamOptions,
     ) -> BoxStream<'static, StreamResult<StreamEvent>>;
-}
-
-// ---------------------------------------------------------------------------
-// Bridge to the pinned adapters
-// ---------------------------------------------------------------------------
-
-/// Wraps an upstream adapter that still implements the ZeroClaw runtime's
-/// trait so it satisfies ZeroRouter's.
-///
-/// This exists so the git pin can be deleted one provider at a time. Two
-/// adapters still come from it — the OpenAI-compatible client (deepinfra,
-/// fireworks, together, minimax) and Bedrock — and rewriting both in the
-/// same change that re-homes the interface would mean a metering regression
-/// and a refactor arriving as one indistinguishable diff. Every provider
-/// that moves to a ZeroRouter-owned wire drops out of this bridge; when the
-/// last one does, the bridge and the pin go together.
-///
-/// The conversions are field-for-field because the shapes are identical by
-/// construction (see this module's header). Nothing is inferred, defaulted,
-/// or dropped on the way through — a bridge that quietly lost
-/// `cached_input_tokens` would silently change what customers are charged.
-pub struct PinnedAdapter {
-    inner: std::sync::Arc<dyn zeroclaw_api::model_provider::ModelProvider>,
-    alias: String,
-}
-
-impl PinnedAdapter {
-    #[must_use]
-    pub fn new(
-        alias: &str,
-        inner: std::sync::Arc<dyn zeroclaw_api::model_provider::ModelProvider>,
-    ) -> Self {
-        Self {
-            inner,
-            alias: alias.to_owned(),
-        }
-    }
-}
-
-fn to_pinned_message(message: &ChatMessage) -> zeroclaw_providers::traits::ChatMessage {
-    zeroclaw_providers::traits::ChatMessage {
-        role: message.role.clone(),
-        content: message.content.clone(),
-    }
-}
-
-fn to_pinned_tool(tool: &ToolSpec) -> zeroclaw_api::tool::ToolSpec {
-    zeroclaw_api::tool::ToolSpec {
-        name: tool.name.clone(),
-        description: tool.description.clone(),
-        parameters: std::sync::Arc::new(tool.parameters.clone()),
-        output: None,
-        param_domains: std::collections::BTreeMap::new(),
-    }
-}
-
-fn from_pinned_usage(usage: zeroclaw_providers::traits::TokenUsage) -> TokenUsage {
-    TokenUsage {
-        input_tokens: usage.input_tokens,
-        output_tokens: usage.output_tokens,
-        cached_input_tokens: usage.cached_input_tokens,
-    }
-}
-
-fn from_pinned_tool_call(call: zeroclaw_providers::traits::ToolCall) -> ToolCall {
-    ToolCall {
-        id: call.id,
-        name: call.name,
-        arguments: call.arguments,
-        extra_content: call.extra_content,
-    }
-}
-
-#[async_trait]
-impl ModelProvider for PinnedAdapter {
-    fn alias(&self) -> Cow<'_, str> {
-        Cow::Borrowed(&self.alias)
-    }
-
-    fn capabilities(&self) -> ProviderCapabilities {
-        let inner = self.inner.capabilities();
-        ProviderCapabilities {
-            native_tool_calling: inner.native_tool_calling,
-            vision: inner.vision,
-            prompt_caching: inner.prompt_caching,
-        }
-    }
-
-    fn supports_streaming(&self) -> bool {
-        self.inner.supports_streaming()
-    }
-
-    async fn chat(
-        &self,
-        request: ChatRequest<'_>,
-        model: &str,
-        temperature: Option<f64>,
-    ) -> anyhow::Result<ChatResponse> {
-        let messages: Vec<_> = request.messages.iter().map(to_pinned_message).collect();
-        let tools: Option<Vec<_>> = request
-            .tools
-            .map(|tools| tools.iter().map(to_pinned_tool).collect());
-        let pinned = zeroclaw_providers::traits::ChatRequest {
-            messages: &messages,
-            tools: tools.as_deref(),
-            thinking: None,
-        };
-        let response = self.inner.chat(pinned, model, temperature).await?;
-        Ok(ChatResponse {
-            text: response.text,
-            tool_calls: response
-                .tool_calls
-                .into_iter()
-                .map(from_pinned_tool_call)
-                .collect(),
-            usage: response.usage.map(from_pinned_usage),
-            reasoning_content: response.reasoning_content,
-        })
-    }
-
-    fn stream_chat(
-        &self,
-        request: ChatRequest<'_>,
-        model: &str,
-        temperature: Option<f64>,
-        options: StreamOptions,
-    ) -> BoxStream<'static, StreamResult<StreamEvent>> {
-        let messages: Vec<_> = request.messages.iter().map(to_pinned_message).collect();
-        let tools: Option<Vec<_>> = request
-            .tools
-            .map(|tools| tools.iter().map(to_pinned_tool).collect());
-        let inner = std::sync::Arc::clone(&self.inner);
-        let model = model.to_owned();
-        let pinned_options = zeroclaw_providers::traits::StreamOptions {
-            enabled: options.enabled,
-            count_tokens: options.count_tokens,
-        };
-        // The pinned stream borrows its request, so the owned copies above
-        // are moved into the generator and the borrow is taken inside.
-        let stream = async_stream::stream! {
-            let pinned = zeroclaw_providers::traits::ChatRequest {
-                messages: &messages,
-                tools: tools.as_deref(),
-                thinking: None,
-            };
-            let mut inner_stream = inner.stream_chat(pinned, &model, temperature, pinned_options);
-            while let Some(event) = futures_util::StreamExt::next(&mut inner_stream).await {
-                yield match event {
-                    Ok(event) => Ok(match event {
-                        zeroclaw_providers::traits::StreamEvent::TextDelta(chunk) => {
-                            StreamEvent::TextDelta(StreamChunk {
-                                delta: chunk.delta,
-                                reasoning: chunk.reasoning,
-                                is_final: chunk.is_final,
-                                token_count: chunk.token_count,
-                            })
-                        }
-                        zeroclaw_providers::traits::StreamEvent::ToolCall(call) => {
-                            StreamEvent::ToolCall(from_pinned_tool_call(call))
-                        }
-                        zeroclaw_providers::traits::StreamEvent::Usage(usage) => {
-                            StreamEvent::Usage(from_pinned_usage(usage))
-                        }
-                        zeroclaw_providers::traits::StreamEvent::Final => StreamEvent::Final,
-                        // Pre-executed tool events are an agent-runtime
-                        // concept: a gateway neither executes tools nor
-                        // reports them, so they carry nothing to forward.
-                        _ => continue,
-                    }),
-                    Err(error) => Err(match error {
-                        zeroclaw_providers::traits::StreamError::Json(error) => {
-                            StreamError::Json(error)
-                        }
-                        zeroclaw_providers::traits::StreamError::InvalidSse(detail) => {
-                            StreamError::InvalidSse(detail)
-                        }
-                        // Everything else keeps its text, which is what
-                        // `retry::classify` reads.
-                        other => StreamError::Http(other.to_string()),
-                    }),
-                };
-            }
-        };
-        Box::pin(stream)
-    }
 }
 
 #[cfg(test)]
