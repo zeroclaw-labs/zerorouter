@@ -320,29 +320,55 @@ jobs:
             --cluster "${ECS_CLUSTER}" \
             --services "${ECS_SERVICE}"
 
-          service_json="$(aws ecs describe-services \
-            --cluster "${ECS_CLUSTER}" \
-            --services "${ECS_SERVICE}" \
-            --output json)"
-          service_task_definition="$(jq -r '.services[0].taskDefinition // empty' <<<"${service_json}")"
-          primary_count="$(jq '[.services[0].deployments[] | select(.status == "PRIMARY")] | length' <<<"${service_json}")"
-          primary_task_definition="$(jq -r '.services[0].deployments[] | select(.status == "PRIMARY") | .taskDefinition' <<<"${service_json}")"
-          primary_rollout_state="$(jq -r '.services[0].deployments[] | select(.status == "PRIMARY") | .rolloutState // empty' <<<"${service_json}")"
-          desired_count="$(jq -r '.services[0].desiredCount // -1' <<<"${service_json}")"
-          running_count="$(jq -r '.services[0].runningCount // -1' <<<"${service_json}")"
-          pending_count="$(jq -r '.services[0].pendingCount // -1' <<<"${service_json}")"
+          # `wait services-stable` can return a beat before the PRIMARY
+          # deployment's rolloutState flips to COMPLETED: its own stability
+          # test is satisfied by runningCount == desiredCount with a single
+          # deployment, which is briefly true first. Asserting once right
+          # here therefore failed a deployment that was three seconds from
+          # done, and reported a healthy rollout as a broken one. Re-check on
+          # an interval instead, and only give up once the window closes.
+          deadline=$(( SECONDS + 300 ))
+          while :; do
+            service_json="$(aws ecs describe-services \
+              --cluster "${ECS_CLUSTER}" \
+              --services "${ECS_SERVICE}" \
+              --output json)"
+            service_task_definition="$(jq -r '.services[0].taskDefinition // empty' <<<"${service_json}")"
+            primary_count="$(jq '[.services[0].deployments[] | select(.status == "PRIMARY")] | length' <<<"${service_json}")"
+            primary_task_definition="$(jq -r '.services[0].deployments[] | select(.status == "PRIMARY") | .taskDefinition' <<<"${service_json}")"
+            primary_rollout_state="$(jq -r '.services[0].deployments[] | select(.status == "PRIMARY") | .rolloutState // empty' <<<"${service_json}")"
+            desired_count="$(jq -r '.services[0].desiredCount // -1' <<<"${service_json}")"
+            running_count="$(jq -r '.services[0].runningCount // -1' <<<"${service_json}")"
+            pending_count="$(jq -r '.services[0].pendingCount // -1' <<<"${service_json}")"
 
-          if [[ "${service_task_definition}" != "${TASK_DEFINITION_ARN}" ||
-                "${primary_count}" != "1" ||
-                "${primary_task_definition}" != "${TASK_DEFINITION_ARN}" ||
-                "${primary_rollout_state}" != "COMPLETED" ||
-                "${running_count}" != "${desired_count}" ||
-                "${pending_count}" != "0" ]]; then
-            jq '{service: .services[0] | {status, taskDefinition, desiredCount, runningCount, pendingCount, deployments, events: (.events[0:10])}, failures}' \
-              <<<"${service_json}" >&2
-            echo "::error::ECS stabilized without completing the requested task definition"
-            exit 1
-          fi
+            if [[ "${service_task_definition}" == "${TASK_DEFINITION_ARN}" &&
+                  "${primary_count}" == "1" &&
+                  "${primary_task_definition}" == "${TASK_DEFINITION_ARN}" &&
+                  "${primary_rollout_state}" == "COMPLETED" &&
+                  "${running_count}" == "${desired_count}" &&
+                  "${pending_count}" == "0" ]]; then
+              break
+            fi
+
+            # A rollout ECS has already given up on will never converge, so
+            # fail immediately rather than burning the whole window.
+            if [[ "${primary_rollout_state}" == "FAILED" ]]; then
+              jq '{service: .services[0] | {status, taskDefinition, desiredCount, runningCount, pendingCount, deployments, events: (.events[0:10])}, failures}' \
+                <<<"${service_json}" >&2
+              echo "::error::ECS reported the requested task definition's rollout as FAILED"
+              exit 1
+            fi
+
+            if (( SECONDS >= deadline )); then
+              jq '{service: .services[0] | {status, taskDefinition, desiredCount, runningCount, pendingCount, deployments, events: (.events[0:10])}, failures}' \
+                <<<"${service_json}" >&2
+              echo "::error::ECS stabilized without completing the requested task definition"
+              exit 1
+            fi
+
+            echo "waiting for rollout to complete (state=${primary_rollout_state:-unknown}, running=${running_count}/${desired_count}, pending=${pending_count})"
+            sleep 10
+          done
 
       - name: Write deployment summary
         if: steps.service.outputs.exists == 'true'
