@@ -4,15 +4,12 @@ use std::{
     sync::Arc,
 };
 
+use crate::provider::{
+    ChatRequest, ChatResponse, ModelProvider, StreamEvent, StreamOptions, StreamResult,
+};
 use futures_util::stream::BoxStream;
 use serde::Deserialize;
 use thiserror::Error;
-use zeroclaw_providers::{
-    ProviderDispatch,
-    bedrock::BedrockModelProvider,
-    compatible::{AuthStyle, OpenAiCompatibleModelProvider},
-    traits::{ChatRequest, ChatResponse, ModelProvider, StreamEvent, StreamOptions, StreamResult},
-};
 
 use crate::{
     config::TierCandidate,
@@ -42,10 +39,6 @@ struct ProviderMetadata {
 enum ProviderAdapter {
     #[serde(rename = "anthropic")]
     Anthropic,
-    #[serde(rename = "bedrock")]
-    Bedrock,
-    #[serde(rename = "openai_compatible")]
-    OpenAiCompatible,
     /// First-party OpenAI on ZeroRouter's own Responses wire client
     /// (`crate::wire`) — billing-grade usage extraction on the wire where
     /// gpt-5.x and codex actually live. The pinned adapters cannot serve
@@ -93,26 +86,18 @@ impl ProviderInventory {
                     detail: format!("duplicate provider key {}", provider.key),
                 });
             }
-            match provider.adapter {
-                ProviderAdapter::OpenAiCompatible
-                    if provider
-                        .base_url
-                        .as_deref()
-                        .is_none_or(|url| url.trim().is_empty()) =>
-                {
-                    return Err(ProviderBuildError::InvalidInventory {
-                        detail: format!(
-                            "OpenAI-compatible provider {} requires base_url",
-                            provider.key
-                        ),
-                    });
-                }
-                ProviderAdapter::Bedrock if provider.base_url.is_some() => {
-                    return Err(ProviderBuildError::InvalidInventory {
-                        detail: "Bedrock does not support a base_url override".to_owned(),
-                    });
-                }
-                _ => {}
+            // Neither shipped adapter takes a base_url override: both wires
+            // own their endpoints, and the only override is the documented
+            // test seam. The per-adapter validation this replaced covered
+            // aggregator and Bedrock shapes that no longer exist.
+            if provider
+                .base_url
+                .as_deref()
+                .is_some_and(|url| url.trim().is_empty())
+            {
+                return Err(ProviderBuildError::InvalidInventory {
+                    detail: format!("provider {} has an empty base_url", provider.key),
+                });
             }
         }
         Ok(())
@@ -161,19 +146,18 @@ impl ProviderCandidate {
     /// Aim a candidate at a scripted local upstream so the router-owned
     /// streaming walk can be driven end to end without a network provider.
     pub(crate) fn against_local_upstream(definition: TierCandidate, base_url: &str) -> Self {
-        let provider: Arc<dyn ModelProvider> = Arc::new(
-            OpenAiCompatibleModelProvider::builder("test-upstream")
-                .display_name("test upstream")
-                .base_url(base_url)
-                .auth_style(AuthStyle::Bearer)
-                .credential(Some("test-credential"))
-                .max_tokens(Some(zeroclaw_api::model_provider::BASELINE_MAX_TOKENS))
-                .build(),
-        );
-        Self {
+        // A stand-in upstream for tests that only need "some provider":
+        // the owned Responses wire, aimed at a local scripted server.
+        Self::with_provider(
             definition,
-            provider,
-        }
+            Arc::new(crate::wire::OpenAiResponsesWire::new(
+                "test-upstream",
+                "test-credential",
+                Some(base_url),
+                None,
+                1,
+            )),
+        )
     }
 }
 
@@ -211,7 +195,7 @@ impl ProviderCandidate {
         request: ChatRequest<'_>,
         temperature: Option<f64>,
     ) -> anyhow::Result<ChatResponse> {
-        ProviderDispatch::new(Arc::clone(&self.provider))
+        self.provider
             .chat(request, &self.definition.model, temperature)
             .await
     }
@@ -224,12 +208,8 @@ impl ProviderCandidate {
         temperature: Option<f64>,
         options: StreamOptions,
     ) -> BoxStream<'static, StreamResult<StreamEvent>> {
-        ProviderDispatch::new(Arc::clone(&self.provider)).stream_chat(
-            request,
-            &self.definition.model,
-            temperature,
-            options,
-        )
+        self.provider
+            .stream_chat(request, &self.definition.model, temperature, options)
     }
 }
 
@@ -419,15 +399,6 @@ fn create_provider(
             // default.
             900,
         )),
-        ProviderAdapter::Bedrock => {
-            // `.bearer_token` pins the credential and skips every ambient AWS probe.
-            Arc::new(
-                BedrockModelProvider::builder(alias)
-                    .bearer_token(credential)
-                    .max_tokens(max_output_tokens)
-                    .build(),
-            )
-        }
         ProviderAdapter::OpenAiResponses => Arc::new(OpenAiResponsesWire::new(
             alias,
             credential,
@@ -437,35 +408,13 @@ fn create_provider(
             // upstream budget, not an adapter default.
             900,
         )),
-        ProviderAdapter::OpenAiCompatible => {
-            let Some(base_url) = effective_base_url else {
-                return Err(ProviderBuildError::InvalidInventory {
-                    detail: format!(
-                        "OpenAI-compatible provider {} requires base_url",
-                        metadata.key
-                    ),
-                });
-            };
-            let name = metadata.display_name.as_deref().unwrap_or(alias);
-            // `build()` panics unless display_name, base_url, and auth_style
-            // are all set — set all three explicitly.
-            Arc::new(
-                OpenAiCompatibleModelProvider::builder(alias)
-                    .display_name(name)
-                    .base_url(base_url)
-                    .auth_style(AuthStyle::Bearer)
-                    .credential(Some(credential))
-                    .max_tokens(Some(max_output_tokens))
-                    .build(),
-            )
-        }
     };
     Ok(provider)
 }
 
 #[cfg(test)]
 mod tests {
-    use zeroclaw_providers::pricing::ModelRates;
+    use crate::provider::ModelRates;
 
     use super::*;
 
@@ -484,35 +433,42 @@ mod tests {
 
     #[test]
     fn supported_provider_check_uses_constructor_table() {
-        for provider in ["anthropic", "bedrock", "deepinfra", "fireworks", "together"] {
+        // The MVP inventory: two providers, both on ZeroRouter-owned wires.
+        for provider in ["anthropic", "openai"] {
             assert!(is_supported_provider(provider));
+        }
+        // Retired with the git dependency that supplied their adapters.
+        for provider in ["bedrock", "deepinfra", "fireworks", "together", "minimax"] {
+            assert!(
+                !is_supported_provider(provider),
+                "{provider} is no longer in the inventory"
+            );
         }
         assert!(!is_supported_provider("unknown"));
     }
 
     #[test]
     fn missing_credentials_skip_candidates_without_reordering() {
+        // A provider with no credential in the environment contributes no
+        // candidates, and the survivors keep their catalog order — failover
+        // must not silently reshuffle because a key happened to be absent.
         let inventory = ProviderInventory::load().expect("inventory should load");
-        let bedrock_env = inventory
-            .provider("bedrock")
-            .expect("Bedrock metadata should exist")
-            .credential_env
-            .clone();
-        let together_env = inventory
-            .provider("together")
-            .expect("Together metadata should exist")
+        let anthropic_env = inventory
+            .provider("anthropic")
+            .expect("anthropic metadata should exist")
             .credential_env
             .clone();
         let route = build_with_credentials(
             vec![
-                candidate("one", "anthropic"),
-                candidate("two", "bedrock"),
-                candidate("three", "together"),
+                candidate("one", "openai"),
+                candidate("two", "anthropic"),
+                candidate("three", "anthropic"),
             ],
-            zeroclaw_api::model_provider::BASELINE_MAX_TOKENS,
-            |name| (name == bedrock_env || name == together_env).then(|| "secret".to_owned()),
+            crate::provider::BASELINE_MAX_TOKENS,
+            // Only Anthropic is credentialed, so the OpenAI rung drops out.
+            |name| (name == anthropic_env).then(|| "secret".to_owned()),
         )
-        .expect("two providers should be available");
+        .expect("a credentialed provider should still build a route");
 
         let ids = route
             .candidates()
@@ -523,37 +479,9 @@ mod tests {
     }
 
     #[test]
-    fn bedrock_only_keeps_bedrock_candidates_in_mixed_route() {
-        let inventory = ProviderInventory::load().expect("inventory should load");
-        let bedrock_env = inventory
-            .provider("bedrock")
-            .expect("Bedrock metadata should exist")
-            .credential_env
-            .clone();
-        let route = build_with_credentials(
-            vec![
-                candidate("anthropic-primary", "anthropic"),
-                candidate("bedrock-sonnet", "bedrock"),
-                candidate("anthropic-secondary", "anthropic"),
-                candidate("bedrock-opus", "bedrock"),
-            ],
-            zeroclaw_api::model_provider::BASELINE_MAX_TOKENS,
-            |name| (name == bedrock_env).then(|| "secret".to_owned()),
-        )
-        .expect("Bedrock credential should keep both Bedrock candidates");
-
-        let ids = route
-            .candidates()
-            .iter()
-            .map(|candidate| candidate.definition().id.as_str())
-            .collect::<Vec<_>>();
-        assert_eq!(ids, ["bedrock-sonnet", "bedrock-opus"]);
-    }
-
-    #[test]
     fn candidates_on_same_upstream_share_one_client() {
         let route = build_with_credentials(
-            vec![candidate("one", "fireworks"), candidate("two", "fireworks")],
+            vec![candidate("one", "openai"), candidate("two", "openai")],
             8_192,
             |_| Some("secret".to_owned()),
         )
@@ -566,47 +494,11 @@ mod tests {
     }
 
     #[test]
-    fn bedrock_requires_its_bearer_credential() {
-        let inventory = ProviderInventory::load().expect("inventory should load");
-        let bedrock_env = inventory
-            .provider("bedrock")
-            .expect("Bedrock metadata should exist")
-            .credential_env
-            .clone();
-        let error = build_with_credentials(
-            vec![candidate("one", "bedrock")],
-            zeroclaw_api::model_provider::BASELINE_MAX_TOKENS,
-            |_| None,
-        )
-        .expect_err("missing Bedrock bearer token should make the route unavailable");
-
-        match error {
-            ProviderBuildError::NoAvailableCredentials { credential_envs } => {
-                assert_eq!(credential_envs, [bedrock_env]);
-            }
-            other => panic!("unexpected error: {other}"),
-        }
-    }
-
-    #[test]
-    fn together_uses_current_api_endpoint() {
-        let inventory = ProviderInventory::load().expect("inventory should load");
-        let together = inventory
-            .provider("together")
-            .expect("Together metadata should exist");
-        assert_eq!(together.adapter, ProviderAdapter::OpenAiCompatible);
-        assert_eq!(
-            together.base_url.as_deref(),
-            Some("https://api.together.ai/v1")
-        );
-    }
-
-    #[test]
     fn debug_output_never_contains_credentials() {
         let credential = "credential-that-must-not-be-logged";
         let route = build_with_credentials(
-            vec![candidate("one", "deepinfra")],
-            zeroclaw_api::model_provider::BASELINE_MAX_TOKENS,
+            vec![candidate("one", "openai")],
+            crate::provider::BASELINE_MAX_TOKENS,
             |_| Some(credential.to_owned()),
         )
         .expect("DeepInfra provider should build");
@@ -621,8 +513,8 @@ mod tests {
     #[test]
     fn candidates_carry_their_pinned_upstream_model() {
         let route = build_with_credentials(
-            vec![candidate("one", "fireworks")],
-            zeroclaw_api::model_provider::BASELINE_MAX_TOKENS,
+            vec![candidate("one", "openai")],
+            crate::provider::BASELINE_MAX_TOKENS,
             |_| Some("secret".to_owned()),
         )
         .expect("Fireworks provider should build");

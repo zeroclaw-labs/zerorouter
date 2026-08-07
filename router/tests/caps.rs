@@ -25,7 +25,7 @@ use sqlx_core::{query::query, query_scalar::query_scalar};
 use sqlx_postgres::{PgConnectOptions, PgPool, PgPoolOptions};
 use tower::ServiceExt;
 use uuid::Uuid;
-use zeroclaw_providers::pricing::ModelRates;
+use zerorouter::provider::ModelRates;
 use zerorouter::{
     auth::{AuthenticatedKey, generate_api_key, hash_api_key},
     db::{

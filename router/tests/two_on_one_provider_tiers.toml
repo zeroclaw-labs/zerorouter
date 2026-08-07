@@ -17,8 +17,8 @@ cached_input_per_mtok = 0.60
 output_per_mtok = 6.00
 
 [[tiers."zero/test-twin".candidates]]
-id = "together/twin-a"
-provider = "together"
+id = "anthropic/twin-a"
+provider = "anthropic"
 model = "upstream/twin-a"
 
 [tiers."zero/test-twin".candidates.rates]
@@ -27,8 +27,8 @@ cached_input_per_mtok = 0.20
 output_per_mtok = 2.00
 
 [[tiers."zero/test-twin".candidates]]
-id = "together/twin-b"
-provider = "together"
+id = "anthropic/twin-b"
+provider = "anthropic"
 model = "upstream/twin-b"
 
 [tiers."zero/test-twin".candidates.rates]

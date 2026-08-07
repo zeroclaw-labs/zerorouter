@@ -10,7 +10,7 @@ use rust_decimal::Decimal;
 use sqlx_core::{query::query, query_as::query_as, query_scalar::query_scalar};
 use sqlx_postgres::{PgConnectOptions, PgPool, PgPoolOptions};
 use uuid::Uuid;
-use zeroclaw_providers::pricing::ModelRates;
+use zerorouter::provider::ModelRates;
 use zerorouter::{
     auth::{AuthenticatedKey, generate_api_key, hash_api_key},
     billing::{

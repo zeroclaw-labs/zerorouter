@@ -17,8 +17,8 @@ cached_input_per_mtok = 0.60
 output_per_mtok = 6.00
 
 [[tiers."zero/test-solo".candidates]]
-id = "deepinfra/solo"
-provider = "deepinfra"
+id = "openai/solo"
+provider = "openai"
 model = "upstream/solo"
 
 [tiers."zero/test-solo".candidates.rates]

@@ -4,9 +4,9 @@ use std::{
     sync::{Mutex, OnceLock, PoisonError},
 };
 
+use crate::provider::ModelRates;
 use serde::{Deserialize, Deserializer};
 use thiserror::Error;
-use zeroclaw_providers::pricing::ModelRates;
 
 use crate::{
     openai::{MAX_RATE_PER_MTOK, billable_rate},
@@ -610,7 +610,7 @@ input_per_mtok = 1
 output_per_mtok = 2
 [[tiers."zero/test".candidates]]
 id = "provider/model"
-provider = "fireworks"
+provider = "openai"
 model = "upstream-model"
 [tiers."zero/test".candidates.rates]
 input_per_mtok = 1
@@ -641,7 +641,7 @@ input_per_mtok = 10
 output_per_mtok = 20
 [[tiers."zero/test".candidates]]
 id = "provider/model"
-provider = "fireworks"
+provider = "openai"
 model = "upstream-model"
 [tiers."zero/test".candidates.rates]
 input_per_mtok = 1
@@ -671,7 +671,7 @@ schema_version = 1
 {sell}
 [[tiers."zero/test".candidates]]
 id = "provider/model"
-provider = "fireworks"
+provider = "openai"
 model = "upstream-model"
 [tiers."zero/test".candidates.rates]
 {basis}
@@ -823,8 +823,8 @@ schema_version = 1
 input_per_mtok = 1.00
 output_per_mtok = 2.00
 [[tiers."zero/healthy".candidates]]
-id = "fireworks/cheap"
-provider = "fireworks"
+id = "openai/cheap"
+provider = "openai"
 model = "upstream/cheap"
 [tiers."zero/healthy".candidates.rates]
 input_per_mtok = 0.50
@@ -880,7 +880,7 @@ output_per_mtok = 10.00
         catalog.withhold(withheld);
 
         assert!(catalog.resolve("zero/healthy").is_some());
-        assert!(catalog.resolve("fireworks/cheap").is_some());
+        assert!(catalog.resolve("openai/cheap").is_some());
         assert!(catalog.resolve("zero/below-cost").is_none());
         assert!(catalog.resolve("anthropic/dear").is_none());
 
@@ -901,7 +901,7 @@ output_per_mtok = 10.00
         let listing = catalog.model_listing();
         assert_eq!(
             listing.keys().map(String::as_str).collect::<Vec<_>>(),
-            ["fireworks/cheap", "zero/healthy"]
+            ["openai/cheap", "zero/healthy"]
         );
     }
 
@@ -967,8 +967,8 @@ output_per_mtok = 10.00
         let catalog = mixed_catalog(
             r#"
 [[tiers."zero/below-cost".candidates]]
-id = "fireworks/cheap"
-provider = "fireworks"
+id = "openai/cheap"
+provider = "openai"
 model = "upstream/cheap"
 [tiers."zero/below-cost".candidates.rates]
 input_per_mtok = 0.10
@@ -979,7 +979,7 @@ output_per_mtok = 0.20
         let error = validate_tier_catalog(&catalog)
             .expect_err("a repeated concrete id must refuse the whole catalog");
         assert!(
-            matches!(error, TierConfigError::DuplicateModelId(ref id) if id == "fireworks/cheap"),
+            matches!(error, TierConfigError::DuplicateModelId(ref id) if id == "openai/cheap"),
             "unexpected error {error:?}"
         );
     }
@@ -1004,8 +1004,8 @@ schema_version = 1
 input_per_mtok = 1
 output_per_mtok = 2
 [[tiers."{id_line}".candidates]]
-id = "fireworks/fast"
-provider = "fireworks"
+id = "openai/fast"
+provider = "openai"
 model = "upstream/fast"
 [tiers."{id_line}".candidates.rates]
 input_per_mtok = 1
@@ -1029,8 +1029,8 @@ schema_version = 1
 input_per_mtok = 1
 output_per_mtok = 2
 [[tiers."zero/test".candidates]]
-id = "fireworks/fast:cost"
-provider = "fireworks"
+id = "openai/fast:cost"
+provider = "openai"
 model = "upstream/fast"
 [tiers."zero/test".candidates.rates]
 input_per_mtok = 1
@@ -1041,7 +1041,7 @@ output_per_mtok = 2
         let error = validate_tier_catalog(&catalog)
             .expect_err("a colliding candidate id must refuse the catalog");
         assert!(
-            matches!(error, TierConfigError::PrioritySuffixCollision(ref id) if id == "fireworks/fast:cost"),
+            matches!(error, TierConfigError::PrioritySuffixCollision(ref id) if id == "openai/fast:cost"),
             "unexpected error {error:?}"
         );
     }
@@ -1060,7 +1060,7 @@ input_per_mtok = 1
 output_per_mtok = 2
 [[tiers."zero/test".candidates]]
 id = "arn:aws:bedrock:us-east-1"
-provider = "fireworks"
+provider = "openai"
 model = "upstream/fast"
 [tiers."zero/test".candidates.rates]
 input_per_mtok = 1
@@ -1088,8 +1088,8 @@ schema_version = 1
 input_per_mtok = 1.00
 output_per_mtok = 2.00
 [[tiers."zero/one".candidates]]
-id = "fireworks/one"
-provider = "fireworks"
+id = "openai/one"
+provider = "openai"
 model = "upstream/one"
 [tiers."zero/one".candidates.rates]
 input_per_mtok = 9.00
@@ -1100,8 +1100,8 @@ output_per_mtok = 2.00
 input_per_mtok = 1.00
 output_per_mtok = 2.00
 [[tiers."zero/two".candidates]]
-id = "together/two"
-provider = "together"
+id = "anthropic/two"
+provider = "anthropic"
 model = "upstream/two"
 [tiers."zero/two".candidates.rates]
 input_per_mtok = 1.00

@@ -8,9 +8,9 @@ use serde_json::json;
 // Named directly rather than through the `crate::sqlx` shim: the shim exists to
 // keep the sqlx-core/sqlx-postgres split out of call sites, and [`admit_key_mint`]
 // is the only place in the crate that needs a bare connection handle.
+use crate::provider::ModelRates;
 use sqlx_postgres::PgConnection;
 use uuid::Uuid;
-use zeroclaw_providers::pricing::ModelRates;
 
 use crate::{
     auth::AuthenticatedKey,

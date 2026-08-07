@@ -28,7 +28,7 @@ hex = "0.4"
 hmac = "0.12"
 openidconnect = "4"
 rand = "0.10"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls", "json"] }
 rust_decimal = "1.40"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -44,8 +44,6 @@ tower-http = { version = "0.6", features = ["fs"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 uuid = { version = "1.22", features = ["serde", "v4"] }
-zeroclaw-api = { git = "https://github.com/zeroclaw-labs/zeroclaw.git", rev = "f4b297e93e6bc64ede951ade59347486baf7f85f" }
-zeroclaw-providers = { git = "https://github.com/zeroclaw-labs/zeroclaw.git", rev = "f4b297e93e6bc64ede951ade59347486baf7f85f" }
 
 [dev-dependencies]
 http-body-util = "0.1"
