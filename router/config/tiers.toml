@@ -3,24 +3,57 @@ schema_version = 1
 # This file is the sole source of truth for the public catalog, fallback order,
 # upstream model IDs, and metering rates. Prices were verified on 2026-07-11.
 #
-# MVP SHAPE (2026-08-06): ZeroRouter integrates OpenAI and Anthropic directly
-# and nothing else. Every tier is therefore a single upstream priced at that
-# model's list rate — `basis == sell` on every dimension — and margin comes
-# from the volume discounts those two accounts earn, not from a spread the
-# customer pays. Aggregator rungs (deepinfra, fireworks, together, minimax)
-# and Bedrock were removed with the git dependency that supplied their
-# adapters; re-adding any of them restores a routed tier and its failover.
+# THE CATALOG HAS TWO KINDS OF ENTRY (2026-08-07).
+#
+# 1. PINS — `zero/<model>`. You name a model, you get that model, priced at
+#    what it costs. `basis == sell` on every dimension, so ZeroRouter earns
+#    nothing on the spread; margin comes from the volume discounts the OpenAI
+#    and Anthropic accounts earn. A pin never changes model under you.
+#
+# 2. BANDS — `zero/low-cost`, `zero/optimized`, `zero/best`. You name an
+#    INTENT and ZeroRouter picks. A band's model is expected to change over
+#    time as models and prices move; that is the point of buying one.
+#
+# WHAT THE BANDS ACTUALLY DO TODAY, STATED PLAINLY: each resolves to exactly
+# one model. The selection machinery they are named for is not finished —
+# `Priority::Cost` orders by learned expected cost (`src/estimator.rs`), but
+# `Balanced` is identity by design and `Success` is stubbed until its
+# benchmark-aware machinery exists, and neither the per-task quality scores
+# `best` implies nor the promotional-rate tracking `low-cost` implies are
+# modeled anywhere in this system. A band with one candidate cannot route.
+#
+# The consequence is deliberate and it is the honest one: because each band
+# holds a single candidate, each band's sell rate EQUALS that candidate's
+# basis today, exactly like a pin. No customer pays a routing premium for
+# routing that is not happening.
+#
+# When real selection lands, a band gains candidates and its sell rate must
+# rise to cover the most expensive one — that is a PRICE CHANGE for anyone
+# already on the band, and it needs notice. Do not slip it in with a config
+# edit. Pins are the escape hatch: a customer who never wants a price to move
+# under them buys a pin.
 #
 # Pricing invariant, enforced at load time by `validate_tier_catalog`
 # (`src/config.rs`): no candidate's cost basis may exceed its owning tier's
 # sell rate on any dimension. `basis == sell` is the intended shape here and
-# stays legal; only a strictly greater basis is rejected, because such a
-# candidate loses money on every request it serves.
+# stays legal; only a strictly greater basis is rejected.
 #
-# What this shape gives up, stated plainly: a tier is exactly as available as
-# its single upstream. There is no in-tier failover until a second provider
-# serving the same model class is added back.
+# Concrete candidate ids are unique file-wide and each belongs to exactly one
+# tier — that is why a band's candidate carries a `band/...` id even when it
+# dispatches the same upstream model as a pin. The two are genuinely different
+# products: same model, different promise about whether it can change.
+#
+# Availability: every tier here has ONE upstream, so a tier is exactly as
+# available as its provider. There is no in-tier failover until a second
+# provider serving the same model class is added back.
 
+# ---------------------------------------------------------------------------
+# BANDS — intent-priced. ZeroRouter chooses the model.
+# ---------------------------------------------------------------------------
+
+# Cheapest workable model. Intended rule: cheapest model that clears a
+# capability floor, accounting for promotional rates. Today: gpt-5.6-luna,
+# because promotional-rate tracking does not exist and luna is the floor.
 [tiers."zero/low-cost"]
 
 [tiers."zero/low-cost".rates]
@@ -29,11 +62,72 @@ cached_input_per_mtok = 0.02
 output_per_mtok = 1.20
 
 [[tiers."zero/low-cost".candidates]]
-id = "openai/gpt-5.6-luna"
+id = "band/low-cost/gpt-5.6-luna"
 provider = "openai"
 model = "gpt-5.6-luna"
 
 [tiers."zero/low-cost".candidates.rates]
+input_per_mtok = 0.20
+cached_input_per_mtok = 0.02
+output_per_mtok = 1.20
+
+# Best value for the task. Intended rule: highest quality per dollar for the
+# request's task signature. Today: claude-sonnet-5, a fixed sensible default,
+# because per-task quality scores do not exist in this system.
+[tiers."zero/optimized"]
+
+[tiers."zero/optimized".rates]
+input_per_mtok = 3.00
+cached_input_per_mtok = 0.30
+output_per_mtok = 15.00
+
+[[tiers."zero/optimized".candidates]]
+id = "band/optimized/claude-sonnet-5"
+provider = "anthropic"
+model = "claude-sonnet-5"
+
+[tiers."zero/optimized".candidates.rates]
+input_per_mtok = 3.00
+cached_input_per_mtok = 0.30
+output_per_mtok = 15.00
+
+# Highest capability available. Intended rule: the best-benchmarking model for
+# the request's task. Today: claude-fable-5, the top of the catalog by price,
+# which is the only capability proxy on hand until benchmark data exists.
+[tiers."zero/best"]
+
+[tiers."zero/best".rates]
+input_per_mtok = 10.00
+cached_input_per_mtok = 1.00
+output_per_mtok = 50.00
+
+[[tiers."zero/best".candidates]]
+id = "band/best/claude-fable-5"
+provider = "anthropic"
+model = "claude-fable-5"
+
+[tiers."zero/best".candidates.rates]
+input_per_mtok = 10.00
+cached_input_per_mtok = 1.00
+output_per_mtok = 50.00
+
+# ---------------------------------------------------------------------------
+# PINS — you get this model, at cost, and it does not change.
+# ---------------------------------------------------------------------------
+
+[tiers."zero/luna"]
+
+[tiers."zero/luna".rates]
+input_per_mtok = 0.20
+cached_input_per_mtok = 0.02
+output_per_mtok = 1.20
+
+[[tiers."zero/luna".candidates]]
+id = "openai/gpt-5.6-luna"
+provider = "openai"
+model = "gpt-5.6-luna"
+
+[tiers."zero/luna".candidates.rates]
 input_per_mtok = 0.20
 cached_input_per_mtok = 0.02
 output_per_mtok = 1.20
@@ -72,43 +166,25 @@ input_per_mtok = 1.75
 cached_input_per_mtok = 0.175
 output_per_mtok = 14.00
 
-# Sonnet 5's introductory rate expired into the standard rate that both the
-# basis and the sell now carry. The dated cliff this file used to warn about
-# is gone with it: basis == sell, so no calendar change can trip the margin
-# withhold.
-[tiers."zero/high-end"]
+# Renamed from `zero/high-end` on 2026-08-07. That name promised the top of the
+# catalog and delivered the fourth rung of seven — three tiers cost more. The
+# intent it was reaching for is now `zero/best`; this is the model pin.
+[tiers."zero/sonnet-5"]
 
-[tiers."zero/high-end".rates]
+[tiers."zero/sonnet-5".rates]
 input_per_mtok = 3.00
 cached_input_per_mtok = 0.30
 output_per_mtok = 15.00
 
-[[tiers."zero/high-end".candidates]]
+[[tiers."zero/sonnet-5".candidates]]
 id = "anthropic/claude-sonnet-5"
 provider = "anthropic"
 model = "claude-sonnet-5"
 
-[tiers."zero/high-end".candidates.rates]
+[tiers."zero/sonnet-5".candidates.rates]
 input_per_mtok = 3.00
 cached_input_per_mtok = 0.30
 output_per_mtok = 15.00
-
-[tiers."zero/sol"]
-
-[tiers."zero/sol".rates]
-input_per_mtok = 5.00
-cached_input_per_mtok = 0.50
-output_per_mtok = 30.00
-
-[[tiers."zero/sol".candidates]]
-id = "openai/gpt-5.6-sol"
-provider = "openai"
-model = "gpt-5.6-sol"
-
-[tiers."zero/sol".candidates.rates]
-input_per_mtok = 5.00
-cached_input_per_mtok = 0.50
-output_per_mtok = 30.00
 
 [tiers."zero/opus-5"]
 
@@ -126,6 +202,23 @@ model = "claude-opus-5"
 input_per_mtok = 5.00
 cached_input_per_mtok = 0.50
 output_per_mtok = 25.00
+
+[tiers."zero/sol"]
+
+[tiers."zero/sol".rates]
+input_per_mtok = 5.00
+cached_input_per_mtok = 0.50
+output_per_mtok = 30.00
+
+[[tiers."zero/sol".candidates]]
+id = "openai/gpt-5.6-sol"
+provider = "openai"
+model = "gpt-5.6-sol"
+
+[tiers."zero/sol".candidates.rates]
+input_per_mtok = 5.00
+cached_input_per_mtok = 0.50
+output_per_mtok = 30.00
 
 [tiers."zero/fable-5"]
 
