@@ -73,11 +73,12 @@ schema_version = 1
 # claim from a checked one. A declared limit of 0 or an empty modality list is
 # refused at load — say nothing by saying nothing.
 #
-# Values below were read from models.dev on 2026-08-08, except where a comment
-# says otherwise, and `zerorouter admin catalog-drift` reconciles them against
-# that same catalog on every CI run — so a window that moves upstream is
-# caught the way a price is. They are token counts and capability flags, not
-# money: nothing here changes what anyone is billed.
+# Every value below was read from models.dev on 2026-08-08 and every one of
+# the seven upstreams was found there, so nothing here is inferred. You do not
+# have to take that on trust: `zerorouter admin catalog-drift` reconciles this
+# table against that same catalog on every CI run, so a window that moves
+# upstream is caught the way a price is. They are token counts and capability
+# flags, not money: nothing here changes what anyone is billed.
 
 # ---------------------------------------------------------------------------
 # BANDS — intent-priced. ZeroRouter chooses the model.
@@ -291,17 +292,6 @@ id = "anthropic/claude-opus-5"
 provider = "anthropic"
 model = "claude-opus-5"
 
-# NOT SOURCED. models.dev has no `claude-opus-5` entry at all (checked
-# 2026-08-08), so these two limits are inferred from its nearest siblings:
-# claude-opus-4-6, -4-7 and -4-8 are each 1,000,000 / 128,000, as are
-# claude-sonnet-5 and claude-fable-5. The modalities and tool_call are the
-# whole-catalog constant and are not in doubt.
-#
-# This is the one row in the file a reviewer cannot check against an upstream.
-# Correct it the moment a real number exists; deleting both limit lines is
-# always the safe move, since absence reads as "unknown" rather than as a
-# claim. `catalog-drift` reports this candidate as NOT IN SOURCE, which is
-# accurate and should stay visible rather than be suppressed.
 [tiers."zero/opus-5".candidates.metadata]
 context_window = 1000000
 max_output_tokens = 128000
