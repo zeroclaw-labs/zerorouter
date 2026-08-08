@@ -219,6 +219,7 @@ mod tests {
     use chrono::Utc;
 
     use super::*;
+    use crate::config::ModelMetadata;
     use crate::db::AttemptTokens;
 
     fn candidate(provider: &str, model: &str) -> TierCandidate {
@@ -231,6 +232,9 @@ mod tests {
                 output_per_mtok: Some(2.0),
                 cached_input_per_mtok: None,
             },
+            // Health scoring is about whether a candidate answers, not about
+            // what it can accept.
+            metadata: ModelMetadata::default(),
         }
     }
 

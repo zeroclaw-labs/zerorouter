@@ -414,6 +414,7 @@ fn create_provider(
 
 #[cfg(test)]
 mod tests {
+    use crate::config::ModelMetadata;
     use crate::provider::ModelRates;
 
     use super::*;
@@ -428,6 +429,8 @@ mod tests {
                 output_per_mtok: Some(2.0),
                 cached_input_per_mtok: None,
             },
+            // Provider dispatch reads `provider` and `model` and nothing else.
+            metadata: ModelMetadata::default(),
         }
     }
 
