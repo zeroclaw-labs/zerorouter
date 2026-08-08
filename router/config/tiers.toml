@@ -72,16 +72,28 @@ input_per_mtok = 1.75
 cached_input_per_mtok = 0.175
 output_per_mtok = 14.00
 
-# Sonnet 5's introductory rate expired into the standard rate that both the
-# basis and the sell now carry. The dated cliff this file used to warn about
-# is gone with it: basis == sell, so no calendar change can trip the margin
-# withhold.
+# PRICED AT SONNET'S INTRODUCTORY RATE, WHICH LAPSES ON 2026-08-31.
+#
+# This table previously carried the POST-lapse rate (3.00/0.30/15.00) as both
+# basis and sell, raised ahead of the calendar so the cliff could never
+# withhold the tier. The side effect was a 1.50x markup on every sonnet
+# request — Anthropic still charges 2.00/0.20/10.00 — on a tier that promises
+# cost. We do not sell at a profit here, so the rate is the rate we pay.
+#
+# The load-time validator cannot catch a repeat of this: `basis == sell` held
+# throughout, so the file agreed with itself and was simply untrue. Only a
+# comparison against the upstream can see it.
+#
+# What this costs: on 2026-08-31 the real basis becomes 3.00/0.30/15.00 and
+# this table must move the same day, or ZeroRouter serves sonnet BELOW cost.
+# If you move only one number, raise the BASIS first — basis above sell
+# withholds the tier, which fails closed. Raising sell first restores markup.
 [tiers."zero/high-end"]
 
 [tiers."zero/high-end".rates]
-input_per_mtok = 3.00
-cached_input_per_mtok = 0.30
-output_per_mtok = 15.00
+input_per_mtok = 2.00
+cached_input_per_mtok = 0.20
+output_per_mtok = 10.00
 
 [[tiers."zero/high-end".candidates]]
 id = "anthropic/claude-sonnet-5"
@@ -89,9 +101,9 @@ provider = "anthropic"
 model = "claude-sonnet-5"
 
 [tiers."zero/high-end".candidates.rates]
-input_per_mtok = 3.00
-cached_input_per_mtok = 0.30
-output_per_mtok = 15.00
+input_per_mtok = 2.00
+cached_input_per_mtok = 0.20
+output_per_mtok = 10.00
 
 [tiers."zero/sol"]
 
