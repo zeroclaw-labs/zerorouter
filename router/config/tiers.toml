@@ -77,9 +77,9 @@ output_per_mtok = 1.20
 [tiers."zero/optimized"]
 
 [tiers."zero/optimized".rates]
-input_per_mtok = 3.00
-cached_input_per_mtok = 0.30
-output_per_mtok = 15.00
+input_per_mtok = 2.00
+cached_input_per_mtok = 0.20
+output_per_mtok = 10.00
 
 [[tiers."zero/optimized".candidates]]
 id = "band/optimized/claude-sonnet-5"
@@ -87,9 +87,9 @@ provider = "anthropic"
 model = "claude-sonnet-5"
 
 [tiers."zero/optimized".candidates.rates]
-input_per_mtok = 3.00
-cached_input_per_mtok = 0.30
-output_per_mtok = 15.00
+input_per_mtok = 2.00
+cached_input_per_mtok = 0.20
+output_per_mtok = 10.00
 
 # Highest capability available. Intended rule: the best-benchmarking model for
 # the request's task. Today: claude-fable-5, the top of the catalog by price,
@@ -169,12 +169,29 @@ output_per_mtok = 14.00
 # Renamed from `zero/high-end` on 2026-08-07. That name promised the top of the
 # catalog and delivered the fourth rung of seven — three tiers cost more. The
 # intent it was reaching for is now `zero/best`; this is the model pin.
+#
+# PRICED AT 2.00/0.20/10.00, WHICH IS SONNET'S INTRODUCTORY RATE, AND IT LAPSES
+# ON 2026-08-31. Until 2026-08-07 this table carried the post-lapse rate
+# (3.00/0.30/15.00) as both basis and sell — raised ahead of the calendar so
+# the cliff could never withhold the tier. The side effect was a 1.50x markup
+# on every sonnet request in the meantime, on tiers that promise cost. We do
+# not sell at a profit here, so the rate is now the rate we actually pay.
+#
+# The trade that buys: on 2026-08-31 the real cost becomes 3.00/0.30/15.00 and
+# this table must move the same day, or ZeroRouter sells sonnet BELOW cost and
+# loses money on every request. Nothing auto-detects that at runtime — the
+# load-time validator only compares this file against itself, and both numbers
+# here would still agree. `zerorouter admin catalog-drift` is what catches it,
+# and CI runs it daily (.github/workflows/catalog-drift.yml).
+#
+# If you must update only one number, raise the BASIS first: basis above sell
+# withholds the tier, which fails closed. Raising sell first sells at a markup.
 [tiers."zero/sonnet-5"]
 
 [tiers."zero/sonnet-5".rates]
-input_per_mtok = 3.00
-cached_input_per_mtok = 0.30
-output_per_mtok = 15.00
+input_per_mtok = 2.00
+cached_input_per_mtok = 0.20
+output_per_mtok = 10.00
 
 [[tiers."zero/sonnet-5".candidates]]
 id = "anthropic/claude-sonnet-5"
@@ -182,9 +199,9 @@ provider = "anthropic"
 model = "claude-sonnet-5"
 
 [tiers."zero/sonnet-5".candidates.rates]
-input_per_mtok = 3.00
-cached_input_per_mtok = 0.30
-output_per_mtok = 15.00
+input_per_mtok = 2.00
+cached_input_per_mtok = 0.20
+output_per_mtok = 10.00
 
 [tiers."zero/opus-5"]
 
