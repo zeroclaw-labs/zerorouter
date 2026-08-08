@@ -69,6 +69,104 @@ pub struct TierCandidate {
     pub model: String,
     #[serde(deserialize_with = "deserialize_model_rates")]
     pub rates: ModelRates,
+    /// What this model can take and produce. Declared here, beside the rates,
+    /// because it is the same kind of claim: static, human-owned, and true
+    /// only because someone checked. A candidate that declares none is
+    /// `ModelMetadata::default()` — every field unknown — which is exactly how
+    /// the file read before this table existed.
+    #[serde(default)]
+    pub metadata: ModelMetadata,
+}
+
+/// What a model can take and produce, as declared in `config/tiers.toml`.
+///
+/// Every field is optional and every one of them means *unknown* when absent,
+/// never a default. That distinction is the whole point of the type: a
+/// consumer has to be able to tell "this model has a small window" from "no
+/// one has told me what this model's window is", because the two call for
+/// opposite behaviour. ZeroClaw's `ModelInfo.context_window` is an `Option`
+/// for the same reason — and when it is `None` that client falls back to
+/// `UNCONFIGURED_CONTEXT_WINDOW_FALLBACK` (32,000 tokens), which is why an
+/// omitted field here is a real cost and a *wrong* field here is a worse one.
+///
+/// Names follow models.dev, the catalog `zerorouter admin catalog-drift`
+/// reconciles against, so a drift check is a direct comparison rather than a
+/// translation. The wire spelling differs in one place — see
+/// [`crate::openai::ModelObject`].
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct ModelMetadata {
+    /// Maximum input window, in tokens.
+    pub context_window: Option<u64>,
+    /// Maximum tokens the model will generate in one response.
+    pub max_output_tokens: Option<u64>,
+    /// Input modalities the model accepts, in models.dev's vocabulary
+    /// (`text`, `image`, `pdf`, `audio`).
+    pub input_modalities: Option<Vec<String>>,
+    /// Whether the model supports native tool calling.
+    pub tool_call: Option<bool>,
+}
+
+impl ModelMetadata {
+    /// The metadata a *tier* may honestly advertise, given every candidate a
+    /// request for that tier could land on.
+    ///
+    /// A tier id is a promise about the worst rung the walk can reach, not the
+    /// best. Advertising the flagship's 1M window on a tier that can fail over
+    /// to a 200k rung would hand the customer a number that is wrong precisely
+    /// when failover happens — the moment they are least able to notice. So
+    /// limits take the minimum, modalities take the intersection, and tool
+    /// calling holds only if it holds for every candidate.
+    ///
+    /// A single undeclared candidate makes the whole field unknown rather than
+    /// being skipped. Narrowing over the rest would publish a bound this tier
+    /// cannot keep: the candidate nobody described might be the 32k one.
+    ///
+    /// Today every shipped tier has exactly one candidate, so this reduces to
+    /// copying that candidate's metadata. The rule is written for the tier
+    /// that gains a second rung, which is the change that would otherwise turn
+    /// a correct listing into a confident lie.
+    #[must_use]
+    fn narrowed(candidates: &[TierCandidate]) -> Self {
+        // `try_fold` over `Option` is the "one unknown poisons the field" rule
+        // itself: a `None` from any candidate short-circuits the whole fold.
+        let smallest = |pick: fn(&Self) -> Option<u64>| {
+            candidates
+                .iter()
+                .map(|candidate| pick(&candidate.metadata))
+                .try_fold(None::<u64>, |narrowed, declared| {
+                    declared.map(|declared| Some(narrowed.map_or(declared, |n| n.min(declared))))
+                })
+                .flatten()
+        };
+
+        Self {
+            context_window: smallest(|metadata| metadata.context_window),
+            max_output_tokens: smallest(|metadata| metadata.max_output_tokens),
+            input_modalities: candidates
+                .iter()
+                .map(|candidate| candidate.metadata.input_modalities.as_deref())
+                .try_fold(None::<Vec<String>>, |shared, declared| {
+                    let declared = declared?;
+                    Some(Some(match shared {
+                        // The first candidate's order is kept, so the listing
+                        // reads the way the file does.
+                        None => declared.to_vec(),
+                        Some(shared) => shared
+                            .into_iter()
+                            .filter(|modality| declared.contains(modality))
+                            .collect(),
+                    }))
+                })
+                .flatten(),
+            tool_call: candidates
+                .iter()
+                .map(|candidate| candidate.metadata.tool_call)
+                .try_fold(None::<bool>, |narrowed, declared| {
+                    declared.map(|declared| Some(narrowed.is_none_or(|n| n) && declared))
+                })
+                .flatten(),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -143,6 +241,20 @@ pub enum TierConfigError {
          (design doc: 'Model-suffix carrier') would mask — rename the id"
     )]
     PrioritySuffixCollision(String),
+    #[error(
+        "candidate {candidate} in tier {tier} declares {field} = 0: a zero limit is not a small \
+         limit, it is a broken one — omit the field to say the limit is unknown"
+    )]
+    ZeroModelLimit {
+        tier: String,
+        candidate: String,
+        field: &'static str,
+    },
+    #[error(
+        "candidate {candidate} in tier {tier} declares an empty or blank input_modalities entry — \
+         omit the field to say the modalities are unknown"
+    )]
+    InvalidModalities { tier: String, candidate: String },
     #[error(
         "candidate {candidate} in tier {tier} costs more than the tier sells: \
          {dimension} cost basis {basis} exceeds tier sell rate {sell}"
@@ -243,6 +355,15 @@ impl TierCatalog {
     ///
     /// Withheld tiers are absent from `tiers` and so are their candidates:
     /// the catalog never offers a model that a request for it would refuse.
+    ///
+    /// Metadata does *not* follow the sell-rate rule, and the asymmetry is
+    /// deliberate. A price is a property of the tier a request is billed
+    /// through, so a pinned candidate inherits its tier's. A context window is
+    /// a property of the model itself: a request for
+    /// `anthropic/claude-sonnet-5` reaches sonnet and gets sonnet's window
+    /// whatever tier the id happens to sit under. So a candidate row carries
+    /// its own metadata and a tier row carries
+    /// [`ModelMetadata::narrowed`] across everything it can route to.
     #[must_use]
     pub fn model_listing(&self) -> BTreeMap<String, ModelListing> {
         let mut models = BTreeMap::new();
@@ -252,6 +373,7 @@ impl TierCatalog {
                 ModelListing {
                     owned_by: "zerorouter".to_owned(),
                     sell_rates: definition.rates,
+                    metadata: ModelMetadata::narrowed(&definition.candidates),
                 },
             );
             for candidate in &definition.candidates {
@@ -260,6 +382,7 @@ impl TierCatalog {
                     .or_insert_with(|| ModelListing {
                         owned_by: candidate.provider.clone(),
                         sell_rates: definition.rates,
+                        metadata: candidate.metadata.clone(),
                     });
             }
         }
@@ -267,12 +390,14 @@ impl TierCatalog {
     }
 }
 
-/// One row of the public catalog: the provider that serves this id, and the
-/// sell rate a request for it is billed at.
+/// One row of the public catalog: the provider that serves this id, the sell
+/// rate a request for it is billed at, and what the model can take and
+/// produce.
 #[derive(Clone, Debug)]
 pub struct ModelListing {
     pub owned_by: String,
     pub sell_rates: ModelRates,
+    pub metadata: ModelMetadata,
 }
 
 pub async fn load_tier_catalog(path: &Path) -> Result<TierCatalog, TierConfigError> {
@@ -417,6 +542,7 @@ fn validate_tier_catalog(
                 return Err(TierConfigError::DuplicateModelId(candidate.id.clone()));
             }
             validate_rates(tier_id, candidate.rates)?;
+            validate_metadata(tier_id, candidate)?;
             if let Err(error) = validate_candidate_margin(tier_id, definition.rates, candidate) {
                 // The first violating candidate becomes the tier's reason, but
                 // the walk continues: a later candidate in the same tier can
@@ -529,6 +655,48 @@ fn validate_candidate_margin(
                 sell,
             });
         }
+    }
+    Ok(())
+}
+
+/// Reject metadata that is present but says nothing, on the *structural* side
+/// of the split described on [`validate_tier_catalog`].
+///
+/// Absence is always legal — an undeclared field means "unknown", which is a
+/// true statement about a model no one has described. What this refuses is a
+/// field that was written down and still carries no information: a zero
+/// context window, a zero max output, an empty or blank modality list. Each of
+/// those is an authoring accident that a consumer cannot tell apart from a
+/// deliberate claim, and each has a one-character fix — delete the line — so
+/// there is no reason to route around it. Refusing the file, like an
+/// unsupported provider does, keeps the difference between "unknown" and
+/// "zero" meaning something.
+fn validate_metadata(tier: &str, candidate: &TierCandidate) -> Result<(), TierConfigError> {
+    for (field, limit) in [
+        ("context_window", candidate.metadata.context_window),
+        ("max_output_tokens", candidate.metadata.max_output_tokens),
+    ] {
+        if limit == Some(0) {
+            return Err(TierConfigError::ZeroModelLimit {
+                tier: tier.to_owned(),
+                candidate: candidate.id.clone(),
+                field,
+            });
+        }
+    }
+    let modalities_say_nothing =
+        candidate
+            .metadata
+            .input_modalities
+            .as_ref()
+            .is_some_and(|modalities| {
+                modalities.is_empty() || modalities.iter().any(|m| m.trim().is_empty())
+            });
+    if modalities_say_nothing {
+        return Err(TierConfigError::InvalidModalities {
+            tier: tier.to_owned(),
+            candidate: candidate.id.clone(),
+        });
     }
     Ok(())
 }
@@ -809,6 +977,193 @@ model = "upstream-model"
             format!("input_per_mtok = {MAX_RATE_PER_MTOK}\noutput_per_mtok = {MAX_RATE_PER_MTOK}");
         validate_tier_catalog(&catalog_with(&at_ceiling, &at_ceiling))
             .expect("a rate at the ceiling must still load");
+    }
+
+    /// A one-tier catalog selling at 2.00/10.00 with `candidates` spliced in
+    /// verbatim, so a metadata test can vary the thing it is about without
+    /// restating the pricing that has nothing to do with it.
+    fn catalog_with_candidates(candidates: &str) -> TierCatalog {
+        toml::from_str(&format!(
+            r#"
+schema_version = 1
+[tiers."zero/test"]
+[tiers."zero/test".rates]
+input_per_mtok = 2.00
+output_per_mtok = 10.00
+{candidates}
+"#
+        ))
+        .expect("catalog should parse")
+    }
+
+    /// One candidate under `zero/test`, priced well inside the tier, carrying
+    /// `metadata` as its `[...metadata]` body. An empty `metadata` emits no
+    /// table at all — the shape of a file written before metadata existed.
+    fn candidate(id: &str, metadata: &str) -> String {
+        let metadata = if metadata.trim().is_empty() {
+            String::new()
+        } else {
+            format!("[tiers.\"zero/test\".candidates.metadata]\n{metadata}\n")
+        };
+        format!(
+            r#"
+[[tiers."zero/test".candidates]]
+id = "openai/{id}"
+provider = "openai"
+model = "upstream/{id}"
+{metadata}
+[tiers."zero/test".candidates.rates]
+input_per_mtok = 1.00
+output_per_mtok = 2.00
+"#
+        )
+    }
+
+    #[test]
+    fn a_catalog_that_declares_no_metadata_lists_exactly_as_it_did_before() {
+        // The backward-compatibility contract in one assertion. A file written
+        // before this table existed still parses and still validates, and
+        // every metadata field comes out unknown — not zero, not a plausible
+        // default, not an empty list that would read as "text only".
+        let catalog = catalog_with_candidates(&candidate("plain", ""));
+        validate_tier_catalog(&catalog).expect("metadata must be optional");
+
+        let listing = catalog.model_listing();
+        for id in ["zero/test", "openai/plain"] {
+            assert_eq!(
+                listing[id].metadata,
+                ModelMetadata::default(),
+                "{id} should make no metadata claim at all"
+            );
+        }
+    }
+
+    #[test]
+    fn a_tier_advertises_the_narrowest_thing_its_candidates_can_do() {
+        // A tier id is a promise about wherever the walk lands, so it takes the
+        // smaller window, the smaller output, the shared modalities, and tool
+        // calling only if both rungs have it. Once a 200k rung exists the
+        // flagship's 1M window is emphatically not the tier's window — that
+        // number would be wrong exactly when failover happens.
+        let catalog = catalog_with_candidates(&format!(
+            "{}{}",
+            candidate(
+                "wide",
+                "context_window = 1000000\nmax_output_tokens = 128000\n\
+                 input_modalities = [\"text\", \"image\", \"pdf\"]\ntool_call = true",
+            ),
+            candidate(
+                "narrow",
+                "context_window = 200000\nmax_output_tokens = 64000\n\
+                 input_modalities = [\"text\", \"pdf\"]\ntool_call = false",
+            ),
+        ));
+        validate_tier_catalog(&catalog).expect("catalog should validate");
+        let listing = catalog.model_listing();
+
+        assert_eq!(
+            listing["zero/test"].metadata,
+            ModelMetadata {
+                context_window: Some(200_000),
+                max_output_tokens: Some(64_000),
+                input_modalities: Some(vec!["text".to_owned(), "pdf".to_owned()]),
+                tool_call: Some(false),
+            }
+        );
+
+        // Each pinned candidate keeps its own facts. Pricing runs the other way
+        // — a pinned candidate bills at its owning tier's rate — and the
+        // asymmetry is deliberate: a price belongs to the tier a request is
+        // billed through, a window belongs to the model that serves it.
+        assert_eq!(
+            listing["openai/wide"].metadata,
+            ModelMetadata {
+                context_window: Some(1_000_000),
+                max_output_tokens: Some(128_000),
+                input_modalities: Some(vec![
+                    "text".to_owned(),
+                    "image".to_owned(),
+                    "pdf".to_owned(),
+                ]),
+                tool_call: Some(true),
+            },
+            "a pinned candidate advertises itself, not its tier"
+        );
+        assert_eq!(
+            listing["openai/narrow"].metadata.context_window,
+            Some(200_000)
+        );
+    }
+
+    #[test]
+    fn one_undeclared_candidate_makes_the_whole_tier_field_unknown() {
+        // Narrowing over only the candidates that *did* declare would publish
+        // a bound the tier cannot keep: the rung nobody described might be the
+        // 32k one. Unknown is the only honest tier-level answer — and it is
+        // not contagious, so the candidate that did declare still advertises.
+        let catalog = catalog_with_candidates(&format!(
+            "{}{}",
+            candidate(
+                "declared",
+                "context_window = 1000000\nmax_output_tokens = 128000\n\
+                 input_modalities = [\"text\", \"image\"]\ntool_call = true",
+            ),
+            candidate("silent", ""),
+        ));
+        validate_tier_catalog(&catalog).expect("catalog should validate");
+        let listing = catalog.model_listing();
+
+        assert_eq!(
+            listing["zero/test"].metadata,
+            ModelMetadata::default(),
+            "one silent rung makes every tier-level field unknown"
+        );
+        assert_eq!(
+            listing["openai/declared"].metadata.context_window,
+            Some(1_000_000),
+            "the rung that did declare still advertises its own window"
+        );
+    }
+
+    #[test]
+    fn a_declared_limit_of_zero_refuses_the_file() {
+        // Absence is always legal, so there is never a reason to write a limit
+        // that carries no information. Zero is not a small window, it is a
+        // typo, and a consumer cannot tell it from a checked claim.
+        for (label, body, field) in [
+            ("context window", "context_window = 0", "context_window"),
+            ("max output", "max_output_tokens = 0", "max_output_tokens"),
+        ] {
+            let catalog = catalog_with_candidates(&candidate("zero", body));
+            let error = validate_tier_catalog(&catalog)
+                .expect_err(&format!("a zero {label} must refuse the catalog"));
+            assert!(
+                matches!(
+                    error,
+                    TierConfigError::ZeroModelLimit { field: found, .. } if found == field
+                ),
+                "{label}: unexpected error {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_or_blank_modality_list_refuses_the_file() {
+        // Same rule for the list: declaring `[]` claims the model accepts no
+        // input at all, and a blank entry is a stray comma. Say nothing by
+        // saying nothing.
+        for (label, body) in [
+            ("an empty list", "input_modalities = []"),
+            ("a blank entry", "input_modalities = [\"text\", \"  \"]"),
+        ] {
+            let catalog = catalog_with_candidates(&candidate("blank", body));
+            let error = validate_tier_catalog(&catalog)
+                .expect_err(&format!("{label} must refuse the catalog"));
+            assert!(
+                matches!(error, TierConfigError::InvalidModalities { .. }),
+                "{label}: unexpected error {error:?}"
+            );
+        }
     }
 
     /// Two tiers: `zero/healthy` is priced sanely; `zero/below-cost` sells at

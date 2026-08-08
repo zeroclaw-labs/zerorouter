@@ -3135,6 +3135,7 @@ fn insert_header(response: &mut Response, name: &'static str, value: &str) {
 mod tests {
     use std::str::FromStr;
 
+    use crate::config::ModelMetadata;
     use crate::provider::TokenUsage;
     use rust_decimal::Decimal;
     use uuid::Uuid;
@@ -3243,6 +3244,8 @@ mod tests {
                 output_per_mtok: Some(2.0),
                 cached_input_per_mtok: None,
             },
+            // The walk does not read metadata; it only routes and bills.
+            metadata: ModelMetadata::default(),
         }
     }
 

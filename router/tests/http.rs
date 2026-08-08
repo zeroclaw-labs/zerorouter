@@ -62,8 +62,8 @@ output_per_mtok = 10.00
     )
 }
 
-/// The `data[].id` values of a `/v1/models` response, in wire order.
-async fn listed_model_ids(state: RouterState) -> Vec<String> {
+/// The parsed `/v1/models` body served by a state.
+async fn models_json(state: RouterState) -> Value {
     let response = app(state)
         .oneshot(
             Request::builder()
@@ -80,10 +80,21 @@ async fn listed_model_ids(state: RouterState) -> Vec<String> {
         .await
         .expect("models response body should be readable")
         .to_bytes();
-    let json: Value = serde_json::from_slice(&body).expect("models response should be JSON");
-    json["data"]
+    serde_json::from_slice(&body).expect("models response should be JSON")
+}
+
+/// The `data` array of a `/v1/models` response, in wire order.
+async fn listed_models(state: RouterState) -> Vec<Value> {
+    models_json(state).await["data"]
         .as_array()
         .expect("models response should contain a data array")
+        .clone()
+}
+
+/// The `data[].id` values of a `/v1/models` response, in wire order.
+async fn listed_model_ids(state: RouterState) -> Vec<String> {
+    listed_models(state)
+        .await
         .iter()
         .map(|model| {
             model["id"]
@@ -226,29 +237,12 @@ async fn model_pricing_matches_zeroclaws_model_pricing_wire_contract() {
     // (`crates/zeroclaw-api/src/model_provider.rs`) — `prompt`, `completion`,
     // `input_cache_read` — as decimal-string USD-per-single-token rates, and
     // its values must be the tier's sell rate from `config/tiers.toml`
-    // (`zero/low-cost`: 0.30 / 1.20 / 0.06 USD per 1M tokens) converted
-    // exactly, with no binary-float artifacts.
-    let response = app(RouterState::new(tier_config_path()))
-        .oneshot(
-            Request::builder()
-                .uri("/v1/models")
-                .body(Body::empty())
-                .expect("models request should build"),
-        )
-        .await
-        .expect("models request should complete");
-
-    assert_eq!(response.status(), StatusCode::OK);
-    let body = response
-        .into_body()
-        .collect()
-        .await
-        .expect("models response body should be readable")
-        .to_bytes();
-    let json: Value = serde_json::from_slice(&body).expect("models response should be JSON");
-    let data = json["data"]
-        .as_array()
-        .expect("models response should contain a data array");
+    // (`zero/low-cost`: 0.20 input / 1.20 output / 0.02 cached USD per 1M
+    // tokens) converted exactly, with no binary-float artifacts.
+    //
+    // The snapshot is whole-row on purpose, so it also pins that no field
+    // appears that nobody asked for — including the metadata block below.
+    let data = listed_models(RouterState::new(tier_config_path())).await;
 
     let tier = data
         .iter()
@@ -266,6 +260,10 @@ async fn model_pricing_matches_zeroclaws_model_pricing_wire_contract() {
                 "completion": "0.0000012",
                 "input_cache_read": "0.00000002",
             },
+            "context_length": 1_050_000,
+            "max_output_tokens": 128_000,
+            "input_modalities": ["text", "image", "pdf"],
+            "tool_call": true,
         })
     );
 
@@ -290,8 +288,87 @@ async fn model_pricing_matches_zeroclaws_model_pricing_wire_contract() {
                 "completion": "0.000005",
                 "input_cache_read": "0.0000001",
             },
+            "context_length": 200_000,
+            "max_output_tokens": 64_000,
+            "input_modalities": ["text", "image", "pdf"],
+            "tool_call": true,
         })
     );
+}
+
+#[tokio::test]
+async fn every_shipped_model_publishes_what_it_can_take_and_produce() {
+    // The regression guard for the bug this metadata exists to fix. A client
+    // told nothing has to assume something, and ZeroClaw assumes 32,000 tokens
+    // and no vision (`UNCONFIGURED_CONTEXT_WINDOW_FALLBACK`) — so a tier that
+    // ships without a window does not degrade loudly, it degrades silently, on
+    // exactly the long-context work someone reached for the big model to do.
+    // A new tier has to come back and satisfy this test rather than discover
+    // it in an agent transcript.
+    for model in listed_models(RouterState::new(tier_config_path())).await {
+        let id = model["id"].as_str().expect("every model carries an id");
+        // The shipped catalog's real floor is haiku's 200k. The assertion is a
+        // sanity bound, not a spec: it catches a unit slip (200 for 200k) or a
+        // field that silently went missing, which are the ways this regresses.
+        let window = model["context_length"].as_u64();
+        assert!(
+            window.is_some_and(|window| window >= 200_000),
+            "{id} ships without a plausible context window: {}",
+            model["context_length"]
+        );
+        assert!(
+            model["max_output_tokens"]
+                .as_u64()
+                .is_some_and(|output| output >= 64_000),
+            "{id} ships without a plausible max output: {}",
+            model["max_output_tokens"]
+        );
+        // Every model in the MVP inventory is multimodal and tool-calling.
+        // A rung that is not is a real change and should have to edit this.
+        assert_eq!(
+            model["input_modalities"],
+            serde_json::json!(["text", "image", "pdf"]),
+            "{id} does not take the whole-catalog modality set"
+        );
+        assert_eq!(model["tool_call"], true, "{id} should support tool calling");
+    }
+}
+
+#[tokio::test]
+async fn a_model_that_declares_no_metadata_omits_the_keys_rather_than_nulling_them() {
+    // The optionality contract, on the wire. "Unknown" has to stay
+    // distinguishable from "small", or a consumer cannot tell a checked claim
+    // from a missing one — which is exactly why ZeroClaw's
+    // `ModelInfo.context_window` is an `Option`. An absent key says unknown;
+    // `null` would say "I looked and there is no answer", and a plausible
+    // default would say something false. This fixture declares no metadata at
+    // all, the shape of every tiers.toml written before the table existed.
+    let path = catalog_fixture("models_no_metadata", &two_tier_source("1.00")).await;
+    let data = listed_models(RouterState::new(path)).await;
+
+    assert_eq!(data.len(), 4, "two tiers and their two pinned candidates");
+    for model in &data {
+        let id = model["id"].as_str().expect("every model carries an id");
+        for field in [
+            "context_length",
+            "max_output_tokens",
+            "input_modalities",
+            "tool_call",
+        ] {
+            assert!(
+                model.get(field).is_none(),
+                "{id} should omit {field} entirely, not serve {}",
+                model[field]
+            );
+        }
+        // And the rest of the row is untouched: metadata is additive, so a
+        // file that declares none still lists exactly as it did before.
+        assert_eq!(model["object"], "model");
+        assert!(
+            model["pricing"]["prompt"].is_string(),
+            "{id} should still carry its pricing"
+        );
+    }
 }
 
 #[tokio::test]
