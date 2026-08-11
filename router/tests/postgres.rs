@@ -872,7 +872,10 @@ async fn migration_chain_applies_on_a_fresh_database() {
         outcome.5,
         "the 0009 freeze-state columns exist after the chain"
     );
-    assert_eq!(outcome.6, 9, "the chain reaches migration version 9");
+    // 13, not 10: 0013 (dispute resolution) is numbered with a gap so that
+    // 0010-0012 stay available to branches in flight. The chain's head is the
+    // highest version applied, not a count of files.
+    assert_eq!(outcome.6, 13, "the chain reaches migration version 13");
 }
 
 /// Rewrite the database name in a Postgres URL, keeping any query string
