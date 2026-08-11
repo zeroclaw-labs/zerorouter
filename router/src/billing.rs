@@ -1232,6 +1232,20 @@ pub async fn autopay_candidates(
           -- saved card again, off-session. This narrows the candidate set and
           -- writes nothing; the claim machinery (HANDOFF §6d) is untouched.
           AND u.frozen_at IS NULL
+          -- Nor is an account that OWES money, whether or not it is still
+          -- frozen. Since 0009/0013 a negative balance has exactly one
+          -- meaning: a reversal receivable — money already clawed back
+          -- through Stripe and not yet settled. Such an account is
+          -- maximally eligible on every other predicate (its balance is the
+          -- furthest below the threshold, so it even sorts first), which
+          -- makes the debtor whose freeze has been lifted the very next
+          -- card this sweep would charge off-session. Auto-charging the
+          -- saved card of a customer fresh off a payment dispute is how the
+          -- next dispute is manufactured. Re-entry into autopay is
+          -- therefore an explicit human decision — `admin disputes resolve`
+          -- (write off or record the recovery) brings the balance back to
+          -- zero — and never a side effect of a sweep.
+          AND u.credit_balance_usd >= 0
           AND NOT EXISTS (
               SELECT 1 FROM stripe_autopay_intents i
               WHERE i.user_id = u.id AND i.status = 'pending'
