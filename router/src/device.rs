@@ -385,21 +385,32 @@ async fn poll_device_token(
                 .fetch_one(&mut *transaction)
                 .await
                 .map_err(oauth_database_error)?;
-            if matches!(
-                admit_key_mint(&mut transaction, user_id)
-                    .await
-                    .map_err(oauth_database_error)?,
-                KeyMintAdmission::LimitReached
-            ) {
-                // Terminal for the polling client (RFC 8628 §3.5), and the
-                // transaction rolls back, so the grant keeps its 'approved'
-                // status and no key is minted.
-                tracing::warn!(
-                    authorization = %id,
-                    user_id = %user_id,
-                    "device authorization refused: the user is at its API key limit"
-                );
-                return Err(OauthError::AccessDenied);
+            // Both refusals are terminal for the polling client (RFC 8628
+            // §3.5), and the transaction rolls back either way, so the grant
+            // keeps its 'approved' status and no key is minted. Exhaustive on
+            // purpose: a new refusal reason must be answered here rather than
+            // falling through to a mint.
+            match admit_key_mint(&mut transaction, user_id)
+                .await
+                .map_err(oauth_database_error)?
+            {
+                KeyMintAdmission::Allowed => {}
+                KeyMintAdmission::LimitReached => {
+                    tracing::warn!(
+                        authorization = %id,
+                        user_id = %user_id,
+                        "device authorization refused: the user is at its API key limit"
+                    );
+                    return Err(OauthError::AccessDenied);
+                }
+                KeyMintAdmission::AccountFrozen => {
+                    tracing::warn!(
+                        authorization = %id,
+                        user_id = %user_id,
+                        "device authorization refused: the account is frozen"
+                    );
+                    return Err(OauthError::AccessDenied);
+                }
             }
             let api_key = generate_api_key();
             let key_id = Uuid::new_v4();
