@@ -260,6 +260,7 @@ async fn usage_settlement_debits_the_balance_exactly_once() {
     let Some(pool) = connect().await else {
         return;
     };
+    let _sweep_guard = SWEEP_LOCK.read().await;
     let user_id = create_user(&pool, "settle").await;
     let key = create_key(&pool, user_id).await;
     credit_purchase(&pool, user_id, Decimal::TEN, &unique_session_id(), None)
@@ -328,6 +329,7 @@ async fn credit_admission_fails_closed_and_cannot_jointly_overdraw() {
     let Some(pool) = connect().await else {
         return;
     };
+    let _sweep_guard = SWEEP_LOCK.read().await;
     let user_id = create_user(&pool, "admission").await;
     let key_a = create_key(&pool, user_id).await;
     let key_b = create_key(&pool, user_id).await;
@@ -492,6 +494,7 @@ async fn settlement_debit_is_clamped_to_the_reservation_and_cannot_overdraw() {
     let Some(pool) = connect().await else {
         return;
     };
+    let _sweep_guard = SWEEP_LOCK.read().await;
     let user_id = create_user(&pool, "clamp").await;
     let key = create_key(&pool, user_id).await;
     // Fund exactly the reserved amount, then have actual usage exceed it.
@@ -543,6 +546,7 @@ async fn cap_only_settlement_records_usage_without_touching_the_balance() {
     let Some(pool) = connect().await else {
         return;
     };
+    let _sweep_guard = SWEEP_LOCK.read().await;
     let user_id = create_user(&pool, "caponly").await;
     let key = create_key(&pool, user_id).await;
     // require_credits = false: no balance is funded, and settlement must record
@@ -621,6 +625,22 @@ struct SettleFault {
 /// lifetime of its fault.
 static FAULT_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
     std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+
+/// Serializes admission's GLOBAL quarantine sweep against the two tests that
+/// depend on a row *staying* unquarantined across their own ageing/recovery
+/// window. Every admission (`begin_usage_session`) sweeps aged owed
+/// reservations catalog-wide, so a sibling test's admission can quarantine
+/// this binary's owed-reservation fixture between `age_settlement_intent` and
+/// `recover_owed_settlements` — recovery skips quarantined rows, and the test
+/// fails on a behaviour that is correct in production. Admission-calling
+/// tests take `read()` (they parallelize freely among themselves); the two
+/// sweep-sensitive tests take `write()` (no admission runs concurrently).
+///
+/// Lock order, always: `FAULT_LOCK` first, then `SWEEP_LOCK`. Several tests
+/// hold both, and a consistent order is what keeps two static locks from
+/// deadlocking.
+static SWEEP_LOCK: std::sync::LazyLock<tokio::sync::RwLock<()>> =
+    std::sync::LazyLock::new(|| tokio::sync::RwLock::new(()));
 
 impl SettleFault {
     /// Fail the first `failures` settle INSERTs for `request_id` with
@@ -789,6 +809,7 @@ async fn a_transiently_failing_settlement_is_retried_and_bills_exactly_once() {
     // 40001 (serialization_failure) is in the transient set, so the settle is
     // retried rather than abandoned.
     let _fault_guard = FAULT_LOCK.lock().await;
+    let _sweep_guard = SWEEP_LOCK.read().await;
     let fault = SettleFault::install(&pool, request_id, 1, "40001").await;
     let outcome = session.record(&usage_record(Decimal::ONE)).await;
     let insert_attempts = fault.insert_attempts(&pool).await;
@@ -822,6 +843,7 @@ async fn a_retry_after_an_ambiguous_commit_does_not_double_debit() {
     let Some(pool) = connect().await else {
         return;
     };
+    let _sweep_guard = SWEEP_LOCK.read().await;
     let user_id = create_user(&pool, "settle-ambiguous").await;
     let key = create_key(&pool, user_id).await;
     credit_purchase(&pool, user_id, Decimal::TEN, &unique_session_id(), None)
@@ -861,6 +883,7 @@ async fn a_duplicate_settled_row_is_success_and_reclaims_the_reservation() {
     let Some(pool) = connect().await else {
         return;
     };
+    let _sweep_guard = SWEEP_LOCK.read().await;
     let user_id = create_user(&pool, "settle-duplicate").await;
     let key = create_key(&pool, user_id).await;
     credit_purchase(&pool, user_id, Decimal::TEN, &unique_session_id(), None)
@@ -927,6 +950,7 @@ async fn a_permanently_failing_settlement_is_recoverable_and_bills_once() {
     // P0001 is a plain `RAISE EXCEPTION`: nothing about it clears on a retry,
     // which is exactly how a CHECK violation or a trigger rejection presents.
     let _fault_guard = FAULT_LOCK.lock().await;
+    let _sweep_guard = SWEEP_LOCK.read().await;
     let fault = SettleFault::install(&pool, request_id, i64::MAX, "P0001").await;
     assert!(
         session.record(&usage_record(Decimal::ONE)).await.is_err(),
@@ -1018,6 +1042,7 @@ async fn an_expired_reservation_owing_a_settlement_is_quarantined_not_deleted() 
     let session = admit(&pool, &owed_key, true).await;
     let request_id = request_uuid(&session);
     let _fault_guard = FAULT_LOCK.lock().await;
+    let _sweep_guard = SWEEP_LOCK.write().await;
     let fault = SettleFault::install(&pool, request_id, i64::MAX, "P0001").await;
     assert!(session.record(&usage_record(Decimal::ONE)).await.is_err());
     fault.remove(&pool).await;
@@ -1112,6 +1137,7 @@ async fn a_quarantined_settlement_is_collectable_by_an_operator_exactly_once() {
     // gives up; the row is then parked exactly as eight failures would
     // leave it.
     let _fault_guard = FAULT_LOCK.lock().await;
+    let _sweep_guard = SWEEP_LOCK.read().await;
     let fault = SettleFault::install(&pool, request_id, i64::MAX, "P0001").await;
     assert!(session.record(&usage_record(Decimal::ONE)).await.is_err());
     query(
@@ -1184,6 +1210,7 @@ async fn a_transient_intent_write_failure_still_leaves_a_replayable_payload() {
         return;
     };
     let _fault_guard = FAULT_LOCK.lock().await;
+    let _sweep_guard = SWEEP_LOCK.read().await;
     let user_id = create_user(&pool, "intent-retry").await;
     let key = create_key(&pool, user_id).await;
     credit_purchase(&pool, user_id, Decimal::TEN, &unique_session_id(), None)
@@ -1229,6 +1256,7 @@ async fn an_owed_reservation_keeps_encumbering_the_balance_after_it_expires() {
         return;
     };
     let _fault_guard = FAULT_LOCK.lock().await;
+    let _sweep_guard = SWEEP_LOCK.write().await;
     let user_id = create_user(&pool, "owed-encumbrance").await;
     let key = create_key(&pool, user_id).await;
     // Exactly one reservation's worth ($2, the helper's size), so a second
