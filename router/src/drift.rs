@@ -299,6 +299,9 @@ mod tests {
                     provider: "anthropic".to_owned(),
                     model: model.to_owned(),
                     rates: basis,
+                    // Price reconciliation only; #38 extends drift to the
+                    // metadata fields.
+                    metadata: crate::config::ModelMetadata::default(),
                 }],
             },
         );
