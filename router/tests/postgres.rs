@@ -11,13 +11,23 @@ use zerorouter::{
         AuthenticatedKey, AuthenticationError, KeyAuthenticator, generate_api_key, hash_api_key,
     },
     db::{
-        AttemptRecord, AttemptTokens, RequestTelemetry, ReservationBasis, UsageAdmission,
-        UsageRecord, UsageSession, begin_usage_session, migrate, output_token_percentiles,
-        provider_cogs, segment_clamp_stats, user_clamp_loss,
+        AttemptRecord, AttemptTokens, RequestTelemetry, ReservationSize, ReservationSizing,
+        UsageAdmission, UsageRecord, UsageSession, begin_usage_session, migrate,
+        output_token_percentiles, provider_cogs, segment_clamp_stats, user_clamp_loss,
     },
     openai::{OpenAiUsage, TASK_SIGNATURE_SCHEME, TaskSignature, tool_names_digest, usage_cost},
     priority::Priority,
 };
+
+/// The pre-Stage-4 sizing: one measured bound, offered as the full ceiling
+/// with no learned alternative for admission to choose between.
+fn cold_sizing(total_tokens: i64, output_tokens: i64, cost_usd: Decimal) -> ReservationSizing {
+    ReservationSizing::cold(ReservationSize {
+        total_tokens,
+        output_tokens,
+        cost_usd,
+    })
+}
 
 /// A fixed segment key for tests that only need the reservation to carry one.
 fn test_signature(hex: &str) -> TaskSignature {
@@ -103,11 +113,8 @@ async fn postgres_enforces_reservations_revocation_and_append_only_usage() {
     let session = match begin_usage_session(
         &pool,
         &key,
-        1_000,
-        500,
-        Decimal::ONE,
+        cold_sizing(1_000, 500, Decimal::ONE),
         test_signature("0123456789abcdef"),
-        ReservationBasis::Cold,
         false,
     )
     .await
@@ -120,11 +127,8 @@ async fn postgres_enforces_reservations_revocation_and_append_only_usage() {
         begin_usage_session(
             &pool,
             &key,
-            1_000,
-            500,
-            Decimal::from(20),
+            cold_sizing(1_000, 500, Decimal::from(20)),
             test_signature("0123456789abcdef"),
-            ReservationBasis::Cold,
             false,
         )
         .await
@@ -176,22 +180,16 @@ async fn postgres_enforces_reservations_revocation_and_append_only_usage() {
         begin_usage_session(
             &pool,
             &key,
-            800,
-            400,
-            Decimal::ZERO,
+            cold_sizing(800, 400, Decimal::ZERO),
             test_signature("0123456789abcdef"),
-            ReservationBasis::Cold,
-            false
+            false,
         ),
         begin_usage_session(
             &pool,
             &key,
-            800,
-            400,
-            Decimal::ZERO,
+            cold_sizing(800, 400, Decimal::ZERO),
             test_signature("0123456789abcdef"),
-            ReservationBasis::Cold,
-            false
+            false,
         ),
     );
     let mut admitted = 0;
@@ -241,12 +239,9 @@ async fn postgres_enforces_reservations_revocation_and_append_only_usage() {
         begin_usage_session(
             &pool,
             &cached_key,
-            1,
-            1,
-            Decimal::ZERO,
+            cold_sizing(1, 1, Decimal::ZERO),
             test_signature("0123456789abcdef"),
-            ReservationBasis::Cold,
-            false
+            false,
         )
         .await
         .expect("revoked admission must query"),
@@ -299,11 +294,8 @@ async fn admit(pool: &PgPool, key: &AuthenticatedKey) -> UsageSession {
     match begin_usage_session(
         pool,
         key,
-        4_596,
-        500,
-        Decimal::ONE,
+        cold_sizing(4_596, 500, Decimal::ONE),
         test_signature("00112233aabbccdd"),
-        ReservationBasis::Cold,
         false,
     )
     .await
@@ -782,7 +774,11 @@ async fn migration_chain_applies_on_a_fresh_database() {
     let fresh_url = swap_database(&base, &fresh_db);
     // Nothing inside may panic: the DROP below is the only cleanup, so every
     // step reports through the Result and the assertions run after the drop.
-    let outcome: anyhow::Result<(bool, bool, bool, bool, bool, bool, i64)> = async {
+    // One bool per per-migration probe, then the chain-head version. A named
+    // struct would outlive its usefulness the moment the next migration adds
+    // a probe; the tuple grows in one place and the assertions name the facts.
+    #[allow(clippy::type_complexity)]
+    let outcome: anyhow::Result<(bool, bool, bool, bool, bool, bool, bool, i64)> = async {
         let pool = PgPoolOptions::new()
             .max_connections(1)
             .connect_with(PgConnectOptions::from_str(&fresh_url)?)
@@ -829,6 +825,16 @@ async fn migration_chain_applies_on_a_fresh_database() {
         )
         .fetch_one(&pool)
         .await?;
+        let dispatched_marker_exists = query_scalar::<_, bool>(
+            r#"
+            SELECT COUNT(*) = 1
+            FROM information_schema.columns
+            WHERE table_name = 'usage_reservations'
+              AND column_name = 'dispatched_at'
+            "#,
+        )
+        .fetch_one(&pool)
+        .await?;
         let version = query_scalar::<_, i64>("SELECT MAX(version) FROM _sqlx_migrations")
             .fetch_one(&pool)
             .await?;
@@ -840,6 +846,7 @@ async fn migration_chain_applies_on_a_fresh_database() {
             settlement_outbox_exists,
             ledger_honesty_exists,
             freeze_state_exists,
+            dispatched_marker_exists,
             version,
         ))
     }
@@ -850,7 +857,7 @@ async fn migration_chain_applies_on_a_fresh_database() {
         .execute(&admin)
         .await;
 
-    let outcome = outcome.expect("the 0001->0009 chain must apply on a fresh database");
+    let outcome = outcome.expect("the 0001->0014 chain must apply on a fresh database");
     assert!(outcome.0, "request_attempts exists after the fresh chain");
     assert!(
         outcome.1,
@@ -872,10 +879,15 @@ async fn migration_chain_applies_on_a_fresh_database() {
         outcome.5,
         "the 0009 freeze-state columns exist after the chain"
     );
-    // 13, not 10: 0013 (dispute resolution) is numbered with a gap so that
-    // 0010-0012 stay available to branches in flight. The chain's head is the
-    // highest version applied, not a count of files.
-    assert_eq!(outcome.6, 13, "the chain reaches migration version 13");
+    assert!(
+        outcome.6,
+        "the 0014 dispatched_at column exists after the chain"
+    );
+    // 14, not 10: 0013 (dispute resolution) and 0014 (dispatched
+    // reservations) are numbered with a gap so 0010-0012 stay available to
+    // branches in flight. The chain's head is the highest version applied,
+    // not a count of files.
+    assert_eq!(outcome.7, 14, "the chain reaches migration version 14");
 }
 
 /// Rewrite the database name in a Postgres URL, keeping any query string

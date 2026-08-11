@@ -1,4 +1,10 @@
-use std::{borrow::Cow, env, str::FromStr, time::Duration};
+use std::{
+    borrow::Cow,
+    env,
+    str::FromStr,
+    sync::atomic::{AtomicBool, Ordering},
+    time::Duration,
+};
 
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Utc};
@@ -579,8 +585,86 @@ pub struct UsageSession {
     estimator_basis: ReservationBasis,
 }
 
+/// One candidate reservation size: what admission would check the caps and the
+/// prepaid balance against if it chose this sizing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReservationSize {
+    /// Input + output token bound, checked against the velocity caps.
+    pub total_tokens: i64,
+    /// The output-token bound alone, carried to settle as provenance.
+    pub output_tokens: i64,
+    /// Sell-price ceiling, checked against the spend caps and the balance.
+    pub cost_usd: Decimal,
+}
+
+/// The sizings admission chooses between, and the reason the choice is made
+/// here rather than at the call site.
+///
+/// The estimator's learned sizing is decided in `chat_completions` from the
+/// segment's warm percentiles. It cannot also decide whether the user is
+/// running enough concurrent requests for that sizing to be safe, because that
+/// count is only trustworthy under the per-user advisory lock — which
+/// admission takes, and the caller does not hold. So the caller offers both
+/// sizings and admission picks one with the count in hand.
+pub struct ReservationSizing {
+    /// The estimator's sizing, when every Stage-4 gate passed. `None` means
+    /// the caller already decided on the full ceiling and there is nothing to
+    /// choose between.
+    pub learned: Option<ReservationSize>,
+    /// The full requested ceiling — today's cold sizing, and the fallback the
+    /// concurrency gate reverts to.
+    pub full: ReservationSize,
+}
+
+impl ReservationSizing {
+    /// A request that is not eligible for learned sizing at all.
+    #[must_use]
+    pub fn cold(full: ReservationSize) -> Self {
+        Self {
+            learned: None,
+            full,
+        }
+    }
+}
+
 const DATABASE_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
 const RESERVATION_TTL: Duration = Duration::from_secs(20 * 60);
+
+/// Live reservations a user may already hold and still have this request sized
+/// by the estimator. At or above it, the request reserves the full requested
+/// ceiling instead.
+///
+/// # The overrun this bounds
+///
+/// A learned reservation is floored at 25% of the request's own `max_tokens`
+/// (design doc, "Use — reservation sizing only, never billing"), while the
+/// FULL `max_tokens` still goes upstream: the reservation narrows, the
+/// generation limit does not. One request therefore encumbers as little as a
+/// quarter of what it may be delivered. Serially that is fine — settlement
+/// bills metered actuals and the debit clamp makes any under-reservation
+/// ZeroRouter's tail rather than the customer's. Concurrently it is not: k
+/// same-shape requests admitted together encumber k/4 requests' worth of
+/// balance while up to k requests' worth of tokens is generated, so at k = 4 a
+/// user has prepaid for one request and may receive four (sol review #1).
+///
+/// The gate caps k rather than the ratio. At most this many live reservations
+/// can have been sized learned, because the (N+1)th admission sees N live and
+/// reverts; everything after it encumbers honestly. With the limit at 2 the
+/// worst case is 2 x 0.75 = 1.5 requests' worth of unencumbered ceiling,
+/// bounded and constant, instead of growing with the concurrency a caller
+/// chooses.
+///
+/// This is a SIZING gate, never an admission gate: the request still runs. A
+/// user who wants more concurrency gets it, and simply pays the full ceiling's
+/// encumbrance for it — which is exactly what the pre-Stage-4 router did for
+/// every request.
+///
+/// Not configurable. The money-policy constants in this file
+/// (`RESERVATION_TTL`, `MAX_SETTLE_ATTEMPTS`) and in the estimator
+/// (`RESERVATION_FLOOR_FRACTION`, `TAIL_GATE_RATIO`) are all plain constants;
+/// the crate's env-var surface is deployment configuration (credentials, bind
+/// address, feature groups), and this is not that.
+pub const LEARNED_SIZING_CONCURRENCY_LIMIT: i64 = 2;
 
 /// Settle transactions one request may run before it hands the durable intent
 /// to the recovery sweep. Bounded on purpose: the client is already waiting
@@ -608,6 +692,18 @@ const MAX_SETTLE_ATTEMPTS: i32 = 8;
 /// version this build does not know is quarantined, never guessed at: the
 /// alternative is deserializing an unknown shape into a wrong charge.
 const SETTLEMENT_INTENT_VERSION: u8 = 1;
+
+/// Why the expiry sweep parked a reservation that holds no settlement intent.
+///
+/// Written into `last_settle_error` because that is the only free-text column
+/// `zerorouter admin owed-settlements` prints, and this class of row has no
+/// settle failure to report — it never got as far as a settle. The wording
+/// says what an operator has to do, because nothing automatic can: there is no
+/// stored payload, so the amount owed has to come from the provider's own
+/// usage records rather than from ZeroRouter.
+const DISPATCHED_WITHOUT_INTENT: &str = "dispatched upstream but expired holding no settlement intent: inference was \
+     delivered and its charge was never recorded; reconcile against the provider's \
+     usage records";
 
 pub async fn database_pool_from_env() -> Result<PgPool> {
     let pool = if let Ok(database_url) = env::var("DATABASE_URL") {
@@ -746,6 +842,15 @@ pub async fn migrate(pool: &PgPool) -> Result<()> {
                 Cow::Borrowed(include_str!("../migrations/0013_dispute_resolution.sql")),
                 false,
             ),
+            Migration::new(
+                14,
+                Cow::Borrowed("dispatched reservations"),
+                MigrationType::Simple,
+                Cow::Borrowed(include_str!(
+                    "../migrations/0014_dispatched_reservations.sql"
+                )),
+                false,
+            ),
         ]),
         ignore_missing: false,
         locking: true,
@@ -757,21 +862,19 @@ pub async fn migrate(pool: &PgPool) -> Result<()> {
         .context("database migration failed")
 }
 
-#[allow(clippy::too_many_arguments)]
 pub async fn begin_usage_session(
     pool: &PgPool,
     key: &AuthenticatedKey,
-    reserved_tokens: i64,
-    reserved_output_tokens: i64,
-    reserved_cost_usd: Decimal,
+    sizing: ReservationSizing,
     task_signature: TaskSignature,
-    estimator_basis: ReservationBasis,
     require_credits: bool,
 ) -> Result<UsageAdmission, sqlx::Error> {
-    if reserved_tokens < 0 || reserved_output_tokens < 0 || reserved_cost_usd < Decimal::ZERO {
-        return Err(sqlx::Error::Protocol(
-            "usage reservation cannot be negative".to_owned(),
-        ));
+    for size in [Some(sizing.full), sizing.learned].into_iter().flatten() {
+        if size.total_tokens < 0 || size.output_tokens < 0 || size.cost_usd < Decimal::ZERO {
+            return Err(sqlx::Error::Protocol(
+                "usage reservation cannot be negative".to_owned(),
+            ));
+        }
     }
 
     let mut transaction = pool.begin().await?;
@@ -907,35 +1010,74 @@ pub async fn begin_usage_session(
         Some(None) => {}
     }
 
-    // Reclaim expired reservations, but only the ones that owe nothing. A row
-    // carrying a settlement intent is money the customer already received and
-    // ZeroRouter has not yet recorded; deleting it (which is what this sweep
-    // used to do unconditionally) erases the charge, the usage event, and every
-    // trace that either was owed. Those are quarantined instead — parked for
-    // reconciliation and readable through [`quarantined_settlements`].
+    // Reclaim expired reservations, but only the ones that prove nothing
+    // happened. An expired row falls into exactly one of three classes, and
+    // only the first may be deleted:
     //
-    // A quarantined row stays VISIBLE to the aggregates below, and that is
-    // the point: it represents money the customer received and ZeroRouter
-    // has not collected, so it must keep encumbering the balance and the
-    // caps until it is settled or written off. (This comment previously
-    // claimed the opposite — that surviving rows were invisible to
-    // admission "exactly as a deleted one was" — which is precisely the
-    // hole: the same balance could fund a second request while the first
-    // debt stood.)
+    //   never dispatched, no intent  -> reclaim. The walk never reached an
+    //     upstream, so no inference exists to bill and the encumbrance is
+    //     genuinely free to release. This is the original behavior and it is
+    //     the only case it was ever right for.
+    //
+    //   dispatched, holds an intent  -> quarantine. Money the customer already
+    //     received and ZeroRouter has not yet recorded; deleting it (which is
+    //     what this sweep used to do unconditionally) erases the charge, the
+    //     usage event, and every trace that either was owed. Parked for
+    //     reconciliation instead, readable through [`quarantined_settlements`]
+    //     and replayable by [`recover_owed_settlements`] from its payload.
+    //
+    //   dispatched, holds NO intent  -> quarantine, never reclaim. The request
+    //     WAS sent upstream and the intent write never landed: it failed
+    //     permanently, or the process died between the answer and the intent.
+    //     Without `dispatched_at` this row is byte-identical to one whose walk
+    //     never dispatched, so the sweep reclaimed it and delivered inference
+    //     was silently forgiven — no event, no debit, no record that anything
+    //     was owed (sol review #3, structural half). There is no payload to
+    //     replay, so quarantine here buys visibility, not collection: an
+    //     operator sees it with a NULL owed amount and reconciles it against
+    //     the provider's own usage records.
+    //
+    // A quarantined row that carries an INTENT stays VISIBLE to the aggregates
+    // below, and that is the point: it represents money the customer received
+    // and ZeroRouter has not collected, so it must keep encumbering the
+    // balance and the caps until it is settled or written off. (This comment
+    // previously claimed the opposite — that surviving rows were invisible to
+    // admission "exactly as a deleted one was" — which is precisely the hole:
+    // the same balance could fund a second request while the first debt
+    // stood.) An intentless dispatched row is NOT made to encumber: its debt
+    // has no known size and no way to be collected or released, so freezing a
+    // customer's balance against it forever is a policy decision for the repo
+    // owner rather than a side effect of recording the fact.
     sqlx::query(
-        "DELETE FROM usage_reservations WHERE expires_at <= NOW() AND settlement_intent IS NULL",
+        r#"
+        DELETE FROM usage_reservations
+        WHERE expires_at <= NOW()
+          AND settlement_intent IS NULL
+          AND dispatched_at IS NULL
+        "#,
     )
     .execute(&mut *transaction)
     .await?;
+    // Both quarantine classes in one statement, so the reason a row was parked
+    // travels with the parking. `last_settle_error` is the only free-text
+    // column `admin owed-settlements` prints, and an intentless row has no
+    // settle error to report, so it carries the explanation instead —
+    // COALESCEd, so a genuine settle failure is never overwritten.
     sqlx::query(
         r#"
         UPDATE usage_reservations
-        SET quarantined_at = NOW()
+        SET quarantined_at = NOW(),
+            last_settle_error = CASE
+                WHEN settlement_intent IS NULL
+                    THEN COALESCE(last_settle_error, $1)
+                ELSE last_settle_error
+            END
         WHERE expires_at <= NOW()
-          AND settlement_intent IS NOT NULL
           AND quarantined_at IS NULL
+          AND (settlement_intent IS NOT NULL OR dispatched_at IS NOT NULL)
         "#,
     )
+    .bind(DISPATCHED_WITHOUT_INTENT)
     .execute(&mut *transaction)
     .await?;
 
@@ -1014,7 +1156,8 @@ pub async fn begin_usage_session(
         user_active_reserved_tokens,
         active_reserved_cost,
         active_reserved_tokens,
-    ) = sqlx::query_as::<_, (Decimal, i64, Decimal, i64)>(
+        user_live_reservations,
+    ) = sqlx::query_as::<_, (Decimal, i64, Decimal, i64, i64)>(
         r#"
         SELECT
             COALESCE(SUM(usage_reservations.reserved_cost_usd), 0),
@@ -1030,7 +1173,16 @@ pub async fn begin_usage_session(
                     WHERE usage_reservations.api_key_id = $2
                 ),
                 0
-            )::BIGINT
+            )::BIGINT,
+            -- How many requests this user has in flight right now, for the
+            -- learned-sizing concurrency gate below. Counted off the same scan
+            -- as the encumbrance sums, so the gate costs no extra round trip,
+            -- and restricted to the unexpired arm: a row that outlived its TTL
+            -- while still owing is a DEBT, not a concurrent request. It goes
+            -- on encumbering the balance through the sum above; it must not
+            -- also make every later request of that user reserve full ceiling
+            -- forever.
+            COUNT(*) FILTER (WHERE usage_reservations.expires_at > NOW())::BIGINT
         FROM usage_reservations
         INNER JOIN api_keys ON api_keys.id = usage_reservations.api_key_id
         WHERE api_keys.user_id = $1
@@ -1051,6 +1203,51 @@ pub async fn begin_usage_session(
     .bind(key.id)
     .fetch_one(&mut *transaction)
     .await?;
+
+    // The learned-sizing concurrency gate (sol review #1). The estimator's
+    // sizing encumbers as little as a quarter of the ceiling that still goes
+    // upstream, which is safe one request at a time and is not safe k at a
+    // time — see [`LEARNED_SIZING_CONCURRENCY_LIMIT`] for the arithmetic. A
+    // user already running that many live requests gets the full ceiling for
+    // this one.
+    //
+    // # Why the count is race-safe
+    //
+    // It is read inside the transaction that already holds
+    // `pg_advisory_xact_lock` on this user, from the same statement as the
+    // encumbrance sums, and it decides a value used by the INSERT that commits
+    // with that lock still held. Two simultaneous admissions for one user are
+    // therefore strictly ordered by the lock: the first commits its reservation
+    // before the second's count runs, so the second cannot fail to see it.
+    // Under READ COMMITTED an uncommitted sibling would be invisible to this
+    // count — which is exactly what the lock rules out, and the same property
+    // the balance check has always depended on.
+    //
+    // # Why the decision has to be here
+    //
+    // The caller sizes learned from the estimator cache, outside any
+    // transaction, and could not take this lock without restructuring
+    // admission around it. Offering both sizings and choosing one under the
+    // lock keeps the ordering, the gates, and the INSERT exactly as they were,
+    // and adds a branch rather than a round trip.
+    let (reserved_tokens, reserved_output_tokens, reserved_cost_usd, estimator_basis) =
+        match sizing.learned {
+            Some(learned) if user_live_reservations < LEARNED_SIZING_CONCURRENCY_LIMIT => (
+                learned.total_tokens,
+                learned.output_tokens,
+                learned.cost_usd,
+                ReservationBasis::Learned,
+            ),
+            // Not eligible, or eligible but too concurrent. Either way the
+            // request still RUNS — this gate sizes, it never refuses — it just
+            // encumbers what it may actually be delivered.
+            _ => (
+                sizing.full.total_tokens,
+                sizing.full.output_tokens,
+                sizing.full.cost_usd,
+                ReservationBasis::Cold,
+            ),
+        };
 
     // Both ceilings are enforced and the tighter one wins: a request is
     // admitted only if it fits under the presenting key's own cap AND under the
@@ -1174,6 +1371,70 @@ impl UsageSession {
         format!("chatcmpl-{}", self.reservation_id.simple())
     }
 
+    /// The output-token bound admission actually reserved against.
+    ///
+    /// Which of the offered sizings won is decided inside admission, under the
+    /// per-user lock, so the caller has to read it back rather than assume it.
+    /// The caller's own `reservation_usage` — the bound it bills against when
+    /// an upstream reports no usage — must be rebuilt from this, or a request
+    /// the concurrency gate re-sized would settle its fallback against a
+    /// reservation it no longer matches.
+    #[must_use]
+    pub fn reserved_output_tokens(&self) -> u32 {
+        // Non-negative by construction: every offered sizing is validated at
+        // the top of `begin_usage_session`.
+        self.reserved_output_tokens.unsigned_abs()
+    }
+
+    /// Which sizing admission chose. `Learned` only when the estimator's
+    /// sizing survived the concurrency gate.
+    #[must_use]
+    pub fn estimator_basis(&self) -> ReservationBasis {
+        self.estimator_basis
+    }
+
+    /// Record that this request has begun an upstream call.
+    ///
+    /// This is what lets the expiry sweep tell "the customer received tokens
+    /// and the paperwork was lost" apart from "nothing ever happened". Without
+    /// it the two are the same row and the sweep reclaims both, forgiving
+    /// delivered inference in silence (migration 0010).
+    ///
+    /// # Why it is fire-and-forget
+    ///
+    /// The request path may not grow a round trip that can fail a request, and
+    /// there is no existing write at dispatch time to piggyback on — admission
+    /// committed before the route was built, and the next write is the
+    /// settlement intent, which is precisely the write this marker exists to
+    /// survive the absence of. So the UPDATE is spawned and never awaited: it
+    /// runs concurrently with the upstream call, adds nothing to latency, and
+    /// its failure is a WARN rather than a customer-visible error.
+    ///
+    /// The cost of that choice is stated rather than hidden: the marker is
+    /// best effort. A process that dies inside its own marker round trip
+    /// leaves an unmarked dispatched row, which the sweep will still reclaim.
+    /// The window this closes is the whole upstream call — seconds to the
+    /// fifteen-minute budget; the window it leaves open is one statement.
+    ///
+    /// Idempotent and safe to call more than once: `dispatched_at IS NULL`
+    /// keeps the FIRST dispatch's timestamp, and a row already consumed by a
+    /// settle simply matches nothing.
+    ///
+    /// Handed out as a detached [`DispatchMarker`] rather than called on the
+    /// session, because both walks reach their dispatch inside a
+    /// `tokio::select!` whose other arm moves the session into a settle
+    /// terminal. The marker owns everything it needs, so recording a dispatch
+    /// never contends with settling one.
+    #[must_use]
+    pub fn dispatch_marker(&self) -> DispatchMarker {
+        DispatchMarker {
+            pool: self.pool.clone(),
+            reservation_id: self.reservation_id,
+            api_key_id: self.api_key_id,
+            fired: AtomicBool::new(false),
+        }
+    }
+
     /// Settle this request.
     ///
     /// Two durable steps, in this order and never the other way round:
@@ -1253,6 +1514,67 @@ impl UsageSession {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+}
+
+/// Records that a reservation's request reached an upstream.
+///
+/// See [`UsageSession::dispatch_marker`] for why this exists as a detached
+/// handle and why the write is fire-and-forget.
+///
+/// Deliberately not `Clone`: the once-only latch is what keeps a walk that
+/// dispatches four times from issuing four statements, and a clone would give
+/// each copy its own latch.
+#[derive(Debug)]
+pub struct DispatchMarker {
+    pool: PgPool,
+    reservation_id: Uuid,
+    api_key_id: Uuid,
+    fired: AtomicBool,
+}
+
+impl DispatchMarker {
+    /// Stamp `dispatched_at` without waiting for it.
+    ///
+    /// Call this at the moment the upstream call begins — not when the walk is
+    /// chosen, and not after the answer returns. A walk cancelled before it
+    /// dispatched has genuinely delivered nothing and must stay reclaimable.
+    ///
+    /// Every rung of a walk calls this and only the first one writes. The
+    /// column answers "did this request ever reach an upstream", which the
+    /// first dispatch settles for good; a later rung's statement could only
+    /// match zero rows, and it would still cost a pooled connection at the
+    /// exact moment the walk is retrying and the settle is coming.
+    pub fn fire(&self) {
+        if self.fired.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        let pool = self.pool.clone();
+        let reservation_id = self.reservation_id;
+        let api_key_id = self.api_key_id;
+        tokio::spawn(async move {
+            let marked = sqlx::query(
+                r#"
+                UPDATE usage_reservations
+                SET dispatched_at = NOW()
+                WHERE id = $1 AND api_key_id = $2 AND dispatched_at IS NULL
+                "#,
+            )
+            .bind(reservation_id)
+            .bind(api_key_id)
+            .execute(&pool)
+            .await;
+            if let Err(error) = marked {
+                // Not an error for the customer — the request is unaffected —
+                // but it is the loss of the only evidence that would stop this
+                // reservation being reclaimed as though it had never run.
+                tracing::warn!(
+                    request_id = %reservation_id,
+                    error = %error,
+                    "dispatch marker could not be written; if this request's settlement is also lost, its expired reservation will be reclaimed instead of quarantined"
+                );
+            }
+        });
     }
 }
 

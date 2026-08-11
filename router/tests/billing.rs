@@ -18,13 +18,23 @@ use zerorouter::{
         ledger_entries, record_checkout_intent, settle_checkout_intent,
     },
     db::{
-        RequestTelemetry, ReservationBasis, UsageAdmission, UsageRecord, UsageSession,
-        begin_usage_session, migrate, quarantined_settlements, recover_owed_settlements,
-        recover_quarantined_settlement,
+        LEARNED_SIZING_CONCURRENCY_LIMIT, RequestTelemetry, ReservationBasis, ReservationSize,
+        ReservationSizing, UsageAdmission, UsageRecord, UsageSession, begin_usage_session, migrate,
+        quarantined_settlements, recover_owed_settlements, recover_quarantined_settlement,
     },
     openai::{OpenAiUsage, TASK_SIGNATURE_SCHEME, TaskSignature, tool_names_digest},
     priority::Priority,
 };
+
+/// The pre-Stage-4 sizing: one measured bound, offered as the full ceiling
+/// with no learned alternative for admission to choose between.
+fn cold_sizing(total_tokens: i64, output_tokens: i64, cost_usd: Decimal) -> ReservationSizing {
+    ReservationSizing::cold(ReservationSize {
+        total_tokens,
+        output_tokens,
+        cost_usd,
+    })
+}
 
 /// A fixed segment key for tests that only need the reservation to carry one.
 fn test_signature() -> TaskSignature {
@@ -270,11 +280,8 @@ async fn usage_settlement_debits_the_balance_exactly_once() {
     let session = match begin_usage_session(
         &pool,
         &key,
-        1_000,
-        500,
-        Decimal::from(2),
+        cold_sizing(1_000, 500, Decimal::from(2)),
         test_signature(),
-        ReservationBasis::Cold,
         true,
     )
     .await
@@ -341,12 +348,9 @@ async fn credit_admission_fails_closed_and_cannot_jointly_overdraw() {
         begin_usage_session(
             &pool,
             &key_a,
-            100,
-            50,
-            Decimal::from(2),
+            cold_sizing(100, 50, Decimal::from(2)),
             test_signature(),
-            ReservationBasis::Cold,
-            true
+            true,
         )
         .await
         .expect("underfunded admission must query"),
@@ -357,11 +361,8 @@ async fn credit_admission_fails_closed_and_cannot_jointly_overdraw() {
     match begin_usage_session(
         &pool,
         &key_a,
-        100,
-        50,
-        Decimal::from(2),
+        cold_sizing(100, 50, Decimal::from(2)),
         test_signature(),
-        ReservationBasis::Cold,
         false,
     )
     .await
@@ -388,22 +389,16 @@ async fn credit_admission_fails_closed_and_cannot_jointly_overdraw() {
         begin_usage_session(
             &pool,
             &key_a,
-            100,
-            50,
-            Decimal::from(2),
+            cold_sizing(100, 50, Decimal::from(2)),
             test_signature(),
-            ReservationBasis::Cold,
-            true
+            true,
         ),
         begin_usage_session(
             &pool,
             &key_b,
-            100,
-            50,
-            Decimal::from(2),
+            cold_sizing(100, 50, Decimal::from(2)),
             test_signature(),
-            ReservationBasis::Cold,
-            true
+            true,
         ),
     );
     let mut admitted = 0;
@@ -505,11 +500,8 @@ async fn settlement_debit_is_clamped_to_the_reservation_and_cannot_overdraw() {
     let session = match begin_usage_session(
         &pool,
         &key,
-        1_000,
-        500,
-        Decimal::from(2),
+        cold_sizing(1_000, 500, Decimal::from(2)),
         test_signature(),
-        ReservationBasis::Cold,
         true,
     )
     .await
@@ -554,11 +546,8 @@ async fn cap_only_settlement_records_usage_without_touching_the_balance() {
     let session = match begin_usage_session(
         &pool,
         &key,
-        1_000,
-        500,
-        Decimal::from(2),
+        cold_sizing(1_000, 500, Decimal::from(2)),
         test_signature(),
-        ReservationBasis::Cold,
         false,
     )
     .await
@@ -750,11 +739,8 @@ async fn admit(pool: &PgPool, key: &AuthenticatedKey, require_credits: bool) -> 
     match begin_usage_session(
         pool,
         key,
-        1_000,
-        500,
-        Decimal::from(2),
+        cold_sizing(1_000, 500, Decimal::from(2)),
         test_signature(),
-        ReservationBasis::Cold,
         require_credits,
     )
     .await
@@ -1100,6 +1086,505 @@ async fn an_expired_reservation_owing_a_settlement_is_quarantined_not_deleted() 
     assert!(entry.last_settle_error.is_some());
 }
 
+/// Age one reservation past its TTL and state the two facts the expiry sweep
+/// classifies on: whether the walk ever dispatched, and whether a settlement
+/// is owed.
+///
+/// The row itself comes from a real admission, so every other column is what
+/// admission writes; only the three timestamps and the payload are stated. All
+/// of them land two hours back together, which keeps the row's ordering CHECKs
+/// (`expires_at > created_at`, `settlement_intent_at >= created_at`) satisfied
+/// exactly as a genuinely old row would.
+///
+/// The intent payload is a stand-in: the sweep classifies on the column being
+/// non-NULL and never reads it, and a test that needs a REPLAYABLE payload
+/// gets one from a real failed settle instead (see the fault-injection tests).
+async fn expire_reservation(pool: &PgPool, reservation_id: Uuid, dispatched: bool, owes: bool) {
+    query(
+        r#"
+        UPDATE usage_reservations
+        SET created_at = NOW() - INTERVAL '2 hours',
+            expires_at = NOW() - INTERVAL '100 minutes',
+            dispatched_at = CASE WHEN $2 THEN NOW() - INTERVAL '110 minutes' END,
+            settlement_intent = CASE WHEN $3 THEN '{"version": 1}'::JSONB END,
+            settlement_intent_at = CASE WHEN $3 THEN NOW() - INTERVAL '110 minutes' END
+        WHERE id = $1
+        "#,
+    )
+    .bind(reservation_id)
+    .bind(dispatched)
+    .bind(owes)
+    .execute(pool)
+    .await
+    .expect("reservation ageing must apply");
+}
+
+/// `(survives, quarantined, last_settle_error)` for one reservation.
+async fn swept_state(pool: &PgPool, reservation_id: Uuid) -> (bool, bool, Option<String>) {
+    let row = query_as::<_, (bool, Option<String>)>(
+        "SELECT quarantined_at IS NOT NULL, last_settle_error
+         FROM usage_reservations WHERE id = $1",
+    )
+    .bind(reservation_id)
+    .fetch_optional(pool)
+    .await
+    .expect("reservation state must query");
+    row.map_or((false, false, None), |(quarantined, error)| {
+        (true, quarantined, error)
+    })
+}
+
+/// The hole sol's review named, closed. A reservation whose request WAS sent
+/// upstream but which holds no settlement intent — the intent write failed
+/// permanently, or the process died between the answer and the intent — used
+/// to be byte-identical to one whose walk never dispatched at all. The sweep
+/// reclaimed it: the customer kept the tokens, the encumbrance was released,
+/// and nothing anywhere recorded that anything had been owed.
+///
+/// `dispatched_at` is what tells the two apart, and a dispatched row is now
+/// parked for an operator instead of erased. There is no payload to replay, so
+/// what quarantine buys here is visibility — the row is listed with a NULL
+/// owed amount and a stated reason, which is exactly the state of knowledge:
+/// inference was delivered and ZeroRouter cannot say what it was worth.
+#[tokio::test]
+async fn an_expired_dispatched_reservation_owing_no_intent_is_quarantined_not_reclaimed() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let _sweep_guard = SWEEP_LOCK.write().await;
+    let user_id = create_user(&pool, "dispatched-intentless").await;
+    let key = create_key(&pool, user_id).await;
+
+    let lost = request_uuid(&admit(&pool, &key, false).await);
+    expire_reservation(&pool, lost, true, false).await;
+
+    // Any admission runs the sweep.
+    let _sweeper = admit(&pool, &key, false).await;
+
+    let (survives, quarantined, reason) = swept_state(&pool, lost).await;
+    assert!(
+        survives,
+        "a reservation that was dispatched upstream must never be silently reclaimed"
+    );
+    assert!(
+        quarantined,
+        "a dispatched reservation holding no intent belongs in the operator queue"
+    );
+    assert!(
+        reason.is_some_and(|reason| reason.contains("no settlement intent")),
+        "the queue has to say why the row is parked; nothing else on it explains a NULL owed amount"
+    );
+
+    let parked = quarantined_settlements(&pool, 500)
+        .await
+        .expect("quarantine must query");
+    let entry = parked
+        .iter()
+        .find(|entry| entry.request_id == lost)
+        .expect("the lost charge must be listed for reconciliation");
+    assert_eq!(entry.api_key_id, key.id);
+    assert_eq!(
+        entry.owed_cost_usd, None,
+        "there is no stored payload, so the queue must not claim to know the amount"
+    );
+    assert_eq!(
+        entry.reserved_cost_usd,
+        Decimal::from(2),
+        "the admission ceiling is still the one bound an operator has to work from"
+    );
+
+    // Nothing automatic may act on this row: there is no payload to replay, so
+    // a recovery pass must leave it exactly where the operator can see it.
+    // Asserted on the row, not on the pass's counters — the recovery sweep is
+    // global and another test's owed row may legitimately be settled by it.
+    recover_owed_settlements(&pool, 500)
+        .await
+        .expect("recovery must query");
+    recover_quarantined_settlement(&pool, lost)
+        .await
+        .expect("operator collection must query");
+    let (survives, quarantined, _) = swept_state(&pool, lost).await;
+    assert!(
+        survives && quarantined,
+        "with no payload there is nothing to replay: neither the automatic \
+         sweep nor the operator command may consume this row"
+    );
+    drop_reservations(&pool, key.id).await;
+}
+
+/// The sweep's three classes are a partition, and only one of them may delete.
+/// Asserted in a single sweep so the classification cannot be right for one
+/// row by being wrong about which class it is in.
+#[tokio::test]
+async fn expiry_reclaims_only_the_reservation_that_never_dispatched() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let _sweep_guard = SWEEP_LOCK.write().await;
+    let user_id = create_user(&pool, "sweep-partition").await;
+    let key = create_key(&pool, user_id).await;
+
+    // Never dispatched, owes nothing: the request never reached an upstream,
+    // so there is genuinely nothing to bill and the encumbrance is free.
+    let never_ran = request_uuid(&admit(&pool, &key, false).await);
+    expire_reservation(&pool, never_ran, false, false).await;
+    // Dispatched, owes a settlement: 0006's class, unchanged.
+    let owes = request_uuid(&admit(&pool, &key, false).await);
+    expire_reservation(&pool, owes, true, true).await;
+    // Dispatched, owes nothing: delivered inference whose charge was lost.
+    let lost = request_uuid(&admit(&pool, &key, false).await);
+    expire_reservation(&pool, lost, true, false).await;
+
+    let _sweeper = admit(&pool, &key, false).await;
+
+    assert_eq!(
+        swept_state(&pool, never_ran).await,
+        (false, false, None),
+        "an expired reservation that never dispatched is still reclaimed"
+    );
+    let (owes_survives, owes_quarantined, _) = swept_state(&pool, owes).await;
+    assert!(
+        owes_survives && owes_quarantined,
+        "an expired reservation carrying an intent is still quarantined, not deleted"
+    );
+    let (lost_survives, lost_quarantined, _) = swept_state(&pool, lost).await;
+    assert!(
+        lost_survives && lost_quarantined,
+        "an expired reservation that dispatched without an intent is quarantined, not deleted"
+    );
+    drop_reservations(&pool, key.id).await;
+}
+
+/// The full requested ceiling used by the concurrency-gate tests, in the three
+/// units admission checks: tokens against velocity, output tokens as
+/// provenance, dollars against the spend cap and the balance.
+const FULL_CEILING: ReservationSize = ReservationSize {
+    total_tokens: 4_000,
+    output_tokens: 4_000,
+    cost_usd: Decimal::from_parts(4, 0, 0, false, 0),
+};
+
+/// A request the estimator sized, offering admission both options.
+///
+/// The learned arm is a quarter of the ceiling on every dimension — Stage 4's
+/// floor (`max(p99 x 1.25, 0.25 x requested_max)`), and therefore the largest
+/// gap between what is encumbered and what may be delivered that learned
+/// sizing can produce. It is the worst case the gate exists to bound, which is
+/// why it is the case under test.
+fn learned_sizing() -> ReservationSizing {
+    ReservationSizing {
+        learned: Some(ReservationSize {
+            total_tokens: 1_000,
+            output_tokens: 1_000,
+            cost_usd: Decimal::ONE,
+        }),
+        full: FULL_CEILING,
+    }
+}
+
+/// Offer both sizings and report which one admission took, or `None` when the
+/// request was not admitted at all.
+async fn admit_learned(
+    pool: &PgPool,
+    key: &AuthenticatedKey,
+    require_credits: bool,
+) -> Option<ReservationBasis> {
+    match begin_usage_session(
+        pool,
+        key,
+        learned_sizing(),
+        test_signature(),
+        require_credits,
+    )
+    .await
+    .expect("admission must query")
+    {
+        UsageAdmission::Allowed(session) => Some(session.estimator_basis()),
+        UsageAdmission::InsufficientCredits => None,
+        other => panic!(
+            "unexpected admission outcome: {:?}",
+            std::mem::discriminant(&other)
+        ),
+    }
+}
+
+/// Every reservation this key holds, cheapest-first, so a test can say what was
+/// encumbered rather than only how many rows exist.
+async fn reserved_costs(pool: &PgPool, api_key_id: Uuid) -> Vec<Decimal> {
+    query_scalar::<_, Decimal>(
+        "SELECT reserved_cost_usd FROM usage_reservations WHERE api_key_id = $1
+         ORDER BY reserved_cost_usd",
+    )
+    .bind(api_key_id)
+    .fetch_all(pool)
+    .await
+    .expect("reserved costs must query")
+}
+
+/// The learned reservation encumbers a quarter of the ceiling that still goes
+/// upstream, so concurrency multiplies the gap: four same-shape requests are
+/// admitted against roughly one request's worth of balance while four
+/// requests' worth of tokens may be generated (sol review #1).
+///
+/// The remedy is a sizing gate, not an admission gate. A user already holding
+/// the limit's worth of live requests keeps getting served — the next request
+/// simply encumbers the full ceiling it may actually be delivered.
+#[tokio::test]
+async fn learned_sizing_stops_once_the_user_holds_enough_live_reservations() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let _sweep_guard = SWEEP_LOCK.read().await;
+    let user_id = create_user(&pool, "sizing-gate").await;
+    let key = create_key(&pool, user_id).await;
+    credit_purchase(
+        &pool,
+        user_id,
+        Decimal::from(100),
+        &unique_session_id(),
+        None,
+    )
+    .await
+    .expect("funding purchase must apply");
+
+    // Below the limit the estimator's sizing stands: this is Stage 4 working
+    // as designed, and the gate must not take it away.
+    for held in 0..LEARNED_SIZING_CONCURRENCY_LIMIT {
+        assert_eq!(
+            admit_learned(&pool, &key, true).await,
+            Some(ReservationBasis::Learned),
+            "a user holding {held} live reservations is still under the limit"
+        );
+    }
+
+    // At the limit the same request sizes at the full ceiling instead. Not
+    // refused — the basis is what changes.
+    assert_eq!(
+        admit_learned(&pool, &key, true).await,
+        Some(ReservationBasis::Cold),
+        "at the concurrency limit the request runs, and encumbers honestly"
+    );
+
+    let mut expected: Vec<Decimal> = (0..LEARNED_SIZING_CONCURRENCY_LIMIT)
+        .map(|_| Decimal::ONE)
+        .collect();
+    expected.push(FULL_CEILING.cost_usd);
+    assert_eq!(
+        reserved_costs(&pool, key.id).await,
+        expected,
+        "exactly the limit's worth of reservations were sized learned"
+    );
+    drop_reservations(&pool, key.id).await;
+}
+
+/// The gate's count is only worth anything if it cannot be read twice from the
+/// same state. Two admissions launched together, with the user already holding
+/// one live reservation, have exactly one learned slot left between them: if
+/// the count raced, both would read "one live", both would take it, and the
+/// limit would be a suggestion.
+///
+/// What makes it safe is that the count is read inside the transaction holding
+/// this user's `pg_advisory_xact_lock`, from the same statement as the
+/// encumbrance sums, and consumed by an INSERT that commits with the lock still
+/// held — so the two admissions are strictly ordered and the loser sees the
+/// winner's row.
+#[tokio::test]
+async fn two_simultaneous_admissions_cannot_both_take_the_last_learned_slot() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let _sweep_guard = SWEEP_LOCK.read().await;
+    let user_id = create_user(&pool, "sizing-race").await;
+    // Two keys of one user, because the gate is per USER: a per-key count
+    // would be reset by minting a second key, exactly as the spend caps were.
+    let key_a = create_key(&pool, user_id).await;
+    let key_b = create_key(&pool, user_id).await;
+    credit_purchase(
+        &pool,
+        user_id,
+        Decimal::from(100),
+        &unique_session_id(),
+        None,
+    )
+    .await
+    .expect("funding purchase must apply");
+
+    // Fill every learned slot but one.
+    for _ in 1..LEARNED_SIZING_CONCURRENCY_LIMIT {
+        assert_eq!(
+            admit_learned(&pool, &key_a, true).await,
+            Some(ReservationBasis::Learned)
+        );
+    }
+
+    let (first, second) = tokio::join!(
+        admit_learned(&pool, &key_a, true),
+        admit_learned(&pool, &key_b, true),
+    );
+    let mut outcomes = [first, second];
+    outcomes.sort_by_key(|basis| format!("{basis:?}"));
+    assert_eq!(
+        outcomes,
+        [
+            Some(ReservationBasis::Cold),
+            Some(ReservationBasis::Learned)
+        ],
+        "the last learned slot goes to exactly one of the two; the other sizes \
+         at the full ceiling"
+    );
+    drop_reservations(&pool, key_a.id).await;
+    drop_reservations(&pool, key_b.id).await;
+}
+
+/// The overrun, priced. A balance covering exactly one full ceiling used to
+/// admit four learned same-shape requests — four ceilings' worth of generation
+/// against one ceiling's worth of prepaid credit. The gate bounds how many of
+/// those requests may be sized learned, and the credit check does the rest:
+/// once the third request has to reserve the whole ceiling, the balance it
+/// would need is not there.
+///
+/// The bound is honest rather than absolute. Two learned reservations still
+/// under-encumber by 0.75 ceilings each, so the exposure is capped at 1.5
+/// ceilings — a constant, where it used to grow with whatever concurrency the
+/// caller chose.
+#[tokio::test]
+async fn concurrent_learned_admissions_cannot_outrun_the_balance() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let _sweep_guard = SWEEP_LOCK.read().await;
+    let user_id = create_user(&pool, "sizing-overdraw").await;
+    let key = create_key(&pool, user_id).await;
+    credit_purchase(
+        &pool,
+        user_id,
+        FULL_CEILING.cost_usd,
+        &unique_session_id(),
+        None,
+    )
+    .await
+    .expect("funding purchase must apply");
+
+    let (a, b, c, d) = tokio::join!(
+        admit_learned(&pool, &key, true),
+        admit_learned(&pool, &key, true),
+        admit_learned(&pool, &key, true),
+        admit_learned(&pool, &key, true),
+    );
+    let outcomes = [a, b, c, d];
+    let learned = outcomes
+        .iter()
+        .filter(|basis| **basis == Some(ReservationBasis::Learned))
+        .count();
+    assert_eq!(
+        i64::try_from(learned).expect("count fits"),
+        LEARNED_SIZING_CONCURRENCY_LIMIT,
+        "no more than the limit may be sized learned, however many arrive at once"
+    );
+    assert!(
+        outcomes
+            .iter()
+            .all(|basis| *basis != Some(ReservationBasis::Cold)),
+        "the rest could not afford the full ceiling and were refused, not \
+         quietly admitted at the learned size"
+    );
+
+    let reserved: Decimal = reserved_costs(&pool, key.id).await.into_iter().sum();
+    assert!(
+        reserved <= FULL_CEILING.cost_usd,
+        "admission never encumbers more than the balance covers: {reserved} > {}",
+        FULL_CEILING.cost_usd
+    );
+    assert_eq!(
+        balance(&pool, user_id).await.expect("balance must query"),
+        FULL_CEILING.cost_usd,
+        "nothing has settled yet, so nothing is debited"
+    );
+    drop_reservations(&pool, key.id).await;
+}
+
+/// Remove the rows a quarantine test deliberately left behind.
+///
+/// Quarantine's whole contract is that nothing automatic removes these rows,
+/// so a test that plants them has to clear them itself. Without this they
+/// accumulate in a shared development database and crowd out later rows in
+/// `quarantined_settlements`, which reads oldest-first under a caller-supplied
+/// LIMIT.
+async fn drop_reservations(pool: &PgPool, api_key_id: Uuid) {
+    query("DELETE FROM usage_reservations WHERE api_key_id = $1")
+        .bind(api_key_id)
+        .execute(pool)
+        .await
+        .expect("test reservation cleanup must apply");
+}
+
+/// The marker the whole classification rests on. It is fire-and-forget by
+/// design — the request path may not grow a round trip that can fail a request
+/// — so what is pinned here is that the write lands, records the FIRST
+/// dispatch, and is safe to issue on every rung of a walk.
+#[tokio::test]
+async fn the_dispatch_marker_records_the_first_upstream_call() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let _sweep_guard = SWEEP_LOCK.read().await;
+    let user_id = create_user(&pool, "dispatch-marker").await;
+    let key = create_key(&pool, user_id).await;
+    let session = admit(&pool, &key, false).await;
+    let reservation_id = request_uuid(&session);
+
+    assert_eq!(
+        dispatched_at(&pool, reservation_id).await,
+        None,
+        "admission alone has dispatched nothing"
+    );
+
+    let marker = session.dispatch_marker();
+    marker.fire();
+    let first = await_dispatch_marker(&pool, reservation_id).await;
+
+    // A walk fires the marker on every rung it dispatches to, and every rung
+    // after the first must be free: no statement, no pooled connection, and
+    // above all no restatement of the time. "When did this request first reach
+    // an upstream" is the fact the sweep needs, and it is settled by rung one.
+    marker.fire();
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(
+        dispatched_at(&pool, reservation_id).await,
+        Some(first),
+        "a later rung must not overwrite the first dispatch's timestamp"
+    );
+}
+
+async fn dispatched_at(
+    pool: &PgPool,
+    reservation_id: Uuid,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    query_scalar::<_, Option<chrono::DateTime<chrono::Utc>>>(
+        "SELECT dispatched_at FROM usage_reservations WHERE id = $1",
+    )
+    .bind(reservation_id)
+    .fetch_one(pool)
+    .await
+    .expect("dispatch marker must query")
+}
+
+/// Wait for a fire-and-forget marker to land. Polled rather than awaited
+/// because not awaiting it is the point: the request path never blocks on this
+/// write, so a test cannot either.
+async fn await_dispatch_marker(
+    pool: &PgPool,
+    reservation_id: Uuid,
+) -> chrono::DateTime<chrono::Utc> {
+    for _ in 0..200 {
+        if let Some(at) = dispatched_at(pool, reservation_id).await {
+            return at;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("the dispatch marker never landed");
+}
+
 /// The reservation id a session will key every settled row on.
 fn request_uuid(session: &UsageSession) -> Uuid {
     Uuid::parse_str(
@@ -1289,11 +1774,8 @@ async fn an_owed_reservation_keeps_encumbering_the_balance_after_it_expires() {
     let second = begin_usage_session(
         &pool,
         &key,
-        1_000,
-        500,
-        Decimal::from(2),
+        cold_sizing(1_000, 500, Decimal::from(2)),
         test_signature(),
-        ReservationBasis::Cold,
         true,
     )
     .await
@@ -1304,10 +1786,21 @@ async fn an_owed_reservation_keeps_encumbering_the_balance_after_it_expires() {
     );
 
     // And the debt is still collectable, which is the whole point of holding it.
+    //
+    // Which collection path applies is not this test's to choose. The expiry
+    // sweep is GLOBAL — it runs inside every admission, for every user — and
+    // an expired row that still owes is exactly what it quarantines. Once
+    // quarantined the row leaves the automatic scan (`quarantined_at IS NULL`)
+    // and belongs to the operator command instead. Whether some concurrent
+    // admission got there first is a race this test cannot and should not win,
+    // so both collectors are run: they settle the same debt through the same
     age_settlement_intent(&pool, key.id).await;
     recover_owed_settlements(&pool, 100)
         .await
         .expect("recovery must query");
+    recover_quarantined_settlement(&pool, request_uuid(&session))
+        .await
+        .expect("operator collection must query");
     assert_eq!(
         balance(&pool, user_id).await.expect("balance must query"),
         Decimal::ONE,
