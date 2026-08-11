@@ -6,6 +6,7 @@ use uuid::Uuid;
 
 use crate::{
     auth::{generate_api_key, hash_api_key},
+    billing::ResolutionOutcome,
     db::{
         database_pool_from_env, migrate, parse_decimal, provider_cogs, quarantined_settlements,
         recover_owed_settlements, recover_quarantined_settlement,
@@ -42,6 +43,12 @@ pub enum AdminCommand {
     /// chargeback applies (migration 0009) — without it, lifting a freeze
     /// would mean hand-written SQL against the users table.
     SetFrozen(SetFrozenArgs),
+    /// The dispute review workflow: the queue of accounts a chargeback or a
+    /// freeze left needing a decision, one account's full history, and the
+    /// settlement of a receivable. `list` and `show` are read-only; `resolve`
+    /// is the only writer and never changes the freeze state.
+    #[command(subcommand)]
+    Disputes(DisputesCommand),
     /// Disable an existing key.
     RevokeKey(RevokeKeyArgs),
     /// List key metadata without hashes or plaintext credentials.
@@ -125,6 +132,57 @@ pub struct SetFrozenArgs {
     pub off: bool,
 }
 
+#[derive(Debug, Subcommand)]
+pub enum DisputesCommand {
+    /// The review queue: every account that is frozen, owes money, or was
+    /// reversed inside the trailing window. Read-only.
+    List(DisputesListArgs),
+    /// One account in full — freeze state, balance, every ledger entry with
+    /// its Stripe anchors, a usage summary, and live key metadata. Read-only,
+    /// and never prints a key hash or a plaintext key.
+    Show(DisputesShowArgs),
+    /// Settle a receivable: forgive it (`--write-off`) or record money
+    /// recovered outside Stripe (`--recover`). Does NOT unfreeze — "the money
+    /// is settled" and "we trust this account again" are separate decisions,
+    /// and the second one is `set-frozen --off`.
+    Resolve(DisputesResolveArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct DisputesListArgs {
+    /// Trailing window, in days, for the "was reversed recently" trigger. A
+    /// freeze and a negative balance are durable and never age out of this
+    /// list regardless of the window.
+    #[arg(long, default_value_t = 30)]
+    pub days: i32,
+}
+
+#[derive(Debug, Args)]
+pub struct DisputesShowArgs {
+    #[arg(long)]
+    pub email: String,
+}
+
+#[derive(Debug, Args)]
+pub struct DisputesResolveArgs {
+    #[arg(long)]
+    pub email: String,
+    /// Forgive the whole receivable: bring a negative balance up to exactly
+    /// zero. The amount is read from the account under the money lock, never
+    /// passed in, so it cannot overshoot into credit.
+    #[arg(long, conflicts_with = "recover")]
+    pub write_off: bool,
+    /// Record money recovered outside Stripe (a dispute won, a wire received)
+    /// and credit the balance by that amount, in USD.
+    #[arg(long)]
+    pub recover: Option<String>,
+    /// Why. Required rather than defaulted: a resolution points at no Stripe
+    /// object and no request, so this note is the entire record of why an
+    /// operator moved the money.
+    #[arg(long)]
+    pub note: String,
+}
+
 fn parse_priority(value: &str) -> Result<Priority, String> {
     Priority::from_keyword(value)
         .ok_or_else(|| format!("unknown priority '{value}' (expected cost, balanced, or success)"))
@@ -201,6 +259,11 @@ pub async fn run(args: AdminArgs) -> Result<()> {
         AdminCommand::UserStatus(args) => user_status(&pool, args).await,
         AdminCommand::GrantCredit(args) => grant_credit(&pool, args).await,
         AdminCommand::SetFrozen(args) => set_frozen(&pool, args).await,
+        AdminCommand::Disputes(command) => match command {
+            DisputesCommand::List(args) => disputes_list(&pool, args).await,
+            DisputesCommand::Show(args) => disputes_show(&pool, args).await,
+            DisputesCommand::Resolve(args) => disputes_resolve(&pool, args).await,
+        },
         AdminCommand::Treasury(args) => treasury(&pool, args).await,
         AdminCommand::RevokeKey(args) => revoke_key(&pool, args).await,
         AdminCommand::ListKeys(args) => list_keys(&pool, args).await,
@@ -407,6 +470,190 @@ async fn set_frozen(pool: &PgPool, args: SetFrozenArgs) -> Result<()> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Dispute review (migration 0013)
+// ---------------------------------------------------------------------------
+
+/// Normalize an operator-supplied email and resolve it to exactly one user.
+///
+/// Refuses loudly on an unknown address rather than returning an empty result:
+/// every caller here is about to act on, or report on, real money, and a typo
+/// that quietly produced "nothing to see" is how an operator concludes a
+/// receivable was already settled.
+async fn resolve_user(pool: &PgPool, email: &str) -> Result<(Uuid, String)> {
+    let email = email.trim().to_lowercase();
+    if email.is_empty() || !email.contains('@') {
+        bail!("email must be a non-empty email address")
+    }
+    let Some(user_id) = sqlx::query_scalar::<_, Uuid>("SELECT id FROM users WHERE email = $1")
+        .bind(&email)
+        .fetch_optional(pool)
+        .await
+        .context("failed to resolve user")?
+    else {
+        bail!("no user with email {email}")
+    };
+    Ok((user_id, email))
+}
+
+/// The review queue. An empty list is the healthy state.
+async fn disputes_list(pool: &PgPool, args: DisputesListArgs) -> Result<()> {
+    if args.days <= 0 {
+        bail!("days must be positive")
+    }
+    let rows = crate::billing::review_queue(pool, args.days)
+        .await
+        .context("failed to build the dispute review queue")?;
+    // The receivable total is the number the operator is actually managing, and
+    // summing a JSON array by eye is how it gets read wrong.
+    let receivable_total: Decimal = rows.iter().filter_map(|row| row.receivable_usd).sum();
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "window_days": args.days,
+            "accounts": rows.len(),
+            "receivable_total_usd": receivable_total,
+            "queue": rows,
+        }))?
+    );
+    Ok(())
+}
+
+/// One account, in full. This is the "reviews logs" surface.
+async fn disputes_show(pool: &PgPool, args: DisputesShowArgs) -> Result<()> {
+    let (user_id, email) = resolve_user(pool, &args.email).await?;
+    let balance = crate::billing::balance(pool, user_id)
+        .await
+        .context("failed to read balance")?;
+    let freeze = crate::billing::freeze_state(pool, user_id)
+        .await
+        .context("failed to read the freeze state")?;
+    let ledger = crate::billing::ledger_history(pool, user_id)
+        .await
+        .context("failed to read the ledger")?;
+    let usage = crate::billing::usage_summary(pool, user_id)
+        .await
+        .context("failed to summarize usage")?;
+    // Same projection as `list_keys`: metadata only. The key hash is a
+    // credential-equivalent and has no place in a review transcript.
+    let keys = list_key_metadata(pool, Some(email.clone()))
+        .await
+        .context("failed to list API keys")?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "user_id": user_id,
+            "email": email,
+            "balance_usd": balance,
+            "receivable_usd": (balance < Decimal::ZERO).then(|| -balance),
+            "frozen": freeze.is_some(),
+            "frozen_at": freeze.as_ref().map(|(at, _)| at),
+            "frozen_reason": freeze.as_ref().map(|(_, reason)| reason),
+            "usage": usage,
+            "ledger": ledger,
+            "keys": keys,
+        }))?
+    );
+    Ok(())
+}
+
+/// Settle a receivable. The only writer in this subcommand tree.
+async fn disputes_resolve(pool: &PgPool, args: DisputesResolveArgs) -> Result<()> {
+    let note = args.note.trim();
+    if note.is_empty() {
+        bail!("note cannot be empty; a resolution's note is the only record of why")
+    }
+    let recover = args
+        .recover
+        .as_deref()
+        .map(|value| parse_decimal(value, "recover"))
+        .transpose()?;
+    // A "resolve" whose default is silently one direction is how a receivable
+    // gets forgiven by an operator who meant to record a wire.
+    let mode = match (args.write_off, recover) {
+        (true, None) => None,
+        (false, Some(amount)) => Some(amount),
+        _ => bail!("pass exactly one of --write-off or --recover <amount>"),
+    };
+    if let Some(amount) = mode {
+        if amount <= Decimal::ZERO {
+            bail!("recover must be positive")
+        }
+        // The same fat-finger bound `grant-credit` uses, for the same reason:
+        // an operator recording a wire should never be typing five digits by
+        // accident. Run it twice for more.
+        if amount > Decimal::from(10_000) {
+            bail!("recover must be at most 10000")
+        }
+    }
+
+    let (user_id, email) = resolve_user(pool, &args.email).await?;
+    let frozen_before = crate::billing::freeze_state(pool, user_id)
+        .await
+        .context("failed to read the freeze state")?;
+
+    let outcome = match mode {
+        None => crate::billing::write_off_receivable(pool, user_id, note)
+            .await
+            .context("failed to write off the receivable")?,
+        Some(amount) => crate::billing::record_recovery(pool, user_id, amount, note)
+            .await
+            .context("failed to record the recovery")?,
+    };
+
+    // Read back rather than trusting the outcome: this is the line an operator
+    // will quote when they say the account was settled.
+    let balance = crate::billing::balance(pool, user_id)
+        .await
+        .context("failed to read balance")?;
+    let frozen_after = crate::billing::freeze_state(pool, user_id)
+        .await
+        .context("failed to re-read the freeze state")?;
+
+    let (action, detail) = match &outcome {
+        ResolutionOutcome::WrittenOff { forgiven_usd, .. } => (
+            "written_off",
+            serde_json::json!({ "forgiven_usd": forgiven_usd }),
+        ),
+        ResolutionOutcome::AlreadyWrittenOff { .. } => (
+            "already_written_off",
+            serde_json::json!({
+                "detail": "this account was already written off and owes nothing; \
+                           no second ledger entry was made",
+            }),
+        ),
+        ResolutionOutcome::Recovered { amount_usd, .. } => (
+            "recovered",
+            serde_json::json!({ "recovered_usd": amount_usd }),
+        ),
+        ResolutionOutcome::Refused { reason } => {
+            ("refused", serde_json::json!({ "reason": reason }))
+        }
+    };
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "user_id": user_id,
+            "email": email,
+            "action": action,
+            "detail": detail,
+            "balance_usd": balance,
+            "receivable_usd": (balance < Decimal::ZERO).then(|| -balance),
+            // Resolving settles money, never trust. Reported on both sides so
+            // the transcript itself shows the freeze did not move.
+            "frozen_before": frozen_before.is_some(),
+            "frozen": frozen_after.is_some(),
+            "frozen_reason": frozen_after.as_ref().map(|(_, reason)| reason),
+            "note": note,
+        }))?
+    );
+    // Loud failure last, so the operator still sees the state that refused.
+    if let ResolutionOutcome::Refused { reason } = outcome {
+        bail!("refused to resolve {email}: {reason}")
+    }
+    Ok(())
+}
+
 async fn mint_key(pool: &PgPool, args: MintKeyArgs) -> Result<()> {
     let email = args.email.trim().to_lowercase();
     let name = args.name.trim();
@@ -516,6 +763,18 @@ async fn revoke_key(pool: &PgPool, args: RevokeKeyArgs) -> Result<()> {
 }
 
 async fn list_keys(pool: &PgPool, args: ListKeysArgs) -> Result<()> {
+    let rows = list_key_metadata(pool, args.email).await?;
+    println!("{}", serde_json::to_string_pretty(&rows)?);
+    Ok(())
+}
+
+/// Key metadata for an optional email filter — hashes and plaintext excluded by
+/// projection, not by redaction, so there is no way to widen it by accident.
+///
+/// Extracted from `list_keys` so `disputes show` renders keys through exactly
+/// the same query. A second hand-written projection is how a review transcript
+/// eventually grows a `key_hash` column.
+async fn list_key_metadata(pool: &PgPool, email: Option<String>) -> Result<Vec<KeyMetadata>> {
     let rows = sqlx::query_as::<
         _,
         (
@@ -547,7 +806,7 @@ async fn list_keys(pool: &PgPool, args: ListKeysArgs) -> Result<()> {
         ORDER BY api_keys.created_at DESC
         "#,
     )
-    .bind(args.email.map(|email| email.trim().to_lowercase()))
+    .bind(email.map(|email| email.trim().to_lowercase()))
     .fetch_all(pool)
     .await
     .context("failed to list API keys")?
@@ -576,8 +835,7 @@ async fn list_keys(pool: &PgPool, args: ListKeysArgs) -> Result<()> {
         },
     )
     .collect::<Vec<_>>();
-    println!("{}", serde_json::to_string_pretty(&rows)?);
-    Ok(())
+    Ok(rows)
 }
 
 /// Reconcile the shipped tier file against a public model catalog.

@@ -735,6 +735,17 @@ pub async fn migrate(pool: &PgPool) -> Result<()> {
                 Cow::Borrowed(include_str!("../migrations/0009_dispute_freeze.sql")),
                 false,
             ),
+            // 10-12 are reserved for concurrent branches; see the 0013 header.
+            // `ignore_missing: false` below rejects an APPLIED migration that
+            // has vanished from this list, not a lower-numbered one that
+            // arrives late, so a 0010 landing after 0013 has run still applies.
+            Migration::new(
+                13,
+                Cow::Borrowed("dispute resolution"),
+                MigrationType::Simple,
+                Cow::Borrowed(include_str!("../migrations/0013_dispute_resolution.sql")),
+                false,
+            ),
         ]),
         ignore_missing: false,
         locking: true,
