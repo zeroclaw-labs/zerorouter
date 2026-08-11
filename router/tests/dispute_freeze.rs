@@ -36,6 +36,7 @@ use zerorouter::{
     auth::{generate_api_key, hash_api_key},
     billing::{
         FreezeReason, autopay_candidates, balance, credit_purchase, freeze_account, grant_promo,
+        unfreeze_account, write_off_receivable,
     },
     config::ResolvedRoute,
     db::{KeyMintAdmission, admit_key_mint, migrate},
@@ -869,4 +870,133 @@ async fn the_autopay_sweep_skips_frozen_accounts() {
         ),
         "a frozen account is never charged"
     );
+}
+
+/// Arm autopay on an existing account with a threshold of $5 and a $25 top-up,
+/// exactly as the portal's autopay form does.
+async fn arm_autopay(pool: &PgPool, user_id: Uuid) {
+    query(
+        r#"
+        UPDATE users
+        SET stripe_customer_id = $2, autopay_enabled = TRUE,
+            autopay_threshold_usd = 5, autopay_topup_usd = 25
+        WHERE id = $1
+        "#,
+    )
+    .bind(user_id)
+    .bind(format!("cus_test_{}", user_id.simple()))
+    .execute(pool)
+    .await
+    .expect("autopay enablement must update");
+}
+
+/// Disarm the accounts a candidate test armed. The sweep is GLOBAL, so an
+/// account left armed here becomes a charge in `tests/autopay_sweep.rs` against
+/// that suite's mock Stripe and poisons its counters.
+async fn disarm_autopay(pool: &PgPool, user_id: Uuid) {
+    query("UPDATE users SET autopay_enabled = FALSE WHERE id = $1")
+        .bind(user_id)
+        .execute(pool)
+        .await
+        .expect("autopay teardown must update");
+}
+
+/// GUARD (mutation-checked): the sweep must also skip an account that OWES
+/// money, whether or not it is still frozen.
+///
+/// The freeze exclusion above is not enough, because the freeze is the half an
+/// operator lifts first: "this customer is real again" and "this customer has
+/// paid us back" are separate decisions, and `set-frozen --off` only makes the
+/// first. A negative balance has exactly one meaning since 0009/0013 — a
+/// reversal receivable, money already clawed back through Stripe — and such an
+/// account satisfies every other autopay predicate maximally: it is the
+/// furthest below its threshold, so it even sorts to the front of the
+/// worklist. Left alone, the first sweep after the freeze lifted would take an
+/// off-session charge on the saved card of a customer fresh off a payment
+/// dispute, which is how the SECOND dispute gets manufactured.
+///
+/// Re-entry is therefore an explicit human decision, and this pins both halves:
+/// the debtor is skipped while the debt stands, and is a candidate again the
+/// moment `admin disputes resolve` settles it.
+#[tokio::test]
+async fn the_autopay_sweep_skips_an_unfrozen_debtor_until_the_receivable_is_settled() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    // The debtor, through the real money paths: bought $25, consumed $20 of
+    // it, then had the whole purchase clawed back. What is left is a $20
+    // receivable and an automatic dispute freeze.
+    let (debtor, payment_intent) = buyer(&pool, "autopay-debtor", Decimal::from(25)).await;
+    // Stand-in for "the customer consumed $20 of inference", as in
+    // `a_dispute_on_spent_credit_leaves_a_negative_receivable`: what is under
+    // test is candidate selection against the balance a reversal leaves.
+    query("UPDATE users SET credit_balance_usd = 5 WHERE id = $1")
+        .bind(debtor)
+        .execute(&pool)
+        .await
+        .expect("spend simulation must apply");
+    arm_autopay(&pool, debtor).await;
+    let dispute_id = format!("dp_test_{}", Uuid::new_v4().simple());
+    let (status, body) = post_webhook(
+        &pool,
+        &dispute_event(&dispute_id, &payment_intent, 2_500, "usd"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(
+        balance(&pool, debtor).await.expect("balance must query"),
+        Decimal::from(-20),
+        "the spent-through chargeback leaves a receivable"
+    );
+
+    // A solvent control, armed identically and just as far under its
+    // threshold: a zero balance IS the ordinary autopay case, so if this one
+    // ever stops being selected the exclusion has swallowed the feature.
+    let solvent = create_user(&pool, "autopay-solvent").await;
+    arm_autopay(&pool, solvent).await;
+
+    // The freeze is lifted — the operator has decided the account is real —
+    // but the money is still owed, and that alone must keep the card alone.
+    assert!(
+        unfreeze_account(&pool, debtor)
+            .await
+            .expect("unfreeze must apply"),
+        "the dispute freeze must be liftable"
+    );
+    let listed = |candidates: &[zerorouter::billing::AutopayCandidate], user: Uuid| {
+        candidates.iter().any(|candidate| candidate.user_id == user)
+    };
+    let candidates = autopay_candidates(&pool, 10_000)
+        .await
+        .expect("candidates must query");
+    assert!(
+        !listed(&candidates, debtor),
+        "an unfrozen account that still owes money must never be recharged"
+    );
+    assert!(
+        listed(&candidates, solvent),
+        "an ordinary below-threshold account is still a candidate"
+    );
+
+    // Re-entry: the operator settles the receivable, which is the human
+    // decision this exclusion exists to require. `disputes resolve
+    // --write-off` is that decision, and it brings the balance to exactly
+    // zero — at which point autopay resumes on its own.
+    write_off_receivable(&pool, debtor, "test: uncollectable receivable")
+        .await
+        .expect("write-off must apply");
+    assert_eq!(
+        balance(&pool, debtor).await.expect("balance must query"),
+        Decimal::ZERO
+    );
+    let candidates = autopay_candidates(&pool, 10_000)
+        .await
+        .expect("candidates must query");
+    assert!(
+        listed(&candidates, debtor),
+        "a settled account rejoins autopay; the exclusion is a hold, not a ban"
+    );
+
+    disarm_autopay(&pool, debtor).await;
+    disarm_autopay(&pool, solvent).await;
 }
