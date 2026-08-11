@@ -782,7 +782,7 @@ async fn migration_chain_applies_on_a_fresh_database() {
     let fresh_url = swap_database(&base, &fresh_db);
     // Nothing inside may panic: the DROP below is the only cleanup, so every
     // step reports through the Result and the assertions run after the drop.
-    let outcome: anyhow::Result<(bool, bool, bool, bool, bool, i64)> = async {
+    let outcome: anyhow::Result<(bool, bool, bool, bool, bool, bool, i64)> = async {
         let pool = PgPoolOptions::new()
             .max_connections(1)
             .connect_with(PgConnectOptions::from_str(&fresh_url)?)
@@ -819,6 +819,16 @@ async fn migration_chain_applies_on_a_fresh_database() {
         )
         .fetch_one(&pool)
         .await?;
+        let freeze_state_exists = query_scalar::<_, bool>(
+            r#"
+            SELECT COUNT(*) = 2
+            FROM information_schema.columns
+            WHERE table_name = 'users'
+              AND column_name IN ('frozen_at', 'frozen_reason')
+            "#,
+        )
+        .fetch_one(&pool)
+        .await?;
         let version = query_scalar::<_, i64>("SELECT MAX(version) FROM _sqlx_migrations")
             .fetch_one(&pool)
             .await?;
@@ -829,6 +839,7 @@ async fn migration_chain_applies_on_a_fresh_database() {
             intents_exists,
             settlement_outbox_exists,
             ledger_honesty_exists,
+            freeze_state_exists,
             version,
         ))
     }
@@ -839,7 +850,7 @@ async fn migration_chain_applies_on_a_fresh_database() {
         .execute(&admin)
         .await;
 
-    let outcome = outcome.expect("the 0001->0007 chain must apply on a fresh database");
+    let outcome = outcome.expect("the 0001->0009 chain must apply on a fresh database");
     assert!(outcome.0, "request_attempts exists after the fresh chain");
     assert!(
         outcome.1,
@@ -857,7 +868,11 @@ async fn migration_chain_applies_on_a_fresh_database() {
         outcome.4,
         "the 0007 ledger-honesty columns exist after the chain"
     );
-    assert_eq!(outcome.5, 8, "the chain reaches migration version 8");
+    assert!(
+        outcome.5,
+        "the 0009 freeze-state columns exist after the chain"
+    );
+    assert_eq!(outcome.6, 9, "the chain reaches migration version 9");
 }
 
 /// Rewrite the database name in a Postgres URL, keeping any query string

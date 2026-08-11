@@ -1,8 +1,10 @@
 name: CI
 
 on:
-  pull_request:
-    branches: [main]
+  # No `branches:` filter: a PR's base is not always `main` — a PR stacked on
+  # another open PR's branch (e.g. #38 based on #35) needs the same checks as
+  # any other, and this repo has that shape often enough to matter.
+  pull_request: {}
   push:
     branches: [main]
 

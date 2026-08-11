@@ -39,6 +39,24 @@
 //! record, never from the event. A session created before migration 0005 has
 //! no record and is rejected — see [`stripe_webhook`].
 //!
+//! # Events consumed
+//!
+//! | Event | Action |
+//! |---|---|
+//! | `checkout.session.completed` / `.async_payment_succeeded` | credit the purchase, once per session id |
+//! | `payment_intent.succeeded` / `.payment_failed` | settle or fail an autopay charge (migration 0008) |
+//! | `charge.dispute.created` | freeze the account and reverse the credit (migration 0009) |
+//! | `charge.refunded` | reverse the credit; no freeze (migration 0009) |
+//!
+//! Everything else is acknowledged without action so Stripe stops retrying it.
+//! **The Stripe endpoint must be subscribed to the events above** — an event
+//! Stripe does not send is an event this code never runs (see
+//! `docs/DEPLOY.md`).
+//!
+//! The reversal arm reads none of the metadata the crediting arms have to
+//! defend: a dispute is mapped to a user through Stripe's own `payment_intent`
+//! id joined against ZeroRouter's ledger — see [`handle_reversal_event`].
+//!
 //! Nothing in this module ever logs the Stripe secret key, the webhook
 //! secret, a signature value, or a request/response body.
 
@@ -78,6 +96,12 @@ fn checkout_sessions_url(settings: &StripeSettings) -> String {
 const STRIPE_HTTP_TIMEOUT: Duration = Duration::from_secs(15);
 const CHECKOUT_COMPLETED_EVENT: &str = "checkout.session.completed";
 const CHECKOUT_ASYNC_SUCCEEDED_EVENT: &str = "checkout.session.async_payment_succeeded";
+/// A charge was refunded, in whole or in part. The event object is the CHARGE,
+/// so its `amount_refunded` is CUMULATIVE across every refund on it.
+const CHARGE_REFUNDED_EVENT: &str = "charge.refunded";
+/// A cardholder disputed a charge. The event object is the DISPUTE; the money
+/// has already left the ZeroRouter balance at Stripe by the time it arrives.
+const DISPUTE_CREATED_EVENT: &str = "charge.dispute.created";
 const CHECKOUT_PRODUCT_NAME: &str = "ZeroRouter credits";
 /// The one ISO-4217 currency ZeroRouter prices checkout in. Quoted to Stripe
 /// at session creation, stored on the pending record, and re-checked against
@@ -571,6 +595,9 @@ async fn stripe_webhook(
     {
         return handle_autopay_intent_event(&ctx, &event).await;
     }
+    if event.event_type == DISPUTE_CREATED_EVENT || event.event_type == CHARGE_REFUNDED_EVENT {
+        return handle_reversal_event(&ctx, &event).await;
+    }
     if event.event_type != CHECKOUT_COMPLETED_EVENT
         && event.event_type != CHECKOUT_ASYNC_SUCCEEDED_EVENT
     {
@@ -764,6 +791,212 @@ async fn stripe_webhook(
 
 fn received() -> Json<Value> {
     Json(serde_json::json!({ "received": true }))
+}
+
+// ---------------------------------------------------------------------------
+// Refunds and chargebacks (migration 0009)
+// ---------------------------------------------------------------------------
+
+/// The `charge.refunded` / `charge.dispute.created` arm: take the credit back,
+/// and — for a dispute only — freeze the account.
+///
+/// # Why a dispute freezes and a refund does not
+///
+/// A refund is ZeroRouter or Stripe support giving money back deliberately;
+/// taking the credit with it is the whole correction. A dispute is a customer
+/// telling their bank the charge was not legitimate. The money is already gone
+/// from the ZeroRouter balance, the customer may have consumed the inference it
+/// bought, and nothing about the account can be trusted until a human looks —
+/// so the account stops spending. Its history stays readable: the freeze blocks
+/// spend, not visibility.
+///
+/// # What this trusts
+///
+/// Only Stripe's own fields, and only after the HMAC has been verified. The
+/// charge/dispute is mapped back to a user through its `payment_intent` — a
+/// Stripe-generated id — joined against ZeroRouter's OWN ledger
+/// ([`billing::credited_purchase`]). `metadata` is never read here, so the
+/// co-tenant problem the checkout and autopay arms have to defend against
+/// (anyone able to create objects in the Stripe account can write metadata)
+/// does not arise: an event naming an intent this deployment never credited
+/// matches nothing and moves nothing.
+///
+/// # What it deliberately does not do
+///
+/// Reverse a PARTIAL refund or a partial dispute. The reversal takes back
+/// exactly what was credited, so it only runs when the reversed amount covers
+/// that credit in full; anything less is logged for an operator instead of
+/// guessed at. A dispute still freezes in that case, which is the half that
+/// cannot wait. Partial refunds of prepaid credit are not something this
+/// deployment issues today, and inventing an apportioning rule for money
+/// without an operator asking for one is exactly the kind of quiet decision
+/// this module exists to avoid.
+async fn handle_reversal_event(
+    ctx: &WebCtx,
+    event: &StripeEvent,
+) -> Result<Json<Value>, StripeHttpError> {
+    let object = &event.data.object;
+    let is_dispute = event.event_type == DISPUTE_CREATED_EVENT;
+
+    // The Stripe object this reversal is anchored to: the dispute id for a
+    // chargeback, the charge id for a refund. It becomes the reversal's
+    // `credit_ledger.stripe_session_id`, so a redelivery deduplicates against
+    // the same unique index a replayed purchase does.
+    let Some(object_id) = object.get("id").and_then(Value::as_str) else {
+        tracing::warn!(
+            event_type = %event.event_type,
+            "stripe webhook rejected: reversal event is missing its object id"
+        );
+        return Err(StripeHttpError::MalformedEvent);
+    };
+    // Present on both shapes: a Dispute carries the intent it disputes, a
+    // Charge the intent that created it.
+    let payment_intent = object.get("payment_intent").and_then(Value::as_str);
+    let Some(payment_intent) = payment_intent else {
+        // Unattributable. Acknowledged so Stripe stops retrying something no
+        // redelivery can fix, but logged at error level: if this is ours, a
+        // human has to reconcile it by hand.
+        tracing::error!(
+            event_type = %event.event_type,
+            stripe_object_id = %object_id,
+            "stripe reversal event names no payment intent; it cannot be attributed to a user \
+             and nothing was reversed or frozen — reconcile by hand if this charge is ours"
+        );
+        return Ok(received());
+    };
+
+    let Some(credited) = billing::credited_purchase(&ctx.pool, payment_intent)
+        .await
+        .map_err(|error| {
+            tracing::warn!(
+                stripe_object_id = %object_id,
+                %error,
+                "stripe reversal deferred: the credit ledger could not be read; stripe will retry"
+            );
+            StripeHttpError::DatabaseUnavailable
+        })?
+    else {
+        // A charge this deployment never credited — another integration in the
+        // same Stripe account, or a payment that never became credit.
+        // Acknowledged untouched, exactly as a foreign payment intent is.
+        tracing::info!(
+            event_type = %event.event_type,
+            stripe_object_id = %object_id,
+            "stripe reversal event references a charge this deployment never credited; ignoring"
+        );
+        return Ok(received());
+    };
+
+    // Freeze FIRST, and independently of whether the reversal can be computed:
+    // the account must stop spending even when the money question needs a
+    // human. Idempotent, so a redelivered dispute does not restamp it.
+    if is_dispute {
+        let froze = billing::freeze_account(
+            &ctx.pool,
+            credited.user_id,
+            billing::FreezeReason::Dispute,
+        )
+        .await
+        .map_err(|error| {
+            tracing::warn!(
+                stripe_object_id = %object_id,
+                %error,
+                "stripe dispute deferred: the account could not be frozen; stripe will retry"
+            );
+            StripeHttpError::DatabaseUnavailable
+        })?;
+        tracing::error!(
+            user_id = %credited.user_id,
+            stripe_dispute_id = %object_id,
+            payment_intent = %payment_intent,
+            credited_usd = %credited.amount_usd,
+            newly_frozen = froze,
+            "stripe chargeback: account frozen"
+        );
+    }
+
+    // Only a reversal that covers the whole credit is applied automatically.
+    // For a dispute the disputed `amount` is the money withdrawn; for a refund
+    // `amount_refunded` is the cumulative refunded total on the charge.
+    let reversed_cents = if is_dispute {
+        object.get("amount").and_then(Value::as_i64)
+    } else {
+        object.get("amount_refunded").and_then(Value::as_i64)
+    };
+    let currency = object
+        .get("currency")
+        .and_then(Value::as_str)
+        .map(str::to_ascii_lowercase);
+    let credited_cents = usd_to_cents(credited.amount_usd);
+    let covers_the_credit = match (reversed_cents, currency.as_deref(), credited_cents) {
+        (Some(reversed), Some(currency), Some(credited_cents)) => {
+            // Currency is checked independently of the amount for the same
+            // reason the checkout arm checks it: the smallest unit of a
+            // zero-decimal currency numerically matches a cents amount while
+            // being worth a fraction of it.
+            currency == CHECKOUT_CURRENCY && reversed >= credited_cents
+        }
+        _ => false,
+    };
+    if !covers_the_credit {
+        tracing::error!(
+            event_type = %event.event_type,
+            user_id = %credited.user_id,
+            stripe_object_id = %object_id,
+            payment_intent = %payment_intent,
+            credited_usd = %credited.amount_usd,
+            ?reversed_cents,
+            ?currency,
+            frozen = is_dispute,
+            "stripe reversal does not cover the full credit (partial, foreign-currency, or \
+             missing amount); NOTHING was reversed — an operator must reconcile this by hand"
+        );
+        return Ok(received());
+    }
+
+    let note = if is_dispute {
+        format!("chargeback reversal ({object_id})")
+    } else {
+        format!("refund reversal ({object_id})")
+    };
+    let outcome = billing::reverse_purchase(&ctx.pool, payment_intent, object_id, &note)
+        .await
+        .map_err(|error| {
+            tracing::warn!(
+                stripe_object_id = %object_id,
+                %error,
+                "stripe reversal failed to apply; stripe will retry"
+            );
+            StripeHttpError::DatabaseUnavailable
+        })?;
+    match outcome {
+        billing::ReversalOutcome::Reversed {
+            amount_usd,
+            balance_after,
+        } => tracing::warn!(
+            event_type = %event.event_type,
+            user_id = %credited.user_id,
+            stripe_object_id = %object_id,
+            reversed_usd = %amount_usd,
+            balance_after = %balance_after,
+            // A negative balance is not an error state: it IS the receivable,
+            // and saying so here is what makes it findable later.
+            receivable = balance_after < Decimal::ZERO,
+            "reversed a stripe credit"
+        ),
+        billing::ReversalOutcome::AlreadyReversed => tracing::info!(
+            stripe_object_id = %object_id,
+            "stripe reversal replayed: this purchase was already reversed"
+        ),
+        // Unreachable in practice: the credit was just read above. Logged
+        // rather than errored, because a retry cannot improve it.
+        billing::ReversalOutcome::UnknownPurchase => tracing::error!(
+            stripe_object_id = %object_id,
+            payment_intent = %payment_intent,
+            "stripe reversal found no credit for an intent that had one moments earlier"
+        ),
+    }
+    Ok(received())
 }
 
 fn is_foreign_key_violation(error: &sqlx::Error) -> bool {
