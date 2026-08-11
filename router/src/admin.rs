@@ -629,6 +629,7 @@ async fn catalog_drift(args: CatalogDriftArgs) -> Result<()> {
             rate(found.recorded_basis),
             rate(found.upstream_cost),
             found
+                .upstream_metadata
                 .context_window
                 .map_or_else(|| "-".to_owned(), |c| format!("{c}")),
             found
@@ -664,9 +665,36 @@ async fn catalog_drift(args: CatalogDriftArgs) -> Result<()> {
         }
     }
 
+    // Model metadata drifts for the same reason a price does — an upstream
+    // moves and the file keeps asserting the old number — but it fails
+    // differently. A stale rate costs margin; a stale context window costs
+    // correctness, silently, on the client side: a window ZeroRouter
+    // overstates becomes requests the upstream rejects, and one it understates
+    // becomes long-context work quietly truncated. Neither shows up in the
+    // ledger, so this is the only place it can be seen.
+    let metadata: Vec<_> = findings
+        .iter()
+        .filter(|f| !f.metadata_drift.is_empty())
+        .collect();
+    if !metadata.is_empty() {
+        println!("\nModel metadata:");
+        for found in &metadata {
+            for drift in &found.metadata_drift {
+                println!(
+                    "  {:<32} {:<18} {:<18} file {} vs source {}",
+                    found.candidate_id,
+                    drift.kind.label(),
+                    drift.field,
+                    drift.recorded,
+                    drift.upstream,
+                );
+            }
+        }
+    }
+
     let actionable: Vec<_> = findings
         .iter()
-        .filter(|f| f.verdict.is_actionable())
+        .filter(|f| f.verdict.is_actionable() || f.has_actionable_metadata_drift())
         .collect();
     if actionable.is_empty() {
         println!("\n{} candidates reconciled, no drift.", findings.len());
@@ -674,12 +702,31 @@ async fn catalog_drift(args: CatalogDriftArgs) -> Result<()> {
     }
     println!("\n{} candidate(s) need attention:", actionable.len());
     for found in &actionable {
-        println!(
-            "  {} ({}) — {}",
-            found.candidate_id,
-            found.model,
-            found.verdict.label()
-        );
+        // A candidate can fail on both axes at once — a repriced model whose
+        // window also moved — so report every reason rather than the first.
+        if found.verdict.is_actionable() {
+            println!(
+                "  {} ({}) — {}",
+                found.candidate_id,
+                found.model,
+                found.verdict.label()
+            );
+        }
+        for drift in found
+            .metadata_drift
+            .iter()
+            .filter(|drift| drift.kind.is_actionable())
+        {
+            println!(
+                "  {} ({}) — {} {}: file says {}, source says {}",
+                found.candidate_id,
+                found.model,
+                drift.kind.label(),
+                drift.field,
+                drift.recorded,
+                drift.upstream,
+            );
+        }
     }
     if args.allow_drift {
         return Ok(());
