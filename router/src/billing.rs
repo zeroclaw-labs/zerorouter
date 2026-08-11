@@ -334,6 +334,869 @@ pub async fn ledger_entries(
 }
 
 // ---------------------------------------------------------------------------
+// Refunds, chargebacks, and the account freeze (migration 0009)
+// ---------------------------------------------------------------------------
+
+/// Why an account is frozen. A closed set, mirroring the CHECK in `0009`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FreezeReason {
+    /// A Stripe chargeback. Set by the webhook, never by a human.
+    Dispute,
+    /// An operator's deliberate hold (`admin set-frozen --on`).
+    Operator,
+}
+
+impl FreezeReason {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Dispute => "dispute",
+            Self::Operator => "operator",
+        }
+    }
+}
+
+/// Freeze an account: admission refuses new inference and the self-service
+/// mint paths refuse new keys, until an operator lifts it.
+///
+/// Idempotent, and deliberately first-writer-wins: a dispute freeze that is
+/// already in place is not restamped by a redelivered webhook, so `frozen_at`
+/// keeps saying when the account actually stopped. Returns whether this call
+/// was the one that froze it.
+///
+/// Freezing is intentionally NOT part of the reversal transaction. The two
+/// answer different questions — "stop the spend" and "state the debt" — and a
+/// dispute whose purchase cannot be mapped back to a ledger row must still
+/// freeze if the user is known, while a reversal that fails must be retryable
+/// without the freeze flapping.
+pub async fn freeze_account(
+    pool: &PgPool,
+    user_id: Uuid,
+    reason: FreezeReason,
+) -> Result<bool, sqlx::Error> {
+    let frozen = sqlx::query(
+        r#"
+        UPDATE users
+        SET frozen_at = NOW(), frozen_reason = $2
+        WHERE id = $1 AND frozen_at IS NULL
+        "#,
+    )
+    .bind(user_id)
+    .bind(reason.as_str())
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(frozen > 0)
+}
+
+/// Lift a freeze, restoring inference and key minting.
+///
+/// The operator's only path back, and the reason a freeze is safe to ship
+/// before the review workflow exists: a control with no documented release is
+/// an outage waiting for a support ticket. Returns whether this call was the
+/// one that thawed it.
+pub async fn unfreeze_account(pool: &PgPool, user_id: Uuid) -> Result<bool, sqlx::Error> {
+    let thawed = sqlx::query(
+        r#"
+        UPDATE users
+        SET frozen_at = NULL, frozen_reason = NULL
+        WHERE id = $1 AND frozen_at IS NOT NULL
+        "#,
+    )
+    .bind(user_id)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(thawed > 0)
+}
+
+/// Current freeze state: `(frozen_at, reason)`, or `None` when the account is
+/// live.
+pub async fn freeze_state(
+    pool: &PgPool,
+    user_id: Uuid,
+) -> Result<Option<(DateTime<Utc>, String)>, sqlx::Error> {
+    let row = sqlx::query_as::<_, (Option<DateTime<Utc>>, Option<String>)>(
+        "SELECT frozen_at, frozen_reason FROM users WHERE id = $1",
+    )
+    .bind(user_id)
+    .fetch_one(pool)
+    .await?;
+    Ok(match row {
+        (Some(frozen_at), Some(reason)) => Some((frozen_at, reason)),
+        // The 0009 CHECK makes the two columns one fact, so a half-set pair
+        // cannot exist; treating anything else as "live" is fail-safe anyway.
+        _ => None,
+    })
+}
+
+/// A credit ZeroRouter applied for a Stripe PaymentIntent, as its own ledger
+/// records it — the server-side answer to "what did this charge buy?".
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CreditedPurchase {
+    pub user_id: Uuid,
+    /// The dollars credited, positive.
+    pub amount_usd: Decimal,
+    /// `purchase` (Checkout) or `autopay` (off-session recharge).
+    pub entry_type: String,
+}
+
+/// The credit a PaymentIntent bought, looked up the way a dispute arrives:
+/// by the Stripe object id, not by metadata.
+///
+/// This is the reversal's equivalent of the checkout arm's
+/// [`checkout_intent`] precondition, and it is a strictly stronger one. A
+/// dispute event names its `payment_intent` and `charge` — Stripe's own
+/// fields, not the attacker-writable `metadata` — and this joins that id
+/// against ZeroRouter's own ledger. An event naming an intent this deployment
+/// never credited returns `None` and moves nothing.
+///
+/// Both credit shapes are covered: a Checkout purchase records the intent in
+/// `stripe_payment_intent_id`, while an autopay recharge (0008) anchors itself
+/// on `stripe_session_id` because the intent id IS its idempotence key. Stripe
+/// object ids are globally unique, so accepting either column cannot
+/// cross-match.
+pub async fn credited_purchase(
+    pool: &PgPool,
+    payment_intent_id: &str,
+) -> Result<Option<CreditedPurchase>, sqlx::Error> {
+    let row = sqlx::query_as::<_, (Uuid, Decimal, String)>(
+        r#"
+        SELECT user_id, amount_usd, entry_type
+        FROM credit_ledger
+        WHERE entry_type IN ('purchase', 'autopay')
+          AND (stripe_payment_intent_id = $1 OR stripe_session_id = $1)
+        ORDER BY id
+        LIMIT 1
+        "#,
+    )
+    .bind(payment_intent_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(
+        row.map(|(user_id, amount_usd, entry_type)| CreditedPurchase {
+            user_id,
+            amount_usd,
+            entry_type,
+        }),
+    )
+}
+
+/// What a reversal did.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReversalOutcome {
+    Reversed {
+        amount_usd: Decimal,
+        balance_after: Decimal,
+    },
+    /// This purchase has already been reversed — by a redelivery of the same
+    /// event, or by a different Stripe object reversing the same charge.
+    AlreadyReversed,
+    /// No credit in this deployment's ledger belongs to that PaymentIntent.
+    UnknownPurchase,
+}
+
+/// Take back what a refunded or disputed charge credited.
+///
+/// The mirror image of [`credit_purchase`], and deliberately built from the
+/// same parts: the per-user advisory lock that admission and settlement
+/// serialize on, one transaction, and a `credit_ledger` row snapshotting the
+/// balance it produced.
+///
+/// # Idempotence
+///
+/// Two anchors, both checked under the lock:
+///
+/// 1. `stripe_object_id` — the dispute or charge id — occupies the unique
+///    `credit_ledger.stripe_session_id` index, exactly as a Checkout session id
+///    anchors a purchase. A redelivered webhook finds its own row.
+/// 2. The originating PaymentIntent. A charge can be reversed by more than one
+///    Stripe object (a dispute, then an operator refund of the same charge),
+///    and those carry DIFFERENT ids, so anchor 1 alone would reverse the same
+///    purchase twice. Both writers serialize on the user's advisory lock, so
+///    this check is not racy.
+///
+/// # Why the balance may go negative
+///
+/// The reversal takes back what was credited, not what is left. A customer who
+/// spent the credit before disputing it lands below zero, and that number is
+/// the receivable — visible in the ledger, for the review workflow to act on.
+/// Clamping at zero would silently forgive the debt. The transaction declares
+/// itself to the `0009` overdraft trigger for exactly this reason; no other
+/// path may do so, so settlement is still backstopped as `0003` left it.
+pub async fn reverse_purchase(
+    pool: &PgPool,
+    payment_intent_id: &str,
+    stripe_object_id: &str,
+    note: &str,
+) -> Result<ReversalOutcome, sqlx::Error> {
+    if stripe_object_id.trim().is_empty() {
+        return Err(sqlx::Error::Protocol(
+            "credit reversal requires a Stripe object id".to_owned(),
+        ));
+    }
+
+    let mut transaction = pool.begin().await?;
+    sqlx::query("SET LOCAL lock_timeout = '5s'")
+        .execute(&mut *transaction)
+        .await?;
+    // Declares this transaction — and only this one — allowed to drive the
+    // balance below zero (migration 0009). SET LOCAL, so it is discarded at
+    // commit and cannot leak to the next transaction on a pooled connection.
+    sqlx::query("SET LOCAL zerorouter.credit_reversal = 'on'")
+        .execute(&mut *transaction)
+        .await?;
+
+    let credited = sqlx::query_as::<_, (Uuid, Decimal)>(
+        r#"
+        SELECT user_id, amount_usd
+        FROM credit_ledger
+        WHERE entry_type IN ('purchase', 'autopay')
+          AND (stripe_payment_intent_id = $1 OR stripe_session_id = $1)
+        ORDER BY id
+        LIMIT 1
+        "#,
+    )
+    .bind(payment_intent_id)
+    .fetch_optional(&mut *transaction)
+    .await?;
+    let Some((user_id, amount_usd)) = credited else {
+        transaction.rollback().await?;
+        return Ok(ReversalOutcome::UnknownPurchase);
+    };
+
+    // Same USER-keyed advisory lock as admission, settlement, and
+    // `credit_purchase`. Taken before the idempotence check so two reversals
+    // of the same charge cannot both observe "not yet reversed".
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1::TEXT, 0))")
+        .bind(user_id.to_string())
+        .execute(&mut *transaction)
+        .await?;
+
+    let already_reversed = sqlx::query_scalar::<_, i32>(
+        r#"
+        SELECT 1 FROM credit_ledger
+        WHERE stripe_session_id = $1
+           OR (entry_type = 'refund' AND stripe_payment_intent_id = $2)
+        LIMIT 1
+        "#,
+    )
+    .bind(stripe_object_id)
+    .bind(payment_intent_id)
+    .fetch_optional(&mut *transaction)
+    .await?
+    .is_some();
+    if already_reversed {
+        transaction.rollback().await?;
+        return Ok(ReversalOutcome::AlreadyReversed);
+    }
+
+    let balance_after = sqlx::query_scalar::<_, Decimal>(
+        r#"
+        UPDATE users
+        SET credit_balance_usd = credit_balance_usd - $2
+        WHERE id = $1
+        RETURNING credit_balance_usd
+        "#,
+    )
+    .bind(user_id)
+    .bind(amount_usd)
+    .fetch_optional(&mut *transaction)
+    .await?
+    .ok_or_else(|| sqlx::Error::Protocol("credit reversal found no such user".to_owned()))?;
+    sqlx::query(
+        r#"
+        INSERT INTO credit_ledger (
+            user_id,
+            entry_type,
+            amount_usd,
+            balance_after_usd,
+            stripe_session_id,
+            stripe_payment_intent_id,
+            note
+        )
+        VALUES ($1, 'refund', $2, $3, $4, $5, $6)
+        "#,
+    )
+    .bind(user_id)
+    .bind(-amount_usd)
+    .bind(balance_after)
+    .bind(stripe_object_id)
+    .bind(payment_intent_id)
+    .bind(note)
+    .execute(&mut *transaction)
+    .await?;
+    transaction.commit().await?;
+    Ok(ReversalOutcome::Reversed {
+        amount_usd,
+        balance_after,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Dispute review and resolution (migration 0013)
+// ---------------------------------------------------------------------------
+
+/// Why an account is in the review queue. An account can carry more than one.
+///
+/// These are the three shapes a chargeback leaves behind, and they come apart
+/// in practice: a reversal that was not spent through freezes the account and
+/// writes a `refund` row but leaves the balance at zero, while an account whose
+/// freeze an operator already lifted can still owe money. Reporting the reasons
+/// rather than just the membership is what lets an operator tell "needs a
+/// decision about money" from "needs a decision about trust".
+pub const REVIEW_TRIGGER_FROZEN: &str = "frozen";
+pub const REVIEW_TRIGGER_NEGATIVE_BALANCE: &str = "negative_balance";
+pub const REVIEW_TRIGGER_RECENT_REFUND: &str = "recent_refund";
+
+/// One account awaiting dispute review.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct ReviewQueueRow {
+    pub user_id: Uuid,
+    pub email: String,
+    pub balance_usd: Decimal,
+    /// The debt, positive, present only when the balance is below zero. This is
+    /// the number `disputes resolve` acts on; a non-negative account has no
+    /// receivable even when it is frozen.
+    pub receivable_usd: Option<Decimal>,
+    pub frozen: bool,
+    pub frozen_at: Option<DateTime<Utc>>,
+    pub frozen_reason: Option<String>,
+    /// `refund` entries inside the window.
+    pub recent_refunds: i64,
+    /// Dollars reversed inside the window, reported positive — the ledger
+    /// stores reversals as negative amounts.
+    pub reversed_in_window_usd: Decimal,
+    /// The dispute or charge ids anchoring this account's reversals, newest
+    /// first. Every reversal ever recorded, not only the windowed ones: an
+    /// operator looking a case up in the Stripe dashboard wants the account's
+    /// whole reversal history, and the window only decides membership.
+    pub stripe_object_ids: Vec<String>,
+    /// The PaymentIntents those reversals took back.
+    pub stripe_payment_intent_ids: Vec<String>,
+    pub triggers: Vec<String>,
+}
+
+/// Every account that is frozen, owes money, or was reversed inside the
+/// trailing window.
+///
+/// Read-only. The window bounds only the `recent_refund` trigger — a freeze and
+/// a receivable are durable states that do not age out, and an account that
+/// dropped off this list because its chargeback got old would be a receivable
+/// nobody is ever shown again.
+pub async fn review_queue(pool: &PgPool, days: i32) -> Result<Vec<ReviewQueueRow>, sqlx::Error> {
+    if days <= 0 {
+        return Err(sqlx::Error::Protocol(
+            "review window must be a positive number of days".to_owned(),
+        ));
+    }
+    let rows = sqlx::query_as::<
+        _,
+        (
+            Uuid,
+            String,
+            Decimal,
+            Option<DateTime<Utc>>,
+            Option<String>,
+            i64,
+            Decimal,
+            Vec<String>,
+            Vec<String>,
+        ),
+    >(
+        r#"
+        WITH reversals AS (
+            SELECT
+                user_id,
+                COUNT(*) FILTER (
+                    WHERE created_at >= NOW() - MAKE_INTERVAL(days => $1)
+                ) AS recent,
+                COALESCE(SUM(-amount_usd) FILTER (
+                    WHERE created_at >= NOW() - MAKE_INTERVAL(days => $1)
+                ), 0) AS reversed,
+                ARRAY_REMOVE(
+                    ARRAY_AGG(stripe_session_id ORDER BY id DESC), NULL
+                ) AS object_ids,
+                ARRAY_REMOVE(
+                    ARRAY_AGG(stripe_payment_intent_id ORDER BY id DESC), NULL
+                ) AS intent_ids
+            FROM credit_ledger
+            WHERE entry_type = 'refund'
+            GROUP BY user_id
+        )
+        SELECT
+            users.id,
+            users.email,
+            users.credit_balance_usd,
+            users.frozen_at,
+            users.frozen_reason,
+            COALESCE(reversals.recent, 0),
+            COALESCE(reversals.reversed, 0),
+            COALESCE(reversals.object_ids, ARRAY[]::TEXT[]),
+            COALESCE(reversals.intent_ids, ARRAY[]::TEXT[])
+        FROM users
+        LEFT JOIN reversals ON reversals.user_id = users.id
+        WHERE users.frozen_at IS NOT NULL
+           OR users.credit_balance_usd < 0
+           OR COALESCE(reversals.recent, 0) > 0
+        ORDER BY users.credit_balance_usd ASC,
+                 users.frozen_at ASC NULLS LAST,
+                 users.email ASC
+        "#,
+    )
+    .bind(days)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(
+            |(
+                user_id,
+                email,
+                balance_usd,
+                frozen_at,
+                frozen_reason,
+                recent_refunds,
+                reversed_in_window_usd,
+                stripe_object_ids,
+                stripe_payment_intent_ids,
+            )| {
+                let mut triggers = Vec::new();
+                if frozen_at.is_some() {
+                    triggers.push(REVIEW_TRIGGER_FROZEN.to_owned());
+                }
+                if balance_usd < Decimal::ZERO {
+                    triggers.push(REVIEW_TRIGGER_NEGATIVE_BALANCE.to_owned());
+                }
+                if recent_refunds > 0 {
+                    triggers.push(REVIEW_TRIGGER_RECENT_REFUND.to_owned());
+                }
+                ReviewQueueRow {
+                    user_id,
+                    email,
+                    balance_usd,
+                    receivable_usd: (balance_usd < Decimal::ZERO).then(|| -balance_usd),
+                    frozen: frozen_at.is_some(),
+                    frozen_at,
+                    frozen_reason,
+                    recent_refunds,
+                    reversed_in_window_usd,
+                    stripe_object_ids,
+                    stripe_payment_intent_ids,
+                    triggers,
+                }
+            },
+        )
+        .collect())
+}
+
+/// A ledger row with the Stripe anchors attached, for operator review only.
+///
+/// Deliberately NOT [`LedgerEntry`], which the customer portal serializes
+/// straight to the browser (`portal.rs`, `portal/src/api.ts`). Stripe object
+/// ids are internal reconciliation handles; widening the customer-facing struct
+/// to carry them would leak them to every portal user. Two structs is the price
+/// of that separation and it is worth paying.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct LedgerEntryDetail {
+    pub id: i64,
+    pub created_at: DateTime<Utc>,
+    pub entry_type: String,
+    pub amount_usd: Decimal,
+    pub balance_after_usd: Decimal,
+    pub note: Option<String>,
+    pub stripe_session_id: Option<String>,
+    pub stripe_payment_intent_id: Option<String>,
+    pub request_id: Option<Uuid>,
+}
+
+/// The account's entire ledger, newest first, with Stripe anchors.
+///
+/// Unbounded on purpose: this is the "reviews logs" surface, and a review that
+/// silently truncated the history would let the entry that explains the case
+/// fall off the bottom. A disputed account's ledger is tens of rows.
+pub async fn ledger_history(
+    pool: &PgPool,
+    user_id: Uuid,
+) -> Result<Vec<LedgerEntryDetail>, sqlx::Error> {
+    let rows = sqlx::query_as::<
+        _,
+        (
+            i64,
+            DateTime<Utc>,
+            String,
+            Decimal,
+            Decimal,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<Uuid>,
+        ),
+    >(
+        r#"
+        SELECT id, created_at, entry_type, amount_usd, balance_after_usd, note,
+               stripe_session_id, stripe_payment_intent_id, request_id
+        FROM credit_ledger
+        WHERE user_id = $1
+        ORDER BY created_at DESC, id DESC
+        "#,
+    )
+    .bind(user_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(
+            |(
+                id,
+                created_at,
+                entry_type,
+                amount_usd,
+                balance_after_usd,
+                note,
+                stripe_session_id,
+                stripe_payment_intent_id,
+                request_id,
+            )| LedgerEntryDetail {
+                id,
+                created_at,
+                entry_type,
+                amount_usd,
+                balance_after_usd,
+                note,
+                stripe_session_id,
+                stripe_payment_intent_id,
+                request_id,
+            },
+        )
+        .collect())
+}
+
+/// What an account actually consumed, summarized.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct UsageSummary {
+    pub requests: i64,
+    pub input_tokens: i64,
+    pub cached_input_tokens: i64,
+    pub output_tokens: i64,
+    /// What the customer was billed, summed.
+    pub spend_usd: Decimal,
+    pub first_request_at: Option<DateTime<Utc>>,
+    pub last_request_at: Option<DateTime<Utc>>,
+}
+
+/// Metered usage across every key the account has ever held, live or revoked.
+///
+/// Scoped by user rather than by key because a disputing account's keys are
+/// routinely revoked before review, and usage attached to a revoked key is
+/// still usage the customer received.
+pub async fn usage_summary(pool: &PgPool, user_id: Uuid) -> Result<UsageSummary, sqlx::Error> {
+    let (requests, input_tokens, cached_input_tokens, output_tokens, spend_usd, first, last) =
+        sqlx::query_as::<
+            _,
+            (
+                i64,
+                i64,
+                i64,
+                i64,
+                Decimal,
+                Option<DateTime<Utc>>,
+                Option<DateTime<Utc>>,
+            ),
+        >(
+            r#"
+        SELECT
+            COUNT(*),
+            COALESCE(SUM(usage_events.input_tokens), 0),
+            COALESCE(SUM(usage_events.cached_input_tokens), 0),
+            COALESCE(SUM(usage_events.output_tokens), 0),
+            COALESCE(SUM(usage_events.cost_usd), 0),
+            MIN(usage_events.ts),
+            MAX(usage_events.ts)
+        FROM usage_events
+        JOIN api_keys ON api_keys.id = usage_events.api_key_id
+        WHERE api_keys.user_id = $1
+        "#,
+        )
+        .bind(user_id)
+        .fetch_one(pool)
+        .await?;
+    Ok(UsageSummary {
+        requests,
+        input_tokens,
+        cached_input_tokens,
+        output_tokens,
+        spend_usd,
+        first_request_at: first,
+        last_request_at: last,
+    })
+}
+
+/// What a resolution attempt did, or why it refused.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ResolutionOutcome {
+    /// The receivable was forgiven and the balance is now exactly zero.
+    WrittenOff {
+        forgiven_usd: Decimal,
+        balance_after: Decimal,
+    },
+    /// A write-off already settled this account and the balance is no longer
+    /// negative. The idempotent no-op: no second ledger row.
+    AlreadyWrittenOff { balance_usd: Decimal },
+    Recovered {
+        amount_usd: Decimal,
+        balance_after: Decimal,
+    },
+    /// The account is not in a state this command may act on. Carries the
+    /// operator-facing reason; `admin` turns it into a non-zero exit.
+    Refused { reason: String },
+}
+
+/// Forgive a receivable: bring a negative balance up to exactly zero.
+///
+/// Built from the same parts as every other credit write — one transaction,
+/// the per-user advisory lock that admission, settlement, `credit_purchase`
+/// and `reverse_purchase` all serialize on, and a `credit_ledger` row
+/// snapshotting the balance it produced.
+///
+/// # Why the amount is not a parameter
+///
+/// A write-off's amount is a FACT about the account, not an operator's choice:
+/// it is whatever is owed at the moment the lock is held. Passing it in would
+/// let a stale figure — read before a concurrent settlement moved the balance —
+/// overshoot into positive credit, which is a customer being handed money
+/// because an operator's terminal was out of date. Reading it under the lock
+/// makes that unrepresentable.
+///
+/// # Idempotence
+///
+/// The intent is "leave this account owing nothing". Once that holds, a repeat
+/// is [`ResolutionOutcome::AlreadyWrittenOff`] and writes nothing — the second
+/// row would be indistinguishable from a real second forgiveness, and the
+/// ledger is append-only, so there is no taking it back.
+///
+/// A non-negative account with no prior write-off is refused instead: there is
+/// no receivable, so there is nothing to forgive, and the likeliest cause is
+/// the wrong email.
+///
+/// # This does not unfreeze
+///
+/// Settling the money and trusting the account again are different decisions
+/// belonging to different people at different times. The freeze columns are not
+/// in this transaction's write set at all.
+pub async fn write_off_receivable(
+    pool: &PgPool,
+    user_id: Uuid,
+    note: &str,
+) -> Result<ResolutionOutcome, sqlx::Error> {
+    let note = note.trim();
+    if note.is_empty() {
+        return Err(sqlx::Error::Protocol(
+            "a write-off must state its reason".to_owned(),
+        ));
+    }
+
+    let mut transaction = pool.begin().await?;
+    sqlx::query("SET LOCAL lock_timeout = '5s'")
+        .execute(&mut *transaction)
+        .await?;
+    // NOTE the absence of `SET LOCAL zerorouter.credit_reversal`. A write-off
+    // only ever moves the balance UP, so it has no business declaring itself to
+    // the 0009 overdraft trigger, and the tripwire keeps its meaning precisely
+    // because the paths that cannot overdraft never claim they might.
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1::TEXT, 0))")
+        .bind(user_id.to_string())
+        .execute(&mut *transaction)
+        .await?;
+
+    // Read under the lock, after it is held: this is the authoritative balance
+    // and no settlement can move it until this transaction commits.
+    let balance = sqlx::query_scalar::<_, Decimal>(
+        "SELECT credit_balance_usd FROM users WHERE id = $1 FOR UPDATE",
+    )
+    .bind(user_id)
+    .fetch_optional(&mut *transaction)
+    .await?
+    .ok_or_else(|| sqlx::Error::Protocol("write-off found no such user".to_owned()))?;
+
+    if balance >= Decimal::ZERO {
+        let settled = sqlx::query_scalar::<_, i32>(
+            "SELECT 1 FROM credit_ledger WHERE user_id = $1 AND entry_type = 'writeoff' LIMIT 1",
+        )
+        .bind(user_id)
+        .fetch_optional(&mut *transaction)
+        .await?
+        .is_some();
+        transaction.rollback().await?;
+        return Ok(if settled {
+            ResolutionOutcome::AlreadyWrittenOff {
+                balance_usd: balance,
+            }
+        } else {
+            ResolutionOutcome::Refused {
+                reason: format!(
+                    "balance is {balance}, so there is no receivable to write off; \
+                     a write-off only settles an account that owes money"
+                ),
+            }
+        });
+    }
+
+    let forgiven = -balance;
+    let balance_after = sqlx::query_scalar::<_, Decimal>(
+        r#"
+        UPDATE users
+        SET credit_balance_usd = 0
+        WHERE id = $1
+        RETURNING credit_balance_usd
+        "#,
+    )
+    .bind(user_id)
+    .fetch_one(&mut *transaction)
+    .await?;
+    sqlx::query(
+        r#"
+        INSERT INTO credit_ledger (user_id, entry_type, amount_usd, balance_after_usd, note)
+        VALUES ($1, 'writeoff', $2, $3, $4)
+        "#,
+    )
+    .bind(user_id)
+    .bind(forgiven)
+    .bind(balance_after)
+    .bind(note)
+    .execute(&mut *transaction)
+    .await?;
+    transaction.commit().await?;
+    Ok(ResolutionOutcome::WrittenOff {
+        forgiven_usd: forgiven,
+        balance_after,
+    })
+}
+
+/// Record money that came back outside Stripe — a dispute won, a wire received.
+///
+/// Credits the balance by exactly `amount_usd`. It is NOT capped at the
+/// outstanding receivable, and that is deliberate: a dispute ZeroRouter WINS
+/// leaves the customer having genuinely paid, so restoring the credit the
+/// reversal took back is the honest entry even when the reversal was never
+/// spent through and the balance is sitting at zero.
+///
+/// The guard against that generality is the precondition, not a cap: the
+/// account must already be in the review queue. On a healthy account this
+/// refuses, because a credit to a healthy account is a promo grant and
+/// `grant-credit` is the command that writes one.
+///
+/// # Idempotence
+///
+/// Weaker than the write-off's, honestly so. Two wires of the same size are two
+/// recoveries, and nothing in a `--recover 50` invocation distinguishes "the
+/// one I already recorded" from "another one". What bounds a repeat is the
+/// precondition: once a recovery lifts the account out of the review queue,
+/// the next `--recover` is refused. A still-frozen account stays reviewable by
+/// design, so an operator settling a frozen account can record several
+/// receipts — which is the real workflow.
+///
+/// # This does not unfreeze
+///
+/// Same reason as [`write_off_receivable`].
+pub async fn record_recovery(
+    pool: &PgPool,
+    user_id: Uuid,
+    amount_usd: Decimal,
+    note: &str,
+) -> Result<ResolutionOutcome, sqlx::Error> {
+    let note = note.trim();
+    if note.is_empty() {
+        return Err(sqlx::Error::Protocol(
+            "a recovery must state its reason".to_owned(),
+        ));
+    }
+    if amount_usd <= Decimal::ZERO {
+        return Err(sqlx::Error::Protocol(
+            "recovery amount must be positive".to_owned(),
+        ));
+    }
+
+    let mut transaction = pool.begin().await?;
+    sqlx::query("SET LOCAL lock_timeout = '5s'")
+        .execute(&mut *transaction)
+        .await?;
+    // As in `write_off_receivable`: a recovery only credits, so it never
+    // declares itself to the 0009 overdraft trigger.
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1::TEXT, 0))")
+        .bind(user_id.to_string())
+        .execute(&mut *transaction)
+        .await?;
+
+    // The reviewable-state precondition, evaluated under the lock against the
+    // same three triggers `review_queue` reports. Recency is checked over ALL
+    // reversals rather than a window: `disputes list --days` narrows what an
+    // operator is shown, but an operator who has decided to record a receipt
+    // against a 90-day-old chargeback should not be told the account is
+    // healthy.
+    let (balance, frozen, reversed) = sqlx::query_as::<_, (Decimal, bool, bool)>(
+        r#"
+        SELECT
+            users.credit_balance_usd,
+            users.frozen_at IS NOT NULL,
+            EXISTS (
+                SELECT 1 FROM credit_ledger
+                WHERE credit_ledger.user_id = users.id
+                  AND credit_ledger.entry_type = 'refund'
+            )
+        FROM users
+        WHERE users.id = $1
+        FOR UPDATE
+        "#,
+    )
+    .bind(user_id)
+    .fetch_optional(&mut *transaction)
+    .await?
+    .ok_or_else(|| sqlx::Error::Protocol("recovery found no such user".to_owned()))?;
+
+    if !frozen && !reversed && balance >= Decimal::ZERO {
+        transaction.rollback().await?;
+        return Ok(ResolutionOutcome::Refused {
+            reason: format!(
+                "account is not under review (balance {balance}, not frozen, no reversal on \
+                 record), so there is nothing to recover; promotional credit is `grant-credit`"
+            ),
+        });
+    }
+
+    let balance_after = sqlx::query_scalar::<_, Decimal>(
+        r#"
+        UPDATE users
+        SET credit_balance_usd = credit_balance_usd + $2
+        WHERE id = $1
+        RETURNING credit_balance_usd
+        "#,
+    )
+    .bind(user_id)
+    .bind(amount_usd)
+    .fetch_one(&mut *transaction)
+    .await?;
+    sqlx::query(
+        r#"
+        INSERT INTO credit_ledger (user_id, entry_type, amount_usd, balance_after_usd, note)
+        VALUES ($1, 'recovery', $2, $3, $4)
+        "#,
+    )
+    .bind(user_id)
+    .bind(amount_usd)
+    .bind(balance_after)
+    .bind(note)
+    .execute(&mut *transaction)
+    .await?;
+    transaction.commit().await?;
+    Ok(ResolutionOutcome::Recovered {
+        amount_usd,
+        balance_after,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Autopay (migration 0008)
 // ---------------------------------------------------------------------------
 
@@ -361,6 +1224,14 @@ pub async fn autopay_candidates(
           AND u.autopay_consecutive_failures < 3
           AND u.credit_balance_usd < u.autopay_threshold_usd
           AND u.stripe_customer_id IS NOT NULL
+          -- A frozen account is never charged (migration 0009). Without this
+          -- the freeze would be self-defeating in the worst possible way: a
+          -- chargeback reverses the credit, the balance drops through the
+          -- autopay threshold — often into the negative the receivable lives
+          -- in — and the very next sweep charges the disputing customer's
+          -- saved card again, off-session. This narrows the candidate set and
+          -- writes nothing; the claim machinery (HANDOFF §6d) is untouched.
+          AND u.frozen_at IS NULL
           AND NOT EXISTS (
               SELECT 1 FROM stripe_autopay_intents i
               WHERE i.user_id = u.id AND i.status = 'pending'

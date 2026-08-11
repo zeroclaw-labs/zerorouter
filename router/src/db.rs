@@ -560,6 +560,11 @@ pub enum UsageAdmission {
     SpendExceeded,
     VelocityExceeded,
     InsufficientCredits,
+    /// The owning account is frozen (migration 0009) — a Stripe chargeback, or
+    /// an operator's deliberate hold. Distinct from
+    /// [`Self::InsufficientCredits`] on purpose: a frozen account is refused
+    /// however much credit it holds, and topping up does not clear it.
+    AccountFrozen,
 }
 
 pub struct UsageSession {
@@ -819,14 +824,30 @@ pub async fn migrate(pool: &PgPool) -> Result<()> {
                 Cow::Borrowed(include_str!("../migrations/0008_autopay.sql")),
                 false,
             ),
-            // 9 is reserved for a change being prepared on another branch;
-            // sqlx orders by version and does not require a dense sequence.
             Migration::new(
-                10,
+                9,
+                Cow::Borrowed("dispute freeze"),
+                MigrationType::Simple,
+                Cow::Borrowed(include_str!("../migrations/0009_dispute_freeze.sql")),
+                false,
+            ),
+            // 10-12 are reserved for concurrent branches; see the 0013 header.
+            // `ignore_missing: false` below rejects an APPLIED migration that
+            // has vanished from this list, not a lower-numbered one that
+            // arrives late, so a 0010 landing after 0013 has run still applies.
+            Migration::new(
+                13,
+                Cow::Borrowed("dispute resolution"),
+                MigrationType::Simple,
+                Cow::Borrowed(include_str!("../migrations/0013_dispute_resolution.sql")),
+                false,
+            ),
+            Migration::new(
+                14,
                 Cow::Borrowed("dispatched reservations"),
                 MigrationType::Simple,
                 Cow::Borrowed(include_str!(
-                    "../migrations/0010_dispatched_reservations.sql"
+                    "../migrations/0014_dispatched_reservations.sql"
                 )),
                 false,
             ),
@@ -956,6 +977,38 @@ pub async fn begin_usage_session(
         transaction.rollback().await?;
         return Ok(UsageAdmission::Unauthorized);
     };
+
+    // The freeze gate (migration 0009). It sits HERE — inside the admission
+    // transaction, under the same per-user advisory lock as every other
+    // ceiling, and before a reservation exists — because a freeze that is
+    // checked later is a freeze that arrives after ZeroRouter has already paid
+    // an upstream for tokens it cannot bill. A chargeback means the money for
+    // this account went back to the card; nothing more may be spent on its
+    // behalf until an operator says so.
+    //
+    // Independent of `require_credits`: a frozen account is refused even in a
+    // cap-only deployment, because the freeze is about the account, not about
+    // the balance. It is also independent of the balance's SIGN — the reversal
+    // deliberately leaves a spent-through account negative, and the freeze,
+    // not the arithmetic, is what refuses it.
+    let frozen =
+        sqlx::query_scalar::<_, Option<DateTime<Utc>>>("SELECT frozen_at FROM users WHERE id = $1")
+            .bind(key.user_id)
+            .fetch_optional(&mut *transaction)
+            .await?;
+    match frozen {
+        // No user row at all: the key's owner vanished. Same answer as a
+        // revoked key, so admission never becomes an oracle.
+        None => {
+            transaction.rollback().await?;
+            return Ok(UsageAdmission::Unauthorized);
+        }
+        Some(Some(_)) => {
+            transaction.rollback().await?;
+            return Ok(UsageAdmission::AccountFrozen);
+        }
+        Some(None) => {}
+    }
 
     // Reclaim expired reservations, but only the ones that prove nothing
     // happened. An expired row falls into exactly one of three classes, and
@@ -2608,6 +2661,12 @@ pub const KEY_CREATION_WINDOW_HOURS: i64 = 24;
 pub enum KeyMintAdmission {
     Allowed,
     LimitReached,
+    /// The account is frozen (migration 0009). A freeze that stopped inference
+    /// but still handed out fresh credentials would be a freeze in name only —
+    /// the new key would be refused at admission anyway, so minting it is at
+    /// best a confusing dead end and at worst a hole the moment any future path
+    /// forgets the admission check.
+    AccountFrozen,
 }
 
 /// Decide whether `user_id` may mint another API key, inside the caller's
@@ -2633,10 +2692,23 @@ pub enum KeyMintAdmission {
 /// `admin mint-key` CLI is operator-only (it needs database credentials, not a
 /// session) and is deliberately left exempt, so an operator can always issue a
 /// key for a user who has hit the throttle.
+///
+/// The freeze check (migration 0009) lives here for the same reason the two
+/// limits do: both self-service mint paths already funnel through this call
+/// under the owning user's row lock, so one check covers the portal and the
+/// device grant and cannot be forgotten by only one of them.
 pub async fn admit_key_mint(
     connection: &mut PgConnection,
     user_id: Uuid,
 ) -> Result<KeyMintAdmission, sqlx::Error> {
+    let frozen =
+        sqlx::query_scalar::<_, Option<DateTime<Utc>>>("SELECT frozen_at FROM users WHERE id = $1")
+            .bind(user_id)
+            .fetch_optional(&mut *connection)
+            .await?;
+    if frozen.flatten().is_some() {
+        return Ok(KeyMintAdmission::AccountFrozen);
+    }
     let (active_keys, recently_created_keys) = sqlx::query_as::<_, (i64, i64)>(
         r#"
         SELECT

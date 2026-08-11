@@ -3085,6 +3085,7 @@ async fn admit_usage(
         UsageAdmission::SpendExceeded => Err(ApiError::SpendCapExceeded),
         UsageAdmission::VelocityExceeded => Err(ApiError::VelocityCapExceeded),
         UsageAdmission::InsufficientCredits => Err(ApiError::InsufficientCredits),
+        UsageAdmission::AccountFrozen => Err(ApiError::AccountFrozen),
     }
 }
 
@@ -3164,6 +3165,7 @@ fn insert_header(response: &mut Response, name: &'static str, value: &str) {
 mod tests {
     use std::str::FromStr;
 
+    use crate::config::ModelMetadata;
     use crate::provider::TokenUsage;
     use rust_decimal::Decimal;
     use uuid::Uuid;
@@ -3272,6 +3274,8 @@ mod tests {
                 output_per_mtok: Some(2.0),
                 cached_input_per_mtok: None,
             },
+            // The walk does not read metadata; it only routes and bills.
+            metadata: ModelMetadata::default(),
         }
     }
 

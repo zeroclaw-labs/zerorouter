@@ -72,6 +72,10 @@ pub fn spa_router(dist_path: &std::path::Path) -> Router<()> {
 enum PortalError {
     InvalidRequest(&'static str),
     KeyLimitReached,
+    /// The account is frozen (migration 0009), so it may not mint new keys.
+    /// Reads are untouched: a frozen customer can still see their balance,
+    /// ledger and usage — the freeze blocks spend, not visibility.
+    AccountFrozen,
     KeyNotFound,
     Database,
 }
@@ -93,6 +97,13 @@ impl IntoResponse for PortalError {
                  or too many keys created recently. Disabling a key does not raise the \
                  creation limit; wait for the window to pass.",
                 "key_limit_reached",
+            ),
+            Self::AccountFrozen => (
+                StatusCode::FORBIDDEN,
+                "This account is frozen and cannot create new API keys. A frozen account is \
+                 usually the result of a payment dispute or chargeback. Contact ZeroRouter \
+                 support to have the freeze reviewed.",
+                "account_frozen",
             ),
             Self::KeyNotFound => (
                 StatusCode::NOT_FOUND,
@@ -307,11 +318,12 @@ async fn create_key(
     // grant can no longer mint past a limit the portal enforces. Counts
     // disabled keys against a trailing creation window, which is what makes
     // disable-and-remint stop resetting the limit.
-    if matches!(
-        admit_key_mint(&mut transaction, user.user_id).await?,
-        KeyMintAdmission::LimitReached
-    ) {
-        return Err(PortalError::KeyLimitReached);
+    // Exhaustive on purpose: a new refusal reason must be answered here rather
+    // than falling through to a mint.
+    match admit_key_mint(&mut transaction, user.user_id).await? {
+        KeyMintAdmission::Allowed => {}
+        KeyMintAdmission::LimitReached => return Err(PortalError::KeyLimitReached),
+        KeyMintAdmission::AccountFrozen => return Err(PortalError::AccountFrozen),
     }
 
     let api_key = generate_api_key();

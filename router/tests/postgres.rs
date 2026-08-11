@@ -774,7 +774,11 @@ async fn migration_chain_applies_on_a_fresh_database() {
     let fresh_url = swap_database(&base, &fresh_db);
     // Nothing inside may panic: the DROP below is the only cleanup, so every
     // step reports through the Result and the assertions run after the drop.
-    let outcome: anyhow::Result<(bool, bool, bool, bool, bool, i64)> = async {
+    // One bool per per-migration probe, then the chain-head version. A named
+    // struct would outlive its usefulness the moment the next migration adds
+    // a probe; the tuple grows in one place and the assertions name the facts.
+    #[allow(clippy::type_complexity)]
+    let outcome: anyhow::Result<(bool, bool, bool, bool, bool, bool, bool, i64)> = async {
         let pool = PgPoolOptions::new()
             .max_connections(1)
             .connect_with(PgConnectOptions::from_str(&fresh_url)?)
@@ -811,6 +815,26 @@ async fn migration_chain_applies_on_a_fresh_database() {
         )
         .fetch_one(&pool)
         .await?;
+        let freeze_state_exists = query_scalar::<_, bool>(
+            r#"
+            SELECT COUNT(*) = 2
+            FROM information_schema.columns
+            WHERE table_name = 'users'
+              AND column_name IN ('frozen_at', 'frozen_reason')
+            "#,
+        )
+        .fetch_one(&pool)
+        .await?;
+        let dispatched_marker_exists = query_scalar::<_, bool>(
+            r#"
+            SELECT COUNT(*) = 1
+            FROM information_schema.columns
+            WHERE table_name = 'usage_reservations'
+              AND column_name = 'dispatched_at'
+            "#,
+        )
+        .fetch_one(&pool)
+        .await?;
         let version = query_scalar::<_, i64>("SELECT MAX(version) FROM _sqlx_migrations")
             .fetch_one(&pool)
             .await?;
@@ -821,6 +845,8 @@ async fn migration_chain_applies_on_a_fresh_database() {
             intents_exists,
             settlement_outbox_exists,
             ledger_honesty_exists,
+            freeze_state_exists,
+            dispatched_marker_exists,
             version,
         ))
     }
@@ -831,7 +857,7 @@ async fn migration_chain_applies_on_a_fresh_database() {
         .execute(&admin)
         .await;
 
-    let outcome = outcome.expect("the 0001->0007 chain must apply on a fresh database");
+    let outcome = outcome.expect("the 0001->0014 chain must apply on a fresh database");
     assert!(outcome.0, "request_attempts exists after the fresh chain");
     assert!(
         outcome.1,
@@ -849,7 +875,19 @@ async fn migration_chain_applies_on_a_fresh_database() {
         outcome.4,
         "the 0007 ledger-honesty columns exist after the chain"
     );
-    assert_eq!(outcome.5, 10, "the chain reaches migration version 10");
+    assert!(
+        outcome.5,
+        "the 0009 freeze-state columns exist after the chain"
+    );
+    assert!(
+        outcome.6,
+        "the 0014 dispatched_at column exists after the chain"
+    );
+    // 14, not 10: 0013 (dispute resolution) and 0014 (dispatched
+    // reservations) are numbered with a gap so 0010-0012 stay available to
+    // branches in flight. The chain's head is the highest version applied,
+    // not a count of files.
+    assert_eq!(outcome.7, 14, "the chain reaches migration version 14");
 }
 
 /// Rewrite the database name in a Postgres URL, keeping any query string

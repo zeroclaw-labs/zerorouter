@@ -372,6 +372,36 @@ pub struct ModelList {
     pub data: Vec<ModelObject>,
 }
 
+/// One `/v1/models` row.
+///
+/// Beyond `pricing`, the row carries what the model can take and produce. Those
+/// four fields are `skip_serializing_if = "Option::is_none"` and that is a
+/// contract, not a size optimisation: an absent key means *unknown*, and a
+/// consumer must be able to tell it from a small value. Emitting `null`, or
+/// worse a plausible default, would erase the difference. ZeroClaw's
+/// `ModelInfo.context_window` is an `Option` for the same reason.
+///
+/// The names follow OpenRouter, the shape `pricing` already commits to
+/// (see [`ModelPricing`]), because that is the vocabulary the OpenAI-compatible
+/// clients consuming this endpoint already read. That costs one rename against
+/// `config/tiers.toml`, which spells the same field models.dev's way:
+///
+/// | `tiers.toml`       | wire               |
+/// |--------------------|--------------------|
+/// | `context_window`   | `context_length`   |
+/// | `max_output_tokens`| `max_output_tokens`|
+/// | `input_modalities` | `input_modalities` |
+/// | `tool_call`        | `tool_call`        |
+///
+/// Only the window is respelled, and only because a consumer already reads it
+/// by that name: ZeroClaw's `fetch_openai_compatible_context_window`
+/// (`zeroclaw-providers/src/lib.rs`) looks for `context_length` first and
+/// `context_window` second, so `context_length` is the spelling that works
+/// without asking anyone to change. The remaining three have no OpenRouter
+/// top-level equivalent — OpenRouter nests them under `top_provider`,
+/// `architecture` and `supported_parameters`, three objects that describe a
+/// model marketplace ZeroRouter is not — so they stay flat and keep the file's
+/// names.
 #[derive(Debug, Serialize)]
 pub struct ModelObject {
     pub id: String,
@@ -379,6 +409,20 @@ pub struct ModelObject {
     pub created: u64,
     pub owned_by: String,
     pub pricing: ModelPricing,
+    /// Maximum input window in tokens. Absent means unknown.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_length: Option<u64>,
+    /// Maximum tokens generated in one response. Absent means unknown.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u64>,
+    /// Accepted input modalities (`text`, `image`, `pdf`, `audio`). Absent
+    /// means unknown — never "text only".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_modalities: Option<Vec<String>>,
+    /// Native tool-calling support. Absent means unknown, which is not the
+    /// same claim as `false`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_call: Option<bool>,
 }
 
 /// OpenRouter-shaped per-token pricing, string-valued. This is ZeroClaw's
@@ -434,6 +478,10 @@ impl ModelList {
                     created: 0,
                     owned_by: row.owned_by,
                     pricing: ModelPricing::from_sell_rates(row.sell_rates),
+                    context_length: row.metadata.context_window,
+                    max_output_tokens: row.metadata.max_output_tokens,
+                    input_modalities: row.metadata.input_modalities,
+                    tool_call: row.metadata.tool_call,
                 })
                 .collect(),
         }

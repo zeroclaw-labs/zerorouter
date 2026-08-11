@@ -1,4 +1,4 @@
--- 0010_dispatched_reservations.sql
+-- 0014_dispatched_reservations.sql
 --
 -- A reservation whose request actually reached an upstream is marked as such,
 -- so the TTL sweep can stop confusing "the customer got nothing" with "the
@@ -64,7 +64,7 @@
 -- silently missing marker — the exact failure this column exists to prevent.
 --
 -- PRE-EXISTING RESERVATIONS: rows that predate this migration carry NULL, which
--- reads as "never dispatched" and gives them the pre-0010 sweep answer. No
+-- reads as "never dispatched" and gives them the pre-0014 sweep answer. No
 -- backfill is possible (the fact was never recorded) or wanted.
 --
 -- REGISTRATION REQUIRED: sqlx migrations are a hardcoded include_str! vec —
@@ -74,12 +74,12 @@
 --       10,
 --       Cow::Borrowed("dispatched reservations"),
 --       MigrationType::Simple,
---       Cow::Borrowed(include_str!("../migrations/0010_dispatched_reservations.sql")),
+--       Cow::Borrowed(include_str!("../migrations/0014_dispatched_reservations.sql")),
 --       false,
 --   ),
 --
--- Version 9 is deliberately skipped: it is reserved for a change being
--- prepared on another branch, and sqlx orders by version rather than requiring
+-- Numbered 14: 0009 (dispute freeze) and 0013 (dispute resolution) landed
+-- while this was in flight; 0010-0012 remain reserved per the 0013 header.
 -- a dense sequence.
 
 ALTER TABLE usage_reservations

@@ -130,6 +130,14 @@ needs from the environment:
   `checkout.session.async_payment_succeeded`). Without the payment-intent
   pair, autopay charges settle only through the 30-minute reconciliation
   sweep — credits still arrive exactly once, just late.
+- **`charge.dispute.created` and `charge.refunded` (migration 0009).**
+  These are not optional and they are not late-tolerant. A dispute freezes
+  the account and reverses the credit; a refund reverses the credit. An
+  endpoint that is not subscribed to them silently keeps the pre-0009
+  behavior — a customer can charge back at Stripe and keep spending — with
+  nothing in the logs to say so, because the events never arrive. **Check
+  the subscription list when deploying this change**, and re-check it after
+  any endpoint is recreated.
 - **A single serving deployment per database** is assumed by the sweep's
   claim rows (one pending intent per user); the ECS service already runs
   one task. Scaling out is safe for correctness (claims are DB-enforced)

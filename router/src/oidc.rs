@@ -190,15 +190,19 @@ async fn login(State(ctx): State<WebCtx>) -> Result<Response, OidcError> {
         tracing::debug!(error = %error, "expired OIDC state cleanup failed");
     }
 
+    // The lifetime is bound, not written inline, so the row and the cookie
+    // below cannot drift apart. Expiry is measured on the database clock,
+    // which is also the clock the callback's `expires_at > NOW()` reads.
     sqlx::query(
         r#"
         INSERT INTO oidc_states (state, nonce, pkce_verifier, expires_at)
-        VALUES ($1, $2, $3, NOW() + INTERVAL '10 minutes')
+        VALUES ($1, $2, $3, NOW() + make_interval(secs => $4))
         "#,
     )
     .bind(state.secret().as_str())
     .bind(nonce.secret().as_str())
     .bind(pkce_verifier.secret().as_str())
+    .bind(OIDC_STATE_TTL_SECS as f64)
     .execute(&ctx.pool)
     .await
     .map_err(|_| OidcError::DatabaseUnavailable)?;
@@ -233,19 +237,24 @@ async fn callback(
     let Some(settings) = ctx.config.oidc.as_ref() else {
         return Err(OidcError::Unavailable);
     };
-    let state = params
+    let secure_cookies = ctx.config.secure_cookies;
+    let Some(state) = params
         .state
         .as_deref()
         .map(str::trim)
         .filter(|state| !state.is_empty())
-        .ok_or(OidcError::StateInvalid)?;
+    else {
+        return Ok(restart_sign_in(&headers, secure_cookies));
+    };
 
     // The browser that began the login must present the matching state cookie;
     // a callback lacking it (or carrying a different value) is not the browser
     // that initiated this flow.
-    let cookie_state = oidc_state_cookie_value(&headers).ok_or(OidcError::StateInvalid)?;
+    let Some(cookie_state) = oidc_cookie_value(&headers, OIDC_STATE_COOKIE) else {
+        return Ok(restart_sign_in(&headers, secure_cookies));
+    };
     if !constant_time_eq(cookie_state.as_bytes(), state.as_bytes()) {
-        return Err(OidcError::StateInvalid);
+        return Ok(restart_sign_in(&headers, secure_cookies));
     }
 
     // Single use: consume the login state before anything else, so a replayed
@@ -261,7 +270,13 @@ async fn callback(
     .fetch_optional(&ctx.pool)
     .await
     .map_err(|_| OidcError::DatabaseUnavailable)?;
-    let (stored_nonce, stored_pkce_verifier) = consumed.ok_or(OidcError::StateInvalid)?;
+    // Expired, already consumed, or never ours. Whichever it was, the state is
+    // unusable and the user is standing at a dead end — restart them instead
+    // of explaining. A replay lands here too, and lands here empty-handed: the
+    // row is gone, so nothing below runs and no session can be minted.
+    let Some((stored_nonce, stored_pkce_verifier)) = consumed else {
+        return Ok(restart_sign_in(&headers, secure_cookies));
+    };
 
     if params.error.is_some() {
         // The provider reported a failure (for example the user denied
@@ -366,9 +381,51 @@ async fn callback(
     );
     response.headers_mut().append(
         header::SET_COOKIE,
-        clear_oidc_state_cookie_header(ctx.config.secure_cookies),
+        clear_oidc_state_cookie_header(secure_cookies),
+    );
+    // This login worked, so any earlier restart is spent: drop the marker or a
+    // later, unrelated failure would be denied its own one restart.
+    response.headers_mut().append(
+        header::SET_COOKIE,
+        clear_oidc_restart_cookie_header(secure_cookies),
     );
     Ok(response)
+}
+
+/// The answer to a callback whose login state is missing, expired, or already
+/// used: send the browser back to `/auth/login` so the flow restarts, rather
+/// than showing an error to a user who has done nothing wrong. A user who has
+/// just finished registering still holds a provider session, so the restarted
+/// authorization returns immediately and the error is never seen.
+///
+/// Bounded to one bounce. A browser that cannot keep the state cookie would
+/// otherwise fail the same way on the restarted flow and be sent around again
+/// forever, so the second consecutive failure answers with the error instead.
+/// The other loop is closed by `/auth/login` itself: when it cannot mint a
+/// fresh state (a database outage) it fails with `database_unavailable` rather
+/// than redirecting anywhere.
+fn restart_sign_in(headers: &HeaderMap, secure_cookies: bool) -> Response {
+    if oidc_cookie_value(headers, OIDC_RESTART_COOKIE).is_some() {
+        let mut response = OidcError::StateInvalid.into_response();
+        // Clear the marker: this attempt is over, and the next one deserves
+        // its own restart.
+        response.headers_mut().append(
+            header::SET_COOKIE,
+            clear_oidc_restart_cookie_header(secure_cookies),
+        );
+        response.headers_mut().append(
+            header::SET_COOKIE,
+            clear_oidc_state_cookie_header(secure_cookies),
+        );
+        return response;
+    }
+
+    let mut response = Redirect::to(SIGN_IN_RESTART_URL).into_response();
+    response.headers_mut().append(
+        header::SET_COOKIE,
+        oidc_restart_cookie_header(secure_cookies),
+    );
+    response
 }
 
 /// Revoke the current session and clear the cookie.
@@ -546,7 +603,40 @@ fn normalize_email(raw: &str) -> String {
 }
 
 const OIDC_STATE_COOKIE: &str = "zr_oidc_state";
-const OIDC_STATE_TTL_SECS: u64 = 600;
+
+/// How long an in-flight login may take to arrive back at `/auth/callback`.
+///
+/// Not a round-trip budget: a brand-new user's first sign-in is registration,
+/// then passkey enrolment, then *email verification* — which means leaving for
+/// an inbox and possibly waiting on a resend. A real signup measured about
+/// twenty-five minutes end to end, so at the previous ten minutes the state
+/// row was already gone when the provider redirected back, and the first thing
+/// a new customer saw from the product was an error.
+///
+/// Widening the window is cheap: the state is an unguessable random value,
+/// single-use (consumed by `DELETE ... RETURNING` before anything is
+/// exchanged), bound to a PKCE verifier, and bound to the initiating browser
+/// through the state cookie. Forty-five minutes covers the observed detour
+/// with margin.
+///
+/// This governs **both** the `oidc_states` row and the state cookie's
+/// `Max-Age`. They have to expire together: whichever half dies first fails
+/// the callback on its own.
+const OIDC_STATE_TTL_SECS: u64 = 45 * 60;
+
+/// Marks a browser that has already been bounced back through `/auth/login`
+/// by [`restart_sign_in`], so the bounce can happen at most once per attempt.
+const OIDC_RESTART_COOKIE: &str = "zr_oidc_restart";
+
+/// Long enough to survive the restarted authorization (including a provider
+/// that asks the user to re-authenticate), short enough that it cannot silence
+/// an unrelated failure hours later.
+const OIDC_RESTART_TTL_SECS: u64 = 600;
+
+/// Where an unusable login state sends the browser. The query parameter is a
+/// hint only — nothing on the server reads it — so the SPA (or a log) can tell
+/// an automatic retry from a fresh sign-in during the moment it is on screen.
+const SIGN_IN_RESTART_URL: &str = "/auth/login?restart=login_state_invalid";
 
 fn oidc_state_cookie_header(state: &str, secure: bool) -> HeaderValue {
     let secure_attr = if secure { "; Secure" } else { "" };
@@ -567,13 +657,33 @@ fn clear_oidc_state_cookie_header(secure: bool) -> HeaderValue {
     })
 }
 
-fn oidc_state_cookie_value(headers: &HeaderMap) -> Option<String> {
+fn oidc_restart_cookie_header(secure: bool) -> HeaderValue {
+    let secure_attr = if secure { "; Secure" } else { "" };
+    let cookie = format!(
+        "{OIDC_RESTART_COOKIE}=1; Path=/auth; HttpOnly; SameSite=Lax; Max-Age={OIDC_RESTART_TTL_SECS}{secure_attr}"
+    );
+    HeaderValue::from_str(&cookie).unwrap_or_else(|_| {
+        HeaderValue::from_static("zr_oidc_restart=; Path=/auth; HttpOnly; Max-Age=0")
+    })
+}
+
+fn clear_oidc_restart_cookie_header(secure: bool) -> HeaderValue {
+    let secure_attr = if secure { "; Secure" } else { "" };
+    let cookie = format!(
+        "{OIDC_RESTART_COOKIE}=; Path=/auth; HttpOnly; SameSite=Lax; Max-Age=0{secure_attr}"
+    );
+    HeaderValue::from_str(&cookie).unwrap_or_else(|_| {
+        HeaderValue::from_static("zr_oidc_restart=; Path=/auth; HttpOnly; Max-Age=0")
+    })
+}
+
+fn oidc_cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
     for header_value in headers.get_all(header::COOKIE) {
         let raw = header_value.to_str().ok()?;
         for pair in raw.split(';') {
             let mut split = pair.trim().splitn(2, '=');
-            let name = split.next()?.trim();
-            if name == OIDC_STATE_COOKIE {
+            let cookie_name = split.next()?.trim();
+            if cookie_name == name {
                 let value = split.next()?.trim();
                 if !value.is_empty() {
                     return Some(value.to_owned());
@@ -689,11 +799,53 @@ mod tests {
         assert!(text.contains("Secure"));
 
         let mut headers = HeaderMap::new();
-        headers.append(header::COOKIE, "zr_oidc_state=state-value".parse().unwrap());
+        headers.append(
+            header::COOKIE,
+            "zr_oidc_restart=1; zr_oidc_state=state-value"
+                .parse()
+                .unwrap(),
+        );
         assert_eq!(
-            oidc_state_cookie_value(&headers).as_deref(),
+            oidc_cookie_value(&headers, OIDC_STATE_COOKIE).as_deref(),
             Some("state-value")
         );
-        assert!(oidc_state_cookie_value(&HeaderMap::new()).is_none());
+        assert_eq!(
+            oidc_cookie_value(&headers, OIDC_RESTART_COOKIE).as_deref(),
+            Some("1")
+        );
+        assert!(oidc_cookie_value(&HeaderMap::new(), OIDC_STATE_COOKIE).is_none());
+        assert!(oidc_cookie_value(&headers, "zr_session").is_none());
+    }
+
+    #[test]
+    fn the_state_row_and_its_cookie_share_one_lifetime() {
+        // The row's expiry is bound from this same constant (see `login`), so
+        // a cookie that outlives the row — or the reverse — is a drift bug.
+        // The value itself is load-bearing: ten minutes is shorter than a real
+        // signup's email-verification detour, which is the bug this fixes.
+        assert_eq!(OIDC_STATE_TTL_SECS, 2_700);
+        let header = oidc_state_cookie_header("state-value", false);
+        let text = header.to_str().expect("cookie header should be ascii");
+        assert!(
+            text.contains("Max-Age=2700"),
+            "state cookie must carry the row's lifetime: {text}"
+        );
+    }
+
+    #[test]
+    fn the_restart_marker_is_scoped_and_clearable() {
+        let set = oidc_restart_cookie_header(true);
+        let text = set.to_str().expect("cookie header should be ascii");
+        assert!(text.starts_with("zr_oidc_restart=1"));
+        assert!(text.contains("Path=/auth"));
+        assert!(text.contains("HttpOnly"));
+        assert!(text.contains("SameSite=Lax"));
+        assert!(text.contains("Secure"));
+        assert!(text.contains(&format!("Max-Age={OIDC_RESTART_TTL_SECS}")));
+
+        let cleared = clear_oidc_restart_cookie_header(false);
+        let text = cleared.to_str().expect("cookie header should be ascii");
+        assert!(text.contains("Max-Age=0"));
+        assert!(!text.contains("Secure"));
     }
 }
