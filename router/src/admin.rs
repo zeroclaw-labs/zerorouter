@@ -36,6 +36,12 @@ pub enum AdminCommand {
     /// The user must already exist (mint-key creates one) — a typo'd email
     /// must fail loudly, never mint a funded ghost account.
     GrantCredit(GrantCreditArgs),
+    /// Freeze or unfreeze an account. A frozen account is refused at
+    /// admission and cannot mint new API keys; its history stays readable.
+    /// `--off` is the release valve for the automatic freeze a Stripe
+    /// chargeback applies (migration 0009) — without it, lifting a freeze
+    /// would mean hand-written SQL against the users table.
+    SetFrozen(SetFrozenArgs),
     /// Disable an existing key.
     RevokeKey(RevokeKeyArgs),
     /// List key metadata without hashes or plaintext credentials.
@@ -46,6 +52,28 @@ pub enum AdminCommand {
     /// Replay settlements that were recorded as owed and never committed. Safe
     /// to run at any time and safe to run twice: the settle is idempotent.
     SettleOwed(SettleOwedArgs),
+    /// Reconcile `tiers.toml` against a public model catalog: prices, context
+    /// windows, modalities. Read-only and database-free, so it runs in CI.
+    /// Exits non-zero when a basis drifted or a model vanished — never writes
+    /// a price, because a bad fetch that repriced a live billing catalog would
+    /// be worse than the staleness it fixed.
+    CatalogDrift(CatalogDriftArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct CatalogDriftArgs {
+    /// Public catalog to reconcile against.
+    #[arg(long, default_value = crate::drift::DEFAULT_SOURCE_URL)]
+    pub source_url: String,
+    /// Read the source from a file instead of the network (offline / CI).
+    #[arg(long)]
+    pub source_file: Option<std::path::PathBuf>,
+    /// Tier file to check. Defaults to the same path the server serves.
+    #[arg(long)]
+    pub tiers: Option<std::path::PathBuf>,
+    /// Report and exit zero even when something drifted.
+    #[arg(long)]
+    pub allow_drift: bool,
 }
 
 #[derive(Debug, Args)]
@@ -83,6 +111,18 @@ pub struct GrantCreditArgs {
     /// Ledger note recorded with the grant.
     #[arg(long, default_value = "beta promo credit")]
     pub note: String,
+}
+
+#[derive(Debug, Args)]
+pub struct SetFrozenArgs {
+    #[arg(long)]
+    pub email: String,
+    /// Freeze the account: an operator-initiated hold.
+    #[arg(long, conflicts_with = "off")]
+    pub on: bool,
+    /// Lift the freeze and restore service, whatever applied it.
+    #[arg(long)]
+    pub off: bool,
 }
 
 fn parse_priority(value: &str) -> Result<Priority, String> {
@@ -147,6 +187,12 @@ struct KeyMetadata {
 }
 
 pub async fn run(args: AdminArgs) -> Result<()> {
+    // Catalog drift is a property of a FILE, not of the ledger. Answering it
+    // before a pool is opened is what lets CI run it with no database.
+    if let AdminCommand::CatalogDrift(args) = args.command {
+        return catalog_drift(args).await;
+    }
+
     let pool = database_pool_from_env().await?;
     migrate(&pool).await?;
 
@@ -154,11 +200,14 @@ pub async fn run(args: AdminArgs) -> Result<()> {
         AdminCommand::MintKey(args) => mint_key(&pool, args).await,
         AdminCommand::UserStatus(args) => user_status(&pool, args).await,
         AdminCommand::GrantCredit(args) => grant_credit(&pool, args).await,
+        AdminCommand::SetFrozen(args) => set_frozen(&pool, args).await,
         AdminCommand::Treasury(args) => treasury(&pool, args).await,
         AdminCommand::RevokeKey(args) => revoke_key(&pool, args).await,
         AdminCommand::ListKeys(args) => list_keys(&pool, args).await,
         AdminCommand::OwedSettlements(args) => owed_settlements(&pool, args).await,
         AdminCommand::SettleOwed(args) => settle_owed(&pool, args).await,
+        // Handled above, before the pool exists.
+        AdminCommand::CatalogDrift(_) => unreachable!("dispatched before the pool"),
     }
 }
 
@@ -208,8 +257,20 @@ async fn user_status(pool: &PgPool, args: UserStatusArgs) -> Result<()> {
     if email.is_empty() || !email.contains('@') {
         bail!("email must be a non-empty email address")
     }
-    let Some((user_id, balance)) = sqlx::query_as::<_, (Uuid, Decimal)>(
-        "SELECT id, credit_balance_usd FROM users WHERE email = $1",
+    // `frozen_at` rides along because this is the command an operator runs to
+    // answer "why is this customer being refused?", and a freeze is now one of
+    // the answers. Listing every frozen account is the review workflow's job,
+    // not this one's.
+    let Some((user_id, balance, frozen_at, frozen_reason)) = sqlx::query_as::<
+        _,
+        (
+            Uuid,
+            Decimal,
+            Option<chrono::DateTime<chrono::Utc>>,
+            Option<String>,
+        ),
+    >(
+        "SELECT id, credit_balance_usd, frozen_at, frozen_reason FROM users WHERE email = $1",
     )
     .bind(&email)
     .fetch_optional(pool)
@@ -243,6 +304,9 @@ async fn user_status(pool: &PgPool, args: UserStatusArgs) -> Result<()> {
             "user_id": user_id,
             "email": email,
             "balance_usd": balance,
+            "frozen": frozen_at.is_some(),
+            "frozen_at": frozen_at,
+            "frozen_reason": frozen_reason,
             "lifetime_spend_usd": spent,
             "live_keys": live_keys,
             "ledger": entries,
@@ -285,6 +349,59 @@ async fn grant_credit(pool: &PgPool, args: GrantCreditArgs) -> Result<()> {
             "user_id": user_id,
             "granted_usd": amount,
             "balance_usd": balance,
+        }))?
+    );
+    Ok(())
+}
+
+/// Freeze or lift the freeze on one account, by email.
+///
+/// Shaped like `grant-credit` on purpose — resolve the user, refuse loudly if
+/// there is not exactly one, act through the same helpers the webhook uses,
+/// print the resulting state as JSON. Exactly one of `--on` / `--off` is
+/// required: a "set" command whose default is silently one direction is how an
+/// operator unfreezes an account they meant to freeze.
+async fn set_frozen(pool: &PgPool, args: SetFrozenArgs) -> Result<()> {
+    let email = args.email.trim().to_lowercase();
+    if email.is_empty() || !email.contains('@') {
+        bail!("email must be a non-empty email address")
+    }
+    let freeze = match (args.on, args.off) {
+        (true, false) => true,
+        (false, true) => false,
+        _ => bail!("pass exactly one of --on or --off"),
+    };
+    let Some(user_id) = sqlx::query_scalar::<_, Uuid>("SELECT id FROM users WHERE email = $1")
+        .bind(&email)
+        .fetch_optional(pool)
+        .await
+        .context("failed to resolve user")?
+    else {
+        bail!("no user with email {email}")
+    };
+    let changed = if freeze {
+        crate::billing::freeze_account(pool, user_id, crate::billing::FreezeReason::Operator)
+            .await
+            .context("failed to freeze the account")?
+    } else {
+        crate::billing::unfreeze_account(pool, user_id)
+            .await
+            .context("failed to lift the freeze")?
+    };
+    let state = crate::billing::freeze_state(pool, user_id)
+        .await
+        .context("failed to read the freeze state")?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "user_id": user_id,
+            "email": email,
+            "frozen": state.is_some(),
+            "frozen_at": state.as_ref().map(|(at, _)| at),
+            "frozen_reason": state.as_ref().map(|(_, reason)| reason),
+            // False means the account was already in the requested state; the
+            // command is idempotent and that is not an error.
+            "changed": changed,
         }))?
     );
     Ok(())
@@ -461,4 +578,164 @@ async fn list_keys(pool: &PgPool, args: ListKeysArgs) -> Result<()> {
     .collect::<Vec<_>>();
     println!("{}", serde_json::to_string_pretty(&rows)?);
     Ok(())
+}
+
+/// Reconcile the shipped tier file against a public model catalog.
+///
+/// Read-only by construction: it prints what it found and sets an exit code.
+/// Prices are never written back. A catalog that reprices itself from a
+/// network fetch can turn one bad upstream document into a billing incident,
+/// and the staleness this detects is slow enough that a human in the loop
+/// costs nothing.
+async fn catalog_drift(args: CatalogDriftArgs) -> Result<()> {
+    use crate::drift::{fetch_source, reconcile};
+
+    let tiers_path = args.tiers.unwrap_or_else(|| {
+        std::env::var("ZEROROUTER_TIERS_PATH")
+            .unwrap_or_else(|_| crate::config::DEFAULT_TIER_CONFIG_PATH.to_owned())
+            .into()
+    });
+    let catalog = crate::config::load_tier_catalog(&tiers_path)
+        .await
+        .with_context(|| format!("loading the tier catalog from {}", tiers_path.display()))?;
+
+    let source = match &args.source_file {
+        Some(path) => tokio::fs::read_to_string(path)
+            .await
+            .with_context(|| format!("reading the catalog source from {}", path.display()))?,
+        None => fetch_source(&args.source_url).await?,
+    };
+
+    let findings = reconcile(&catalog, &source);
+    println!(
+        "{:<22} {:<32} {:<18} {:>26} {:>26} {:>12} {:>10}",
+        "TIER", "CANDIDATE", "VERDICT", "RECORDED BASIS", "UPSTREAM COST", "CONTEXT", "MARKUP"
+    );
+    let rate = |r: crate::provider::ModelRates| {
+        let show = |v: Option<f64>| v.map_or_else(|| "-".to_owned(), |v| format!("{v}"));
+        format!(
+            "{}/{}/{}",
+            show(r.input_per_mtok),
+            show(r.cached_input_per_mtok),
+            show(r.output_per_mtok)
+        )
+    };
+    for found in &findings {
+        println!(
+            "{:<22} {:<32} {:<18} {:>26} {:>26} {:>12} {:>10}",
+            found.tier,
+            found.candidate_id,
+            found.verdict.label(),
+            rate(found.recorded_basis),
+            rate(found.upstream_cost),
+            found
+                .upstream_metadata
+                .context_window
+                .map_or_else(|| "-".to_owned(), |c| format!("{c}")),
+            found
+                .sell_markup()
+                .map_or_else(|| "-".to_owned(), |m| format!("{m:.2}x")),
+        );
+    }
+
+    // A markup on a tier that advertises pass-through is not drift in the
+    // file's own terms — basis == sell, so the validator is satisfied — but it
+    // is the customer paying more than the model costs, which is exactly the
+    // claim an operator needs told.
+    let markups: Vec<_> = findings
+        .iter()
+        .filter(|f| f.is_undisclosed_markup())
+        .collect();
+    if !markups.is_empty() {
+        println!("\nSelling above upstream cost:");
+        for found in &markups {
+            println!(
+                "  {} charges {:.2}x the upstream output rate ({} vs {})",
+                found.tier,
+                found.sell_markup().unwrap_or_default(),
+                found
+                    .sell
+                    .output_per_mtok
+                    .map_or_else(|| "-".to_owned(), |v| format!("{v}")),
+                found
+                    .upstream_cost
+                    .output_per_mtok
+                    .map_or_else(|| "-".to_owned(), |v| format!("{v}")),
+            );
+        }
+    }
+
+    // Model metadata drifts for the same reason a price does — an upstream
+    // moves and the file keeps asserting the old number — but it fails
+    // differently. A stale rate costs margin; a stale context window costs
+    // correctness, silently, on the client side: a window ZeroRouter
+    // overstates becomes requests the upstream rejects, and one it understates
+    // becomes long-context work quietly truncated. Neither shows up in the
+    // ledger, so this is the only place it can be seen.
+    let metadata: Vec<_> = findings
+        .iter()
+        .filter(|f| !f.metadata_drift.is_empty())
+        .collect();
+    if !metadata.is_empty() {
+        println!("\nModel metadata:");
+        for found in &metadata {
+            for drift in &found.metadata_drift {
+                println!(
+                    "  {:<32} {:<18} {:<18} file {} vs source {}",
+                    found.candidate_id,
+                    drift.kind.label(),
+                    drift.field,
+                    drift.recorded,
+                    drift.upstream,
+                );
+            }
+        }
+    }
+
+    let actionable: Vec<_> = findings
+        .iter()
+        .filter(|f| f.verdict.is_actionable() || f.has_actionable_metadata_drift())
+        .collect();
+    if actionable.is_empty() {
+        println!("\n{} candidates reconciled, no drift.", findings.len());
+        return Ok(());
+    }
+    println!("\n{} candidate(s) need attention:", actionable.len());
+    for found in &actionable {
+        // A candidate can fail on both axes at once — a repriced model whose
+        // window also moved — so report every reason rather than the first.
+        if found.verdict.is_actionable() {
+            println!(
+                "  {} ({}) — {}",
+                found.candidate_id,
+                found.model,
+                found.verdict.label()
+            );
+        }
+        for drift in found
+            .metadata_drift
+            .iter()
+            .filter(|drift| drift.kind.is_actionable())
+        {
+            println!(
+                "  {} ({}) — {} {}: file says {}, source says {}",
+                found.candidate_id,
+                found.model,
+                drift.kind.label(),
+                drift.field,
+                drift.recorded,
+                drift.upstream,
+            );
+        }
+    }
+    if args.allow_drift {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "{} candidate(s) drifted from {}; update tiers.toml deliberately, or pass --allow-drift",
+        actionable.len(),
+        args.source_file
+            .as_ref()
+            .map_or(args.source_url.clone(), |p| p.display().to_string())
+    )
 }
