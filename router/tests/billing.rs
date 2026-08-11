@@ -18,9 +18,10 @@ use zerorouter::{
         ledger_entries, record_checkout_intent, settle_checkout_intent,
     },
     db::{
-        LEARNED_SIZING_CONCURRENCY_LIMIT, RequestTelemetry, ReservationBasis, ReservationSize,
-        ReservationSizing, UsageAdmission, UsageRecord, UsageSession, begin_usage_session, migrate,
-        quarantined_settlements, recover_owed_settlements, recover_quarantined_settlement,
+        LEARNED_SIZING_CONCURRENCY_LIMIT, RequestTelemetry, ReservationBasis, ReservationRelease,
+        ReservationSize, ReservationSizing, UsageAdmission, UsageRecord, UsageSession,
+        begin_usage_session, migrate, quarantined_settlements, recover_owed_settlements,
+        recover_quarantined_settlement, release_quarantined_reservation,
     },
     openai::{OpenAiUsage, TASK_SIGNATURE_SCHEME, TaskSignature, tool_names_digest},
     priority::Priority,
@@ -1806,4 +1807,322 @@ async fn an_owed_reservation_keeps_encumbering_the_balance_after_it_expires() {
         Decimal::ONE,
         "collecting the debt charges exactly what it recorded ($1 of the $2 funded)"
     );
+}
+
+// ============================================================================
+// Releasing a quarantined reservation (migration 0015)
+// ============================================================================
+
+/// Whether the operator queue currently lists this request.
+///
+/// The queue is GLOBAL and oldest-first under a caller-supplied limit, so the
+/// limit is generous and the answer is scoped to one request id — the same
+/// shape every other quarantine assertion in this file uses.
+async fn queued(pool: &PgPool, request_id: Uuid) -> bool {
+    quarantined_settlements(pool, 1_000)
+        .await
+        .expect("quarantine must query")
+        .iter()
+        .any(|entry| entry.request_id == request_id)
+}
+
+/// The release record on a row: `(released_at, released_note)`, or `None` when
+/// it has not been released.
+async fn release_record(
+    pool: &PgPool,
+    reservation_id: Uuid,
+) -> Option<(chrono::DateTime<chrono::Utc>, String)> {
+    query_as::<_, (Option<chrono::DateTime<chrono::Utc>>, Option<String>)>(
+        "SELECT released_at, released_note FROM usage_reservations WHERE id = $1",
+    )
+    .bind(reservation_id)
+    .fetch_optional(pool)
+    .await
+    .expect("release record must query")
+    .and_then(|(at, note)| Some((at?, note?)))
+}
+
+/// GUARD (mutation-checked): a released row leaves the reconciliation queue.
+///
+/// The dispatched-intentless class (0014) is the one that had no exit at all.
+/// There is no stored payload, so `settle-owed` cannot collect it and must not
+/// try; the amount is unknowable, so nothing can be billed; and it does not
+/// encumber, so nothing is being held. All that is left is the FACT that a
+/// charge was lost, which an operator reconciles against the provider's own
+/// records and then has to be able to close. Before this, they could not: the
+/// row sat in `admin owed-settlements` forever, and a queue that only grows
+/// stops being read.
+///
+/// Marking, not deleting, is what makes the closure a record — the row keeps
+/// what was reserved, when it dispatched, why it was parked, and now who gave
+/// up on it and why.
+#[tokio::test]
+async fn releasing_an_intentless_quarantined_reservation_takes_it_out_of_the_queue() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let _sweep_guard = SWEEP_LOCK.write().await;
+    let user_id = create_user(&pool, "release-intentless").await;
+    let key = create_key(&pool, user_id).await;
+    credit_purchase(&pool, user_id, Decimal::TEN, &unique_session_id(), None)
+        .await
+        .expect("funding purchase must apply");
+
+    let lost = request_uuid(&admit(&pool, &key, false).await);
+    expire_reservation(&pool, lost, true, false).await;
+    // Any admission runs the sweep, which is what parks the row.
+    let _sweeper = admit(&pool, &key, false).await;
+    assert!(
+        queued(&pool, lost).await,
+        "a dispatched intentless row is parked for an operator"
+    );
+
+    let outcome = release_quarantined_reservation(
+        &pool,
+        lost,
+        "reconciled against the provider's own usage export; no charge recoverable",
+        false,
+    )
+    .await
+    .expect("release must query");
+    assert!(
+        matches!(
+            outcome,
+            ReservationRelease::Released {
+                owed: false,
+                forgiven_usd: None,
+                ..
+            }
+        ),
+        "an intentless row owes nothing, so nothing is forgiven and no \
+         --forgive is demanded: {outcome:?}"
+    );
+    assert!(
+        !queued(&pool, lost).await,
+        "a released row must leave the operator queue"
+    );
+
+    // The record outlives the command: the fact, the time, and the reason are
+    // all still on the row, and a terminal transcript was never the record.
+    let (_, note) = release_record(&pool, lost)
+        .await
+        .expect("the release must be recorded on the row");
+    assert_eq!(
+        note,
+        "reconciled against the provider's own usage export; no charge recoverable"
+    );
+    assert_eq!(
+        balance(&pool, user_id).await.expect("balance must query"),
+        Decimal::TEN,
+        "releasing a reservation moves no money in either direction"
+    );
+
+    // And no sweep may reclaim the record afterwards.
+    let _sweeper = admit(&pool, &key, false).await;
+    let (survives, quarantined, _) = swept_state(&pool, lost).await;
+    assert!(
+        survives && quarantined,
+        "the release record must outlive every later sweep"
+    );
+
+    // Idempotent: the second attempt writes nothing and says why.
+    let repeat = release_quarantined_reservation(&pool, lost, "second pass", false)
+        .await
+        .expect("release must query");
+    assert!(
+        matches!(repeat, ReservationRelease::AlreadyReleased { .. }),
+        "a repeated release is a refusing no-op: {repeat:?}"
+    );
+    assert_eq!(
+        release_record(&pool, lost)
+            .await
+            .expect("the record must still be there")
+            .1,
+        "reconciled against the provider's own usage export; no charge recoverable",
+        "a repeat must not overwrite the sentence explaining the first decision"
+    );
+
+    drop_reservations(&pool, key.id).await;
+}
+
+/// GUARD (mutation-checked): a row that still owes a collectable settlement is
+/// refused unless `--forgive` says otherwise, and forgiving it frees the credit
+/// it was holding.
+///
+/// The two halves belong in one test because each is only correct given the
+/// other. Refusing by default is what keeps `release-reservation` from becoming
+/// the fast way to make a debt disappear — the money is collectable, the payload
+/// is right there, and `settle-owed` collects it. But once an operator HAS
+/// decided not to collect, the encumbrance that debt held has to go with it:
+/// admission counts an owed row against the customer's balance forever (that is
+/// the fix that stopped the same dollar funding two requests), so a forgiven
+/// row left counting would freeze real credit against a charge ZeroRouter has
+/// just said it will never take.
+#[tokio::test]
+async fn forgiving_an_owed_reservation_is_opt_in_and_frees_the_credit_it_held() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let _fault_guard = FAULT_LOCK.lock().await;
+    let _sweep_guard = SWEEP_LOCK.write().await;
+    let user_id = create_user(&pool, "release-forgive").await;
+    let key = create_key(&pool, user_id).await;
+    // Exactly one reservation's worth ($2, the helper's size), so a second
+    // admission is possible only once the first row stops encumbering.
+    credit_purchase(&pool, user_id, Decimal::from(2), &unique_session_id(), None)
+        .await
+        .expect("funding purchase must apply");
+
+    let session = admit(&pool, &key, true).await;
+    let request_id = request_uuid(&session);
+    let fault = SettleFault::install(&pool, request_id, i64::MAX, "P0001").await;
+    // Delivered, then unsettleable: the row carries a real $1 intent — a debt.
+    assert!(session.record(&usage_record(Decimal::ONE)).await.is_err());
+    fault.remove(&pool).await;
+    // Park it exactly as an exhausted retry budget would. Note this leaves
+    // `expires_at` in the FUTURE: a row quarantined by repeated settle
+    // failures need not have expired, and it encumbers through the live arm
+    // of admission's aggregate as well as the owed one. Releasing has to free
+    // both, which is why the filter sits above them rather than inside one.
+    query(
+        "UPDATE usage_reservations
+         SET quarantined_at = NOW(), settle_attempts = 8
+         WHERE id = $1",
+    )
+    .bind(request_id)
+    .execute(&pool)
+    .await
+    .expect("quarantine must apply");
+
+    let refused = release_quarantined_reservation(&pool, request_id, "clear the queue", false)
+        .await
+        .expect("release must query");
+    let ReservationRelease::Refused { reason } = &refused else {
+        panic!("a collectable debt must not be released by default: {refused:?}")
+    };
+    assert!(
+        reason.contains("settle-owed"),
+        "the refusal must point at the command that collects: {reason}"
+    );
+    assert!(
+        release_record(&pool, request_id).await.is_none(),
+        "a refused release must write nothing"
+    );
+    assert!(
+        queued(&pool, request_id).await,
+        "and must leave the row in the queue"
+    );
+    let blocked = begin_usage_session(
+        &pool,
+        &key,
+        cold_sizing(1_000, 500, Decimal::from(2)),
+        test_signature(),
+        true,
+    )
+    .await
+    .expect("admission must query");
+    assert!(
+        matches!(blocked, UsageAdmission::InsufficientCredits),
+        "while the debt stands it goes on holding the credit it owes"
+    );
+
+    // The operator decides not to collect. Now — and only now — the row is
+    // resolved and the credit it held is released.
+    let forgiven = release_quarantined_reservation(
+        &pool,
+        request_id,
+        "provider outage; charge waived as goodwill",
+        true,
+    )
+    .await
+    .expect("release must query");
+    assert!(
+        matches!(
+            forgiven,
+            ReservationRelease::Released {
+                owed: true,
+                forgiven_usd: Some(amount),
+                ..
+            } if amount == Decimal::ONE
+        ),
+        "the release states what charge was given up: {forgiven:?}"
+    );
+    assert!(!queued(&pool, request_id).await);
+    assert_eq!(
+        balance(&pool, user_id).await.expect("balance must query"),
+        Decimal::from(2),
+        "forgiving a charge that was never taken debits nobody and credits nobody"
+    );
+    assert_eq!(
+        usage_debits(&pool, user_id).await,
+        0,
+        "and writes no ledger entry: there was no debit to reverse"
+    );
+
+    let admitted = begin_usage_session(
+        &pool,
+        &key,
+        cold_sizing(1_000, 500, Decimal::from(2)),
+        test_signature(),
+        true,
+    )
+    .await
+    .expect("admission must query");
+    assert!(
+        matches!(admitted, UsageAdmission::Allowed(_)),
+        "a forgiven debt holds none of the customer's credit"
+    );
+
+    drop_reservations(&pool, key.id).await;
+}
+
+/// Only a QUARANTINED reservation may be released, and each of the other
+/// states is refused by name rather than by silence. A live row is finished by
+/// settlement and an expired one by the sweep; a release that acted on either
+/// would be reaching around the paths that exist to charge honestly, and an
+/// unknown id is far more likely to be a typo than a resolution.
+#[tokio::test]
+async fn releasing_a_reservation_that_is_not_quarantined_is_refused_by_name() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let _sweep_guard = SWEEP_LOCK.write().await;
+    let user_id = create_user(&pool, "release-refusals").await;
+    let key = create_key(&pool, user_id).await;
+
+    let live = request_uuid(&admit(&pool, &key, false).await);
+    let expired = request_uuid(&admit(&pool, &key, false).await);
+    // Expired, never dispatched, owing nothing: the class the sweep reclaims.
+    expire_reservation(&pool, expired, false, false).await;
+
+    for (reservation, fragment, what) in [
+        (live, "still live", "a running request"),
+        (
+            expired,
+            "not quarantined",
+            "an expired row awaiting the sweep",
+        ),
+        (
+            Uuid::new_v4(),
+            "no reservation",
+            "an id that names nothing at all",
+        ),
+    ] {
+        let refused = release_quarantined_reservation(&pool, reservation, "should refuse", true)
+            .await
+            .expect("release must query");
+        let ReservationRelease::Refused { reason } = &refused else {
+            panic!("{what} must be refused: {refused:?}")
+        };
+        assert!(
+            reason.contains(fragment),
+            "{what} must be refused by name; got: {reason}"
+        );
+        assert!(
+            release_record(&pool, reservation).await.is_none(),
+            "{what} must not be marked released"
+        );
+    }
+
+    drop_reservations(&pool, key.id).await;
 }

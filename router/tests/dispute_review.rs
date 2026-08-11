@@ -1,5 +1,6 @@
 //! The dispute review workflow: `admin disputes list | show | resolve`
-//! (migration 0013).
+//! (migration 0013), and `admin disputes release-reservation` (migration
+//! 0015).
 //!
 //! Every test drives the real `zerorouter admin` binary, the way an operator
 //! does, because the JSON on stdout IS the deliverable — a test that called the
@@ -878,4 +879,279 @@ async fn resolve_requires_exactly_one_mode_and_a_note() {
         !oversized.status.success(),
         "the fat-finger bound should refuse five digits"
     );
+}
+
+// ---------------------------------------------------------------------------
+// `disputes release-reservation` (migration 0015)
+// ---------------------------------------------------------------------------
+
+/// Park one reservation in the operator queue and return its request id.
+///
+/// Written as a direct INSERT rather than driven through admission and the
+/// expiry sweep: what these tests are about is the operator surface over a
+/// parked row, the sweep's own classification is pinned in `tests/billing.rs`,
+/// and a row inserted already-quarantined is inert — no sweep in any concurrent
+/// suite can reclaim it or re-park it out from under the assertions.
+///
+/// `intent` is the stored settlement payload, or `None` for the
+/// dispatched-but-intentless class 0014 added. Every timestamp is backdated
+/// consistently so the row satisfies the same ordering CHECKs a genuinely old
+/// one would.
+async fn park_reservation(pool: &PgPool, email: &str, intent: Option<&str>) -> Uuid {
+    let api_key_id = query_scalar::<_, Uuid>(
+        "SELECT api_keys.id FROM api_keys
+         INNER JOIN users ON users.id = api_keys.user_id
+         WHERE users.email = $1",
+    )
+    .bind(email)
+    .fetch_one(pool)
+    .await
+    .expect("the seeded user's key should resolve");
+    let request_id = Uuid::new_v4();
+    query(
+        r#"
+        INSERT INTO usage_reservations (
+            id, api_key_id, created_at, expires_at, reserved_tokens,
+            reserved_cost_usd, dispatched_at, quarantined_at, last_settle_error,
+            settlement_intent, settlement_intent_at
+        )
+        VALUES (
+            $1, $2, NOW() - INTERVAL '2 hours', NOW() - INTERVAL '100 minutes',
+            1000, 2, NOW() - INTERVAL '110 minutes', NOW() - INTERVAL '90 minutes',
+            $4,
+            $3::JSONB,
+            CASE WHEN $3 IS NOT NULL THEN NOW() - INTERVAL '110 minutes' END
+        )
+        "#,
+    )
+    .bind(request_id)
+    .bind(api_key_id)
+    .bind(intent)
+    .bind(if intent.is_some() {
+        "injected settle failure"
+    } else {
+        "dispatched upstream with no settlement intent"
+    })
+    .execute(pool)
+    .await
+    .expect("the parked reservation should insert");
+    request_id
+}
+
+/// Whether `admin owed-settlements` currently lists a request.
+fn owed_lists(database_url: &str, request_id: Uuid) -> bool {
+    let listed = run_admin(database_url, &["owed-settlements", "--limit", "1000"]);
+    assert!(
+        listed.status.success(),
+        "owed-settlements should succeed: {}",
+        String::from_utf8_lossy(&listed.stderr)
+    );
+    json(&listed)
+        .as_array()
+        .expect("owed-settlements should print an array")
+        .iter()
+        .any(|row| row["request_id"].as_str() == Some(request_id.to_string().as_str()))
+}
+
+/// Remove the rows a release test parked. Nothing automatic removes a
+/// quarantined row — that is its whole contract — so a test that plants one
+/// clears it, or it crowds the shared queue for every later run.
+async fn drop_reservation(pool: &PgPool, request_id: Uuid) {
+    query("DELETE FROM usage_reservations WHERE id = $1")
+        .bind(request_id)
+        .execute(pool)
+        .await
+        .expect("parked reservation cleanup should apply");
+}
+
+/// The exit 0014's class never had. A dispatched reservation carrying no
+/// settlement intent is inference the customer received whose charge was lost:
+/// unknowable in amount, unbacked by any payload, and therefore invisible to
+/// `settle-owed`. It could only ever accumulate. This closes it, against a
+/// required reason, and the record stays on the row afterwards.
+#[tokio::test]
+async fn release_reservation_resolves_an_intentless_row_and_records_why() {
+    let Some((pool, database_url)) = connect().await else {
+        return;
+    };
+    let email = seed_user(&database_url, "release-intentless").await;
+    let request_id = park_reservation(&pool, &email, None).await;
+    let id = request_id.to_string();
+    assert!(
+        owed_lists(&database_url, request_id),
+        "the parked row starts in the operator queue"
+    );
+
+    // A release with no stated reason is refused before anything is read: the
+    // note is the entire record of why a charge stopped being pursued.
+    let blank = run_admin(
+        &database_url,
+        &[
+            "disputes",
+            "release-reservation",
+            "--request-id",
+            &id,
+            "--note",
+            "   ",
+        ],
+    );
+    assert!(
+        !blank.status.success(),
+        "a whitespace note is no reason at all"
+    );
+
+    let released = run_admin(
+        &database_url,
+        &[
+            "disputes",
+            "release-reservation",
+            "--request-id",
+            &id,
+            "--note",
+            "reconciled against the provider invoice; no charge recoverable",
+        ],
+    );
+    assert!(
+        released.status.success(),
+        "releasing an intentless row should succeed: {}",
+        String::from_utf8_lossy(&released.stderr)
+    );
+    let report = json(&released);
+    assert_eq!(report["action"], "released");
+    assert_eq!(
+        report["detail"]["forgave_a_collectable_charge"], false,
+        "there was no collectable charge to give up"
+    );
+    assert!(
+        report["detail"]["forgiven_usd"].is_null(),
+        "and no amount to claim: the payload never existed"
+    );
+    assert!(report["detail"]["released_at"].is_string());
+
+    assert!(
+        !owed_lists(&database_url, request_id),
+        "a released row must leave the operator queue"
+    );
+    // The record is on the row, not in a terminal transcript.
+    let (released_at, note) = sqlx_core::query_as::query_as::<
+        _,
+        (Option<chrono::DateTime<chrono::Utc>>, Option<String>),
+    >(
+        "SELECT released_at, released_note FROM usage_reservations WHERE id = $1",
+    )
+    .bind(request_id)
+    .fetch_one(&pool)
+    .await
+    .expect("the released row should still exist");
+    assert!(released_at.is_some(), "the release records when");
+    assert_eq!(
+        note.as_deref(),
+        Some("reconciled against the provider invoice; no charge recoverable"),
+        "and why"
+    );
+
+    // GUARD (mutation-checked): a repeat is a refusing no-op that says so, and
+    // above all does not overwrite the first release's stated reason.
+    let repeat = run_admin(
+        &database_url,
+        &[
+            "disputes",
+            "release-reservation",
+            "--request-id",
+            &id,
+            "--note",
+            "second pass",
+        ],
+    );
+    assert!(
+        !repeat.status.success(),
+        "releasing an already-released reservation must not report success"
+    );
+    let report = json(&repeat);
+    assert_eq!(report["action"], "already_released");
+    assert_eq!(
+        report["detail"]["released_note"],
+        "reconciled against the provider invoice; no charge recoverable",
+        "the repeat reports the release that stands, and writes nothing"
+    );
+
+    drop_reservation(&pool, request_id).await;
+}
+
+/// GUARD (mutation-checked): a row that CAN be collected is refused by default.
+///
+/// Releasing an owed row is ZeroRouter deciding not to collect money it is able
+/// to collect, and the payload to collect it with is sitting on the row. That
+/// decision has to be typed out in full — `--forgive` — and the refusal names
+/// the command that takes the money instead.
+#[tokio::test]
+async fn release_reservation_refuses_a_collectable_debt_unless_forgive_is_typed_out() {
+    let Some((pool, database_url)) = connect().await else {
+        return;
+    };
+    let email = seed_user(&database_url, "release-owed").await;
+    let request_id =
+        park_reservation(&pool, &email, Some(r#"{"version": 1, "cost_usd": "1.25"}"#)).await;
+    let id = request_id.to_string();
+
+    let refused = run_admin(
+        &database_url,
+        &[
+            "disputes",
+            "release-reservation",
+            "--request-id",
+            &id,
+            "--note",
+            "clearing the queue",
+        ],
+    );
+    assert!(
+        !refused.status.success(),
+        "an owed row must not be released by default"
+    );
+    let report = json(&refused);
+    assert_eq!(report["action"], "refused");
+    assert!(
+        report["detail"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("settle-owed") && reason.contains("1.25")),
+        "the refusal must state the debt and point at the command that \
+         collects it: {report}"
+    );
+    assert!(
+        owed_lists(&database_url, request_id),
+        "a refused release leaves the row exactly where it was"
+    );
+
+    let forgiven = run_admin(
+        &database_url,
+        &[
+            "disputes",
+            "release-reservation",
+            "--request-id",
+            &id,
+            "--forgive",
+            "--note",
+            "upstream outage; charge waived as goodwill",
+        ],
+    );
+    assert!(
+        forgiven.status.success(),
+        "an explicit forgiveness should succeed: {}",
+        String::from_utf8_lossy(&forgiven.stderr)
+    );
+    let report = json(&forgiven);
+    assert_eq!(report["action"], "released");
+    assert_eq!(
+        report["detail"]["forgave_a_collectable_charge"], true,
+        "the transcript has to say a collectable charge was given up"
+    );
+    assert_eq!(
+        report["detail"]["forgiven_usd"].as_str(),
+        Some("1.25"),
+        "and how much"
+    );
+    assert!(!owed_lists(&database_url, request_id));
+
+    drop_reservation(&pool, request_id).await;
 }

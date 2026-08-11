@@ -8,8 +8,9 @@ use crate::{
     auth::{generate_api_key, hash_api_key},
     billing::ResolutionOutcome,
     db::{
-        database_pool_from_env, migrate, parse_decimal, provider_cogs, quarantined_settlements,
-        recover_owed_settlements, recover_quarantined_settlement,
+        ReservationRelease, database_pool_from_env, migrate, parse_decimal, provider_cogs,
+        quarantined_settlements, recover_owed_settlements, recover_quarantined_settlement,
+        release_quarantined_reservation,
     },
     priority::Priority,
     sqlx::{self, PgPool},
@@ -44,9 +45,11 @@ pub enum AdminCommand {
     /// would mean hand-written SQL against the users table.
     SetFrozen(SetFrozenArgs),
     /// The dispute review workflow: the queue of accounts a chargeback or a
-    /// freeze left needing a decision, one account's full history, and the
-    /// settlement of a receivable. `list` and `show` are read-only; `resolve`
-    /// is the only writer and never changes the freeze state.
+    /// freeze left needing a decision, one account's full history, the
+    /// settlement of a receivable, and the release of a quarantined
+    /// reservation. `list` and `show` are read-only; `resolve` and
+    /// `release-reservation` are the writers, and neither changes the freeze
+    /// state.
     #[command(subcommand)]
     Disputes(DisputesCommand),
     /// Disable an existing key.
@@ -146,6 +149,14 @@ pub enum DisputesCommand {
     /// is settled" and "we trust this account again" are separate decisions,
     /// and the second one is `set-frozen --off`.
     Resolve(DisputesResolveArgs),
+    /// Resolve ONE quarantined reservation from `owed-settlements`, so it
+    /// leaves that queue with its reason recorded. This is the exit for a
+    /// dispatched row that holds no settlement intent — inference the customer
+    /// received whose charge was lost, in an amount nobody can reconstruct, and
+    /// which `settle-owed` therefore cannot collect. A row that CAN be
+    /// collected is refused here unless `--forgive` says otherwise. Debits
+    /// nobody, ever.
+    ReleaseReservation(DisputesReleaseReservationArgs),
 }
 
 #[derive(Debug, Args)]
@@ -179,6 +190,24 @@ pub struct DisputesResolveArgs {
     /// Why. Required rather than defaulted: a resolution points at no Stripe
     /// object and no request, so this note is the entire record of why an
     /// operator moved the money.
+    #[arg(long)]
+    pub note: String,
+}
+
+#[derive(Debug, Args)]
+pub struct DisputesReleaseReservationArgs {
+    /// The reservation to resolve, as printed by `admin owed-settlements`.
+    #[arg(long)]
+    pub request_id: Uuid,
+    /// Give up a collectable charge. Required for a reservation that still
+    /// holds a settlement intent, and only for that case: such a debt CAN be
+    /// collected (`settle-owed --request-id`), so releasing it is ZeroRouter
+    /// deciding not to. It must be typed out, never be the easy default.
+    #[arg(long)]
+    pub forgive: bool,
+    /// Why. Required rather than defaulted, exactly as `resolve --note` is: a
+    /// release anchors to no Stripe object and writes no ledger row, so this
+    /// sentence is the whole record of why a charge stopped being pursued.
     #[arg(long)]
     pub note: String,
 }
@@ -263,6 +292,9 @@ pub async fn run(args: AdminArgs) -> Result<()> {
             DisputesCommand::List(args) => disputes_list(&pool, args).await,
             DisputesCommand::Show(args) => disputes_show(&pool, args).await,
             DisputesCommand::Resolve(args) => disputes_resolve(&pool, args).await,
+            DisputesCommand::ReleaseReservation(args) => {
+                disputes_release_reservation(&pool, args).await
+            }
         },
         AdminCommand::Treasury(args) => treasury(&pool, args).await,
         AdminCommand::RevokeKey(args) => revoke_key(&pool, args).await,
@@ -652,6 +684,88 @@ async fn disputes_resolve(pool: &PgPool, args: DisputesResolveArgs) -> Result<()
         bail!("refused to resolve {email}: {reason}")
     }
     Ok(())
+}
+
+/// Resolve one quarantined reservation. The second writer in this subcommand
+/// tree, and the only one that touches no balance at all.
+///
+/// Shaped like `disputes resolve`: validate the note before anything else, act
+/// through one helper, print the resulting state as JSON, and turn a refusal
+/// into a non-zero exit AFTER printing — so an operator whose command was
+/// refused still sees the state that refused it.
+async fn disputes_release_reservation(
+    pool: &PgPool,
+    args: DisputesReleaseReservationArgs,
+) -> Result<()> {
+    let note = args.note.trim();
+    if note.is_empty() {
+        bail!("note cannot be empty; a release's note is the only record of why")
+    }
+
+    let outcome = release_quarantined_reservation(pool, args.request_id, note, args.forgive)
+        .await
+        .context("failed to release the quarantined reservation")?;
+
+    let (action, detail) = match &outcome {
+        ReservationRelease::Released {
+            released_at,
+            owed,
+            forgiven_usd,
+        } => (
+            "released",
+            serde_json::json!({
+                "released_at": released_at,
+                // Which class was resolved, in the operator's own terms: a
+                // debt given up, or a row that never had a collectable amount.
+                "forgave_a_collectable_charge": owed,
+                "forgiven_usd": forgiven_usd,
+                "detail": if *owed {
+                    "the settlement intent will not be collected; the credit it \
+                     encumbered is released and the row is kept as the record"
+                } else {
+                    "no settlement intent was ever recorded, so there was no \
+                     charge to collect and no encumbrance to release"
+                },
+            }),
+        ),
+        ReservationRelease::AlreadyReleased { released_at, note } => (
+            "already_released",
+            serde_json::json!({
+                "released_at": released_at,
+                "released_note": note,
+                "detail": "this reservation was already released; nothing was \
+                           written and the original note stands",
+            }),
+        ),
+        ReservationRelease::Refused { reason } => {
+            ("refused", serde_json::json!({ "reason": reason }))
+        }
+    };
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "request_id": args.request_id,
+            "action": action,
+            "detail": detail,
+            "note": note,
+        }))?
+    );
+    // Loud failure last, so the operator still sees what refused. A repeat is
+    // a refusal here rather than the success `disputes resolve` reports for a
+    // repeated write-off: that command's second run re-states a settled
+    // BALANCE, which is a fact about the account; this one would be claiming
+    // to have resolved a queue entry that someone else already resolved, for
+    // a different stated reason.
+    match outcome {
+        ReservationRelease::Refused { reason } => {
+            bail!("refused to release {}: {reason}", args.request_id)
+        }
+        ReservationRelease::AlreadyReleased { released_at, .. } => bail!(
+            "reservation {} was already released at {released_at}",
+            args.request_id
+        ),
+        ReservationRelease::Released { .. } => Ok(()),
+    }
 }
 
 async fn mint_key(pool: &PgPool, args: MintKeyArgs) -> Result<()> {

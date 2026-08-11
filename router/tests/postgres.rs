@@ -778,7 +778,7 @@ async fn migration_chain_applies_on_a_fresh_database() {
     // struct would outlive its usefulness the moment the next migration adds
     // a probe; the tuple grows in one place and the assertions name the facts.
     #[allow(clippy::type_complexity)]
-    let outcome: anyhow::Result<(bool, bool, bool, bool, bool, bool, bool, i64)> = async {
+    let outcome: anyhow::Result<(bool, bool, bool, bool, bool, bool, bool, bool, i64)> = async {
         let pool = PgPoolOptions::new()
             .max_connections(1)
             .connect_with(PgConnectOptions::from_str(&fresh_url)?)
@@ -835,6 +835,16 @@ async fn migration_chain_applies_on_a_fresh_database() {
         )
         .fetch_one(&pool)
         .await?;
+        let release_record_exists = query_scalar::<_, bool>(
+            r#"
+            SELECT COUNT(*) = 2
+            FROM information_schema.columns
+            WHERE table_name = 'usage_reservations'
+              AND column_name IN ('released_at', 'released_note')
+            "#,
+        )
+        .fetch_one(&pool)
+        .await?;
         let version = query_scalar::<_, i64>("SELECT MAX(version) FROM _sqlx_migrations")
             .fetch_one(&pool)
             .await?;
@@ -847,6 +857,7 @@ async fn migration_chain_applies_on_a_fresh_database() {
             ledger_honesty_exists,
             freeze_state_exists,
             dispatched_marker_exists,
+            release_record_exists,
             version,
         ))
     }
@@ -857,7 +868,7 @@ async fn migration_chain_applies_on_a_fresh_database() {
         .execute(&admin)
         .await;
 
-    let outcome = outcome.expect("the 0001->0014 chain must apply on a fresh database");
+    let outcome = outcome.expect("the 0001->0015 chain must apply on a fresh database");
     assert!(outcome.0, "request_attempts exists after the fresh chain");
     assert!(
         outcome.1,
@@ -883,11 +894,15 @@ async fn migration_chain_applies_on_a_fresh_database() {
         outcome.6,
         "the 0014 dispatched_at column exists after the chain"
     );
-    // 14, not 10: 0013 (dispute resolution) and 0014 (dispatched
-    // reservations) are numbered with a gap so 0010-0012 stay available to
-    // branches in flight. The chain's head is the highest version applied,
-    // not a count of files.
-    assert_eq!(outcome.7, 14, "the chain reaches migration version 14");
+    assert!(
+        outcome.7,
+        "the 0015 release-record columns exist after the chain"
+    );
+    // 15, not 11: 0013 (dispute resolution), 0014 (dispatched reservations)
+    // and 0015 (released reservations) are numbered with a gap so 0010-0012
+    // stay available to branches in flight. The chain's head is the highest
+    // version applied, not a count of files.
+    assert_eq!(outcome.8, 15, "the chain reaches migration version 15");
 }
 
 /// Rewrite the database name in a Postgres URL, keeping any query string

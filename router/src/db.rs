@@ -851,6 +851,13 @@ pub async fn migrate(pool: &PgPool) -> Result<()> {
                 )),
                 false,
             ),
+            Migration::new(
+                15,
+                Cow::Borrowed("released reservations"),
+                MigrationType::Simple,
+                Cow::Borrowed(include_str!("../migrations/0015_released_reservations.sql")),
+                false,
+            ),
         ]),
         ignore_missing: false,
         locking: true,
@@ -1048,12 +1055,21 @@ pub async fn begin_usage_session(
     // has no known size and no way to be collected or released, so freezing a
     // customer's balance against it forever is a policy decision for the repo
     // owner rather than a side effect of recording the fact.
+    //
+    // A RELEASED row (migration 0015) is a record, not a reservation, and this
+    // statement may never take one. Belt and braces: a released row is
+    // quarantined by construction, and 0014's evidence CHECK means a
+    // quarantined row always carries an intent or a dispatch marker, so no
+    // released row can match the predicate below today. The filter is stated
+    // anyway, because "the record of a forgiven charge outlives the sweep" is
+    // too important to hold only by way of a constraint in another file.
     sqlx::query(
         r#"
         DELETE FROM usage_reservations
         WHERE expires_at <= NOW()
           AND settlement_intent IS NULL
           AND dispatched_at IS NULL
+          AND released_at IS NULL
         "#,
     )
     .execute(&mut *transaction)
@@ -1186,6 +1202,16 @@ pub async fn begin_usage_session(
         FROM usage_reservations
         INNER JOIN api_keys ON api_keys.id = usage_reservations.api_key_id
         WHERE api_keys.user_id = $1
+          -- A released row (migration 0015) encumbers nothing, in any state.
+          -- An operator has resolved it: either it never owed anything
+          -- collectable, or the debt was explicitly forgiven under
+          -- `--forgive`. Holding a customer's credit against a charge
+          -- ZeroRouter has said it will not collect is a freeze with no end
+          -- condition. Stated OUTSIDE the two arms below on purpose — a row
+          -- quarantined by exhausted settle retries can still be inside its
+          -- TTL, so filtering only the intent arm would leave it encumbering
+          -- through the live arm until it expired.
+          AND usage_reservations.released_at IS NULL
           AND (
               usage_reservations.expires_at > NOW()
               -- A row carrying a settlement intent is money the customer
@@ -1300,6 +1326,9 @@ pub async fn begin_usage_session(
             FROM usage_reservations
             INNER JOIN api_keys ON api_keys.id = usage_reservations.api_key_id
             WHERE api_keys.user_id = $1
+              -- The prepaid half of the 0015 release rule as well: a row an
+              -- operator has resolved holds none of this customer's credit.
+              AND usage_reservations.released_at IS NULL
               AND (
                   usage_reservations.expires_at > NOW()
                   -- The prepaid half of the same rule as the cap aggregate
@@ -2308,6 +2337,11 @@ pub async fn quarantined_settlements(
             last_settle_error
         FROM usage_reservations
         WHERE quarantined_at IS NOT NULL
+          -- A released row (migration 0015) has been resolved by an operator
+          -- and is a record, not work. Leaving it here is what turns the
+          -- queue into something that only grows, and a queue nobody finishes
+          -- reading is where the rows that DO need collecting get lost.
+          AND released_at IS NULL
         ORDER BY quarantined_at
         LIMIT $1
         "#,
@@ -2337,6 +2371,238 @@ pub async fn quarantined_settlements(
             },
         )
         .collect())
+}
+
+/// What [`release_quarantined_reservation`] did, or why it refused.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReservationRelease {
+    /// The row is resolved: it has left the reconciliation queue and holds
+    /// none of the customer's credit. Nothing was debited and nothing was
+    /// credited — a release settles a charge that was never taken.
+    Released {
+        released_at: DateTime<Utc>,
+        /// Whether the row carried a settlement intent, i.e. whether this was
+        /// a debt given up (`--forgive`) or a row that never had a collectable
+        /// amount at all.
+        owed: bool,
+        /// The charge given up, when the stored payload states a readable one.
+        /// `None` for an intentless row (there is no payload) and for a
+        /// payload whose amount cannot be read — never zero, which would
+        /// claim the release cost nothing.
+        forgiven_usd: Option<Decimal>,
+    },
+    /// This reservation was already released. The idempotent no-op: it writes
+    /// nothing and reports the release that stands.
+    AlreadyReleased {
+        released_at: DateTime<Utc>,
+        note: Option<String>,
+    },
+    /// Not a row this command may act on. Carries the operator-facing reason;
+    /// `admin` turns it into a non-zero exit.
+    Refused { reason: String },
+}
+
+/// Resolve ONE quarantined reservation an operator has inspected: mark it
+/// released, with a stated reason, so it leaves the queue for good.
+///
+/// [`quarantined_settlements`] can hold two classes, and until this existed
+/// only one of them had an exit. A row carrying a settlement intent is
+/// collectable through [`recover_quarantined_settlement`] — that is the debt
+/// being *paid*, and it stays the default. A dispatched row carrying no intent
+/// (migration 0014) is a charge that was lost before it was ever written down:
+/// the amount is unknowable, there is no payload to replay, and it does not
+/// encumber. Nothing could ever act on it, so it accumulated in the operator's
+/// queue forever, and a queue that only grows is one that stops being read.
+///
+/// # What it refuses, and why by name
+///
+/// - A **live** reservation, or one that is merely expired: neither is
+///   quarantined, and a request still in flight is finished by settlement, an
+///   expired one by the sweep. Releasing either would be this command reaching
+///   around the paths that exist to charge honestly.
+/// - An **owed** row without `forgive`: the debt is collectable and the
+///   operator is pointed at `settle-owed`. Giving up money must be typed out
+///   in full, never reached by taking the shortest path through a menu.
+/// - An **already released** row: reported as such and written to twice by
+///   nobody. The first release's note is the record, and a second one would
+///   overwrite the sentence explaining the decision.
+///
+/// # It never debits anyone
+///
+/// No branch here moves a balance. What `forgive` frees is the ENCUMBRANCE the
+/// owed row held through admission's aggregates — credit reserved against a
+/// charge ZeroRouter has just said it will not collect. The `credit_ledger` is
+/// not touched, because an unsettled reservation was never debited: there is
+/// no entry to reverse, and a `writeoff` row would double-count against the
+/// 0013 bad-debt total.
+///
+/// # Serialization
+///
+/// The whole decision runs under the same per-user advisory lock admission,
+/// settlement and every credit write take, then `FOR UPDATE` on the row —
+/// advisory-then-row, this crate's lock order everywhere. That is what makes
+/// the classification the release acts on the same one that was true when it
+/// committed, and what orders the encumbrance change against a concurrent
+/// admission rather than landing in the middle of one.
+pub async fn release_quarantined_reservation(
+    pool: &PgPool,
+    request_id: Uuid,
+    note: &str,
+    forgive: bool,
+) -> Result<ReservationRelease, sqlx::Error> {
+    let note = note.trim();
+    if note.is_empty() {
+        return Err(sqlx::Error::Protocol(
+            "a reservation release must state its reason".to_owned(),
+        ));
+    }
+
+    // The advisory lock is per USER and the reservation names a KEY, so the
+    // owner has to be resolved before the lock can be taken. Nothing is
+    // decided on this read: every fact the decision rests on is re-read under
+    // the lock below, and a row that disappears in between (settled by its own
+    // request, collected by `settle-owed`) is refused as missing.
+    let owner = sqlx::query_scalar::<_, Uuid>(
+        r#"
+        SELECT api_keys.user_id
+        FROM usage_reservations
+        INNER JOIN api_keys ON api_keys.id = usage_reservations.api_key_id
+        WHERE usage_reservations.id = $1
+        "#,
+    )
+    .bind(request_id)
+    .fetch_optional(pool)
+    .await?;
+    let Some(user_id) = owner else {
+        return Ok(ReservationRelease::Refused {
+            reason: format!(
+                "no reservation {request_id} exists; a settled or reclaimed \
+                 request leaves no row, and only a quarantined one can be released"
+            ),
+        });
+    };
+
+    let mut transaction = pool.begin().await?;
+    sqlx::query("SET LOCAL lock_timeout = '5s'")
+        .execute(&mut *transaction)
+        .await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1::TEXT, 0))")
+        .bind(user_id.to_string())
+        .execute(&mut *transaction)
+        .await?;
+
+    #[allow(clippy::type_complexity)]
+    let row = sqlx::query_as::<
+        _,
+        (
+            Option<DateTime<Utc>>,
+            Option<DateTime<Utc>>,
+            Option<String>,
+            bool,
+            bool,
+            Option<Decimal>,
+        ),
+    >(
+        r#"
+        SELECT
+            quarantined_at,
+            released_at,
+            released_note,
+            -- Compared in SQL, against the same clock the sweep and the
+            -- aggregates use, so the answer cannot drift with the caller's.
+            expires_at > NOW(),
+            settlement_intent IS NOT NULL,
+            -- Pattern-guarded exactly as `quarantined_settlements` reads it:
+            -- an unreadable payload must not fail the release, it must make
+            -- the amount unknown.
+            CASE
+                WHEN settlement_intent->>'cost_usd' ~ '^[0-9]+(\.[0-9]+)?$'
+                    THEN (settlement_intent->>'cost_usd')::NUMERIC
+            END
+        FROM usage_reservations
+        WHERE id = $1
+        FOR UPDATE
+        "#,
+    )
+    .bind(request_id)
+    .fetch_optional(&mut *transaction)
+    .await?;
+    let Some((quarantined_at, released_at, released_note, live, owed, owed_cost_usd)) = row else {
+        transaction.rollback().await?;
+        return Ok(ReservationRelease::Refused {
+            reason: format!(
+                "no reservation {request_id} exists; a settled or reclaimed \
+                 request leaves no row, and only a quarantined one can be released"
+            ),
+        });
+    };
+
+    if let Some(released_at) = released_at {
+        transaction.rollback().await?;
+        return Ok(ReservationRelease::AlreadyReleased {
+            released_at,
+            note: released_note,
+        });
+    }
+    if quarantined_at.is_none() {
+        transaction.rollback().await?;
+        return Ok(ReservationRelease::Refused {
+            reason: if live {
+                format!(
+                    "reservation {request_id} is still live; a running request \
+                     is finished by settlement, not released"
+                )
+            } else {
+                format!(
+                    "reservation {request_id} is expired but not quarantined; \
+                     the expiry sweep resolves those, and it has not run on \
+                     this one yet"
+                )
+            },
+        });
+    }
+    if owed && !forgive {
+        let amount = owed_cost_usd.map_or_else(
+            || "an amount its payload does not state readably".to_owned(),
+            |amount| format!("${amount}"),
+        );
+        transaction.rollback().await?;
+        return Ok(ReservationRelease::Refused {
+            reason: format!(
+                "reservation {request_id} still owes {amount} and its \
+                 settlement payload can be replayed; collect it with \
+                 `zerorouter admin settle-owed --request-id {request_id}`, or \
+                 pass --forgive to give that charge up"
+            ),
+        });
+    }
+
+    // Guarded on `released_at IS NULL` as well as read under the lock: the
+    // UPDATE is the one statement that must not be able to overwrite an
+    // existing release's note, whatever a future caller does.
+    let released_at = sqlx::query_scalar::<_, DateTime<Utc>>(
+        r#"
+        UPDATE usage_reservations
+        SET released_at = NOW(), released_note = $2
+        WHERE id = $1 AND released_at IS NULL
+        RETURNING released_at
+        "#,
+    )
+    .bind(request_id)
+    .bind(note)
+    .fetch_one(&mut *transaction)
+    .await?;
+    transaction.commit().await?;
+    tracing::info!(
+        request_id = %request_id,
+        owed,
+        "quarantined reservation released by an operator"
+    );
+    Ok(ReservationRelease::Released {
+        released_at,
+        owed,
+        forgiven_usd: if owed { owed_cost_usd } else { None },
+    })
 }
 
 /// The durable settle payload: everything a settle transaction needs, in a form
