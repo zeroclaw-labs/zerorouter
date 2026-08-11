@@ -187,15 +187,24 @@ async fn models_are_materialized_from_tiers_toml() {
         .expect("models response should contain a data array");
 
     assert_eq!(json["object"], "list");
-    // 7 tier ids + 7 concrete candidates: the MVP catalog is one upstream
-    // per tier, so every tier contributes exactly one pinned id.
-    assert_eq!(data.len(), 14);
+    // 10 tier ids + 10 concrete candidates. Seven model PINS plus three
+    // intent BANDS, each holding exactly one candidate today, so every tier
+    // still contributes exactly one concrete id.
+    assert_eq!(data.len(), 20);
     assert!(data.iter().all(|model| model["object"] == "model"));
-    assert!(data.iter().any(|model| model["id"] == "zero/high-end"));
+    assert!(data.iter().any(|model| model["id"] == "zero/sonnet-5"));
     assert!(
         data.iter()
             .any(|model| model["id"] == "anthropic/claude-sonnet-5"),
-        "the high-end tier's pinned candidate is listed alongside the alias"
+        "the sonnet pin's candidate is listed alongside the alias"
+    );
+    // A band advertises what it currently resolves to, so a customer can see
+    // the model behind the intent rather than having to trust the name.
+    assert!(data.iter().any(|model| model["id"] == "zero/best"));
+    assert!(
+        data.iter()
+            .any(|model| model["id"] == "band/best/claude-fable-5"),
+        "a band discloses its current pick in the public catalog"
     );
     assert!(
         data.iter()
@@ -373,15 +382,18 @@ async fn bundled_tier_catalog_has_expected_virtual_models() {
     assert_eq!(
         tiers,
         [
+            "zero/best",
             "zero/codex",
             "zero/fable-5",
             "zero/haiku-4-5",
-            "zero/high-end",
             "zero/low-cost",
+            "zero/luna",
+            "zero/optimized",
             "zero/opus-5",
             "zero/sol",
+            "zero/sonnet-5",
         ],
-        "the MVP catalog is seven tiers"
+        "seven model pins plus three intent bands"
     );
 
     // One upstream each, and only from the two providers ZeroRouter
@@ -405,7 +417,7 @@ async fn bundled_tier_catalog_has_expected_virtual_models() {
 async fn no_shipped_candidate_costs_more_than_its_tier_sells() {
     // The margin-leak regression guard, re-derived from the table rather than
     // delegated to the loader: three candidates once sat above their tier's
-    // sell rate (opus in zero/high-end on all three dimensions, haiku in
+    // sell rate (opus in zero/sonnet-5 on all three dimensions, haiku in
     // zero/balanced on output alone) and lost money on every request they
     // served. `load_tier_catalog` now refuses such a table outright, so this
     // test failing at the assert rather than the load would mean the rule
@@ -496,7 +508,7 @@ async fn a_withheld_tier_is_refused_as_misconfigured_rather_than_missing_or_tran
     // a message naming the tier are what tell an operator where to look.
     let (status, body) = error_envelope(
         ApiError::ModelUnavailable {
-            tier: "zero/high-end".to_owned(),
+            tier: "zero/sonnet-5".to_owned(),
         }
         .into_response(),
     )
@@ -509,7 +521,7 @@ async fn a_withheld_tier_is_refused_as_misconfigured_rather_than_missing_or_tran
     let message = body["error"]["message"]
         .as_str()
         .expect("the error message should be a string");
-    assert!(message.contains("zero/high-end"), "{message}");
+    assert!(message.contains("zero/sonnet-5"), "{message}");
     assert!(message.contains("below its own cost basis"), "{message}");
     assert!(message.contains("not a transient outage"), "{message}");
 
@@ -580,22 +592,21 @@ input_per_mtok = 9.00"#,
 }
 
 #[tokio::test]
-async fn a_basis_hike_above_sell_withholds_high_end_and_nothing_else() {
+async fn a_basis_hike_above_sell_withholds_that_tier_and_nothing_else() {
     // The withhold mechanism, pinned against the *shipped* table with a
-    // real event it models: Sonnet 5's introductory rate lapses on
+    // real event it now models: Sonnet 5's introductory rate lapses on
     // 2026-08-31, taking its basis from 2.00/0.20/10.00 to 3.00/0.30/15.00.
     // The table sells at the intro rate — we do not sell at a profit — so on
-    // that day the basis crosses ABOVE sell, and withholding is what stands
-    // between a lapsed promo and serving sonnet at a loss. Both high-end
-    // candidate bases (and only they — the tier's sells stay exactly as
-    // shipped) are raised above sell, and the catalog must lose zero/high-end
-    // alone while every other tier keeps serving.
+    // that day the basis crosses ABOVE sell and this mechanism is what stands
+    // between a lapsed promo and serving sonnet below cost. Both high-end candidate bases (and only they — the tier's
+    // sells stay exactly as shipped) are raised above sell, and the catalog
+    // must lose zero/sonnet-5 alone while every other tier keeps serving.
     let shipped = tokio::fs::read_to_string(tier_config_path())
         .await
         .expect("shipped catalog should read");
     let split = shipped
-        .find(r#"[[tiers."zero/high-end".candidates]]"#)
-        .expect("the shipped catalog should define high-end candidates");
+        .find(r#"[[tiers."zero/sonnet-5".candidates]]"#)
+        .expect("the shipped catalog should define the sonnet pin candidates");
     let (head, candidates) = shipped.split_at(split);
     let lapsed = format!(
         "{head}{}",
@@ -611,17 +622,23 @@ async fn a_basis_hike_above_sell_withholds_high_end_and_nothing_else() {
 
     let catalog = load_tier_catalog(&path)
         .await
-        .expect("a lapsed high-end intro price must not take the catalog down");
+        .expect("a lapsed sonnet intro price must not take the catalog down");
 
-    // The two tiers that have nothing to do with Sonnet's pricing still route,
-    // through their tier ids and through their pinned candidates alike.
+    // Every tier that has nothing to do with Sonnet's pricing still routes,
+    // through its tier id and its pinned candidate alike. `zero/optimized`
+    // survives too: it dispatches the same upstream model, but it carries its
+    // own candidate on its own rates, so a hike to the PIN cannot withhold
+    // the BAND. That independence is the point of the separate entries.
     assert_eq!(
         catalog.tiers.keys().map(String::as_str).collect::<Vec<_>>(),
         [
+            "zero/best",
             "zero/codex",
             "zero/fable-5",
             "zero/haiku-4-5",
             "zero/low-cost",
+            "zero/luna",
+            "zero/optimized",
             "zero/opus-5",
             "zero/sol"
         ]
@@ -638,14 +655,15 @@ async fn a_basis_hike_above_sell_withholds_high_end_and_nothing_else() {
         );
     }
 
-    // High-end is withheld, and says so for its tier id and for either sonnet
-    // row pinned directly.
-    for requested in ["zero/high-end", "anthropic/claude-sonnet-5"] {
+    // The sonnet PIN is withheld, and says so for its tier id and for its
+    // candidate pinned directly. Withholding is the SAFE outcome of a lapsed
+    // promo: the tier stops serving rather than serving below cost.
+    for requested in ["zero/sonnet-5", "anthropic/claude-sonnet-5"] {
         assert!(catalog.resolve(requested).is_none(), "{requested}");
         let withheld = catalog
             .unavailable_for(requested)
-            .unwrap_or_else(|| panic!("{requested} should report zero/high-end as withheld"));
-        assert_eq!(withheld.tier, "zero/high-end");
+            .unwrap_or_else(|| panic!("{requested} should report zero/sonnet-5 as withheld"));
+        assert_eq!(withheld.tier, "zero/sonnet-5");
         assert!(
             withheld
                 .reason
@@ -655,24 +673,82 @@ async fn a_basis_hike_above_sell_withholds_high_end_and_nothing_else() {
         );
     }
     // The tier's own sell rates are untouched — only the cost basis moved,
-    // which is exactly what the calendar does to this table.
-    let sell = catalog.unavailable["zero/high-end"].definition.rates;
+    // which is exactly what the calendar does to this table on 2026-08-31.
+    let sell = catalog.unavailable["zero/sonnet-5"].definition.rates;
     assert_eq!(sell.input_per_mtok, Some(2.00));
     assert_eq!(sell.output_per_mtok, Some(10.00));
 
-    // And the public catalog stops advertising what it cannot serve: the
-    // six surviving tier ids plus their six pinned candidates, with no
-    // sonnet row.
+    // And the public catalog stops advertising what it cannot serve: the nine
+    // surviving tier ids plus their nine candidates.
     let listed = listed_model_ids(RouterState::new(path)).await;
-    assert_eq!(listed.len(), 12);
+    assert_eq!(listed.len(), 18);
     assert!(listed.iter().any(|id| id == "zero/low-cost"));
     assert!(listed.iter().any(|id| id == "zero/haiku-4-5"));
+
+    // The mispriced PIN and its candidate are both gone.
     assert!(
         !listed
             .iter()
-            .any(|id| id.contains("sonnet") || id == "zero/high-end"),
-        "{listed:?}"
+            .any(|id| id == "zero/sonnet-5" || id == "anthropic/claude-sonnet-5"),
+        "the withheld pin must not be advertised: {listed:?}"
     );
+    // But `zero/optimized` still dispatches claude-sonnet-5 and still sells,
+    // because the band prices its own candidate. Withholding is per-tier
+    // economics, not a blanket ban on a model — a customer buying the intent
+    // is unaffected by a pin that went underwater.
+    assert!(
+        listed.iter().any(|id| id == "zero/optimized"),
+        "the band must survive a hike to the pin: {listed:?}"
+    );
+    assert!(
+        listed
+            .iter()
+            .any(|id| id == "band/optimized/claude-sonnet-5"),
+        "the band's own sonnet candidate is unaffected: {listed:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_band_charges_no_routing_premium_while_it_cannot_route() {
+    // The bands are named for selection machinery that is not finished, so
+    // each holds exactly ONE candidate and therefore sells at that
+    // candidate's basis — a customer pays for routing only once routing
+    // happens. The day a band gains a second candidate its sell rate must
+    // rise to cover the dearer one, and that is a PRICE CHANGE for everyone
+    // already on the band. This test is the tripwire: it fails the moment a
+    // band gains a rung, so the pricing decision cannot be made silently in
+    // a config edit.
+    let catalog = load_tier_catalog(&tier_config_path())
+        .await
+        .expect("bundled tier catalog must load");
+
+    for band in BAND_TIERS {
+        let tier = catalog
+            .tiers
+            .get(band)
+            .unwrap_or_else(|| panic!("{band} must ship"));
+        assert_eq!(
+            tier.candidates.len(),
+            1,
+            "{band} gained a rung — it can now route, so decide its sell rate \
+             and announce the price change before updating this test"
+        );
+        let candidate = &tier.candidates[0];
+        assert_eq!(
+            (
+                candidate.rates.input_per_mtok,
+                candidate.rates.cached_input_per_mtok,
+                candidate.rates.output_per_mtok
+            ),
+            (
+                tier.rates.input_per_mtok,
+                tier.rates.cached_input_per_mtok,
+                tier.rates.output_per_mtok
+            ),
+            "{band} must sell at its single candidate's cost: no premium for \
+             a choice ZeroRouter is not yet making"
+        );
+    }
 }
 
 #[tokio::test]
@@ -689,7 +765,7 @@ async fn the_shipped_catalog_withholds_no_tier_today() {
         "the shipped catalog withholds {:?}",
         catalog.unavailable.keys().collect::<Vec<_>>()
     );
-    assert_eq!(catalog.tiers.len(), 7);
+    assert_eq!(catalog.tiers.len(), 10);
 }
 
 /// The routed tiers vs the pass-through tiers, told apart explicitly so
@@ -699,15 +775,24 @@ async fn the_shipped_catalog_withholds_no_tier_today() {
 // rungs across >=2 providers). Every tier is pass-through until a second
 // provider serves a model class again.
 const ROUTED_TIERS: [&str; 0] = [];
-const PASS_THROUGH_TIERS: [&str; 7] = [
-    "zero/low-cost",
+const PASS_THROUGH_TIERS: [&str; 10] = [
+    // Model pins.
+    "zero/luna",
     "zero/haiku-4-5",
     "zero/codex",
-    "zero/high-end",
+    "zero/sonnet-5",
     "zero/sol",
     "zero/opus-5",
     "zero/fable-5",
+    // Intent bands. They are pass-through TODAY only because each still
+    // holds a single candidate; see `a_band_charges_no_routing_premium`.
+    "zero/low-cost",
+    "zero/optimized",
+    "zero/best",
 ];
+
+/// The three intent bands, whose model is expected to change over time.
+const BAND_TIERS: [&str; 3] = ["zero/low-cost", "zero/optimized", "zero/best"];
 
 #[tokio::test]
 async fn every_shipped_tier_keeps_its_structural_promise() {

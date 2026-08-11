@@ -5,6 +5,7 @@ pub mod billing;
 pub mod config;
 pub mod db;
 pub mod device;
+pub mod drift;
 pub mod error;
 pub mod estimator;
 pub mod health;

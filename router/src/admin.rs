@@ -52,6 +52,28 @@ pub enum AdminCommand {
     /// Replay settlements that were recorded as owed and never committed. Safe
     /// to run at any time and safe to run twice: the settle is idempotent.
     SettleOwed(SettleOwedArgs),
+    /// Reconcile `tiers.toml` against a public model catalog: prices, context
+    /// windows, modalities. Read-only and database-free, so it runs in CI.
+    /// Exits non-zero when a basis drifted or a model vanished — never writes
+    /// a price, because a bad fetch that repriced a live billing catalog would
+    /// be worse than the staleness it fixed.
+    CatalogDrift(CatalogDriftArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct CatalogDriftArgs {
+    /// Public catalog to reconcile against.
+    #[arg(long, default_value = crate::drift::DEFAULT_SOURCE_URL)]
+    pub source_url: String,
+    /// Read the source from a file instead of the network (offline / CI).
+    #[arg(long)]
+    pub source_file: Option<std::path::PathBuf>,
+    /// Tier file to check. Defaults to the same path the server serves.
+    #[arg(long)]
+    pub tiers: Option<std::path::PathBuf>,
+    /// Report and exit zero even when something drifted.
+    #[arg(long)]
+    pub allow_drift: bool,
 }
 
 #[derive(Debug, Args)]
@@ -165,6 +187,12 @@ struct KeyMetadata {
 }
 
 pub async fn run(args: AdminArgs) -> Result<()> {
+    // Catalog drift is a property of a FILE, not of the ledger. Answering it
+    // before a pool is opened is what lets CI run it with no database.
+    if let AdminCommand::CatalogDrift(args) = args.command {
+        return catalog_drift(args).await;
+    }
+
     let pool = database_pool_from_env().await?;
     migrate(&pool).await?;
 
@@ -178,6 +206,8 @@ pub async fn run(args: AdminArgs) -> Result<()> {
         AdminCommand::ListKeys(args) => list_keys(&pool, args).await,
         AdminCommand::OwedSettlements(args) => owed_settlements(&pool, args).await,
         AdminCommand::SettleOwed(args) => settle_owed(&pool, args).await,
+        // Handled above, before the pool exists.
+        AdminCommand::CatalogDrift(_) => unreachable!("dispatched before the pool"),
     }
 }
 
@@ -548,4 +578,117 @@ async fn list_keys(pool: &PgPool, args: ListKeysArgs) -> Result<()> {
     .collect::<Vec<_>>();
     println!("{}", serde_json::to_string_pretty(&rows)?);
     Ok(())
+}
+
+/// Reconcile the shipped tier file against a public model catalog.
+///
+/// Read-only by construction: it prints what it found and sets an exit code.
+/// Prices are never written back. A catalog that reprices itself from a
+/// network fetch can turn one bad upstream document into a billing incident,
+/// and the staleness this detects is slow enough that a human in the loop
+/// costs nothing.
+async fn catalog_drift(args: CatalogDriftArgs) -> Result<()> {
+    use crate::drift::{fetch_source, reconcile};
+
+    let tiers_path = args.tiers.unwrap_or_else(|| {
+        std::env::var("ZEROROUTER_TIERS_PATH")
+            .unwrap_or_else(|_| crate::config::DEFAULT_TIER_CONFIG_PATH.to_owned())
+            .into()
+    });
+    let catalog = crate::config::load_tier_catalog(&tiers_path)
+        .await
+        .with_context(|| format!("loading the tier catalog from {}", tiers_path.display()))?;
+
+    let source = match &args.source_file {
+        Some(path) => tokio::fs::read_to_string(path)
+            .await
+            .with_context(|| format!("reading the catalog source from {}", path.display()))?,
+        None => fetch_source(&args.source_url).await?,
+    };
+
+    let findings = reconcile(&catalog, &source);
+    println!(
+        "{:<22} {:<32} {:<18} {:>26} {:>26} {:>12} {:>10}",
+        "TIER", "CANDIDATE", "VERDICT", "RECORDED BASIS", "UPSTREAM COST", "CONTEXT", "MARKUP"
+    );
+    let rate = |r: crate::provider::ModelRates| {
+        let show = |v: Option<f64>| v.map_or_else(|| "-".to_owned(), |v| format!("{v}"));
+        format!(
+            "{}/{}/{}",
+            show(r.input_per_mtok),
+            show(r.cached_input_per_mtok),
+            show(r.output_per_mtok)
+        )
+    };
+    for found in &findings {
+        println!(
+            "{:<22} {:<32} {:<18} {:>26} {:>26} {:>12} {:>10}",
+            found.tier,
+            found.candidate_id,
+            found.verdict.label(),
+            rate(found.recorded_basis),
+            rate(found.upstream_cost),
+            found
+                .context_window
+                .map_or_else(|| "-".to_owned(), |c| format!("{c}")),
+            found
+                .sell_markup()
+                .map_or_else(|| "-".to_owned(), |m| format!("{m:.2}x")),
+        );
+    }
+
+    // A markup on a tier that advertises pass-through is not drift in the
+    // file's own terms — basis == sell, so the validator is satisfied — but it
+    // is the customer paying more than the model costs, which is exactly the
+    // claim an operator needs told.
+    let markups: Vec<_> = findings
+        .iter()
+        .filter(|f| f.is_undisclosed_markup())
+        .collect();
+    if !markups.is_empty() {
+        println!("\nSelling above upstream cost:");
+        for found in &markups {
+            println!(
+                "  {} charges {:.2}x the upstream output rate ({} vs {})",
+                found.tier,
+                found.sell_markup().unwrap_or_default(),
+                found
+                    .sell
+                    .output_per_mtok
+                    .map_or_else(|| "-".to_owned(), |v| format!("{v}")),
+                found
+                    .upstream_cost
+                    .output_per_mtok
+                    .map_or_else(|| "-".to_owned(), |v| format!("{v}")),
+            );
+        }
+    }
+
+    let actionable: Vec<_> = findings
+        .iter()
+        .filter(|f| f.verdict.is_actionable())
+        .collect();
+    if actionable.is_empty() {
+        println!("\n{} candidates reconciled, no drift.", findings.len());
+        return Ok(());
+    }
+    println!("\n{} candidate(s) need attention:", actionable.len());
+    for found in &actionable {
+        println!(
+            "  {} ({}) — {}",
+            found.candidate_id,
+            found.model,
+            found.verdict.label()
+        );
+    }
+    if args.allow_drift {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "{} candidate(s) drifted from {}; update tiers.toml deliberately, or pass --allow-drift",
+        actionable.len(),
+        args.source_file
+            .as_ref()
+            .map_or(args.source_url.clone(), |p| p.display().to_string())
+    )
 }
