@@ -11,13 +11,23 @@ use zerorouter::{
         AuthenticatedKey, AuthenticationError, KeyAuthenticator, generate_api_key, hash_api_key,
     },
     db::{
-        AttemptRecord, AttemptTokens, RequestTelemetry, ReservationBasis, UsageAdmission,
-        UsageRecord, UsageSession, begin_usage_session, migrate, output_token_percentiles,
-        provider_cogs, segment_clamp_stats, user_clamp_loss,
+        AttemptRecord, AttemptTokens, RequestTelemetry, ReservationSize, ReservationSizing,
+        UsageAdmission, UsageRecord, UsageSession, begin_usage_session, migrate,
+        output_token_percentiles, provider_cogs, segment_clamp_stats, user_clamp_loss,
     },
     openai::{OpenAiUsage, TASK_SIGNATURE_SCHEME, TaskSignature, tool_names_digest, usage_cost},
     priority::Priority,
 };
+
+/// The pre-Stage-4 sizing: one measured bound, offered as the full ceiling
+/// with no learned alternative for admission to choose between.
+fn cold_sizing(total_tokens: i64, output_tokens: i64, cost_usd: Decimal) -> ReservationSizing {
+    ReservationSizing::cold(ReservationSize {
+        total_tokens,
+        output_tokens,
+        cost_usd,
+    })
+}
 
 /// A fixed segment key for tests that only need the reservation to carry one.
 fn test_signature(hex: &str) -> TaskSignature {
@@ -103,11 +113,8 @@ async fn postgres_enforces_reservations_revocation_and_append_only_usage() {
     let session = match begin_usage_session(
         &pool,
         &key,
-        1_000,
-        500,
-        Decimal::ONE,
+        cold_sizing(1_000, 500, Decimal::ONE),
         test_signature("0123456789abcdef"),
-        ReservationBasis::Cold,
         false,
     )
     .await
@@ -120,11 +127,8 @@ async fn postgres_enforces_reservations_revocation_and_append_only_usage() {
         begin_usage_session(
             &pool,
             &key,
-            1_000,
-            500,
-            Decimal::from(20),
+            cold_sizing(1_000, 500, Decimal::from(20)),
             test_signature("0123456789abcdef"),
-            ReservationBasis::Cold,
             false,
         )
         .await
@@ -176,22 +180,16 @@ async fn postgres_enforces_reservations_revocation_and_append_only_usage() {
         begin_usage_session(
             &pool,
             &key,
-            800,
-            400,
-            Decimal::ZERO,
+            cold_sizing(800, 400, Decimal::ZERO),
             test_signature("0123456789abcdef"),
-            ReservationBasis::Cold,
-            false
+            false,
         ),
         begin_usage_session(
             &pool,
             &key,
-            800,
-            400,
-            Decimal::ZERO,
+            cold_sizing(800, 400, Decimal::ZERO),
             test_signature("0123456789abcdef"),
-            ReservationBasis::Cold,
-            false
+            false,
         ),
     );
     let mut admitted = 0;
@@ -241,12 +239,9 @@ async fn postgres_enforces_reservations_revocation_and_append_only_usage() {
         begin_usage_session(
             &pool,
             &cached_key,
-            1,
-            1,
-            Decimal::ZERO,
+            cold_sizing(1, 1, Decimal::ZERO),
             test_signature("0123456789abcdef"),
-            ReservationBasis::Cold,
-            false
+            false,
         )
         .await
         .expect("revoked admission must query"),
@@ -299,11 +294,8 @@ async fn admit(pool: &PgPool, key: &AuthenticatedKey) -> UsageSession {
     match begin_usage_session(
         pool,
         key,
-        4_596,
-        500,
-        Decimal::ONE,
+        cold_sizing(4_596, 500, Decimal::ONE),
         test_signature("00112233aabbccdd"),
-        ReservationBasis::Cold,
         false,
     )
     .await

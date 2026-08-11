@@ -29,8 +29,8 @@ use zerorouter::provider::ModelRates;
 use zerorouter::{
     auth::{AuthenticatedKey, generate_api_key, hash_api_key},
     db::{
-        KEY_CREATION_WINDOW_HOURS, MAX_KEYS_CREATED_PER_WINDOW, RequestTelemetry, ReservationBasis,
-        UsageAdmission, UsageRecord, begin_usage_session, migrate,
+        KEY_CREATION_WINDOW_HOURS, MAX_KEYS_CREATED_PER_WINDOW, RequestTelemetry, ReservationSize,
+        ReservationSizing, UsageAdmission, UsageRecord, begin_usage_session, migrate,
     },
     device,
     openai::{
@@ -41,6 +41,16 @@ use zerorouter::{
     session::{CSRF_HEADER, SESSION_COOKIE, create_session},
     web::{WebConfig, WebCtx},
 };
+
+/// The pre-Stage-4 sizing: one measured bound, offered as the full ceiling
+/// with no learned alternative for admission to choose between.
+fn cold_sizing(total_tokens: i64, output_tokens: i64, cost_usd: Decimal) -> ReservationSizing {
+    ReservationSizing::cold(ReservationSize {
+        total_tokens,
+        output_tokens,
+        cost_usd,
+    })
+}
 
 /// A fixed segment key for tests that only need the reservation to carry one.
 fn test_signature() -> TaskSignature {
@@ -173,11 +183,8 @@ async fn admit(
     begin_usage_session(
         pool,
         key,
-        reserved_tokens,
-        reserved_tokens.min(64),
-        reserved_cost_usd,
+        cold_sizing(reserved_tokens, reserved_tokens.min(64), reserved_cost_usd),
         test_signature(),
-        ReservationBasis::Cold,
         false,
     )
     .await

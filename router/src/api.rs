@@ -30,10 +30,10 @@ use crate::{
     auth::{AuthenticatedKey, AuthenticationError, KeyAuthenticator},
     config::{ResolvedRoute, TierCandidate, TierCatalog, load_tier_catalog},
     db::{
-        AttemptRecord, AttemptTokens, RequestTelemetry, ReservationBasis, SegmentClampStats,
-        SettlementRecovery, UsageAdmission, UsageRecord, UsageSession, begin_usage_session,
-        output_token_percentiles, recover_owed_settlements, segment_clamp_stats, segment_user,
-        user_clamp_loss,
+        AttemptRecord, AttemptTokens, RequestTelemetry, ReservationSize, ReservationSizing,
+        SegmentClampStats, SettlementRecovery, UsageAdmission, UsageRecord, UsageSession,
+        begin_usage_session, output_token_percentiles, recover_owed_settlements,
+        segment_clamp_stats, segment_user, user_clamp_loss,
     },
     error::{ApiError, streaming_error_json},
     estimator::{
@@ -1019,14 +1019,19 @@ async fn chat_completions(
         }
         _ => None,
     };
-    let (reserved_output_bound, reservation_basis) = match learned_bound {
-        Some(bound) => (bound, ReservationBasis::Learned),
-        None => (max_output_tokens, ReservationBasis::Cold),
-    };
-    // Re-measure the reservation against the sized output bound. The input
-    // side is byte-bound either way and identical to `reservation_usage`
-    // above; only the output side narrows.
-    let reservation_usage = request.reservation_usage(reserved_output_bound);
+    // Both sizings are measured here and the choice between them is made
+    // inside admission. The remaining gate — how many requests this user
+    // already has in flight — is only trustworthy under the per-user advisory
+    // lock, which admission holds and this seam does not (sol review #1,
+    // `LEARNED_SIZING_CONCURRENCY_LIMIT`). Measuring is pure and cheap; the
+    // learned arm is measured only when the estimator offered a bound.
+    let full_sizing = sized_reservation(&request, &resolved, max_output_tokens)?;
+    let learned_sizing = learned_bound
+        .map(|bound| sized_reservation(&request, &resolved, bound))
+        .transpose()?;
+    // Route construction and ordering read the FULL byte-bound usage: the
+    // generation limit sent upstream is untouched by sizing, and the cost
+    // ordering prices a walk rather than a reservation.
     let mut provider_route = services.provider_route(&resolved, max_output_tokens)?;
     order_candidates(
         priority.resolved,
@@ -1039,25 +1044,22 @@ async fn chat_completions(
         },
         &services.health,
     );
-    let reserved_tokens =
-        i64::try_from(reservation_usage.total_tokens).map_err(|_| ApiError::InvalidRequest)?;
-    // Fail closed before admission: a tier whose sell rates cannot be priced
-    // cannot size a reservation, and a request that cannot be metered must not
-    // be dispatched. The catalog validated these rates at load, so this is a
-    // backstop rather than a live path.
-    let reserved_cost =
-        usage_cost(resolved.sell_rates, reservation_usage).ok_or(ApiError::MeteringUnavailable)?;
     let usage_session = admit_usage(
         &services.pool,
         &authenticated,
-        reserved_tokens,
-        i64::from(reserved_output_bound),
-        reserved_cost,
+        ReservationSizing {
+            learned: learned_sizing,
+            full: full_sizing,
+        },
         signature,
-        reservation_basis,
         services.require_credits,
     )
     .await?;
+    // Re-measure against the bound admission actually took. This is what the
+    // walk bills when an upstream reports no usage, so reading it back rather
+    // than assuming the learned bound is what keeps a concurrency-gated
+    // request's fallback and its reservation describing the same request.
+    let reservation_usage = request.reservation_usage(usage_session.reserved_output_tokens());
     let runtime = services.runtime.clone();
     let health = services.health.clone();
 
@@ -3047,29 +3049,36 @@ async fn send_data(sender: &mpsc::Sender<Event>, data: String) -> bool {
         .is_ok_and(|result| result.is_ok())
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Price one candidate reservation: the token bounds the caps are checked
+/// against and the sell-price ceiling the balance is checked against.
+///
+/// Fails closed. A tier whose sell rates cannot be priced cannot size a
+/// reservation, and a request that cannot be metered must not be dispatched.
+/// The catalog validated these rates at load, so this is a backstop rather
+/// than a live path.
+fn sized_reservation(
+    request: &ChatCompletionRequest,
+    resolved: &ResolvedRoute,
+    output_bound: u32,
+) -> Result<ReservationSize, ApiError> {
+    let usage = request.reservation_usage(output_bound);
+    Ok(ReservationSize {
+        total_tokens: i64::try_from(usage.total_tokens).map_err(|_| ApiError::InvalidRequest)?,
+        output_tokens: i64::from(output_bound),
+        cost_usd: usage_cost(resolved.sell_rates, usage).ok_or(ApiError::MeteringUnavailable)?,
+    })
+}
+
 async fn admit_usage(
     pool: &PgPool,
     key: &AuthenticatedKey,
-    reserved_tokens: i64,
-    reserved_output_tokens: i64,
-    reserved_cost: rust_decimal::Decimal,
+    sizing: ReservationSizing,
     task_signature: TaskSignature,
-    estimator_basis: ReservationBasis,
     require_credits: bool,
 ) -> Result<UsageSession, ApiError> {
-    match begin_usage_session(
-        pool,
-        key,
-        reserved_tokens,
-        reserved_output_tokens,
-        reserved_cost,
-        task_signature,
-        estimator_basis,
-        require_credits,
-    )
-    .await
-    .map_err(|_| ApiError::DatabaseUnavailable)?
+    match begin_usage_session(pool, key, sizing, task_signature, require_credits)
+        .await
+        .map_err(|_| ApiError::DatabaseUnavailable)?
     {
         UsageAdmission::Allowed(session) => Ok(session),
         UsageAdmission::Unauthorized => Err(ApiError::Unauthorized),
@@ -3393,11 +3402,14 @@ mod tests {
         let session = match begin_usage_session(
             pool,
             key,
-            i64::try_from(reservation_usage.total_tokens).expect("reservation should fit"),
-            64,
-            usage_cost(resolved.sell_rates, reservation_usage).expect("sell rates must price"),
+            ReservationSizing::cold(ReservationSize {
+                total_tokens: i64::try_from(reservation_usage.total_tokens)
+                    .expect("reservation should fit"),
+                output_tokens: 64,
+                cost_usd: usage_cost(resolved.sell_rates, reservation_usage)
+                    .expect("sell rates must price"),
+            }),
             task_signature("walk-user", &[], 1, 128, true, 64),
-            ReservationBasis::Cold,
             false,
         )
         .await

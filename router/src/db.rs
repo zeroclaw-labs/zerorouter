@@ -580,8 +580,86 @@ pub struct UsageSession {
     estimator_basis: ReservationBasis,
 }
 
+/// One candidate reservation size: what admission would check the caps and the
+/// prepaid balance against if it chose this sizing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReservationSize {
+    /// Input + output token bound, checked against the velocity caps.
+    pub total_tokens: i64,
+    /// The output-token bound alone, carried to settle as provenance.
+    pub output_tokens: i64,
+    /// Sell-price ceiling, checked against the spend caps and the balance.
+    pub cost_usd: Decimal,
+}
+
+/// The sizings admission chooses between, and the reason the choice is made
+/// here rather than at the call site.
+///
+/// The estimator's learned sizing is decided in `chat_completions` from the
+/// segment's warm percentiles. It cannot also decide whether the user is
+/// running enough concurrent requests for that sizing to be safe, because that
+/// count is only trustworthy under the per-user advisory lock — which
+/// admission takes, and the caller does not hold. So the caller offers both
+/// sizings and admission picks one with the count in hand.
+pub struct ReservationSizing {
+    /// The estimator's sizing, when every Stage-4 gate passed. `None` means
+    /// the caller already decided on the full ceiling and there is nothing to
+    /// choose between.
+    pub learned: Option<ReservationSize>,
+    /// The full requested ceiling — today's cold sizing, and the fallback the
+    /// concurrency gate reverts to.
+    pub full: ReservationSize,
+}
+
+impl ReservationSizing {
+    /// A request that is not eligible for learned sizing at all.
+    #[must_use]
+    pub fn cold(full: ReservationSize) -> Self {
+        Self {
+            learned: None,
+            full,
+        }
+    }
+}
+
 const DATABASE_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
 const RESERVATION_TTL: Duration = Duration::from_secs(20 * 60);
+
+/// Live reservations a user may already hold and still have this request sized
+/// by the estimator. At or above it, the request reserves the full requested
+/// ceiling instead.
+///
+/// # The overrun this bounds
+///
+/// A learned reservation is floored at 25% of the request's own `max_tokens`
+/// (design doc, "Use — reservation sizing only, never billing"), while the
+/// FULL `max_tokens` still goes upstream: the reservation narrows, the
+/// generation limit does not. One request therefore encumbers as little as a
+/// quarter of what it may be delivered. Serially that is fine — settlement
+/// bills metered actuals and the debit clamp makes any under-reservation
+/// ZeroRouter's tail rather than the customer's. Concurrently it is not: k
+/// same-shape requests admitted together encumber k/4 requests' worth of
+/// balance while up to k requests' worth of tokens is generated, so at k = 4 a
+/// user has prepaid for one request and may receive four (sol review #1).
+///
+/// The gate caps k rather than the ratio. At most this many live reservations
+/// can have been sized learned, because the (N+1)th admission sees N live and
+/// reverts; everything after it encumbers honestly. With the limit at 2 the
+/// worst case is 2 x 0.75 = 1.5 requests' worth of unencumbered ceiling,
+/// bounded and constant, instead of growing with the concurrency a caller
+/// chooses.
+///
+/// This is a SIZING gate, never an admission gate: the request still runs. A
+/// user who wants more concurrency gets it, and simply pays the full ceiling's
+/// encumbrance for it — which is exactly what the pre-Stage-4 router did for
+/// every request.
+///
+/// Not configurable. The money-policy constants in this file
+/// (`RESERVATION_TTL`, `MAX_SETTLE_ATTEMPTS`) and in the estimator
+/// (`RESERVATION_FLOOR_FRACTION`, `TAIL_GATE_RATIO`) are all plain constants;
+/// the crate's env-var surface is deployment configuration (credentials, bind
+/// address, feature groups), and this is not that.
+pub const LEARNED_SIZING_CONCURRENCY_LIMIT: i64 = 2;
 
 /// Settle transactions one request may run before it hands the durable intent
 /// to the recovery sweep. Bounded on purpose: the client is already waiting
@@ -763,21 +841,19 @@ pub async fn migrate(pool: &PgPool) -> Result<()> {
         .context("database migration failed")
 }
 
-#[allow(clippy::too_many_arguments)]
 pub async fn begin_usage_session(
     pool: &PgPool,
     key: &AuthenticatedKey,
-    reserved_tokens: i64,
-    reserved_output_tokens: i64,
-    reserved_cost_usd: Decimal,
+    sizing: ReservationSizing,
     task_signature: TaskSignature,
-    estimator_basis: ReservationBasis,
     require_credits: bool,
 ) -> Result<UsageAdmission, sqlx::Error> {
-    if reserved_tokens < 0 || reserved_output_tokens < 0 || reserved_cost_usd < Decimal::ZERO {
-        return Err(sqlx::Error::Protocol(
-            "usage reservation cannot be negative".to_owned(),
-        ));
+    for size in [Some(sizing.full), sizing.learned].into_iter().flatten() {
+        if size.total_tokens < 0 || size.output_tokens < 0 || size.cost_usd < Decimal::ZERO {
+            return Err(sqlx::Error::Protocol(
+                "usage reservation cannot be negative".to_owned(),
+            ));
+        }
     }
 
     let mut transaction = pool.begin().await?;
@@ -1027,7 +1103,8 @@ pub async fn begin_usage_session(
         user_active_reserved_tokens,
         active_reserved_cost,
         active_reserved_tokens,
-    ) = sqlx::query_as::<_, (Decimal, i64, Decimal, i64)>(
+        user_live_reservations,
+    ) = sqlx::query_as::<_, (Decimal, i64, Decimal, i64, i64)>(
         r#"
         SELECT
             COALESCE(SUM(usage_reservations.reserved_cost_usd), 0),
@@ -1043,7 +1120,16 @@ pub async fn begin_usage_session(
                     WHERE usage_reservations.api_key_id = $2
                 ),
                 0
-            )::BIGINT
+            )::BIGINT,
+            -- How many requests this user has in flight right now, for the
+            -- learned-sizing concurrency gate below. Counted off the same scan
+            -- as the encumbrance sums, so the gate costs no extra round trip,
+            -- and restricted to the unexpired arm: a row that outlived its TTL
+            -- while still owing is a DEBT, not a concurrent request. It goes
+            -- on encumbering the balance through the sum above; it must not
+            -- also make every later request of that user reserve full ceiling
+            -- forever.
+            COUNT(*) FILTER (WHERE usage_reservations.expires_at > NOW())::BIGINT
         FROM usage_reservations
         INNER JOIN api_keys ON api_keys.id = usage_reservations.api_key_id
         WHERE api_keys.user_id = $1
@@ -1064,6 +1150,51 @@ pub async fn begin_usage_session(
     .bind(key.id)
     .fetch_one(&mut *transaction)
     .await?;
+
+    // The learned-sizing concurrency gate (sol review #1). The estimator's
+    // sizing encumbers as little as a quarter of the ceiling that still goes
+    // upstream, which is safe one request at a time and is not safe k at a
+    // time — see [`LEARNED_SIZING_CONCURRENCY_LIMIT`] for the arithmetic. A
+    // user already running that many live requests gets the full ceiling for
+    // this one.
+    //
+    // # Why the count is race-safe
+    //
+    // It is read inside the transaction that already holds
+    // `pg_advisory_xact_lock` on this user, from the same statement as the
+    // encumbrance sums, and it decides a value used by the INSERT that commits
+    // with that lock still held. Two simultaneous admissions for one user are
+    // therefore strictly ordered by the lock: the first commits its reservation
+    // before the second's count runs, so the second cannot fail to see it.
+    // Under READ COMMITTED an uncommitted sibling would be invisible to this
+    // count — which is exactly what the lock rules out, and the same property
+    // the balance check has always depended on.
+    //
+    // # Why the decision has to be here
+    //
+    // The caller sizes learned from the estimator cache, outside any
+    // transaction, and could not take this lock without restructuring
+    // admission around it. Offering both sizings and choosing one under the
+    // lock keeps the ordering, the gates, and the INSERT exactly as they were,
+    // and adds a branch rather than a round trip.
+    let (reserved_tokens, reserved_output_tokens, reserved_cost_usd, estimator_basis) =
+        match sizing.learned {
+            Some(learned) if user_live_reservations < LEARNED_SIZING_CONCURRENCY_LIMIT => (
+                learned.total_tokens,
+                learned.output_tokens,
+                learned.cost_usd,
+                ReservationBasis::Learned,
+            ),
+            // Not eligible, or eligible but too concurrent. Either way the
+            // request still RUNS — this gate sizes, it never refuses — it just
+            // encumbers what it may actually be delivered.
+            _ => (
+                sizing.full.total_tokens,
+                sizing.full.output_tokens,
+                sizing.full.cost_usd,
+                ReservationBasis::Cold,
+            ),
+        };
 
     // Both ceilings are enforced and the tighter one wins: a request is
     // admitted only if it fits under the presenting key's own cap AND under the
@@ -1185,6 +1316,28 @@ impl UsageSession {
     #[must_use]
     pub fn request_id(&self) -> String {
         format!("chatcmpl-{}", self.reservation_id.simple())
+    }
+
+    /// The output-token bound admission actually reserved against.
+    ///
+    /// Which of the offered sizings won is decided inside admission, under the
+    /// per-user lock, so the caller has to read it back rather than assume it.
+    /// The caller's own `reservation_usage` — the bound it bills against when
+    /// an upstream reports no usage — must be rebuilt from this, or a request
+    /// the concurrency gate re-sized would settle its fallback against a
+    /// reservation it no longer matches.
+    #[must_use]
+    pub fn reserved_output_tokens(&self) -> u32 {
+        // Non-negative by construction: every offered sizing is validated at
+        // the top of `begin_usage_session`.
+        self.reserved_output_tokens.unsigned_abs()
+    }
+
+    /// Which sizing admission chose. `Learned` only when the estimator's
+    /// sizing survived the concurrency gate.
+    #[must_use]
+    pub fn estimator_basis(&self) -> ReservationBasis {
+        self.estimator_basis
     }
 
     /// Record that this request has begun an upstream call.
