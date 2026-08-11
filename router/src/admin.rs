@@ -36,6 +36,12 @@ pub enum AdminCommand {
     /// The user must already exist (mint-key creates one) — a typo'd email
     /// must fail loudly, never mint a funded ghost account.
     GrantCredit(GrantCreditArgs),
+    /// Freeze or unfreeze an account. A frozen account is refused at
+    /// admission and cannot mint new API keys; its history stays readable.
+    /// `--off` is the release valve for the automatic freeze a Stripe
+    /// chargeback applies (migration 0009) — without it, lifting a freeze
+    /// would mean hand-written SQL against the users table.
+    SetFrozen(SetFrozenArgs),
     /// Disable an existing key.
     RevokeKey(RevokeKeyArgs),
     /// List key metadata without hashes or plaintext credentials.
@@ -105,6 +111,18 @@ pub struct GrantCreditArgs {
     /// Ledger note recorded with the grant.
     #[arg(long, default_value = "beta promo credit")]
     pub note: String,
+}
+
+#[derive(Debug, Args)]
+pub struct SetFrozenArgs {
+    #[arg(long)]
+    pub email: String,
+    /// Freeze the account: an operator-initiated hold.
+    #[arg(long, conflicts_with = "off")]
+    pub on: bool,
+    /// Lift the freeze and restore service, whatever applied it.
+    #[arg(long)]
+    pub off: bool,
 }
 
 fn parse_priority(value: &str) -> Result<Priority, String> {
@@ -182,6 +200,7 @@ pub async fn run(args: AdminArgs) -> Result<()> {
         AdminCommand::MintKey(args) => mint_key(&pool, args).await,
         AdminCommand::UserStatus(args) => user_status(&pool, args).await,
         AdminCommand::GrantCredit(args) => grant_credit(&pool, args).await,
+        AdminCommand::SetFrozen(args) => set_frozen(&pool, args).await,
         AdminCommand::Treasury(args) => treasury(&pool, args).await,
         AdminCommand::RevokeKey(args) => revoke_key(&pool, args).await,
         AdminCommand::ListKeys(args) => list_keys(&pool, args).await,
@@ -238,8 +257,20 @@ async fn user_status(pool: &PgPool, args: UserStatusArgs) -> Result<()> {
     if email.is_empty() || !email.contains('@') {
         bail!("email must be a non-empty email address")
     }
-    let Some((user_id, balance)) = sqlx::query_as::<_, (Uuid, Decimal)>(
-        "SELECT id, credit_balance_usd FROM users WHERE email = $1",
+    // `frozen_at` rides along because this is the command an operator runs to
+    // answer "why is this customer being refused?", and a freeze is now one of
+    // the answers. Listing every frozen account is the review workflow's job,
+    // not this one's.
+    let Some((user_id, balance, frozen_at, frozen_reason)) = sqlx::query_as::<
+        _,
+        (
+            Uuid,
+            Decimal,
+            Option<chrono::DateTime<chrono::Utc>>,
+            Option<String>,
+        ),
+    >(
+        "SELECT id, credit_balance_usd, frozen_at, frozen_reason FROM users WHERE email = $1",
     )
     .bind(&email)
     .fetch_optional(pool)
@@ -273,6 +304,9 @@ async fn user_status(pool: &PgPool, args: UserStatusArgs) -> Result<()> {
             "user_id": user_id,
             "email": email,
             "balance_usd": balance,
+            "frozen": frozen_at.is_some(),
+            "frozen_at": frozen_at,
+            "frozen_reason": frozen_reason,
             "lifetime_spend_usd": spent,
             "live_keys": live_keys,
             "ledger": entries,
@@ -315,6 +349,59 @@ async fn grant_credit(pool: &PgPool, args: GrantCreditArgs) -> Result<()> {
             "user_id": user_id,
             "granted_usd": amount,
             "balance_usd": balance,
+        }))?
+    );
+    Ok(())
+}
+
+/// Freeze or lift the freeze on one account, by email.
+///
+/// Shaped like `grant-credit` on purpose — resolve the user, refuse loudly if
+/// there is not exactly one, act through the same helpers the webhook uses,
+/// print the resulting state as JSON. Exactly one of `--on` / `--off` is
+/// required: a "set" command whose default is silently one direction is how an
+/// operator unfreezes an account they meant to freeze.
+async fn set_frozen(pool: &PgPool, args: SetFrozenArgs) -> Result<()> {
+    let email = args.email.trim().to_lowercase();
+    if email.is_empty() || !email.contains('@') {
+        bail!("email must be a non-empty email address")
+    }
+    let freeze = match (args.on, args.off) {
+        (true, false) => true,
+        (false, true) => false,
+        _ => bail!("pass exactly one of --on or --off"),
+    };
+    let Some(user_id) = sqlx::query_scalar::<_, Uuid>("SELECT id FROM users WHERE email = $1")
+        .bind(&email)
+        .fetch_optional(pool)
+        .await
+        .context("failed to resolve user")?
+    else {
+        bail!("no user with email {email}")
+    };
+    let changed = if freeze {
+        crate::billing::freeze_account(pool, user_id, crate::billing::FreezeReason::Operator)
+            .await
+            .context("failed to freeze the account")?
+    } else {
+        crate::billing::unfreeze_account(pool, user_id)
+            .await
+            .context("failed to lift the freeze")?
+    };
+    let state = crate::billing::freeze_state(pool, user_id)
+        .await
+        .context("failed to read the freeze state")?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "user_id": user_id,
+            "email": email,
+            "frozen": state.is_some(),
+            "frozen_at": state.as_ref().map(|(at, _)| at),
+            "frozen_reason": state.as_ref().map(|(_, reason)| reason),
+            // False means the account was already in the requested state; the
+            // command is idempotent and that is not an error.
+            "changed": changed,
         }))?
     );
     Ok(())

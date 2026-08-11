@@ -27,6 +27,11 @@ pub enum ApiError {
     Unauthorized,
     SpendCapExceeded,
     InsufficientCredits,
+    /// The account is frozen (migration 0009): a Stripe chargeback, or an
+    /// operator's hold. Deliberately its own code rather than a reuse of
+    /// [`Self::InsufficientCredits`] — buying more credit does not clear it,
+    /// and a client told "insufficient credits" would reasonably try.
+    AccountFrozen,
     VelocityCapExceeded,
     ModelNotFound,
     /// The requested model is in the catalog file but its tier is withheld for
@@ -146,6 +151,21 @@ impl ApiError {
                 "billing_error",
                 None,
                 "insufficient_credits",
+            ),
+            // 402 and not 403: this is the billing family, and the account is
+            // frozen over money. The message names the freeze and points at
+            // the only thing that clears it — a human — so a client does not
+            // retry, top up, or mint a new key hoping one of them helps.
+            Self::AccountFrozen => (
+                StatusCode::PAYMENT_REQUIRED,
+                Cow::Borrowed(
+                    "This account is frozen and cannot be used for new requests. A frozen account \
+                     is usually the result of a payment dispute or chargeback; adding credit will \
+                     not lift it. Contact ZeroRouter support to have the freeze reviewed.",
+                ),
+                "billing_error",
+                None,
+                "account_frozen",
             ),
             Self::VelocityCapExceeded => (
                 StatusCode::TOO_MANY_REQUESTS,
