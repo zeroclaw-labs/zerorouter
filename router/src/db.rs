@@ -1614,6 +1614,12 @@ enum SettleOutcome {
     /// A previous attempt already committed this request's settled row. The
     /// reservation (if one was still lying around) has been reclaimed.
     AlreadySettled,
+    /// An operator released this reservation with `--forgive` before the
+    /// settle landed. The debt is recorded as given up; charging it now would
+    /// contradict a durable operator decision, so nothing is debited and no
+    /// settled row is written. Terminal for the caller, like `AlreadySettled`,
+    /// but named so logs and operator summaries tell the truth.
+    Forgiven,
 }
 
 /// Run [`settle_once`] until it succeeds, the failure stops being transient, or
@@ -1641,6 +1647,14 @@ async fn settle_with_retry(
                     request_id = %reservation_id,
                     attempt,
                     "settlement was already committed by an earlier attempt"
+                );
+                return Ok(());
+            }
+            Ok(SettleOutcome::Forgiven) => {
+                tracing::warn!(
+                    request_id = %reservation_id,
+                    attempt,
+                    "settlement abandoned: an operator forgave this reservation"
                 );
                 return Ok(());
             }
@@ -1729,19 +1743,36 @@ async fn settle_once(
 
     // Settle the reservation and recover what admission reserved in the
     // same statement; a missing row means it was already settled or expired.
+    // `released_at IS NULL`: a row an operator released with `--forgive` is a
+    // debt durably given up. Consuming it here would debit a charge the
+    // operator recorded as forgiven — collection must lose to forgiveness no
+    // matter which of settle-owed, the recovery sweep, or the request's own
+    // late settle gets here.
     let reserved_cost_usd = sqlx::query_scalar::<_, Decimal>(
-        "DELETE FROM usage_reservations WHERE id = $1 AND api_key_id = $2 RETURNING reserved_cost_usd",
+        "DELETE FROM usage_reservations WHERE id = $1 AND api_key_id = $2 \
+         AND released_at IS NULL RETURNING reserved_cost_usd",
     )
     .bind(reservation_id)
     .bind(api_key_id)
     .fetch_optional(&mut *transaction)
     .await?;
     let Some(reserved_cost_usd) = reserved_cost_usd else {
-        // Nothing to consume. Ask the ledger which of the two reasons it is:
-        // a settled row means an earlier attempt won (success), no settled row
-        // means the reservation was lost without ever being billed (an error
-        // worth surfacing, and the case the intent-before-settle ordering
-        // exists to make impossible).
+        // Nothing to consume. Three reasons are possible, told apart in order:
+        // a surviving released row is a forgiven debt; a settled row means an
+        // earlier attempt won; neither means the reservation was lost without
+        // ever being billed (an error worth surfacing, and the case the
+        // intent-before-settle ordering exists to make impossible).
+        let forgiven = sqlx::query_scalar::<_, i32>(
+            "SELECT 1 FROM usage_reservations WHERE id = $1 AND released_at IS NOT NULL",
+        )
+        .bind(reservation_id)
+        .fetch_optional(&mut *transaction)
+        .await?
+        .is_some();
+        if forgiven {
+            transaction.rollback().await?;
+            return Ok(SettleOutcome::Forgiven);
+        }
         let already_settled =
             sqlx::query_scalar::<_, i32>("SELECT 1 FROM usage_events WHERE request_id = $1")
                 .bind(reservation_id)
@@ -2134,6 +2165,9 @@ pub struct SettlementRecovery {
     pub failed: u64,
     /// Owed settlements handed to an operator instead of being retried again.
     pub quarantined: u64,
+    /// Rows found released with `--forgive`: nothing was collected, by a
+    /// recorded operator decision rather than by failure.
+    pub forgiven: u64,
 }
 
 /// Replay settlements that were recorded as owed and never committed.
@@ -2169,9 +2203,9 @@ pub async fn recover_quarantined_settlement(
     pool: &PgPool,
     request_id: Uuid,
 ) -> Result<SettlementRecovery, sqlx::Error> {
-    let owed = sqlx::query_as::<_, (Uuid, Uuid, String)>(
+    let owed = sqlx::query_as::<_, (Uuid, Uuid, String, Option<DateTime<Utc>>)>(
         r#"
-        SELECT id, api_key_id, settlement_intent::TEXT
+        SELECT id, api_key_id, settlement_intent::TEXT, released_at
         FROM usage_reservations
         WHERE id = $1 AND settlement_intent IS NOT NULL
         "#,
@@ -2180,9 +2214,21 @@ pub async fn recover_quarantined_settlement(
     .fetch_optional(pool)
     .await?;
     let mut summary = SettlementRecovery::default();
-    let Some((reservation_id, api_key_id, payload)) = owed else {
+    let Some((reservation_id, api_key_id, payload, released_at)) = owed else {
         return Ok(summary);
     };
+    // A released row is a debt an operator durably gave up. Collection loses
+    // to forgiveness: report it, never replay it. (settle_once would refuse
+    // too — this answers the operator without spending a settle attempt.)
+    if let Some(released_at) = released_at {
+        tracing::warn!(
+            request_id = %reservation_id,
+            %released_at,
+            "collection refused: this reservation was forgiven by an operator"
+        );
+        summary.forgiven += 1;
+        return Ok(summary);
+    }
     let Ok(intent) = serde_json::from_str::<SettlementIntent>(&payload) else {
         summary.failed += 1;
         return Ok(summary);
@@ -2197,6 +2243,9 @@ pub async fn recover_quarantined_settlement(
             summary.settled += 1;
         }
         Ok(SettleOutcome::AlreadySettled) => summary.already_settled += 1,
+        // Unreachable here by the released-row checks above, but the compiler
+        // rightly demands an answer, and the honest one is the counter.
+        Ok(SettleOutcome::Forgiven) => summary.forgiven += 1,
         Err(error) => {
             tracing::error!(
                 request_id = %reservation_id,
@@ -2266,6 +2315,9 @@ pub async fn recover_owed_settlements(
                 summary.settled += 1;
             }
             Ok(SettleOutcome::AlreadySettled) => summary.already_settled += 1,
+            // Unreachable here by the released-row checks above, but the compiler
+            // rightly demands an answer, and the honest one is the counter.
+            Ok(SettleOutcome::Forgiven) => summary.forgiven += 1,
             Err(error) => {
                 let quarantined = record_settle_failure(pool, reservation_id, &error)
                     .await

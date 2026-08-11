@@ -2076,6 +2076,85 @@ async fn forgiving_an_owed_reservation_is_opt_in_and_frees_the_credit_it_held() 
     drop_reservations(&pool, key.id).await;
 }
 
+/// Forgiveness is final: once an operator releases a debt with `--forgive`,
+/// no collection route may charge it — not `settle-owed` by request id, and
+/// not the request's own settle landing late. Without the released-row guard
+/// in `settle_once`, the second is exactly what happens: a request whose row
+/// was quarantined mid-flight (settle failures) and then forgiven would
+/// debit the customer the moment its retry loop came back around,
+/// contradicting a durable operator decision.
+#[tokio::test]
+async fn a_forgiven_debt_can_never_be_collected_afterwards() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let _fault_guard = FAULT_LOCK.lock().await;
+    let _sweep_guard = SWEEP_LOCK.write().await;
+    let user_id = create_user(&pool, "forgiven-uncollectable").await;
+    let key = create_key(&pool, user_id).await;
+    credit_purchase(&pool, user_id, Decimal::from(2), &unique_session_id(), None)
+        .await
+        .expect("funding purchase must apply");
+
+    let session = admit(&pool, &key, true).await;
+    let request_id = request_uuid(&session);
+    let fault = SettleFault::install(&pool, request_id, i64::MAX, "P0001").await;
+    assert!(session.record(&usage_record(Decimal::ONE)).await.is_err());
+    fault.remove(&pool).await;
+    query(
+        "UPDATE usage_reservations
+         SET quarantined_at = NOW(), settle_attempts = 8
+         WHERE id = $1",
+    )
+    .bind(request_id)
+    .execute(&pool)
+    .await
+    .expect("quarantine must apply");
+
+    let released = release_quarantined_reservation(&pool, request_id, "charge waived", true)
+        .await
+        .expect("release must query");
+    assert!(
+        matches!(released, ReservationRelease::Released { .. }),
+        "{released:?}"
+    );
+
+    // Route 1: the operator command. It must report the forgiveness, not
+    // replay the payload.
+    let attempt = recover_quarantined_settlement(&pool, request_id)
+        .await
+        .expect("collection attempt must query");
+    assert_eq!(
+        (attempt.settled, attempt.forgiven),
+        (0, 1),
+        "settle-owed on a forgiven debt collects nothing and says why: {attempt:?}"
+    );
+
+    // Route 2: the request's own settle, landing after the release. The retry
+    // loop must treat the forgiveness as terminal — no error, and no debit.
+    session
+        .record(&usage_record(Decimal::ONE))
+        .await
+        .expect("a late settle on a forgiven reservation must end quietly, not error");
+
+    assert_eq!(
+        balance(&pool, user_id).await.expect("balance must query"),
+        Decimal::from(2),
+        "no collection route may move money after forgiveness"
+    );
+    assert_eq!(
+        usage_debits(&pool, user_id).await,
+        0,
+        "and no settled row may appear"
+    );
+    assert!(
+        release_record(&pool, request_id).await.is_some(),
+        "the release record survives the attempts on it"
+    );
+
+    drop_reservations(&pool, key.id).await;
+}
+
 /// Only a QUARANTINED reservation may be released, and each of the other
 /// states is refused by name rather than by silence. A live row is finished by
 /// settlement and an expired one by the sweep; a release that acted on either
