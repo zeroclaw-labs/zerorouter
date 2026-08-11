@@ -1075,6 +1075,254 @@ async fn an_expired_reservation_owing_a_settlement_is_quarantined_not_deleted() 
     assert!(entry.last_settle_error.is_some());
 }
 
+/// Age one reservation past its TTL and state the two facts the expiry sweep
+/// classifies on: whether the walk ever dispatched, and whether a settlement
+/// is owed.
+///
+/// The row itself comes from a real admission, so every other column is what
+/// admission writes; only the three timestamps and the payload are stated. All
+/// of them land two hours back together, which keeps the row's ordering CHECKs
+/// (`expires_at > created_at`, `settlement_intent_at >= created_at`) satisfied
+/// exactly as a genuinely old row would.
+///
+/// The intent payload is a stand-in: the sweep classifies on the column being
+/// non-NULL and never reads it, and a test that needs a REPLAYABLE payload
+/// gets one from a real failed settle instead (see the fault-injection tests).
+async fn expire_reservation(pool: &PgPool, reservation_id: Uuid, dispatched: bool, owes: bool) {
+    query(
+        r#"
+        UPDATE usage_reservations
+        SET created_at = NOW() - INTERVAL '2 hours',
+            expires_at = NOW() - INTERVAL '100 minutes',
+            dispatched_at = CASE WHEN $2 THEN NOW() - INTERVAL '110 minutes' END,
+            settlement_intent = CASE WHEN $3 THEN '{"version": 1}'::JSONB END,
+            settlement_intent_at = CASE WHEN $3 THEN NOW() - INTERVAL '110 minutes' END
+        WHERE id = $1
+        "#,
+    )
+    .bind(reservation_id)
+    .bind(dispatched)
+    .bind(owes)
+    .execute(pool)
+    .await
+    .expect("reservation ageing must apply");
+}
+
+/// `(survives, quarantined, last_settle_error)` for one reservation.
+async fn swept_state(pool: &PgPool, reservation_id: Uuid) -> (bool, bool, Option<String>) {
+    let row = query_as::<_, (bool, Option<String>)>(
+        "SELECT quarantined_at IS NOT NULL, last_settle_error
+         FROM usage_reservations WHERE id = $1",
+    )
+    .bind(reservation_id)
+    .fetch_optional(pool)
+    .await
+    .expect("reservation state must query");
+    row.map_or((false, false, None), |(quarantined, error)| {
+        (true, quarantined, error)
+    })
+}
+
+/// The hole sol's review named, closed. A reservation whose request WAS sent
+/// upstream but which holds no settlement intent — the intent write failed
+/// permanently, or the process died between the answer and the intent — used
+/// to be byte-identical to one whose walk never dispatched at all. The sweep
+/// reclaimed it: the customer kept the tokens, the encumbrance was released,
+/// and nothing anywhere recorded that anything had been owed.
+///
+/// `dispatched_at` is what tells the two apart, and a dispatched row is now
+/// parked for an operator instead of erased. There is no payload to replay, so
+/// what quarantine buys here is visibility — the row is listed with a NULL
+/// owed amount and a stated reason, which is exactly the state of knowledge:
+/// inference was delivered and ZeroRouter cannot say what it was worth.
+#[tokio::test]
+async fn an_expired_dispatched_reservation_owing_no_intent_is_quarantined_not_reclaimed() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let user_id = create_user(&pool, "dispatched-intentless").await;
+    let key = create_key(&pool, user_id).await;
+
+    let lost = request_uuid(&admit(&pool, &key, false).await);
+    expire_reservation(&pool, lost, true, false).await;
+
+    // Any admission runs the sweep.
+    let _sweeper = admit(&pool, &key, false).await;
+
+    let (survives, quarantined, reason) = swept_state(&pool, lost).await;
+    assert!(
+        survives,
+        "a reservation that was dispatched upstream must never be silently reclaimed"
+    );
+    assert!(
+        quarantined,
+        "a dispatched reservation holding no intent belongs in the operator queue"
+    );
+    assert!(
+        reason.is_some_and(|reason| reason.contains("no settlement intent")),
+        "the queue has to say why the row is parked; nothing else on it explains a NULL owed amount"
+    );
+
+    let parked = quarantined_settlements(&pool, 500)
+        .await
+        .expect("quarantine must query");
+    let entry = parked
+        .iter()
+        .find(|entry| entry.request_id == lost)
+        .expect("the lost charge must be listed for reconciliation");
+    assert_eq!(entry.api_key_id, key.id);
+    assert_eq!(
+        entry.owed_cost_usd, None,
+        "there is no stored payload, so the queue must not claim to know the amount"
+    );
+    assert_eq!(
+        entry.reserved_cost_usd,
+        Decimal::from(2),
+        "the admission ceiling is still the one bound an operator has to work from"
+    );
+
+    // Nothing automatic may act on this row: there is no payload to replay, so
+    // a recovery pass must leave it exactly where the operator can see it.
+    // Asserted on the row, not on the pass's counters — the recovery sweep is
+    // global and another test's owed row may legitimately be settled by it.
+    recover_owed_settlements(&pool, 500)
+        .await
+        .expect("recovery must query");
+    recover_quarantined_settlement(&pool, lost)
+        .await
+        .expect("operator collection must query");
+    let (survives, quarantined, _) = swept_state(&pool, lost).await;
+    assert!(
+        survives && quarantined,
+        "with no payload there is nothing to replay: neither the automatic \
+         sweep nor the operator command may consume this row"
+    );
+    drop_reservations(&pool, key.id).await;
+}
+
+/// The sweep's three classes are a partition, and only one of them may delete.
+/// Asserted in a single sweep so the classification cannot be right for one
+/// row by being wrong about which class it is in.
+#[tokio::test]
+async fn expiry_reclaims_only_the_reservation_that_never_dispatched() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let user_id = create_user(&pool, "sweep-partition").await;
+    let key = create_key(&pool, user_id).await;
+
+    // Never dispatched, owes nothing: the request never reached an upstream,
+    // so there is genuinely nothing to bill and the encumbrance is free.
+    let never_ran = request_uuid(&admit(&pool, &key, false).await);
+    expire_reservation(&pool, never_ran, false, false).await;
+    // Dispatched, owes a settlement: 0006's class, unchanged.
+    let owes = request_uuid(&admit(&pool, &key, false).await);
+    expire_reservation(&pool, owes, true, true).await;
+    // Dispatched, owes nothing: delivered inference whose charge was lost.
+    let lost = request_uuid(&admit(&pool, &key, false).await);
+    expire_reservation(&pool, lost, true, false).await;
+
+    let _sweeper = admit(&pool, &key, false).await;
+
+    assert_eq!(
+        swept_state(&pool, never_ran).await,
+        (false, false, None),
+        "an expired reservation that never dispatched is still reclaimed"
+    );
+    let (owes_survives, owes_quarantined, _) = swept_state(&pool, owes).await;
+    assert!(
+        owes_survives && owes_quarantined,
+        "an expired reservation carrying an intent is still quarantined, not deleted"
+    );
+    let (lost_survives, lost_quarantined, _) = swept_state(&pool, lost).await;
+    assert!(
+        lost_survives && lost_quarantined,
+        "an expired reservation that dispatched without an intent is quarantined, not deleted"
+    );
+    drop_reservations(&pool, key.id).await;
+}
+
+/// Remove the rows a quarantine test deliberately left behind.
+///
+/// Quarantine's whole contract is that nothing automatic removes these rows,
+/// so a test that plants them has to clear them itself. Without this they
+/// accumulate in a shared development database and crowd out later rows in
+/// `quarantined_settlements`, which reads oldest-first under a caller-supplied
+/// LIMIT.
+async fn drop_reservations(pool: &PgPool, api_key_id: Uuid) {
+    query("DELETE FROM usage_reservations WHERE api_key_id = $1")
+        .bind(api_key_id)
+        .execute(pool)
+        .await
+        .expect("test reservation cleanup must apply");
+}
+
+/// The marker the whole classification rests on. It is fire-and-forget by
+/// design — the request path may not grow a round trip that can fail a request
+/// — so what is pinned here is that the write lands, records the FIRST
+/// dispatch, and is safe to issue on every rung of a walk.
+#[tokio::test]
+async fn the_dispatch_marker_records_the_first_upstream_call() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let user_id = create_user(&pool, "dispatch-marker").await;
+    let key = create_key(&pool, user_id).await;
+    let session = admit(&pool, &key, false).await;
+    let reservation_id = request_uuid(&session);
+
+    assert_eq!(
+        dispatched_at(&pool, reservation_id).await,
+        None,
+        "admission alone has dispatched nothing"
+    );
+
+    let marker = session.dispatch_marker();
+    marker.fire();
+    let first = await_dispatch_marker(&pool, reservation_id).await;
+
+    // A walk fires the marker on every rung it dispatches to, and every rung
+    // after the first must be free: no statement, no pooled connection, and
+    // above all no restatement of the time. "When did this request first reach
+    // an upstream" is the fact the sweep needs, and it is settled by rung one.
+    marker.fire();
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(
+        dispatched_at(&pool, reservation_id).await,
+        Some(first),
+        "a later rung must not overwrite the first dispatch's timestamp"
+    );
+}
+
+async fn dispatched_at(
+    pool: &PgPool,
+    reservation_id: Uuid,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    query_scalar::<_, Option<chrono::DateTime<chrono::Utc>>>(
+        "SELECT dispatched_at FROM usage_reservations WHERE id = $1",
+    )
+    .bind(reservation_id)
+    .fetch_one(pool)
+    .await
+    .expect("dispatch marker must query")
+}
+
+/// Wait for a fire-and-forget marker to land. Polled rather than awaited
+/// because not awaiting it is the point: the request path never blocks on this
+/// write, so a test cannot either.
+async fn await_dispatch_marker(
+    pool: &PgPool,
+    reservation_id: Uuid,
+) -> chrono::DateTime<chrono::Utc> {
+    for _ in 0..200 {
+        if let Some(at) = dispatched_at(pool, reservation_id).await {
+            return at;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("the dispatch marker never landed");
+}
+
 /// The reservation id a session will key every settled row on.
 fn request_uuid(session: &UsageSession) -> Uuid {
     Uuid::parse_str(
@@ -1276,10 +1524,23 @@ async fn an_owed_reservation_keeps_encumbering_the_balance_after_it_expires() {
     );
 
     // And the debt is still collectable, which is the whole point of holding it.
+    //
+    // Which collection path applies is not this test's to choose. The expiry
+    // sweep is GLOBAL — it runs inside every admission, for every user — and
+    // an expired row that still owes is exactly what it quarantines. Once
+    // quarantined the row leaves the automatic scan (`quarantined_at IS NULL`)
+    // and belongs to the operator command instead. Whether some concurrent
+    // admission got there first is a race this test cannot and should not win,
+    // so both collectors are run: they settle the same debt through the same
+    // idempotent `settle_once`, and whichever finds the row first, the other
+    // finds it gone. The invariant under test is the amount, not the route.
     age_settlement_intent(&pool, key.id).await;
     recover_owed_settlements(&pool, 100)
         .await
         .expect("recovery must query");
+    recover_quarantined_settlement(&pool, request_uuid(&session))
+        .await
+        .expect("operator collection must query");
     assert_eq!(
         balance(&pool, user_id).await.expect("balance must query"),
         Decimal::ONE,

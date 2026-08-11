@@ -857,7 +857,7 @@ async fn migration_chain_applies_on_a_fresh_database() {
         outcome.4,
         "the 0007 ledger-honesty columns exist after the chain"
     );
-    assert_eq!(outcome.5, 8, "the chain reaches migration version 8");
+    assert_eq!(outcome.5, 10, "the chain reaches migration version 10");
 }
 
 /// Rewrite the database name in a Postgres URL, keeping any query string

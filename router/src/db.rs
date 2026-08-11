@@ -1,4 +1,10 @@
-use std::{borrow::Cow, env, str::FromStr, time::Duration};
+use std::{
+    borrow::Cow,
+    env,
+    str::FromStr,
+    sync::atomic::{AtomicBool, Ordering},
+    time::Duration,
+};
 
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Utc};
@@ -604,6 +610,18 @@ const MAX_SETTLE_ATTEMPTS: i32 = 8;
 /// alternative is deserializing an unknown shape into a wrong charge.
 const SETTLEMENT_INTENT_VERSION: u8 = 1;
 
+/// Why the expiry sweep parked a reservation that holds no settlement intent.
+///
+/// Written into `last_settle_error` because that is the only free-text column
+/// `zerorouter admin owed-settlements` prints, and this class of row has no
+/// settle failure to report — it never got as far as a settle. The wording
+/// says what an operator has to do, because nothing automatic can: there is no
+/// stored payload, so the amount owed has to come from the provider's own
+/// usage records rather than from ZeroRouter.
+const DISPATCHED_WITHOUT_INTENT: &str = "dispatched upstream but expired holding no settlement intent: inference was \
+     delivered and its charge was never recorded; reconcile against the provider's \
+     usage records";
+
 pub async fn database_pool_from_env() -> Result<PgPool> {
     let pool = if let Ok(database_url) = env::var("DATABASE_URL") {
         let mut options = PgConnectOptions::from_str(&database_url)
@@ -721,6 +739,17 @@ pub async fn migrate(pool: &PgPool) -> Result<()> {
                 Cow::Borrowed("autopay"),
                 MigrationType::Simple,
                 Cow::Borrowed(include_str!("../migrations/0008_autopay.sql")),
+                false,
+            ),
+            // 9 is reserved for a change being prepared on another branch;
+            // sqlx orders by version and does not require a dense sequence.
+            Migration::new(
+                10,
+                Cow::Borrowed("dispatched reservations"),
+                MigrationType::Simple,
+                Cow::Borrowed(include_str!(
+                    "../migrations/0010_dispatched_reservations.sql"
+                )),
                 false,
             ),
         ]),
@@ -852,35 +881,74 @@ pub async fn begin_usage_session(
         return Ok(UsageAdmission::Unauthorized);
     };
 
-    // Reclaim expired reservations, but only the ones that owe nothing. A row
-    // carrying a settlement intent is money the customer already received and
-    // ZeroRouter has not yet recorded; deleting it (which is what this sweep
-    // used to do unconditionally) erases the charge, the usage event, and every
-    // trace that either was owed. Those are quarantined instead — parked for
-    // reconciliation and readable through [`quarantined_settlements`].
+    // Reclaim expired reservations, but only the ones that prove nothing
+    // happened. An expired row falls into exactly one of three classes, and
+    // only the first may be deleted:
     //
-    // A quarantined row stays VISIBLE to the aggregates below, and that is
-    // the point: it represents money the customer received and ZeroRouter
-    // has not collected, so it must keep encumbering the balance and the
-    // caps until it is settled or written off. (This comment previously
-    // claimed the opposite — that surviving rows were invisible to
-    // admission "exactly as a deleted one was" — which is precisely the
-    // hole: the same balance could fund a second request while the first
-    // debt stood.)
+    //   never dispatched, no intent  -> reclaim. The walk never reached an
+    //     upstream, so no inference exists to bill and the encumbrance is
+    //     genuinely free to release. This is the original behavior and it is
+    //     the only case it was ever right for.
+    //
+    //   dispatched, holds an intent  -> quarantine. Money the customer already
+    //     received and ZeroRouter has not yet recorded; deleting it (which is
+    //     what this sweep used to do unconditionally) erases the charge, the
+    //     usage event, and every trace that either was owed. Parked for
+    //     reconciliation instead, readable through [`quarantined_settlements`]
+    //     and replayable by [`recover_owed_settlements`] from its payload.
+    //
+    //   dispatched, holds NO intent  -> quarantine, never reclaim. The request
+    //     WAS sent upstream and the intent write never landed: it failed
+    //     permanently, or the process died between the answer and the intent.
+    //     Without `dispatched_at` this row is byte-identical to one whose walk
+    //     never dispatched, so the sweep reclaimed it and delivered inference
+    //     was silently forgiven — no event, no debit, no record that anything
+    //     was owed (sol review #3, structural half). There is no payload to
+    //     replay, so quarantine here buys visibility, not collection: an
+    //     operator sees it with a NULL owed amount and reconciles it against
+    //     the provider's own usage records.
+    //
+    // A quarantined row that carries an INTENT stays VISIBLE to the aggregates
+    // below, and that is the point: it represents money the customer received
+    // and ZeroRouter has not collected, so it must keep encumbering the
+    // balance and the caps until it is settled or written off. (This comment
+    // previously claimed the opposite — that surviving rows were invisible to
+    // admission "exactly as a deleted one was" — which is precisely the hole:
+    // the same balance could fund a second request while the first debt
+    // stood.) An intentless dispatched row is NOT made to encumber: its debt
+    // has no known size and no way to be collected or released, so freezing a
+    // customer's balance against it forever is a policy decision for the repo
+    // owner rather than a side effect of recording the fact.
     sqlx::query(
-        "DELETE FROM usage_reservations WHERE expires_at <= NOW() AND settlement_intent IS NULL",
+        r#"
+        DELETE FROM usage_reservations
+        WHERE expires_at <= NOW()
+          AND settlement_intent IS NULL
+          AND dispatched_at IS NULL
+        "#,
     )
     .execute(&mut *transaction)
     .await?;
+    // Both quarantine classes in one statement, so the reason a row was parked
+    // travels with the parking. `last_settle_error` is the only free-text
+    // column `admin owed-settlements` prints, and an intentless row has no
+    // settle error to report, so it carries the explanation instead —
+    // COALESCEd, so a genuine settle failure is never overwritten.
     sqlx::query(
         r#"
         UPDATE usage_reservations
-        SET quarantined_at = NOW()
+        SET quarantined_at = NOW(),
+            last_settle_error = CASE
+                WHEN settlement_intent IS NULL
+                    THEN COALESCE(last_settle_error, $1)
+                ELSE last_settle_error
+            END
         WHERE expires_at <= NOW()
-          AND settlement_intent IS NOT NULL
           AND quarantined_at IS NULL
+          AND (settlement_intent IS NOT NULL OR dispatched_at IS NOT NULL)
         "#,
     )
+    .bind(DISPATCHED_WITHOUT_INTENT)
     .execute(&mut *transaction)
     .await?;
 
@@ -1119,6 +1187,48 @@ impl UsageSession {
         format!("chatcmpl-{}", self.reservation_id.simple())
     }
 
+    /// Record that this request has begun an upstream call.
+    ///
+    /// This is what lets the expiry sweep tell "the customer received tokens
+    /// and the paperwork was lost" apart from "nothing ever happened". Without
+    /// it the two are the same row and the sweep reclaims both, forgiving
+    /// delivered inference in silence (migration 0010).
+    ///
+    /// # Why it is fire-and-forget
+    ///
+    /// The request path may not grow a round trip that can fail a request, and
+    /// there is no existing write at dispatch time to piggyback on — admission
+    /// committed before the route was built, and the next write is the
+    /// settlement intent, which is precisely the write this marker exists to
+    /// survive the absence of. So the UPDATE is spawned and never awaited: it
+    /// runs concurrently with the upstream call, adds nothing to latency, and
+    /// its failure is a WARN rather than a customer-visible error.
+    ///
+    /// The cost of that choice is stated rather than hidden: the marker is
+    /// best effort. A process that dies inside its own marker round trip
+    /// leaves an unmarked dispatched row, which the sweep will still reclaim.
+    /// The window this closes is the whole upstream call — seconds to the
+    /// fifteen-minute budget; the window it leaves open is one statement.
+    ///
+    /// Idempotent and safe to call more than once: `dispatched_at IS NULL`
+    /// keeps the FIRST dispatch's timestamp, and a row already consumed by a
+    /// settle simply matches nothing.
+    ///
+    /// Handed out as a detached [`DispatchMarker`] rather than called on the
+    /// session, because both walks reach their dispatch inside a
+    /// `tokio::select!` whose other arm moves the session into a settle
+    /// terminal. The marker owns everything it needs, so recording a dispatch
+    /// never contends with settling one.
+    #[must_use]
+    pub fn dispatch_marker(&self) -> DispatchMarker {
+        DispatchMarker {
+            pool: self.pool.clone(),
+            reservation_id: self.reservation_id,
+            api_key_id: self.api_key_id,
+            fired: AtomicBool::new(false),
+        }
+    }
+
     /// Settle this request.
     ///
     /// Two durable steps, in this order and never the other way round:
@@ -1198,6 +1308,67 @@ impl UsageSession {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+}
+
+/// Records that a reservation's request reached an upstream.
+///
+/// See [`UsageSession::dispatch_marker`] for why this exists as a detached
+/// handle and why the write is fire-and-forget.
+///
+/// Deliberately not `Clone`: the once-only latch is what keeps a walk that
+/// dispatches four times from issuing four statements, and a clone would give
+/// each copy its own latch.
+#[derive(Debug)]
+pub struct DispatchMarker {
+    pool: PgPool,
+    reservation_id: Uuid,
+    api_key_id: Uuid,
+    fired: AtomicBool,
+}
+
+impl DispatchMarker {
+    /// Stamp `dispatched_at` without waiting for it.
+    ///
+    /// Call this at the moment the upstream call begins — not when the walk is
+    /// chosen, and not after the answer returns. A walk cancelled before it
+    /// dispatched has genuinely delivered nothing and must stay reclaimable.
+    ///
+    /// Every rung of a walk calls this and only the first one writes. The
+    /// column answers "did this request ever reach an upstream", which the
+    /// first dispatch settles for good; a later rung's statement could only
+    /// match zero rows, and it would still cost a pooled connection at the
+    /// exact moment the walk is retrying and the settle is coming.
+    pub fn fire(&self) {
+        if self.fired.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        let pool = self.pool.clone();
+        let reservation_id = self.reservation_id;
+        let api_key_id = self.api_key_id;
+        tokio::spawn(async move {
+            let marked = sqlx::query(
+                r#"
+                UPDATE usage_reservations
+                SET dispatched_at = NOW()
+                WHERE id = $1 AND api_key_id = $2 AND dispatched_at IS NULL
+                "#,
+            )
+            .bind(reservation_id)
+            .bind(api_key_id)
+            .execute(&pool)
+            .await;
+            if let Err(error) = marked {
+                // Not an error for the customer — the request is unaffected —
+                // but it is the loss of the only evidence that would stop this
+                // reservation being reclaimed as though it had never run.
+                tracing::warn!(
+                    request_id = %reservation_id,
+                    error = %error,
+                    "dispatch marker could not be written; if this request's settlement is also lost, its expired reservation will be reclaimed instead of quarantined"
+                );
+            }
+        });
     }
 }
 

@@ -1283,6 +1283,9 @@ async fn run_non_streaming(
     estimate: ZeroRouterEstimate,
 ) -> Result<Response, ApiError> {
     let request_id = usage_session.request_id();
+    // Taken before the walk so the marker can be fired from inside the same
+    // `select!` whose other arm moves the session into a settle terminal.
+    let dispatch_marker = usage_session.dispatch_marker();
     let features = RequestFeatures::from_request(&request, reservation_usage, priority, estimate);
     let tools = request.provider_tools();
     let max_tokens = request.max_tokens;
@@ -1402,6 +1405,11 @@ async fn run_non_streaming(
                 }
                 result = async {
                     candidate_started.store(true, Ordering::Relaxed);
+                    // Inside the branch that actually begins the call, not
+                    // before the select: a walk cancelled while still choosing
+                    // has dispatched nothing. Fire-and-forget, so the marker
+                    // costs the request nothing and cannot fail it.
+                    dispatch_marker.fire();
                     tokio::time::timeout(
                         remaining,
                         candidate.chat(provider_request, request.temperature),
@@ -1960,6 +1968,9 @@ async fn stream_to_channel(
     let features = RequestFeatures::from_request(&request, reservation_usage, priority, estimate);
     let started = Instant::now();
     let mut last_candidate = None;
+    // Taken before the session is wrapped in the Option that every terminal
+    // `take()`s, so the marker outlives whichever terminal claims the session.
+    let dispatch_marker = usage_session.dispatch_marker();
     let mut usage_session = Some(usage_session);
     let mut client_connected = true;
     let mut delivery = StreamDelivery::default();
@@ -2100,6 +2111,10 @@ async fn stream_to_channel(
                 }
                 result = async {
                     candidate_started.store(true, Ordering::Relaxed);
+                    // The synthetic-stream path's dispatch. Same rule as the
+                    // buffered walk: marked where the call begins, so a walk
+                    // cancelled before it dispatched stays reclaimable.
+                    dispatch_marker.fire();
                     tokio::time::timeout(
                         remaining,
                         candidate.chat(provider_request, request.temperature),
@@ -2184,6 +2199,11 @@ async fn stream_to_channel(
             }
         }
 
+        // The live-streaming dispatch. Marked before the stream is built
+        // rather than after the first event arrives: the upstream request is
+        // on its way from here, and an upstream that answers nothing at all is
+        // exactly the case where the marker has to already be recorded.
+        dispatch_marker.fire();
         let mut stream = candidate.stream_chat(
             provider_request,
             request.temperature,

@@ -49,9 +49,18 @@ use zerorouter::{
 /// reservation clamp (which `tests/billing.rs` already pins).
 const MAX_TOKENS: u32 = 4_096;
 
-/// Pooled connections each test opens up front. Two is enough for a request
-/// that admits, walks, and settles in sequence while the test reads back rows.
-const POOL_CONNECTIONS: u32 = 2;
+/// Pooled connections each test opens up front.
+///
+/// Two used to be enough: a request admitted, walked, and settled in sequence
+/// while the test read rows back. A request now has one CONCURRENT database
+/// user as well — the dispatch marker (`UsageSession::dispatch_marker`), fired
+/// and never awaited at the moment the walk reaches an upstream — so a settle
+/// can find both connections held. That matters here and essentially nowhere
+/// else: the deadline and backoff tests run under `tokio::time::pause()`, and
+/// a paused runtime advances the mocked clock to the next armed timer whenever
+/// it parks, which turns a momentary wait for a connection into an instant
+/// `PoolTimedOut` and a 503 in place of the answer under test.
+const POOL_CONNECTIONS: u32 = 3;
 
 /// What the fakes report when they serve. Chosen well below the reservation.
 fn served_usage() -> TokenUsage {
@@ -2479,6 +2488,104 @@ async fn non_streaming_deadline_ends_the_walk_instead_of_falling_through() {
         Decimal::from(50)
     );
     assert_eq!(open_reservations(&pool, api_key_id).await, 0);
+}
+
+/// `dispatched_at` on a reservation whose walk is in flight right now.
+///
+/// Read while the upstream is still stalling, because that is the only moment
+/// it is observable: a request that finishes settles, and the settle destroys
+/// the row this column lives on.
+async fn dispatch_marker(pool: &PgPool, api_key_id: Uuid) -> Option<chrono::DateTime<chrono::Utc>> {
+    query_scalar::<_, Option<chrono::DateTime<chrono::Utc>>>(
+        "SELECT dispatched_at FROM usage_reservations WHERE api_key_id = $1",
+    )
+    .bind(api_key_id)
+    .fetch_one(pool)
+    .await
+    .expect("dispatch marker must query")
+}
+
+/// Wait for the fire-and-forget marker to land on an in-flight reservation.
+/// Polled, not awaited: the request path never blocks on this write, which is
+/// the whole reason it is safe on the hot path.
+async fn await_dispatch_marker(pool: &PgPool, api_key_id: Uuid, walk: &str) {
+    for _ in 0..500 {
+        if dispatch_marker(pool, api_key_id).await.is_some() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("the {walk} walk dispatched upstream without marking its reservation");
+}
+
+/// The dispatch marker, proven on the real request path rather than at the
+/// database seam: by the time an upstream has been called, the reservation
+/// already says so.
+///
+/// This is the fact the expiry sweep's classification rests on. Without it a
+/// reservation whose request was dispatched but whose settlement intent never
+/// landed is byte-identical to one that never left admission, and the sweep
+/// reclaims it — releasing the encumbrance on inference the customer received
+/// and leaving no record that anything was owed (sol review #3).
+///
+/// Both walks are exercised because they dispatch at different sites: the
+/// buffered walk inside the `select!` that races the shutdown token, the
+/// streaming walk immediately before the event stream is built.
+#[tokio::test]
+async fn a_walk_marks_its_reservation_dispatched_before_the_upstream_answers() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+
+    // --- the buffered walk ------------------------------------------------
+    let (buffered_key_id, buffered_key) = create_funded_key(&pool, "marker-buffered").await;
+    let solo = FakeModelProvider::new("solo", vec![FakeOutcome::Stall(Duration::from_secs(60))]);
+    let state = router(pool.clone(), vec![solo.clone()]);
+    let inflight = tokio::spawn(app(state.clone()).oneshot(completion_request(
+        &buffered_key,
+        &completion_body("zero/test-solo", false),
+    )));
+    while solo.call_count() == 0 {
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    await_dispatch_marker(&pool, buffered_key_id, "buffered").await;
+
+    // Drain the deploy to end the stall; the reservation settles and goes,
+    // which is also the proof that the marker never blocks a terminal.
+    state.begin_shutdown();
+    let response = inflight
+        .await
+        .expect("request task should not panic")
+        .expect("completion request should complete");
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    state.wait_for_background_tasks().await;
+    assert_eq!(open_reservations(&pool, buffered_key_id).await, 0);
+
+    // --- the streaming walk -----------------------------------------------
+    let (stream_key_id, stream_key) = create_funded_key(&pool, "marker-stream").await;
+    let streaming_solo =
+        FakeModelProvider::new("solo", vec![FakeOutcome::Stall(Duration::from_secs(60))]);
+    let stream_state = router(pool.clone(), vec![streaming_solo.clone()]);
+    // SSE headers return before the walk resolves, so the response arrives
+    // while the upstream is still stalling. Holding it keeps the client
+    // connected, so nothing settles until the drain below.
+    let stream_response = app(stream_state.clone())
+        .oneshot(completion_request(
+            &stream_key,
+            &completion_body("zero/test-solo", true),
+        ))
+        .await
+        .expect("stream request should complete");
+    assert_eq!(stream_response.status(), StatusCode::OK);
+    while streaming_solo.call_count() == 0 {
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    await_dispatch_marker(&pool, stream_key_id, "streaming").await;
+
+    stream_state.begin_shutdown();
+    stream_state.wait_for_background_tasks().await;
+    drop(stream_response);
+    assert_eq!(open_reservations(&pool, stream_key_id).await, 0);
 }
 
 /// A drained deploy releases the reservation without a charge: nothing reached
