@@ -65,14 +65,14 @@ use std::time::Duration;
 use axum::{
     Json, Router,
     body::Bytes,
-    extract::State,
+    extract::{Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::post,
 };
 use chrono::Utc;
 use hmac::{Hmac, Mac};
-use rust_decimal::{Decimal, prelude::ToPrimitive};
+use rust_decimal::{Decimal, RoundingStrategy, prelude::ToPrimitive};
 use serde::Deserialize;
 use serde_json::Value;
 use sha2::Sha256;
@@ -252,6 +252,7 @@ fn parse_signature_header(header: &str) -> Result<ParsedSignatureHeader<'_>, Web
 pub fn router() -> Router<WebCtx> {
     Router::new()
         .route("/api/billing/checkout", post(create_checkout))
+        .route("/api/billing/quote", axum::routing::get(checkout_quote))
         .route(
             "/api/billing/autopay",
             axum::routing::get(get_autopay).put(put_autopay),
@@ -358,14 +359,23 @@ async fn create_checkout(
         return Err(StripeHttpError::BillingUnavailable);
     };
     let amount_usd = request.amount_usd;
-    let unit_amount_cents = validate_checkout_amount(amount_usd, stripe)?;
+    // `amount_usd` is the CREDIT (net) the user picked. Validate its bounds and
+    // whole-cent granularity, then price the deposit: the fee rides on top and
+    // Stripe collects the gross.
+    validate_checkout_amount(amount_usd, stripe)?;
+    let quote = deposit_fee_quote(amount_usd);
+    // Credit and fee are each whole cents, so the gross is too; refuse rather
+    // than quote a sub-cent unit_amount Stripe would reject.
+    let gross_cents = usd_to_cents(quote.gross_usd).ok_or(StripeHttpError::InvalidAmount)?;
     let session = create_checkout_session(
         stripe,
         CheckoutSessionParams {
             user_id: user.user_id,
             customer_email: &user.email,
             credit_usd: amount_usd,
-            unit_amount_cents,
+            fee_usd: quote.fee_usd,
+            gross_usd: quote.gross_usd,
+            unit_amount_cents: gross_cents,
             success_url: ctx.config.absolute_url("/credits?checkout=success"),
             cancel_url: ctx.config.absolute_url("/credits?checkout=cancelled"),
         },
@@ -381,7 +391,10 @@ async fn create_checkout(
         &ctx.pool,
         &session.id,
         user.user_id,
-        unit_amount_cents,
+        // Gross (charge) in expected_amount_cents, net (credit) in
+        // expected_credit_usd — the webhook credits the net and corroborates
+        // the gross.
+        gross_cents,
         amount_usd,
         CHECKOUT_CURRENCY,
     )
@@ -399,10 +412,44 @@ async fn create_checkout(
     tracing::info!(
         user_id = %user.user_id,
         stripe_session_id = %session.id,
-        amount_usd = %amount_usd,
+        credit_usd = %amount_usd,
+        fee_usd = %quote.fee_usd,
+        gross_usd = %quote.gross_usd,
         "created stripe checkout session"
     );
     Ok(Json(serde_json::json!({ "url": session.url })))
+}
+
+#[derive(Debug, Deserialize)]
+struct QuoteParams {
+    /// The credit (net) amount to price. Same deserializer flexibility as
+    /// `CheckoutRequest.amount_usd`: JSON/query string or number.
+    credit: Decimal,
+}
+
+/// GET /api/billing/quote?credit=C — price a deposit server-side so the portal
+/// can show "you pay $gross (includes $fee) → receive $credit" without ever
+/// recomputing the fee in TypeScript. Returns `{credit, fee, gross}` from
+/// [`deposit_fee_quote`], the same source of truth the charge paths consume.
+async fn checkout_quote(
+    State(ctx): State<WebCtx>,
+    _user: PortalUser,
+    Query(params): Query<QuoteParams>,
+) -> Result<Json<Value>, StripeHttpError> {
+    let Some(stripe) = ctx.config.stripe.as_ref() else {
+        return Err(StripeHttpError::BillingUnavailable);
+    };
+    let credit_usd = params.credit;
+    // The same bounds and whole-cent validation the checkout enforces, so a
+    // quote never advertises a price the checkout would then refuse.
+    validate_checkout_amount(credit_usd, stripe)?;
+    let quote = deposit_fee_quote(credit_usd);
+    usd_to_cents(quote.gross_usd).ok_or(StripeHttpError::InvalidAmount)?;
+    Ok(Json(serde_json::json!({
+        "credit": quote.credit_usd,
+        "fee": quote.fee_usd,
+        "gross": quote.gross_usd,
+    })))
 }
 
 /// Validate a requested credit amount and convert it to integer cents.
@@ -438,10 +485,63 @@ fn usd_to_cents(amount_usd: Decimal) -> Option<i64> {
     (amount_usd * Decimal::ONE_HUNDRED).normalize().to_i64()
 }
 
+// ---------------------------------------------------------------------------
+// Deposit fee — ONE helper, the single source of truth for the fee math
+// ---------------------------------------------------------------------------
+
+/// The deposit-fee rate: 5.5% of the credit the user buys, collected on top as
+/// a surcharge. `Decimal` literal 55 / 10^3 = 0.055; never a float.
+const DEPOSIT_FEE_RATE: Decimal = Decimal::from_parts(55, 0, 0, false, 3);
+
+/// The minimum fee, so a small deposit still covers Stripe's fixed per-charge
+/// cost. Stripe US pricing is 2.9% + $0.30; on the smallest allowed deposit
+/// ($5, charged as $5.80 gross) that is 0.029*5.80 + 0.30 = $0.468, leaving
+/// ZeroRouter $0.80 - $0.468 = $0.332 above water after granting the $5 credit.
+/// Below this floor the percentage fee ($0.28 on $5) would not clear the $0.30
+/// fixed component and every small deposit would lose money. `Decimal` literal
+/// 80 / 10^2 = 0.80.
+const DEPOSIT_FEE_FLOOR_USD: Decimal = Decimal::from_parts(80, 0, 0, false, 2);
+
+/// A priced deposit: the credit the user picked, the fee charged on top, and
+/// the gross Stripe collects. Every field is exact `Decimal`; `gross_usd` is a
+/// whole number of cents by construction, so it survives [`usd_to_cents`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DepositFeeQuote {
+    credit_usd: Decimal,
+    fee_usd: Decimal,
+    gross_usd: Decimal,
+}
+
+/// Price a deposit. The ONLY place the fee math lives — the checkout path, the
+/// autopay charge path, the webhook corroborations, and the portal quote
+/// endpoint all consume this, so "what we charge" and "what we require Stripe to
+/// have collected" can never drift.
+///
+/// `fee = max(ceil_to_cent(rate * credit), floor)`, `gross = credit + fee`. The
+/// fee is CEILED to the whole cent so ZeroRouter is never undercharged, and the
+/// caller is expected to have already validated `credit_usd` to whole cents, so
+/// `gross_usd` is whole cents too.
+fn deposit_fee_quote(credit_usd: Decimal) -> DepositFeeQuote {
+    let percentage_fee = (DEPOSIT_FEE_RATE * credit_usd)
+        .round_dp_with_strategy(2, RoundingStrategy::ToPositiveInfinity);
+    let fee_usd = percentage_fee.max(DEPOSIT_FEE_FLOOR_USD);
+    DepositFeeQuote {
+        credit_usd,
+        fee_usd,
+        gross_usd: credit_usd + fee_usd,
+    }
+}
+
 struct CheckoutSessionParams<'a> {
     user_id: Uuid,
     customer_email: &'a str,
+    /// The NET credit the session buys, stamped into `metadata[credit_usd]`.
     credit_usd: Decimal,
+    /// The deposit fee, stamped into `metadata[fee_usd]` for reconciliation.
+    fee_usd: Decimal,
+    /// The GROSS Stripe collects, stamped into `metadata[gross_usd]`.
+    gross_usd: Decimal,
+    /// The gross, in cents — the `unit_amount` Stripe actually charges.
     unit_amount_cents: i64,
     success_url: String,
     cancel_url: String,
@@ -493,7 +593,13 @@ async fn create_checkout_session(
     let unit_amount = params.unit_amount_cents.to_string();
     let user_id = params.user_id.to_string();
     let credit_usd = params.credit_usd.to_string();
-    let form: [(&str, &str); 10] = [
+    let fee_usd = params.fee_usd.to_string();
+    let gross_usd = params.gross_usd.to_string();
+    // fee/gross ride alongside credit so the webhook can see the full price the
+    // session was sold at without a database read; the corroboration still
+    // RECOMPUTES gross from credit (deposit_fee_quote) rather than trusting
+    // these attacker-writable fields.
+    let form: [(&str, &str); 12] = [
         ("mode", "payment"),
         ("line_items[0][price_data][currency]", CHECKOUT_CURRENCY),
         ("line_items[0][price_data][unit_amount]", &unit_amount),
@@ -504,6 +610,8 @@ async fn create_checkout_session(
         ("line_items[0][quantity]", "1"),
         ("metadata[user_id]", &user_id),
         ("metadata[credit_usd]", &credit_usd),
+        ("metadata[fee_usd]", &fee_usd),
+        ("metadata[gross_usd]", &gross_usd),
         ("customer_email", params.customer_email),
         ("success_url", &params.success_url),
         ("cancel_url", &params.cancel_url),
@@ -657,14 +765,22 @@ async fn stripe_webhook(
         );
         return Err(StripeHttpError::MalformedEvent);
     };
-    let Some(claimed_cents) = usd_to_cents(credit_usd) else {
+    // The metadata credit is NET; `amount_total` is the GROSS Stripe collected.
+    // Recompute the gross the fee formula demands for this credit and require
+    // Stripe to have collected exactly it. Recomputing from `credit_usd` via the
+    // one fee helper — NOT trusting the attacker-writable `metadata[gross_usd]`
+    // — keeps this a self-check on the event: forged metadata on a session we
+    // did create cannot make `amount_total` agree with an inflated credit. This
+    // is independent of the intent row Layer 2 checks; both must hold.
+    let expected_gross = deposit_fee_quote(credit_usd).gross_usd;
+    let Some(expected_gross_cents) = usd_to_cents(expected_gross) else {
         tracing::warn!(
             stripe_session_id = %session_id,
-            "stripe webhook rejected: metadata credit is finer than a cent or out of range"
+            "stripe webhook rejected: metadata credit prices a gross finer than a cent or out of range"
         );
         return Err(StripeHttpError::MalformedEvent);
     };
-    if claimed_cents != amount_total_cents || currency != CHECKOUT_CURRENCY {
+    if expected_gross_cents != amount_total_cents || currency != CHECKOUT_CURRENCY {
         // Loud and detailed: this is the shape of a credit-minting attempt,
         // not a transient fault. Everything logged here is already public to
         // whoever produced the event.
@@ -672,7 +788,7 @@ async fn stripe_webhook(
             stripe_session_id = %session_id,
             metadata_user_id = %user_id,
             metadata_credit_usd = %credit_usd,
-            claimed_cents,
+            expected_gross_cents,
             amount_total_cents,
             %currency,
             expected_currency = CHECKOUT_CURRENCY,
@@ -1084,6 +1200,67 @@ mod tests {
     }
 
     #[test]
+    fn deposit_fee_is_five_point_five_percent_above_the_floor() {
+        // $100: 0.055 * 100 = 5.50 exactly, well above the $0.80 floor.
+        let quote = deposit_fee_quote(decimal("100"));
+        assert_eq!(quote.fee_usd, decimal("5.50"));
+        assert_eq!(quote.gross_usd, decimal("105.50"));
+        assert_eq!(quote.credit_usd, decimal("100"));
+    }
+
+    #[test]
+    fn deposit_fee_ceils_to_the_whole_cent() {
+        // $25: 0.055 * 25 = 1.375 — a sub-cent fee ZeroRouter must never round
+        // DOWN. It is ceiled to $1.38, so the gross is a whole $26.38.
+        let quote = deposit_fee_quote(decimal("25"));
+        assert_eq!(quote.fee_usd, decimal("1.38"));
+        assert_eq!(quote.gross_usd, decimal("26.38"));
+        // Any half-cent product ceils up rather than banker-rounds: $45 gives
+        // 0.055 * 45 = 2.475 -> 2.48.
+        assert_eq!(deposit_fee_quote(decimal("45")).fee_usd, decimal("2.48"));
+    }
+
+    #[test]
+    fn deposit_fee_floor_covers_the_smallest_deposit() {
+        // $5 is the smallest allowed deposit. 0.055 * 5 = 0.275 -> ceils to
+        // $0.28, which would not clear Stripe's fixed $0.30, so the $0.80 floor
+        // takes over and the user pays $5.80 gross.
+        let quote = deposit_fee_quote(decimal("5"));
+        assert_eq!(quote.fee_usd, decimal("0.80"));
+        assert_eq!(quote.gross_usd, decimal("5.80"));
+    }
+
+    #[test]
+    fn deposit_fee_crossover_from_floor_to_percentage() {
+        // The floor wins until the percentage fee reaches $0.80, at
+        // credit = 0.80 / 0.055 = 14.5454...  At $14.54 the percentage is
+        // 0.055 * 14.54 = 0.7997 -> ceils to 0.80, tying the floor. At $14.55
+        // it is 0.800250 -> ceils to 0.81 and overtakes the floor.
+        assert_eq!(deposit_fee_quote(decimal("14.54")).fee_usd, decimal("0.80"));
+        assert_eq!(deposit_fee_quote(decimal("14.55")).fee_usd, decimal("0.81"));
+    }
+
+    #[test]
+    fn deposit_fee_gross_is_always_whole_cents() {
+        // The charge path feeds gross straight into usd_to_cents, which rejects
+        // anything finer than a cent. Every credit that is itself whole cents
+        // must therefore price a whole-cent gross.
+        for raw in ["5", "5.01", "14.54", "14.55", "25", "99.99", "100", "1000"] {
+            let quote = deposit_fee_quote(decimal(raw));
+            assert!(
+                usd_to_cents(quote.gross_usd).is_some(),
+                "gross for {raw} ({}) must be whole cents",
+                quote.gross_usd
+            );
+            assert_eq!(
+                quote.gross_usd,
+                quote.credit_usd + quote.fee_usd,
+                "gross is exactly credit + fee for {raw}"
+            );
+        }
+    }
+
+    #[test]
     fn signature_headers_parse_strictly() {
         // Candidates must be the length of a hex SHA-256 digest; anything
         // else cannot match, so it is dropped rather than decoded.
@@ -1464,7 +1641,11 @@ async fn handle_autopay_intent_event(
         let user_id = user_id_raw.and_then(|raw| Uuid::parse_str(raw).ok());
         let credit_usd = credit_usd_raw.and_then(|raw| raw.parse::<Decimal>().ok());
         if let (Some(user_id), Some(credit_usd)) = (user_id, credit_usd) {
-            billing::record_autopay_charge(&ctx.pool, intent_id, user_id, credit_usd)
+            // A terminal (failed) row is never credited, but the table now
+            // records the gross charge beside the net credit; derive it from the
+            // same fee helper so the charge >= credit CHECK holds.
+            let gross_usd = deposit_fee_quote(credit_usd).gross_usd;
+            billing::record_autopay_charge(&ctx.pool, intent_id, user_id, credit_usd, gross_usd)
                 .await
                 .map_err(|_| StripeHttpError::BillingUnavailable)?;
         }
@@ -1489,23 +1670,35 @@ async fn handle_autopay_intent_event(
         tracing::warn!(payment_intent = %intent_id, "autopay success event missing corroboration fields");
         return Err(StripeHttpError::MalformedEvent);
     };
-    let Some(claimed_cents) = usd_to_cents(credit_usd) else {
+    // The metadata credit is NET; `amount_received` is the GROSS Stripe
+    // collected. Recompute the gross the fee formula demands for this credit and
+    // require Stripe to have collected exactly it — the autopay twin of the
+    // checkout Layer-1 self-check. Recomputed from the net credit, not trusting
+    // metadata[gross_usd].
+    let expected_gross = deposit_fee_quote(credit_usd).gross_usd;
+    let Some(expected_gross_cents) = usd_to_cents(expected_gross) else {
         return Err(StripeHttpError::MalformedEvent);
     };
-    if claimed_cents != amount_received || currency != CHECKOUT_CURRENCY {
+    if expected_gross_cents != amount_received || currency != CHECKOUT_CURRENCY {
         tracing::error!(
             payment_intent = %intent_id,
             metadata_user_id = %user_id,
-            claimed_cents,
+            expected_gross_cents,
             amount_received,
             %currency,
             "autopay success event does not corroborate its metadata; crediting nothing"
         );
         return Err(StripeHttpError::AmountMismatch);
     }
-    let outcome = billing::settle_autopay_intent(&ctx.pool, intent_id, Some((user_id, credit_usd)))
-        .await
-        .map_err(|_| StripeHttpError::BillingUnavailable)?;
+    // Pass the NET credit (what settle applies) and the GROSS (what the stored
+    // row's charge must match) separately.
+    let outcome = billing::settle_autopay_intent(
+        &ctx.pool,
+        intent_id,
+        Some((user_id, credit_usd, expected_gross)),
+    )
+    .await
+    .map_err(|_| StripeHttpError::BillingUnavailable)?;
     tracing::info!(payment_intent = %intent_id, ?outcome, "autopay charge settled");
     Ok(received())
 }
@@ -1563,7 +1756,7 @@ async fn reconcile_stale_intents(pool: &crate::sqlx::PgPool, settings: &StripeSe
             return;
         }
     };
-    for (intent_id, user_id, amount_usd) in stale {
+    for (intent_id, user_id, amount_usd, charge_amount_usd) in stale {
         let outcome = if let Some(idempotency_key) = intent_id.strip_prefix("local_") {
             // Up to half an hour has passed since the claim was taken. If
             // the user has turned autopay off in the meantime, the claim is
@@ -1588,7 +1781,15 @@ async fn reconcile_stale_intents(pool: &crate::sqlx::PgPool, settings: &StripeSe
                 Err(error) => Err(anyhow::Error::from(error)),
             }
         } else {
-            reconcile_real_intent(pool, settings, &intent_id, user_id, amount_usd).await
+            reconcile_real_intent(
+                pool,
+                settings,
+                &intent_id,
+                user_id,
+                amount_usd,
+                charge_amount_usd,
+            )
+            .await
         };
         if let Err(error) = outcome {
             tracing::warn!(payment_intent = %intent_id, %error, "autopay reconciliation failed");
@@ -1602,6 +1803,7 @@ async fn reconcile_real_intent(
     intent_id: &str,
     user_id: Uuid,
     amount_usd: Decimal,
+    charge_amount_usd: Decimal,
 ) -> anyhow::Result<()> {
     let client = stripe_client().map_err(|_| anyhow::anyhow!("stripe client"))?;
     let response = client
@@ -1618,7 +1820,12 @@ async fn reconcile_real_intent(
     let body: Value = response.json().await?;
     match body.get("status").and_then(Value::as_str) {
         Some("succeeded") => {
-            billing::settle_autopay_intent(pool, intent_id, Some((user_id, amount_usd))).await?;
+            billing::settle_autopay_intent(
+                pool,
+                intent_id,
+                Some((user_id, amount_usd, charge_amount_usd)),
+            )
+            .await?;
         }
         Some("processing") => {}
         _ => {
@@ -1638,10 +1845,15 @@ async fn charge_candidate(
     // idempotency key survives in the claim row so a lost response is
     // replayed against the SAME PaymentIntent (review findings).
     let idempotency_key = Uuid::new_v4().simple().to_string();
+    // Price the deposit once so the claim records both the NET credit the user
+    // wants and the GROSS charge Stripe will collect. `replay_charge` re-prices
+    // from the same net topup, so the two agree by construction.
+    let quote = deposit_fee_quote(candidate.topup_usd);
     if !billing::claim_autopay_attempt(
         pool,
         candidate.user_id,
         candidate.topup_usd,
+        quote.gross_usd,
         &idempotency_key,
     )
     .await?
@@ -1714,13 +1926,21 @@ async fn replay_charge(
         anyhow::bail!("no saved card payment method");
     };
 
-    let Some(amount_cents) = usd_to_cents(topup_usd) else {
+    // `topup_usd` is the NET credit the user wants; the fee rides on top and
+    // Stripe collects the gross.
+    let quote = deposit_fee_quote(topup_usd);
+    let Some(amount_cents) = usd_to_cents(quote.gross_usd) else {
         billing::fail_autopay_intent(pool, &format!("local_{idempotency_key}")).await?;
-        anyhow::bail!("top-up amount is not a whole cent");
+        anyhow::bail!("top-up gross is not a whole cent");
     };
     let amount = amount_cents.to_string();
     let user_id_text = user_id.to_string();
     let credit_usd = topup_usd.to_string();
+    let fee_usd = quote.fee_usd.to_string();
+    let gross_usd = quote.gross_usd.to_string();
+    // Provenance HMACs the NET credit, unchanged — the webhook recomputes it
+    // from metadata[credit_usd] exactly as before. fee/gross are informational,
+    // and the webhook re-derives the gross it corroborates from the net credit.
     let provenance = autopay_provenance(settings, user_id, &credit_usd);
     let form: Vec<(&str, &str)> = vec![
         ("amount", &amount),
@@ -1732,6 +1952,8 @@ async fn replay_charge(
         ("metadata[purpose]", AUTOPAY_PURPOSE),
         ("metadata[user_id]", &user_id_text),
         ("metadata[credit_usd]", &credit_usd),
+        ("metadata[fee_usd]", &fee_usd),
+        ("metadata[gross_usd]", &gross_usd),
         ("metadata[provenance]", &provenance),
     ];
     let response = client
@@ -1751,7 +1973,12 @@ async fn replay_charge(
             .ok_or_else(|| anyhow::anyhow!("payment intent response missing id"))?;
         billing::attach_autopay_intent(pool, idempotency_key, intent_id).await?;
         if body.get("status").and_then(Value::as_str) == Some("succeeded") {
-            billing::settle_autopay_intent(pool, intent_id, Some((user_id, topup_usd))).await?;
+            billing::settle_autopay_intent(
+                pool,
+                intent_id,
+                Some((user_id, topup_usd, quote.gross_usd)),
+            )
+            .await?;
         }
         return Ok(());
     }

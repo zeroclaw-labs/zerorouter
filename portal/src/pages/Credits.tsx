@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react'
 import type { FormEvent } from 'react'
 import { useSearchParams } from 'react-router-dom'
 import { api, ApiError } from '../api'
-import type { AutopayStatus } from '../api'
+import type { AutopayStatus, Quote } from '../api'
 import {
   Badge,
   Banner,
@@ -62,6 +62,9 @@ export function Credits() {
   const [formError, setFormError] = useState<string | null>(null)
   const [submitting, setSubmitting] = useState(false)
   const [unavailable, setUnavailable] = useState(false)
+  // The server-priced deposit for the current amount. Null until it lands (or
+  // when the amount is invalid / billing is off); the fee is never computed here.
+  const [quote, setQuote] = useState<Quote | null>(null)
 
   const [autopayNotice, setAutopayNotice] = useState<'saved' | 'cancelled' | null>(null)
   // The PUT response is the authoritative status the moment it lands; a
@@ -111,10 +114,30 @@ export function Credits() {
 
   const autopayStatus = autopayOverride ?? autopay.data
 
-  if (user === null) return null
-
   const chosen = custom.trim() !== '' ? custom : (preset ?? '')
   const normalized = normalizeAmount(chosen)
+
+  // Price the deposit on the server whenever the amount changes — the fee is
+  // never recomputed in TypeScript. Reset first so a stale fee never shows
+  // against a new amount; a failed quote (billing off, out of bounds) simply
+  // omits the fee line, and the server is still the authority at checkout.
+  useEffect(() => {
+    setQuote(null)
+    if (normalized === null) return
+    let active = true
+    api
+      .quote(normalized)
+      .then((q) => {
+        if (active) setQuote(q)
+      })
+      .catch(() => {})
+    return () => {
+      active = false
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [normalized])
+
+  if (user === null) return null
 
   async function buy(event: FormEvent) {
     event.preventDefault()
@@ -280,13 +303,21 @@ export function Credits() {
               </label>
             </div>
             <p className="field-hint">Minimum $5.00. Credits are spent by usage at the listed tier rates.</p>
+            {quote !== null && (
+              <p className="field-hint quote-line">
+                You pay {formatUsd(quote.gross)} (includes {formatUsd(quote.fee)} processing fee) →
+                receive {formatUsd(quote.credit)} credit.
+              </p>
+            )}
             {formError !== null && <Banner kind="error">{formError}</Banner>}
             <button className="btn btn-primary" type="submit" disabled={submitting}>
               {submitting
                 ? 'Redirecting to checkout…'
-                : normalized !== null
-                  ? `Buy ${formatUsd(normalized)} of credits`
-                  : 'Buy credits'}
+                : quote !== null
+                  ? `Pay ${formatUsd(quote.gross)} → get ${formatUsd(quote.credit)} credit`
+                  : normalized !== null
+                    ? `Buy ${formatUsd(normalized)} of credits`
+                    : 'Buy credits'}
             </button>
           </form>
         )}
@@ -315,8 +346,8 @@ export function Credits() {
           <div className="panel-body autopay-body">
             <p className="field-hint">
               When your balance falls below the threshold, ZeroRouter charges your saved card for
-              the top-up and adds it as credits — same rates, no interruption. Three failed charges
-              in a row turn autopay off.
+              the top-up plus the same processing fee as a manual purchase, and adds the top-up as
+              credits — no interruption. Three failed charges in a row turn autopay off.
             </p>
             <div className="card-row">
               <span className="dim">

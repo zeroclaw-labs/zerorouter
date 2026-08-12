@@ -14,8 +14,9 @@ use zerorouter::provider::ModelRates;
 use zerorouter::{
     auth::{AuthenticatedKey, generate_api_key, hash_api_key},
     billing::{
-        CheckoutIntent, CreditOutcome, balance, checkout_intent, credit_purchase, grant_promo,
-        ledger_entries, record_checkout_intent, settle_checkout_intent,
+        CheckoutIntent, CreditOutcome, ReversalOutcome, balance, checkout_intent, credit_purchase,
+        grant_promo, ledger_entries, record_checkout_intent, reverse_purchase,
+        settle_checkout_intent,
     },
     db::{
         LEARNED_SIZING_CONCURRENCY_LIMIT, RequestTelemetry, ReservationBasis, ReservationRelease,
@@ -442,6 +443,89 @@ async fn zero_promo_grants_write_nothing() {
             .await
             .expect("ledger must query")
             .is_empty()
+    );
+}
+
+/// The deposit fee is charge-side only. A promo grant has no Stripe charge, so
+/// the fee must never touch it: the full amount is credited and the ledger row
+/// records exactly that, with no wedge between charged and credited.
+#[tokio::test]
+async fn promo_grant_credits_the_full_amount_with_no_fee() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let user_id = create_user(&pool, "promo-fee").await;
+    // A round-number grant makes any accidental 5.5% wedge glaring: a fee would
+    // credit less than $100, or bill a phantom gross above it.
+    grant_promo(&pool, user_id, Decimal::from(100), "grant")
+        .await
+        .expect("promo must apply");
+    assert_eq!(
+        balance(&pool, user_id).await.expect("balance must query"),
+        Decimal::from(100),
+        "the full promo amount is credited; no fee is deducted"
+    );
+    let entries = ledger_entries(&pool, user_id, 10)
+        .await
+        .expect("ledger must query");
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].entry_type, "promo");
+    assert_eq!(
+        entries[0].amount_usd,
+        Decimal::from(100),
+        "the ledger records the full grant, not a net-of-fee figure"
+    );
+}
+
+/// Refunds/disputes reverse the NET credit only. The fee is charge-side and
+/// never entered the ledger, so a full reversal claws back exactly what was
+/// credited (non-refundable fee) and the balance math is exact. This pins
+/// `reverse_purchase`, which the deposit-fee change deliberately does NOT touch.
+#[tokio::test]
+async fn refund_reverses_the_net_credit_only() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let user_id = create_user(&pool, "refund-net").await;
+    let session_id = unique_session_id();
+    let payment_intent = format!("pi_test_{}", Uuid::new_v4().simple());
+    // The user bought $25 of credit (they were charged $26.38 gross, but only
+    // the $25 net ever reached the ledger).
+    credit_purchase(
+        &pool,
+        user_id,
+        Decimal::from(25),
+        &session_id,
+        Some(&payment_intent),
+    )
+    .await
+    .expect("purchase must credit the net");
+    assert_eq!(
+        balance(&pool, user_id).await.expect("balance must query"),
+        Decimal::from(25)
+    );
+
+    let outcome = reverse_purchase(
+        &pool,
+        &payment_intent,
+        &format!("re_test_{}", Uuid::new_v4().simple()),
+        "customer refund",
+    )
+    .await
+    .expect("reversal must apply");
+    // The reversal equals the NET credit — not the gross the card was charged.
+    assert_eq!(
+        outcome,
+        ReversalOutcome::Reversed {
+            amount_usd: Decimal::from(25),
+            balance_after: Decimal::ZERO,
+        },
+        "the reversal claws back exactly the net credit; the fee is non-refundable"
+    );
+    assert_eq!(
+        balance(&pool, user_id).await.expect("balance must query"),
+        Decimal::ZERO,
+        "balance returns exactly to zero"
     );
 }
 

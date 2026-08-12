@@ -304,14 +304,17 @@ async fn recorded_purchase_credits_exactly_once_and_replays_are_idempotent() {
     };
     let user_id = create_user(&pool, "happy").await;
     let session_id = unique_session_id();
-    record_checkout_intent(&pool, &session_id, user_id, 2_500, Decimal::from(25), "usd")
+    // $25 credit costs $26.38 gross (fee ceil(0.055*25)=1.38): the intent stores
+    // gross in cents and net in dollars, and Stripe collects the gross.
+    record_checkout_intent(&pool, &session_id, user_id, 2_638, Decimal::from(25), "usd")
         .await
         .expect("pending purchase record must insert");
-    let event = paid_session_event(&session_id, user_id, "25.00", 2_500, "usd");
+    let event = paid_session_event(&session_id, user_id, "25.00", 2_638, "usd");
 
     let (status, body) = post_webhook(&pool, &event).await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
     assert_eq!(body["received"], json!(true));
+    // The NET credit lands in the ledger; the fee never does.
     assert_eq!(
         balance(&pool, user_id).await.expect("balance must query"),
         Decimal::from(25)
@@ -323,6 +326,17 @@ async fn recorded_purchase_credits_exactly_once_and_replays_are_idempotent() {
     assert!(
         settled.settled_at.is_some(),
         "a delivered purchase must be marked settled"
+    );
+    // Fee revenue is derivable from the intent row: gross cents minus net*100.
+    // $26.38 gross - $25.00 net = $1.38 fee, and no separate ledger column.
+    assert_eq!(
+        settled.expected_amount_cents, 2_638,
+        "gross is stored in cents"
+    );
+    assert_eq!(
+        settled.expected_credit_usd,
+        Decimal::from(25),
+        "net credit is stored in dollars"
     );
 
     // Stripe redelivers on any non-2xx and on its own schedule; the second
@@ -344,11 +358,14 @@ async fn metadata_claiming_more_than_was_paid_credits_nothing() {
     };
     let user_id = create_user(&pool, "inflated").await;
     let session_id = unique_session_id();
-    // ZeroRouter sold $5.00. The event Stripe signs claims $1000.
-    record_checkout_intent(&pool, &session_id, user_id, 500, Decimal::from(5), "usd")
+    // ZeroRouter sold $5.00 (charged $5.80 gross). The event Stripe signs claims
+    // $1000 of credit against the $5.80 actually collected. Layer 1 recomputes
+    // the gross the fee formula demands for $1000 ($1055.00) and sees it does
+    // not match the $5.80 collected, so it rejects before Layer 2 is reached.
+    record_checkout_intent(&pool, &session_id, user_id, 580, Decimal::from(5), "usd")
         .await
         .expect("pending purchase record must insert");
-    let event = paid_session_event(&session_id, user_id, "1000.00", 500, "usd");
+    let event = paid_session_event(&session_id, user_id, "1000.00", 580, "usd");
 
     let (status, body) = post_webhook(&pool, &event).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -371,13 +388,15 @@ async fn wrong_currency_credits_nothing_even_when_the_amount_matches() {
     };
     let user_id = create_user(&pool, "currency").await;
     let session_id = unique_session_id();
-    record_checkout_intent(&pool, &session_id, user_id, 1_000, Decimal::from(10), "usd")
+    // $10 credit is charged $10.80 gross (fee ceil(0.055*10)=0.55).
+    record_checkout_intent(&pool, &session_id, user_id, 1_080, Decimal::from(10), "usd")
         .await
         .expect("pending purchase record must insert");
-    // 1000 JPY is roughly $6 but is also numerically 1000 in the smallest
-    // currency unit, so it passes an amount-only check while claiming $10.
-    // The currency comparison is the control that catches it.
-    let event = paid_session_event(&session_id, user_id, "10.00", 1_000, "jpy");
+    // 1080 JPY is roughly $7 but is also numerically 1080 in the smallest
+    // currency unit, so it matches the recomputed gross for a $10 credit while
+    // being worth a fraction of it. The currency comparison is the control that
+    // catches it.
+    let event = paid_session_event(&session_id, user_id, "10.00", 1_080, "jpy");
 
     let (status, body) = post_webhook(&pool, &event).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -391,12 +410,13 @@ async fn paid_session_without_a_pending_record_credits_nothing() {
         return;
     };
     let user_id = create_user(&pool, "unrecorded").await;
-    // Internally consistent in every way — $1000 claimed, $1000 collected, in
-    // USD — and signed by Stripe. It is still not a session ZeroRouter priced,
-    // which is what a session minted through a second integration or a leaked
-    // restricted key looks like. Sessions predating migration 0005 land here
-    // too: the policy is to reject and reconcile by hand, never to credit.
-    let event = paid_session_event(&unique_session_id(), user_id, "1000.00", 100_000, "usd");
+    // Internally consistent in every way — $1000 credit claimed, its $1055.00
+    // gross collected, in USD, so Layer 1 corroborates — and signed by Stripe.
+    // It is still not a session ZeroRouter priced, which is what a session
+    // minted through a second integration or a leaked restricted key looks
+    // like. Sessions predating migration 0005 land here too: the policy is to
+    // reject and reconcile by hand, never to credit.
+    let event = paid_session_event(&unique_session_id(), user_id, "1000.00", 105_500, "usd");
 
     let (status, body) = post_webhook(&pool, &event).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -412,11 +432,12 @@ async fn metadata_cannot_redirect_a_purchase_to_another_user() {
     let payer = create_user(&pool, "payer").await;
     let attacker = create_user(&pool, "attacker").await;
     let session_id = unique_session_id();
-    record_checkout_intent(&pool, &session_id, payer, 2_500, Decimal::from(25), "usd")
+    record_checkout_intent(&pool, &session_id, payer, 2_638, Decimal::from(25), "usd")
         .await
         .expect("pending purchase record must insert");
-    // Money, amount, and currency all check out; only the recipient is forged.
-    let event = paid_session_event(&session_id, attacker, "25.00", 2_500, "usd");
+    // Money, gross, and currency all corroborate (Layer 1 passes); only the
+    // recipient is forged, so the intent-row check (Layer 2) is what catches it.
+    let event = paid_session_event(&session_id, attacker, "25.00", 2_638, "usd");
 
     let (status, body) = post_webhook(&pool, &event).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -554,13 +575,15 @@ async fn autopay_success_credits_exactly_once_even_without_a_prior_intent_row() 
     enable_autopay(&pool, user_id).await;
     let intent_id = format!("pi_test_{}", Uuid::new_v4().simple());
 
-    // No intent row exists — the metadata-recovery path must build one.
+    // No intent row exists — the metadata-recovery path must build one. A $25
+    // top-up is charged $26.38 gross; the webhook corroborates the gross and
+    // credits the net.
     let payload = autopay_intent_event(
         "payment_intent.succeeded",
         &intent_id,
         user_id,
         "25",
-        2500,
+        2638,
         "usd",
     );
     let (status, _) = post_webhook(&pool, &payload).await;
@@ -622,7 +645,7 @@ async fn three_consecutive_failures_disable_autopay() {
         // The failed intent must exist as pending first (the sweep records
         // it when Stripe reports the declined intent).
         query(
-            "INSERT INTO stripe_autopay_intents (payment_intent_id, user_id, amount_usd) VALUES ($1, $2, 25)",
+            "INSERT INTO stripe_autopay_intents (payment_intent_id, user_id, amount_usd, charge_amount_usd) VALUES ($1, $2, 25, 26.38)",
         )
         .bind(&intent_id)
         .bind(user_id)

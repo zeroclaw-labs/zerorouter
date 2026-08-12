@@ -858,6 +858,13 @@ pub async fn migrate(pool: &PgPool) -> Result<()> {
                 Cow::Borrowed(include_str!("../migrations/0015_released_reservations.sql")),
                 false,
             ),
+            Migration::new(
+                16,
+                Cow::Borrowed("deposit fee"),
+                MigrationType::Simple,
+                Cow::Borrowed(include_str!("../migrations/0016_deposit_fee.sql")),
+                false,
+            ),
         ]),
         ignore_missing: false,
         locking: true,

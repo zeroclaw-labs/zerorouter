@@ -85,6 +85,14 @@ export interface CheckoutSession {
   url: string
 }
 
+/** A server-priced deposit: the credit picked, the fee on top, and the gross
+ * Stripe collects. All are decimal strings — the fee is never computed in TS. */
+export interface Quote {
+  credit: string
+  fee: string
+  gross: string
+}
+
 export interface AutopayStatus {
   enabled: boolean
   threshold_usd: string | null
@@ -179,6 +187,8 @@ export const api = {
     ).then((r) => r.entries),
   checkout: (amountUsd: string) =>
     request<CheckoutSession>('POST', '/api/billing/checkout', { amount_usd: amountUsd }),
+  quote: (creditUsd: string) =>
+    request<Quote>('GET', `/api/billing/quote?credit=${encodeURIComponent(creditUsd)}`),
   autopay: () => request<AutopayStatus>('GET', '/api/billing/autopay'),
   putAutopay: (update: AutopayUpdate) =>
     request<AutopayStatus>('PUT', '/api/billing/autopay', update),
