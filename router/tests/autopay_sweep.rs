@@ -293,8 +293,8 @@ async fn a_stale_pending_intent_is_reconciled_from_stripe() {
     query(
         r#"
         INSERT INTO stripe_autopay_intents
-            (payment_intent_id, user_id, amount_usd, created_at)
-        VALUES ($1, $2, 25, NOW() - INTERVAL '45 minutes')
+            (payment_intent_id, user_id, amount_usd, charge_amount_usd, created_at)
+        VALUES ($1, $2, 25, 26.38, NOW() - INTERVAL '45 minutes')
         "#,
     )
     .bind(&intent_id)
@@ -412,4 +412,86 @@ async fn a_user_who_opts_out_before_the_claim_is_not_charged() {
         "a user who opted out is not charged"
     );
     assert_eq!(balance_of(&pool, user_id).await, Decimal::ZERO);
+}
+
+/// The deposit fee is applied a SECOND time on autopay, in its own charge path:
+/// the saved card is charged the GROSS (credit + fee) while the balance is
+/// credited the NET. This captures the exact `amount` the router sends Stripe
+/// and the two dollar figures the intent row stores.
+#[tokio::test]
+async fn the_sweep_charges_gross_and_credits_net() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let _sweep_guard = SWEEP_LOCK.lock().await;
+    disarm_all_autopay(&pool).await;
+
+    // A mock that records the last `amount` (gross cents) it was asked to
+    // charge, then reports the intent succeeded so the settle path runs inline.
+    let charged: Arc<std::sync::Mutex<Option<String>>> = Arc::new(std::sync::Mutex::new(None));
+    let sink = charged.clone();
+    let app = Router::new()
+        .route(
+            "/v1/customers/{customer}/payment_methods",
+            get(|Path(_customer): Path<String>| async {
+                axum::Json(json!({"data": [{"id": "pm_test_card"}]}))
+            }),
+        )
+        .route(
+            "/v1/payment_intents",
+            post(move |body: String| {
+                let sink = sink.clone();
+                async move {
+                    let amount = body
+                        .split('&')
+                        .filter_map(|pair| pair.split_once('='))
+                        .find(|(key, _)| *key == "amount")
+                        .map(|(_, value)| value.to_owned());
+                    *sink.lock().expect("amount sink") = amount;
+                    axum::Json(json!({
+                        "id": format!("pi_mock_{}", Uuid::new_v4().simple()),
+                        "status": "succeeded",
+                    }))
+                }
+            }),
+        );
+    let base = serve(app).await;
+
+    // $25 top-up is charged $26.38 gross (fee ceil(0.055*25) = $1.38).
+    let user_id = autopay_user(&pool, "fee", 10, 25).await;
+    run_autopay_sweep_once(&pool, &settings(&base)).await;
+
+    assert_eq!(
+        charged.lock().expect("amount sink").as_deref(),
+        Some("2638"),
+        "the card is charged the gross in cents"
+    );
+    assert_eq!(
+        balance_of(&pool, user_id).await,
+        Decimal::from(25),
+        "only the net credit lands in the balance",
+    );
+    let (amount_usd, charge_amount_usd) = query_as::<_, (Decimal, Decimal)>(
+        "SELECT amount_usd, charge_amount_usd FROM stripe_autopay_intents WHERE user_id = $1",
+    )
+    .bind(user_id)
+    .fetch_one(&pool)
+    .await
+    .expect("intent row must exist");
+    assert_eq!(
+        amount_usd,
+        Decimal::from(25),
+        "the row stores the net credit"
+    );
+    assert_eq!(
+        charge_amount_usd,
+        Decimal::from_str("26.38").expect("literal"),
+        "the row stores the gross charge; fee revenue is the difference",
+    );
+
+    query("UPDATE users SET autopay_enabled = FALSE WHERE id = $1")
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .expect("teardown disarm");
 }

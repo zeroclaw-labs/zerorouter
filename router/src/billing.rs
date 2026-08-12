@@ -34,11 +34,14 @@ pub enum CreditOutcome {
 pub struct CheckoutIntent {
     pub stripe_session_id: String,
     pub user_id: Uuid,
-    /// The `unit_amount` quoted to Stripe, in the smallest currency unit
-    /// (cents for USD), for comparison against the event's `amount_total`.
+    /// The GROSS `unit_amount` quoted to Stripe (credit + deposit fee), in the
+    /// smallest currency unit (cents for USD), for comparison against the
+    /// event's `amount_total`.
     pub expected_amount_cents: i64,
-    /// The decimal-dollar credit this session buys. Equal to
-    /// `expected_amount_cents / 100` by a database CHECK.
+    /// The decimal-dollar NET credit this session buys — what the webhook
+    /// applies to the balance. `expected_amount_cents >= expected_credit_usd *
+    /// 100` by a database CHECK (the fee is the difference); before migration
+    /// 0016 the two were held equal.
     pub expected_credit_usd: Decimal,
     /// Lowercase ISO-4217 code the session was priced in.
     pub currency: String,
@@ -1281,6 +1284,7 @@ pub async fn claim_autopay_attempt(
     pool: &PgPool,
     user_id: Uuid,
     amount_usd: Decimal,
+    charge_amount_usd: Decimal,
     idempotency_key: &str,
 ) -> Result<bool, sqlx::Error> {
     // The candidate list is an unlocked snapshot taken before this call, so
@@ -1289,11 +1293,14 @@ pub async fn claim_autopay_attempt(
     // the claim closes that window: a disable that commits first makes the
     // INSERT ... SELECT match nothing, and no charge follows (sol review).
     // The amount is re-read from the row for the same reason, so a topup the
-    // user lowered cannot be charged at its old size.
+    // user lowered cannot be charged at its old size. `amount_usd` is the NET
+    // credit re-read from the row; `charge_amount_usd` is the GROSS the caller
+    // priced from that same net topup.
     let claimed = sqlx::query(
         r#"
-        INSERT INTO stripe_autopay_intents (payment_intent_id, user_id, amount_usd)
-        SELECT $1, id, $3
+        INSERT INTO stripe_autopay_intents
+            (payment_intent_id, user_id, amount_usd, charge_amount_usd)
+        SELECT $1, id, $3, $4
         FROM users
         WHERE id = $2
           AND autopay_enabled
@@ -1309,6 +1316,7 @@ pub async fn claim_autopay_attempt(
     .bind(format!("local_{idempotency_key}"))
     .bind(user_id)
     .bind(amount_usd)
+    .bind(charge_amount_usd)
     .execute(pool)
     .await?
     .rows_affected();
@@ -1371,16 +1379,18 @@ pub async fn stale_autopay_intents(
     pool: &PgPool,
     older_than_minutes: i32,
     replayable_within_minutes: i32,
-) -> Result<Vec<(String, Uuid, Decimal)>, sqlx::Error> {
+) -> Result<Vec<(String, Uuid, Decimal, Decimal)>, sqlx::Error> {
     // Bounded at BOTH ends. The lower bound is the reconciliation delay; the
     // upper bound is Stripe's idempotency-key retention. Replaying past that
     // window stops being a replay and becomes a second charge, because
     // Stripe may have pruned the key and will treat the request as new (sol
     // review). Rows past it are surfaced by `overdue_autopay_intents`
-    // instead of being retried forever.
-    sqlx::query_as::<_, (String, Uuid, Decimal)>(
+    // instead of being retried forever. Returns (intent, user, NET credit,
+    // GROSS charge) so reconciliation settles the net and re-corroborates the
+    // gross.
+    sqlx::query_as::<_, (String, Uuid, Decimal, Decimal)>(
         r#"
-        SELECT payment_intent_id, user_id, amount_usd
+        SELECT payment_intent_id, user_id, amount_usd, charge_amount_usd
         FROM stripe_autopay_intents
         WHERE status = 'pending'
           AND created_at < NOW() - ($1 * INTERVAL '1 minute')
@@ -1437,39 +1447,42 @@ pub enum AutopayOutcome {
 pub async fn settle_autopay_intent(
     pool: &PgPool,
     payment_intent_id: &str,
-    recovered: Option<(Uuid, Decimal)>,
+    recovered: Option<(Uuid, Decimal, Decimal)>,
 ) -> Result<AutopayOutcome, sqlx::Error> {
     let mut transaction = pool.begin().await?;
     sqlx::query("SET LOCAL lock_timeout = '5s'")
         .execute(&mut *transaction)
         .await?;
 
-    if let Some((user_id, amount_usd)) = recovered {
+    if let Some((user_id, amount_usd, charge_amount_usd)) = recovered {
         sqlx::query(
             r#"
-            INSERT INTO stripe_autopay_intents (payment_intent_id, user_id, amount_usd)
-            VALUES ($1, $2, $3)
+            INSERT INTO stripe_autopay_intents
+                (payment_intent_id, user_id, amount_usd, charge_amount_usd)
+            VALUES ($1, $2, $3, $4)
             ON CONFLICT (payment_intent_id) DO NOTHING
             "#,
         )
         .bind(payment_intent_id)
         .bind(user_id)
         .bind(amount_usd)
+        .bind(charge_amount_usd)
         .execute(&mut *transaction)
         .await?;
-        // The stored row is what will be credited; if it disagrees with
-        // what the webhook corroborated Stripe actually collected, refuse
-        // to credit rather than pick a side — a mismatch is either a
-        // partial capture or tampering, and both deserve eyes, not money
-        // movement (review finding: the stored $100 must not be credited
-        // on a $1 collection).
-        let stored = sqlx::query_as::<_, (Uuid, Decimal)>(
-            "SELECT user_id, amount_usd FROM stripe_autopay_intents WHERE payment_intent_id = $1",
+        // The stored row carries the NET credit that will be applied
+        // (amount_usd) and the GROSS Stripe was to collect (charge_amount_usd).
+        // The webhook corroborated the gross against amount_received and passes
+        // both here; if the stored row disagrees on EITHER, refuse to credit
+        // rather than pick a side — a mismatch is either a partial capture or
+        // tampering, and both deserve eyes, not money movement (review finding:
+        // the stored $100 must not be credited on a $1 collection).
+        let stored = sqlx::query_as::<_, (Uuid, Decimal, Decimal)>(
+            "SELECT user_id, amount_usd, charge_amount_usd FROM stripe_autopay_intents WHERE payment_intent_id = $1",
         )
         .bind(payment_intent_id)
         .fetch_one(&mut *transaction)
         .await?;
-        if stored != (user_id, amount_usd) {
+        if stored != (user_id, amount_usd, charge_amount_usd) {
             sqlx::query(
                 r#"
                 UPDATE stripe_autopay_intents
@@ -1614,17 +1627,20 @@ pub async fn record_autopay_charge(
     payment_intent_id: &str,
     user_id: Uuid,
     amount_usd: Decimal,
+    charge_amount_usd: Decimal,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
         r#"
-        INSERT INTO stripe_autopay_intents (payment_intent_id, user_id, amount_usd)
-        VALUES ($1, $2, $3)
+        INSERT INTO stripe_autopay_intents
+            (payment_intent_id, user_id, amount_usd, charge_amount_usd)
+        VALUES ($1, $2, $3, $4)
         ON CONFLICT DO NOTHING
         "#,
     )
     .bind(payment_intent_id)
     .bind(user_id)
     .bind(amount_usd)
+    .bind(charge_amount_usd)
     .execute(pool)
     .await?;
     Ok(())
