@@ -179,6 +179,14 @@ pub async fn credit_purchase(
         .bind(user_id.to_string())
         .execute(&mut *transaction)
         .await?;
+    // FIX A (HIGH-1 round 2): also take the PaymentIntent lock — AFTER the user
+    // lock, never before — so this whole credit (including apply_observed_reversals
+    // below) serializes with a reversal for the same intent that has no user to
+    // lock on. The reversal path takes ONLY the intent lock, so this fixed
+    // user→intent order cannot deadlock. Only when the credit names an intent.
+    if let Some(payment_intent_id) = stripe_payment_intent_id {
+        lock_payment_intent(&mut transaction, payment_intent_id).await?;
+    }
 
     let already_applied =
         sqlx::query_scalar::<_, i32>("SELECT 1 FROM credit_ledger WHERE stripe_session_id = $1")
@@ -647,18 +655,45 @@ pub async fn reverse_purchase(
 // Reversal observed before its credit existed (migration 0017, HIGH-1)
 // ---------------------------------------------------------------------------
 
-/// Durably record a Stripe reversal (refund or dispute) that arrived for a
-/// PaymentIntent this deployment has not yet credited.
+/// Take the PaymentIntent-keyed advisory lock (`hashtextextended(intent, 1)`),
+/// the serialization point between a credit and a reversal for the SAME
+/// PaymentIntent (migration 0017, HIGH-1 round 2 / FIX A).
 ///
-/// The counterpart of `handle_reversal_event`'s formerly-forgotten branch: a
-/// reversal that cannot be attributed to a credit right now is no longer
-/// acknowledged-and-lost, it is written down keyed on the reversal OBJECT id.
-/// `ON CONFLICT (object_id) DO NOTHING` makes a redelivery a no-op, exactly as
-/// the credit_ledger.stripe_session_id unique index does for a redelivered
-/// purchase or reversal. When the credit later lands, [`credit_purchase`] /
-/// [`settle_autopay_intent`] consume the tombstone via [`apply_observed_reversals`].
-pub async fn record_observed_reversal(
-    pool: &PgPool,
+/// Salt **1** keeps it disjoint from the per-user advisory lock (salt 0) that
+/// admission, settlement, and the credit paths take, so the two lock spaces can
+/// never collide. LOCK ORDER, everywhere both are held: the USER lock (salt 0)
+/// FIRST, then this intent lock — so no cycle is possible. The reversal path
+/// takes ONLY this lock (it has no user to lock on until it finds a credit);
+/// the credit paths take the user lock and then this one before checking and
+/// crediting. That makes "credit vs reversal for one intent" a race exactly one
+/// side wins, and the loser sees the winner's committed effect.
+async fn lock_payment_intent(
+    conn: &mut sqlx_postgres::PgConnection,
+    payment_intent_id: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1::TEXT, 1))")
+        .bind(payment_intent_id)
+        .execute(conn)
+        .await?;
+    Ok(())
+}
+
+/// Write (or monotonically merge) the tombstone for a reversal observed before
+/// its credit, inside the caller's transaction — which already holds the intent
+/// lock, so this is serialized against the crediting side.
+///
+/// `charge.refunded` carries the charge's CUMULATIVE `amount_refunded`, so two
+/// refund events for one charge share the same object id. `ON CONFLICT DO
+/// NOTHING` kept the first, possibly-partial amount and dropped a later fuller
+/// one (FIX C). Instead merge NULL-safe-monotonically with `GREATEST`, and ONLY
+/// while the tombstone is still unapplied — never resurrect a consumed one,
+/// because once the credit exists a later refund takes the normal webhook path.
+/// The anchoring fields (`payment_intent_id` / `is_dispute` / `currency`) are
+/// NOT overwritten: a differing value on the same object id is a data error (a
+/// dispute id and a charge id live in different namespaces and cannot collide),
+/// logged for an operator rather than silently clobbered.
+async fn insert_observed_reversal(
+    conn: &mut sqlx_postgres::PgConnection,
     object_id: &str,
     payment_intent_id: &str,
     is_dispute: bool,
@@ -675,12 +710,43 @@ pub async fn record_observed_reversal(
             "observed reversal requires a payment intent id".to_owned(),
         ));
     }
+    // A reused object id whose anchoring fields disagree is a data error we
+    // record but refuse to act on: the DO UPDATE below touches only
+    // reversed_cents, so the original row's intent/type/currency stand, and we
+    // surface the collision for reconciliation instead of guessing.
+    if let Some((existing_intent, existing_is_dispute, existing_currency)) =
+        sqlx::query_as::<_, (String, bool, Option<String>)>(
+            "SELECT payment_intent_id, is_dispute, currency \
+             FROM stripe_observed_reversals WHERE object_id = $1",
+        )
+        .bind(object_id)
+        .fetch_optional(&mut *conn)
+        .await?
+        && (existing_intent != payment_intent_id
+            || existing_is_dispute != is_dispute
+            || existing_currency.as_deref() != currency)
+    {
+        tracing::error!(
+            stripe_object_id = %object_id,
+            %existing_intent,
+            new_intent = %payment_intent_id,
+            existing_is_dispute,
+            new_is_dispute = is_dispute,
+            "observed reversal object id reused with a different intent / type / currency; \
+             keeping the original tombstone and NOT overwriting it — reconcile by hand"
+        );
+    }
     sqlx::query(
         r#"
         INSERT INTO stripe_observed_reversals
             (object_id, payment_intent_id, is_dispute, reversed_cents, currency)
         VALUES ($1, $2, $3, $4, $5)
-        ON CONFLICT (object_id) DO NOTHING
+        ON CONFLICT (object_id) DO UPDATE
+            SET reversed_cents = GREATEST(
+                    COALESCE(EXCLUDED.reversed_cents, stripe_observed_reversals.reversed_cents),
+                    COALESCE(stripe_observed_reversals.reversed_cents, EXCLUDED.reversed_cents)
+                )
+            WHERE stripe_observed_reversals.applied_at IS NULL
         "#,
     )
     .bind(object_id)
@@ -688,9 +754,106 @@ pub async fn record_observed_reversal(
     .bind(is_dispute)
     .bind(reversed_cents)
     .bind(currency)
-    .execute(pool)
+    .execute(&mut *conn)
     .await?;
     Ok(())
+}
+
+/// Resolve a Stripe reversal against the credit ledger UNDER THE INTENT LOCK,
+/// atomically closing the credit/tombstone race (migration 0017, HIGH-1 round
+/// 2 / FIX A).
+///
+/// The reversal path has no user to lock on while the charge is uncredited, so
+/// before this it ran as two autocommit statements — a `credited_purchase`
+/// lookup and a tombstone insert — and a credit committing between them was
+/// seen by neither: refunded money stayed spendable and a dispute stayed
+/// unfrozen. Now the lookup and, when no credit exists yet, the tombstone write
+/// happen in ONE transaction that first takes the PaymentIntent lock. The
+/// credit paths take the SAME lock (after the user lock) before crediting, so
+/// whichever side takes the intent lock first is fully visible to the other:
+///
+/// - reversal first → tombstone committed under the lock → the credit's
+///   [`apply_observed_reversals`] consumes it (reverses, and freezes a dispute);
+/// - credit first → this lookup returns `Some` → the caller takes the normal
+///   reverse-and-freeze path.
+///
+/// Returns the credit when one exists (the caller reverses/freezes as it always
+/// has), or `None` after durably recording the tombstone (nothing to do now;
+/// the credit converges when it lands). The lookup mirrors [`credited_purchase`]
+/// — attribution is by the reversal's PaymentIntent against ZeroRouter's OWN
+/// ledger, never metadata.
+pub async fn resolve_reversal_against_credit(
+    pool: &PgPool,
+    object_id: &str,
+    payment_intent_id: &str,
+    is_dispute: bool,
+    reversed_cents: Option<i64>,
+    currency: Option<&str>,
+) -> Result<Option<CreditedPurchase>, sqlx::Error> {
+    if object_id.trim().is_empty() {
+        return Err(sqlx::Error::Protocol(
+            "observed reversal requires a Stripe object id".to_owned(),
+        ));
+    }
+    if payment_intent_id.trim().is_empty() {
+        return Err(sqlx::Error::Protocol(
+            "observed reversal requires a payment intent id".to_owned(),
+        ));
+    }
+
+    let mut transaction = pool.begin().await?;
+    sqlx::query("SET LOCAL lock_timeout = '5s'")
+        .execute(&mut *transaction)
+        .await?;
+    // Only the intent lock (salt 1). The reversal path never takes the user
+    // lock, so it can never hold the user lock while waiting on the intent lock
+    // — that is what keeps the user→intent order the credit paths use free of a
+    // cycle.
+    lock_payment_intent(&mut transaction, payment_intent_id).await?;
+
+    // A Checkout purchase records the intent in stripe_payment_intent_id; an
+    // autopay recharge anchors on stripe_session_id because the intent id IS its
+    // idempotence key. Stripe object ids are globally unique, so accepting
+    // either column cannot cross-match.
+    let credited = sqlx::query_as::<_, (Uuid, Decimal, String)>(
+        r#"
+        SELECT user_id, amount_usd, entry_type
+        FROM credit_ledger
+        WHERE entry_type IN ('purchase', 'autopay')
+          AND (stripe_payment_intent_id = $1 OR stripe_session_id = $1)
+        ORDER BY id
+        LIMIT 1
+        "#,
+    )
+    .bind(payment_intent_id)
+    .fetch_optional(&mut *transaction)
+    .await?;
+
+    if let Some((user_id, amount_usd, entry_type)) = credited {
+        // The credit is committed — and, because we hold the intent lock, fully
+        // committed, not a half-applied credit still inside its transaction.
+        // Nothing to record; the caller reverses/freezes on the returned credit.
+        transaction.commit().await?;
+        return Ok(Some(CreditedPurchase {
+            user_id,
+            amount_usd,
+            entry_type,
+        }));
+    }
+
+    // No credit yet: record the tombstone before releasing the lock, so a credit
+    // that is waiting on the intent lock is guaranteed to see it and converge.
+    insert_observed_reversal(
+        &mut transaction,
+        object_id,
+        payment_intent_id,
+        is_dispute,
+        reversed_cents,
+        currency,
+    )
+    .await?;
+    transaction.commit().await?;
+    Ok(None)
 }
 
 /// Bring a just-applied credit to the same end state a reversal arriving AFTER
@@ -838,11 +1001,23 @@ async fn apply_observed_reversals(
             }
         }
 
-        // Consume the tombstone exactly once.
-        sqlx::query("UPDATE stripe_observed_reversals SET applied_at = NOW() WHERE object_id = $1")
+        // Stamp the tombstone applied ONLY when its obligation is discharged, so
+        // the operator's unapplied index stays honest (FIX C):
+        //   - a DISPUTE's obligation is the freeze, which always ran above, so a
+        //     dispute tombstone is consumed here whether or not it also covered;
+        //   - a REFUND's obligation is the reversal, so it is consumed only when
+        //     it covered. A NON-COVERING refund stays unapplied — an
+        //     operator-visible reconciliation flag that a later cumulative refund
+        //     event can still merge into, rather than being lost as "applied".
+        let discharged = is_dispute || covers;
+        if discharged {
+            sqlx::query(
+                "UPDATE stripe_observed_reversals SET applied_at = NOW() WHERE object_id = $1",
+            )
             .bind(&object_id)
             .execute(&mut *conn)
             .await?;
+        }
     }
     Ok(())
 }
@@ -1604,6 +1779,32 @@ pub async fn attach_autopay_intent(
     Ok(())
 }
 
+/// Release a claim the sweep took but has provably NOT submitted to Stripe —
+/// the fresh-claim counterpart of the hold-not-fail discipline (FIX D).
+///
+/// A fresh sweep claim that turns ineligible BEFORE its first POST has charged
+/// nothing, so holding it (correct for a possibly-already-submitted
+/// reconciliation claim) is wrong here: combined with one-pending-per-user, the
+/// count-only overdue path, and the ~20h replay window, a permanently-held
+/// fresh claim would block every future recharge for that user. Dropping the
+/// pending `local_<key>` row frees the slot with NO failure strike — nothing
+/// was attempted, so it is not a failure — exactly as [`attach_autopay_intent`]
+/// drops a superseded local claim. Scoped to a still-pending local claim, so it
+/// can never delete a row that has been renamed to a real PaymentIntent or
+/// already settled.
+pub async fn release_autopay_claim(
+    pool: &PgPool,
+    idempotency_key: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "DELETE FROM stripe_autopay_intents WHERE payment_intent_id = $1 AND status = 'pending'",
+    )
+    .bind(format!("local_{idempotency_key}"))
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 /// Pending intents older than the cutoff, for the sweep's reconciliation
 /// pass: local claims whose Stripe response was lost (retried by
 /// idempotency key) and real intents whose terminal webhook never arrived
@@ -1765,6 +1966,10 @@ pub async fn settle_autopay_intent(
         .bind(user_id.to_string())
         .execute(&mut *transaction)
         .await?;
+    // FIX A (HIGH-1 round 2): the intent lock, AFTER the user lock, so this
+    // recharge serializes with a reversal for the same PaymentIntent that has no
+    // user to lock on. The autopay intent id is always present here.
+    lock_payment_intent(&mut transaction, payment_intent_id).await?;
     let balance_after = sqlx::query_scalar::<_, Decimal>(
         r#"
         UPDATE users

@@ -995,49 +995,46 @@ async fn handle_reversal_event(
         .and_then(Value::as_str)
         .map(str::to_ascii_lowercase);
 
-    let Some(credited) = billing::credited_purchase(&ctx.pool, payment_intent)
-        .await
-        .map_err(|error| {
-            tracing::warn!(
-                stripe_object_id = %object_id,
-                %error,
-                "stripe reversal deferred: the credit ledger could not be read; stripe will retry"
-            );
-            StripeHttpError::DatabaseUnavailable
-        })?
+    // FIX A (HIGH-1 round 2): resolve the reversal against the credit ledger
+    // UNDER the PaymentIntent lock, so the lookup and — when no credit exists
+    // yet — the tombstone write are ONE atomic step a racing credit for the same
+    // intent cannot interleave with. Previously these were two autocommit
+    // statements (`credited_purchase` then `record_observed_reversal`), and a
+    // credit committing between them was seen by neither: refunded money stayed
+    // spendable and a dispute stayed unfrozen.
+    //
+    // A reversal for a charge this deployment has NOT yet credited is no longer
+    // acknowledged-and-forgotten. It may be a foreign charge (another
+    // integration in the same Stripe account), OR our own credit that simply has
+    // not landed yet — Stripe delivers events out of order, and the credit path
+    // returns 503 and leans on redelivery, so there are real windows where the
+    // purchase/autopay row does not exist yet. We cannot tell the two apart here
+    // (with no credit row there is no user to freeze), so the reversal is durably
+    // recorded keyed on its object id. When a credit for this intent lands,
+    // `credit_purchase` / `settle_autopay_intent` — taking the SAME intent lock —
+    // consume the tombstone and converge to the reversed (and, for a dispute,
+    // frozen) end state; a foreign charge never gets a credit, so its tombstone
+    // stays inert. Still HTTP 200 — the reversal is now durable, so Stripe need
+    // not retry.
+    let Some(credited) = billing::resolve_reversal_against_credit(
+        &ctx.pool,
+        object_id,
+        payment_intent,
+        is_dispute,
+        reversed_cents,
+        currency.as_deref(),
+    )
+    .await
+    .map_err(|error| {
+        tracing::warn!(
+            event_type = %event.event_type,
+            stripe_object_id = %object_id,
+            %error,
+            "stripe reversal deferred: the credit ledger could not be read or the tombstone written; stripe will retry"
+        );
+        StripeHttpError::DatabaseUnavailable
+    })?
     else {
-        // HIGH-1 (migration 0017): a reversal for a charge this deployment has
-        // NOT yet credited is no longer acknowledged-and-forgotten. It may be a
-        // foreign charge (another integration in the same Stripe account), OR
-        // our own credit that simply has not landed yet — Stripe delivers
-        // events out of order, and the credit path returns 503 and leans on
-        // redelivery, so there are real windows where the purchase/autopay row
-        // does not exist yet. We cannot tell the two apart here (with no credit
-        // row there is no user to freeze), so we durably record the reversal
-        // keyed on its object id. If a credit for this intent ever lands,
-        // `credit_purchase` / `settle_autopay_intent` consume the tombstone and
-        // converge to the reversed (and, for a dispute, frozen) end state; a
-        // foreign charge never gets a credit, so its tombstone stays inert.
-        // ON CONFLICT DO NOTHING makes a redelivery a no-op. Still HTTP 200 —
-        // the reversal is now durably recorded, so Stripe need not retry.
-        if let Err(error) = billing::record_observed_reversal(
-            &ctx.pool,
-            object_id,
-            payment_intent,
-            is_dispute,
-            reversed_cents,
-            currency.as_deref(),
-        )
-        .await
-        {
-            tracing::warn!(
-                event_type = %event.event_type,
-                stripe_object_id = %object_id,
-                %error,
-                "stripe reversal deferred: its tombstone could not be written; stripe will retry"
-            );
-            return Err(StripeHttpError::DatabaseUnavailable);
-        }
         tracing::info!(
             event_type = %event.event_type,
             stripe_object_id = %object_id,
@@ -1812,7 +1809,15 @@ async fn reconcile_stale_intents(pool: &crate::sqlx::PgPool, settings: &StripeSe
                     Ok(())
                 }
                 Ok(true) => {
-                    replay_charge(pool, settings, user_id, amount_usd, idempotency_key).await
+                    replay_charge(
+                        pool,
+                        settings,
+                        user_id,
+                        amount_usd,
+                        idempotency_key,
+                        AutopayClaimOrigin::Reconciliation,
+                    )
+                    .await
                 }
                 Err(error) => Err(anyhow::Error::from(error)),
             }
@@ -1902,8 +1907,24 @@ async fn charge_candidate(
         candidate.user_id,
         candidate.topup_usd,
         &idempotency_key,
+        AutopayClaimOrigin::FreshSweep,
     )
     .await
+}
+
+/// Whether a claim reaching [`replay_charge`] has provably not been submitted to
+/// Stripe yet. It decides what pre-POST ineligibility does to the claim (FIX D).
+#[derive(Clone, Copy, Debug)]
+enum AutopayClaimOrigin {
+    /// A claim this sweep JUST created in `charge_candidate` and has not POSTed.
+    /// Pre-POST ineligibility RELEASES it (no strike), so it cannot wedge the
+    /// user's one-pending slot forever.
+    FreshSweep,
+    /// A stranded claim from an earlier sweep, replayed by reconciliation and
+    /// POSSIBLY already submitted to Stripe under this idempotency key. Pre-POST
+    /// ineligibility HOLDS it — its key is the only durable handle on a charge
+    /// that might have happened.
+    Reconciliation,
 }
 
 /// Create (or idempotently re-create) the off-session charge for a claim.
@@ -1915,6 +1936,7 @@ async fn replay_charge(
     user_id: Uuid,
     topup_usd: Decimal,
     idempotency_key: &str,
+    origin: AutopayClaimOrigin,
 ) -> anyhow::Result<()> {
     let client = stripe_client().map_err(|_| anyhow::anyhow!("stripe client"))?;
     let Some(customer) = sqlx::query_scalar::<_, Option<String>>(
@@ -2000,11 +2022,20 @@ async fn replay_charge(
     // autopay_candidates nor claim_autopay_attempt re-runs at this instant.
     // Off-session charging the saved card of a customer who just disputed is
     // the exact catastrophe migration 0009 exists to prevent, so re-assert the
-    // shared eligibility predicate here. If it no longer holds, refuse to POST
-    // and HOLD the claim (leave the pending row for reconciliation) — never
-    // terminal-fail it, which could free the slot for a second charge or drop
-    // a claim that may already have been charged (sol review, stripe.rs
-    // hold-not-fail discipline above).
+    // shared eligibility predicate here.
+    //
+    // FIX B (documented, not locked): a residual window remains between this
+    // SELECT and the `.send()` below — an inherent local-check-vs-external-
+    // side-effect gap, now bounded to the ~microseconds between the read and the
+    // outbound write rather than the ~20h it once was. It is DELIBERATELY not
+    // closed by holding a DB advisory lock across the Stripe POST: that would
+    // pin a pooled connection for up to the 15s HTTP timeout and block the
+    // freeze webhook itself, trading a vanishingly rare race for a real
+    // availability and lock-contention hazard. If a freeze commits inside that
+    // ~µs window and the POST still lands, Stripe's dispute/refund process is
+    // the backstop — the reversal path (now serialized on the intent lock, FIX
+    // A) converges the account to reversed/frozen when that charge's credit
+    // lands.
     let eligible = sqlx::query_scalar::<_, bool>(&format!(
         "SELECT ({}) FROM users WHERE id = $1",
         billing::AUTOPAY_ELIGIBILITY_PREDICATE
@@ -2013,11 +2044,36 @@ async fn replay_charge(
     .fetch_one(pool)
     .await?;
     if !eligible {
-        tracing::warn!(
-            %user_id,
-            "not charging a frozen / indebted / max-failed account; holding the autopay claim for reconciliation"
-        );
-        anyhow::bail!("account is no longer eligible for autopay; holding the claim");
+        // FIX D: what happens to the claim depends on whether it could already
+        // have been submitted to Stripe.
+        match origin {
+            AutopayClaimOrigin::FreshSweep => {
+                // This claim was created moments ago in `charge_candidate` and
+                // has POSTed nothing, so releasing it charges nothing and frees
+                // the one-pending slot for a later, eligible sweep. Holding it
+                // (right only for a possibly-submitted reconciliation claim)
+                // would otherwise wedge this user's autopay forever. No strike:
+                // nothing was attempted.
+                billing::release_autopay_claim(pool, idempotency_key).await?;
+                tracing::warn!(
+                    %user_id,
+                    "not charging a frozen / indebted / max-failed account; releasing the fresh autopay claim (nothing was submitted)"
+                );
+                return Ok(());
+            }
+            AutopayClaimOrigin::Reconciliation => {
+                // A reconciliation claim may already have been submitted under
+                // this idempotency key, so it must be HELD, never released or
+                // terminal-failed — its key is the only durable handle on a
+                // charge that might have happened. Leave the pending row for the
+                // next reconciliation pass.
+                tracing::warn!(
+                    %user_id,
+                    "not charging a frozen / indebted / max-failed account; holding the reconciliation claim"
+                );
+                anyhow::bail!("account is no longer eligible for autopay; holding the claim");
+            }
+        }
     }
 
     let response = client

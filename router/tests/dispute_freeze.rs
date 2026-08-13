@@ -36,7 +36,8 @@ use zerorouter::{
     auth::{generate_api_key, hash_api_key},
     billing::{
         FreezeReason, autopay_candidates, balance, credit_purchase, freeze_account, grant_promo,
-        unfreeze_account, write_off_receivable,
+        resolve_reversal_against_credit, settle_autopay_intent, unfreeze_account,
+        write_off_receivable,
     },
     config::ResolvedRoute,
     db::{KeyMintAdmission, admit_key_mint, migrate},
@@ -792,6 +793,417 @@ async fn two_reversal_objects_for_one_intent_do_not_double_count() {
     // Both tombstones are consumed.
     assert_eq!(observed_reversal(&pool, &dispute_id).await, Some(true));
     assert_eq!(observed_reversal(&pool, &charge_id).await, Some(true));
+}
+
+// ---------------------------------------------------------------------------
+// FIX A (HIGH-1 round 2): the credit and reversal paths for one PaymentIntent
+// serialize on the intent-keyed advisory lock (salt 1), so a credit and a
+// reversal racing for the same intent converge instead of missing each other.
+// ---------------------------------------------------------------------------
+
+/// The reversed-cents recorded on a tombstone, or `None` when no row exists.
+async fn tombstone_reversed_cents(pool: &PgPool, object_id: &str) -> Option<i64> {
+    query_scalar::<_, Option<i64>>(
+        "SELECT reversed_cents FROM stripe_observed_reversals WHERE object_id = $1",
+    )
+    .bind(object_id)
+    .fetch_optional(pool)
+    .await
+    .expect("tombstone cents must query")
+    .flatten()
+}
+
+/// Credit-first: while a credit transaction holds the intent lock (standing in
+/// for a credit mid-flight, its ledger row inserted but not committed), a
+/// reversal for the SAME intent must BLOCK on that lock rather than racing ahead
+/// to write an orphan tombstone. Once the credit commits, the reversal sees it
+/// and records nothing — the normal reverse-after-credit path takes over.
+#[tokio::test]
+async fn a_reversal_blocks_on_the_intent_lock_a_racing_credit_holds() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let user_id = create_user(&pool, "race-credit-first").await;
+    let session_id = format!("cs_test_{}", Uuid::new_v4().simple());
+    let payment_intent = format!("pi_test_{}", Uuid::new_v4().simple());
+    let dispute_id = format!("dp_test_{}", Uuid::new_v4().simple());
+
+    // A credit transaction mid-flight: holds the intent lock (salt 1) and has
+    // inserted, but not committed, its purchase credit row.
+    let mut credit_tx = pool.begin().await.expect("credit tx");
+    query("SELECT pg_advisory_xact_lock(hashtextextended($1::TEXT, 1))")
+        .bind(&payment_intent)
+        .execute(&mut *credit_tx)
+        .await
+        .expect("credit holds the intent lock");
+    query(
+        r#"
+        INSERT INTO credit_ledger
+            (user_id, entry_type, amount_usd, balance_after_usd,
+             stripe_session_id, stripe_payment_intent_id)
+        VALUES ($1, 'purchase', $2, $2, $3, $4)
+        "#,
+    )
+    .bind(user_id)
+    .bind(Decimal::from(25))
+    .bind(&session_id)
+    .bind(&payment_intent)
+    .execute(&mut *credit_tx)
+    .await
+    .expect("uncommitted credit row");
+
+    // The reversal races on its own connection; it must not complete while the
+    // credit holds the lock.
+    let mut reversal = tokio::spawn({
+        let pool = pool.clone();
+        let object_id = dispute_id.clone();
+        let intent = payment_intent.clone();
+        async move {
+            resolve_reversal_against_credit(
+                &pool,
+                &object_id,
+                &intent,
+                true,
+                Some(2_500),
+                Some("usd"),
+            )
+            .await
+        }
+    });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(750), &mut reversal)
+            .await
+            .is_err(),
+        "the reversal blocks on the intent lock the credit holds"
+    );
+    assert_eq!(
+        observed_reversal(&pool, &dispute_id).await,
+        None,
+        "no orphan tombstone is written while the reversal is blocked"
+    );
+
+    // The credit commits, releasing the lock; the reversal now sees the credit.
+    credit_tx.commit().await.expect("commit credit");
+    let resolved = reversal
+        .await
+        .expect("reversal task joins")
+        .expect("resolve succeeds");
+    assert!(
+        resolved.is_some(),
+        "the unblocked reversal sees the committed credit"
+    );
+    assert_eq!(
+        observed_reversal(&pool, &dispute_id).await,
+        None,
+        "credit-first: the reversal records NO tombstone (it takes the normal path)"
+    );
+}
+
+/// Reversal-first: while the reversal path holds the intent lock (its tombstone
+/// written but not committed), a credit for the SAME intent must BLOCK rather
+/// than committing spendable money that misses the tombstone. Once the reversal
+/// commits, the credit proceeds under the lock, consumes the tombstone, and
+/// converges to the reversed + frozen end state. This is the exact schedule the
+/// round-1 fix could still lose.
+#[tokio::test]
+async fn a_credit_blocks_on_the_intent_lock_a_racing_reversal_holds_then_converges() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let user_id = create_user(&pool, "race-reversal-first").await;
+    let session_id = format!("cs_test_{}", Uuid::new_v4().simple());
+    let payment_intent = format!("pi_test_{}", Uuid::new_v4().simple());
+    let dispute_id = format!("dp_test_{}", Uuid::new_v4().simple());
+
+    // The reversal path mid-flight: holds the intent lock and has written, but
+    // not committed, the dispute tombstone (covering the full $25 credit).
+    let mut reversal_tx = pool.begin().await.expect("reversal tx");
+    query("SELECT pg_advisory_xact_lock(hashtextextended($1::TEXT, 1))")
+        .bind(&payment_intent)
+        .execute(&mut *reversal_tx)
+        .await
+        .expect("reversal holds the intent lock");
+    query(
+        r#"
+        INSERT INTO stripe_observed_reversals
+            (object_id, payment_intent_id, is_dispute, reversed_cents, currency)
+        VALUES ($1, $2, TRUE, 2500, 'usd')
+        "#,
+    )
+    .bind(&dispute_id)
+    .bind(&payment_intent)
+    .execute(&mut *reversal_tx)
+    .await
+    .expect("uncommitted tombstone");
+
+    // The credit races on its own connection; it must block rather than commit.
+    let mut credit = tokio::spawn({
+        let pool = pool.clone();
+        let session = session_id.clone();
+        let intent = payment_intent.clone();
+        async move {
+            credit_purchase(
+                &pool,
+                user_id,
+                Decimal::from(25),
+                &session,
+                Some(intent.as_str()),
+            )
+            .await
+        }
+    });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(750), &mut credit)
+            .await
+            .is_err(),
+        "the credit blocks on the intent lock the reversal holds"
+    );
+    assert_eq!(
+        balance(&pool, user_id).await.expect("balance must query"),
+        Decimal::ZERO,
+        "no spendable credit is committed while the reversal holds the lock"
+    );
+
+    // The reversal commits its tombstone, releasing the lock.
+    reversal_tx.commit().await.expect("commit reversal");
+
+    // The credit proceeds under the intent lock and converges.
+    credit
+        .await
+        .expect("credit task joins")
+        .expect("the delayed credit applies");
+    assert_eq!(
+        balance(&pool, user_id).await.expect("balance must query"),
+        Decimal::ZERO,
+        "converged: no spendable refunded credit remains"
+    );
+    assert!(
+        freeze_of(&pool, user_id).await.0.is_some(),
+        "the racing dispute froze the account"
+    );
+    assert_eq!(
+        reversals(&pool, user_id).await.len(),
+        1,
+        "exactly one reversal ledger row"
+    );
+    assert_eq!(
+        observed_reversal(&pool, &dispute_id).await,
+        Some(true),
+        "the tombstone is consumed exactly once"
+    );
+}
+
+/// The autopay credit path (`settle_autopay_intent`) takes the SAME intent lock
+/// after its user lock, so an off-session recharge racing a reversal for its
+/// PaymentIntent serializes exactly as the checkout credit does. While the
+/// reversal holds the lock (covering dispute tombstone uncommitted), the settle
+/// must block rather than credit spendable money; once the reversal commits, the
+/// settle consumes the tombstone and converges to reversed + frozen.
+#[tokio::test]
+async fn an_autopay_settle_blocks_on_the_intent_lock_a_racing_reversal_holds_then_converges() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let user_id = create_user(&pool, "race-autopay-settle").await;
+    let payment_intent = format!("pi_test_{}", Uuid::new_v4().simple());
+    let dispute_id = format!("dp_test_{}", Uuid::new_v4().simple());
+
+    // A pending autopay claim awaiting its terminal webhook.
+    query(
+        r#"
+        INSERT INTO stripe_autopay_intents
+            (payment_intent_id, user_id, amount_usd, charge_amount_usd)
+        VALUES ($1, $2, 25, 26.38)
+        "#,
+    )
+    .bind(&payment_intent)
+    .bind(user_id)
+    .execute(&pool)
+    .await
+    .expect("pending autopay intent must insert");
+
+    // The reversal path mid-flight: holds the intent lock with an uncommitted
+    // covering dispute tombstone.
+    let mut reversal_tx = pool.begin().await.expect("reversal tx");
+    query("SELECT pg_advisory_xact_lock(hashtextextended($1::TEXT, 1))")
+        .bind(&payment_intent)
+        .execute(&mut *reversal_tx)
+        .await
+        .expect("reversal holds the intent lock");
+    query(
+        r#"
+        INSERT INTO stripe_observed_reversals
+            (object_id, payment_intent_id, is_dispute, reversed_cents, currency)
+        VALUES ($1, $2, TRUE, 2500, 'usd')
+        "#,
+    )
+    .bind(&dispute_id)
+    .bind(&payment_intent)
+    .execute(&mut *reversal_tx)
+    .await
+    .expect("uncommitted tombstone");
+
+    let mut settle = tokio::spawn({
+        let pool = pool.clone();
+        let intent = payment_intent.clone();
+        async move { settle_autopay_intent(&pool, &intent, None).await }
+    });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(750), &mut settle)
+            .await
+            .is_err(),
+        "the autopay settle blocks on the intent lock the reversal holds"
+    );
+    assert_eq!(
+        balance(&pool, user_id).await.expect("balance must query"),
+        Decimal::ZERO,
+        "no autopay credit is committed while the reversal holds the lock"
+    );
+
+    reversal_tx.commit().await.expect("commit reversal");
+    settle
+        .await
+        .expect("settle task joins")
+        .expect("the recharge settles");
+    assert_eq!(
+        balance(&pool, user_id).await.expect("balance must query"),
+        Decimal::ZERO,
+        "converged: the recharge credit is reversed, nothing spendable"
+    );
+    assert!(
+        freeze_of(&pool, user_id).await.0.is_some(),
+        "the racing dispute froze the account"
+    );
+    assert_eq!(
+        observed_reversal(&pool, &dispute_id).await,
+        Some(true),
+        "the tombstone is consumed exactly once"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// FIX C (Medium): cumulative refunds keyed on the charge id must merge, and a
+// non-covering refund tombstone must not be marked "applied".
+// ---------------------------------------------------------------------------
+
+/// Two `charge.refunded` events for one charge carry the CUMULATIVE
+/// `amount_refunded` under the SAME charge id. A partial $4 followed by the full
+/// $10, both before the credit, must merge to the fuller $10 (not drop the
+/// second as a duplicate), so when the $10 credit lands it is reversed in full.
+#[tokio::test]
+async fn a_partial_then_full_cumulative_refund_before_the_credit_reverses_in_full() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let user_id = create_user(&pool, "cumulative-refund").await;
+    let session_id = format!("cs_test_{}", Uuid::new_v4().simple());
+    let payment_intent = format!("pi_test_{}", Uuid::new_v4().simple());
+    let charge_id = format!("ch_test_{}", Uuid::new_v4().simple());
+
+    // Partial $4 first, then the full cumulative $10 — same charge id.
+    let (status, _) = post_webhook(
+        &pool,
+        &refund_event(&charge_id, &payment_intent, 400, "usd"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        tombstone_reversed_cents(&pool, &charge_id).await,
+        Some(400),
+        "the first, partial refund is recorded"
+    );
+    let (status, _) = post_webhook(
+        &pool,
+        &refund_event(&charge_id, &payment_intent, 1_000, "usd"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        tombstone_reversed_cents(&pool, &charge_id).await,
+        Some(1_000),
+        "the later, fuller cumulative refund is merged in, not dropped"
+    );
+    assert_eq!(
+        observed_reversal(&pool, &charge_id).await,
+        Some(false),
+        "still one unapplied tombstone for the charge"
+    );
+
+    // The delayed $10 credit lands; the merged refund now covers it in full.
+    credit_purchase(
+        &pool,
+        user_id,
+        Decimal::from(10),
+        &session_id,
+        Some(payment_intent.as_str()),
+    )
+    .await
+    .expect("the delayed credit must apply");
+
+    assert_eq!(
+        balance(&pool, user_id).await.expect("balance must query"),
+        Decimal::ZERO,
+        "the fully-refunded credit is not spendable"
+    );
+    assert_eq!(
+        reversals(&pool, user_id).await,
+        vec![(Decimal::from(-10), Decimal::ZERO, charge_id.clone())],
+        "one reversal for the full merged amount"
+    );
+    assert_eq!(
+        observed_reversal(&pool, &charge_id).await,
+        Some(true),
+        "the covering tombstone is consumed"
+    );
+}
+
+/// A single partial refund that never grows to cover the credit must NOT be
+/// stamped applied when the credit lands: the credit stays in place (partial
+/// refunds reverse nothing, per policy) and the tombstone remains an
+/// operator-visible reconciliation flag a later cumulative refund can still
+/// merge into.
+#[tokio::test]
+async fn a_non_covering_refund_tombstone_stays_unapplied_after_the_credit() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let user_id = create_user(&pool, "partial-refund").await;
+    let session_id = format!("cs_test_{}", Uuid::new_v4().simple());
+    let payment_intent = format!("pi_test_{}", Uuid::new_v4().simple());
+    let charge_id = format!("ch_test_{}", Uuid::new_v4().simple());
+
+    // A $4 partial refund against a $10 credit — it does not cover.
+    let (status, _) = post_webhook(
+        &pool,
+        &refund_event(&charge_id, &payment_intent, 400, "usd"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    credit_purchase(
+        &pool,
+        user_id,
+        Decimal::from(10),
+        &session_id,
+        Some(payment_intent.as_str()),
+    )
+    .await
+    .expect("the delayed credit must apply");
+
+    assert_eq!(
+        balance(&pool, user_id).await.expect("balance must query"),
+        Decimal::from(10),
+        "a partial refund reverses nothing; the credit stands"
+    );
+    assert!(
+        reversals(&pool, user_id).await.is_empty(),
+        "no reversal ledger row for a non-covering refund"
+    );
+    assert_eq!(
+        observed_reversal(&pool, &charge_id).await,
+        Some(false),
+        "the non-covering tombstone stays UNAPPLIED — a reconciliation flag, not lost"
+    );
 }
 
 // ---------------------------------------------------------------------------
