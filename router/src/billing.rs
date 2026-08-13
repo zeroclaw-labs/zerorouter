@@ -179,6 +179,14 @@ pub async fn credit_purchase(
         .bind(user_id.to_string())
         .execute(&mut *transaction)
         .await?;
+    // FIX A (HIGH-1 round 2): also take the PaymentIntent lock — AFTER the user
+    // lock, never before — so this whole credit (including apply_observed_reversals
+    // below) serializes with a reversal for the same intent that has no user to
+    // lock on. The reversal path takes ONLY the intent lock, so this fixed
+    // user→intent order cannot deadlock. Only when the credit names an intent.
+    if let Some(payment_intent_id) = stripe_payment_intent_id {
+        lock_payment_intent(&mut transaction, payment_intent_id).await?;
+    }
 
     let already_applied =
         sqlx::query_scalar::<_, i32>("SELECT 1 FROM credit_ledger WHERE stripe_session_id = $1")
@@ -224,6 +232,13 @@ pub async fn credit_purchase(
     .bind(stripe_payment_intent_id)
     .execute(&mut *transaction)
     .await?;
+    // HIGH-1 (migration 0017): if a refund/dispute for this PaymentIntent was
+    // observed BEFORE this credit existed, converge to the reversed (and, for a
+    // dispute, frozen) end state now — under the same advisory lock and in the
+    // same transaction — so no spendable refunded credit is ever visible.
+    if let Some(payment_intent_id) = stripe_payment_intent_id {
+        apply_observed_reversals(&mut transaction, user_id, payment_intent_id, amount_usd).await?;
+    }
     transaction.commit().await?;
     Ok(CreditOutcome::Applied { balance_after })
 }
@@ -634,6 +649,455 @@ pub async fn reverse_purchase(
         amount_usd,
         balance_after,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Reversal observed before its credit existed (migration 0017, HIGH-1)
+// ---------------------------------------------------------------------------
+
+/// Take the PaymentIntent-keyed advisory lock (`hashtextextended(intent, 1)`),
+/// the serialization point between a credit and a reversal for the SAME
+/// PaymentIntent (migration 0017, HIGH-1 round 2 / FIX A).
+///
+/// Salt **1** selects a DIFFERENT `hashtextextended` hash function than the
+/// per-user lock's salt 0 — NOT a disjoint output range. The two 64-bit spaces
+/// therefore overlap, and a user-lock key can occasionally collide with an
+/// intent-lock key. That collision is harmless: it only adds extra advisory-lock
+/// contention (resolved by the 5s `lock_timeout` every holder sets), and it
+/// cannot lose same-intent serialization or move money, because correctness
+/// rests on both sides of ONE intent taking the SAME key, never on user and
+/// intent keys being distinct. LOCK ORDER, everywhere both are held: the USER
+/// lock (salt 0) FIRST, then this intent lock — so no cycle is possible. The
+/// reversal path takes ONLY this lock (it has no user to lock on until it finds
+/// a credit); the credit paths take the user lock and then this one before
+/// checking and crediting. That makes "credit vs reversal for one intent" a race
+/// exactly one side wins, and the loser sees the winner's committed effect.
+async fn lock_payment_intent(
+    conn: &mut sqlx_postgres::PgConnection,
+    payment_intent_id: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1::TEXT, 1))")
+        .bind(payment_intent_id)
+        .execute(conn)
+        .await?;
+    Ok(())
+}
+
+/// Write (or monotonically merge) the tombstone for a reversal observed before
+/// its credit, inside the caller's transaction — which already holds the intent
+/// lock, so this is serialized against the crediting side.
+///
+/// `charge.refunded` carries the charge's CUMULATIVE `amount_refunded`, so two
+/// refund events for one charge share the same object id. `ON CONFLICT DO
+/// NOTHING` kept the first, possibly-partial amount and dropped a later fuller
+/// one (FIX C). Instead merge NULL-safe-monotonically with `GREATEST`, and ONLY
+/// while the tombstone is still unapplied — never resurrect a consumed one,
+/// because once the credit exists a later refund takes the normal webhook path.
+/// The anchoring fields (`payment_intent_id` / `is_dispute` / `currency`) are
+/// NOT overwritten: a differing value on the same object id is a data error (a
+/// dispute id and a charge id live in different namespaces and cannot collide),
+/// logged for an operator rather than silently clobbered.
+async fn insert_observed_reversal(
+    conn: &mut sqlx_postgres::PgConnection,
+    object_id: &str,
+    payment_intent_id: &str,
+    is_dispute: bool,
+    reversed_cents: Option<i64>,
+    currency: Option<&str>,
+) -> Result<(), sqlx::Error> {
+    if object_id.trim().is_empty() {
+        return Err(sqlx::Error::Protocol(
+            "observed reversal requires a Stripe object id".to_owned(),
+        ));
+    }
+    if payment_intent_id.trim().is_empty() {
+        return Err(sqlx::Error::Protocol(
+            "observed reversal requires a payment intent id".to_owned(),
+        ));
+    }
+    // A reused object id whose anchoring fields disagree is a data error we
+    // record but refuse to act on. The DO UPDATE below touches only
+    // reversed_cents, so the original row's intent/type/currency always stand;
+    // and its WHERE now ALSO requires the anchors to match, so a mismatched
+    // event cannot even merge its amount in (a larger conflicting amount must
+    // not raise this intent's coverage). The equality is enforced atomically in
+    // the ON CONFLICT clause rather than trusting the SELECT above — that SELECT
+    // is only for the operator log, and is racy because two conflicting intents
+    // take different intent locks. We surface the collision for reconciliation
+    // instead of guessing.
+    if let Some((existing_intent, existing_is_dispute, existing_currency)) =
+        sqlx::query_as::<_, (String, bool, Option<String>)>(
+            "SELECT payment_intent_id, is_dispute, currency \
+             FROM stripe_observed_reversals WHERE object_id = $1",
+        )
+        .bind(object_id)
+        .fetch_optional(&mut *conn)
+        .await?
+        && (existing_intent != payment_intent_id
+            || existing_is_dispute != is_dispute
+            || existing_currency.as_deref() != currency)
+    {
+        tracing::error!(
+            stripe_object_id = %object_id,
+            %existing_intent,
+            new_intent = %payment_intent_id,
+            existing_is_dispute,
+            new_is_dispute = is_dispute,
+            "observed reversal object id reused with a different intent / type / currency; \
+             keeping the original tombstone and NOT overwriting it — reconcile by hand"
+        );
+    }
+    sqlx::query(
+        r#"
+        INSERT INTO stripe_observed_reversals
+            (object_id, payment_intent_id, is_dispute, reversed_cents, currency)
+        VALUES ($1, $2, $3, $4, $5)
+        ON CONFLICT (object_id) DO UPDATE
+            SET reversed_cents = GREATEST(
+                    COALESCE(EXCLUDED.reversed_cents, stripe_observed_reversals.reversed_cents),
+                    COALESCE(stripe_observed_reversals.reversed_cents, EXCLUDED.reversed_cents)
+                )
+            WHERE stripe_observed_reversals.applied_at IS NULL
+              AND stripe_observed_reversals.payment_intent_id = EXCLUDED.payment_intent_id
+              AND stripe_observed_reversals.is_dispute = EXCLUDED.is_dispute
+              AND stripe_observed_reversals.currency IS NOT DISTINCT FROM EXCLUDED.currency
+        "#,
+    )
+    .bind(object_id)
+    .bind(payment_intent_id)
+    .bind(is_dispute)
+    .bind(reversed_cents)
+    .bind(currency)
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
+/// Resolve a Stripe reversal against the credit ledger UNDER THE INTENT LOCK,
+/// atomically closing the credit/tombstone race (migration 0017, HIGH-1 round
+/// 2 / FIX A).
+///
+/// The reversal path has no user to lock on while the charge is uncredited, so
+/// before this it ran as two autocommit statements — a `credited_purchase`
+/// lookup and a tombstone insert — and a credit committing between them was
+/// seen by neither: refunded money stayed spendable and a dispute stayed
+/// unfrozen. Now the lookup and, when no credit exists yet, the tombstone write
+/// happen in ONE transaction that first takes the PaymentIntent lock. The
+/// credit paths take the SAME lock (after the user lock) before crediting, so
+/// whichever side takes the intent lock first is fully visible to the other:
+///
+/// - reversal first → tombstone committed under the lock → the credit's
+///   [`apply_observed_reversals`] consumes it (reverses, and freezes a dispute);
+/// - credit first → this lookup returns `Some` → the caller takes the normal
+///   reverse-and-freeze path.
+///
+/// Returns the credit when one exists (the caller reverses/freezes as it always
+/// has), or `None` after durably recording the tombstone (nothing to do now;
+/// the credit converges when it lands). The lookup mirrors [`credited_purchase`]
+/// — attribution is by the reversal's PaymentIntent against ZeroRouter's OWN
+/// ledger, never metadata.
+pub async fn resolve_reversal_against_credit(
+    pool: &PgPool,
+    object_id: &str,
+    payment_intent_id: &str,
+    is_dispute: bool,
+    reversed_cents: Option<i64>,
+    currency: Option<&str>,
+) -> Result<Option<CreditedPurchase>, sqlx::Error> {
+    if object_id.trim().is_empty() {
+        return Err(sqlx::Error::Protocol(
+            "observed reversal requires a Stripe object id".to_owned(),
+        ));
+    }
+    if payment_intent_id.trim().is_empty() {
+        return Err(sqlx::Error::Protocol(
+            "observed reversal requires a payment intent id".to_owned(),
+        ));
+    }
+
+    let mut transaction = pool.begin().await?;
+    sqlx::query("SET LOCAL lock_timeout = '5s'")
+        .execute(&mut *transaction)
+        .await?;
+    // Only the intent lock (salt 1). The reversal path never takes the user
+    // lock, so it can never hold the user lock while waiting on the intent lock
+    // — that is what keeps the user→intent order the credit paths use free of a
+    // cycle.
+    lock_payment_intent(&mut transaction, payment_intent_id).await?;
+
+    // A Checkout purchase records the intent in stripe_payment_intent_id; an
+    // autopay recharge anchors on stripe_session_id because the intent id IS its
+    // idempotence key. Stripe object ids are globally unique, so accepting
+    // either column cannot cross-match.
+    let credited = sqlx::query_as::<_, (Uuid, Decimal, String)>(
+        r#"
+        SELECT user_id, amount_usd, entry_type
+        FROM credit_ledger
+        WHERE entry_type IN ('purchase', 'autopay')
+          AND (stripe_payment_intent_id = $1 OR stripe_session_id = $1)
+        ORDER BY id
+        LIMIT 1
+        "#,
+    )
+    .bind(payment_intent_id)
+    .fetch_optional(&mut *transaction)
+    .await?;
+
+    if let Some((user_id, amount_usd, entry_type)) = credited {
+        // The credit is committed — and, because we hold the intent lock, fully
+        // committed, not a half-applied credit still inside its transaction. The
+        // caller reverses/freezes on the returned credit. This found path only
+        // READS: it stamps no tombstone.
+        //
+        // FIX 2' (round 4): the stale-tombstone stamp that FIX 3 did here was
+        // premature. `handle_reversal_event` calls this, gets the credit back,
+        // and only AFTERWARDS — in separate transactions — freezes and runs
+        // `reverse_purchase`. Stamping `applied_at` before that reversal actually
+        // lands meant a `reverse_purchase` that then FAILED (e.g. its 5s user-lock
+        // wait timed out and the webhook 503'd) left the tombstone falsely marked
+        // "applied", hiding a real unreconciled reversal — permanently if retries
+        // exhausted. The stamp now happens only after the reversal succeeds, via
+        // `mark_intent_reversals_applied`, called from `handle_reversal_event`
+        // once `reverse_purchase` returns Reversed/AlreadyReversed (and, for a
+        // dispute, after the freeze succeeds). A failed reversal therefore leaves
+        // the tombstone unapplied — correctly retryable and operator-visible.
+        transaction.commit().await?;
+        return Ok(Some(CreditedPurchase {
+            user_id,
+            amount_usd,
+            entry_type,
+        }));
+    }
+
+    // No credit yet: record the tombstone before releasing the lock, so a credit
+    // that is waiting on the intent lock is guaranteed to see it and converge.
+    insert_observed_reversal(
+        &mut transaction,
+        object_id,
+        payment_intent_id,
+        is_dispute,
+        reversed_cents,
+        currency,
+    )
+    .await?;
+    transaction.commit().await?;
+    Ok(None)
+}
+
+/// Stamp every still-unapplied observed-reversal tombstone for
+/// `payment_intent_id` `applied_at = NOW()` — the reconciliation-flag discharge
+/// FIX 3 recorded, moved (FIX 2', round 4) to run ONLY after the reversal has
+/// actually landed.
+///
+/// [`handle_reversal_event`](crate::stripe) calls this after `reverse_purchase`
+/// returns `Reversed`/`AlreadyReversed` (and, for a dispute, after the freeze
+/// succeeds), so a covering reversal that fully discharges the credit clears any
+/// stale non-covering tombstone left behind — while a reversal that FAILED never
+/// reaches here, leaving the tombstone unapplied and operator-visible. The caller
+/// has already established coverage (`reverse_purchase` runs only on a covering
+/// event), so every unapplied tombstone for this now-reversed intent is genuinely
+/// resolved; `reverse_purchase` is per-intent idempotent, so this moves no money —
+/// it only clears the flag.
+///
+/// Takes the SAME per-intent advisory lock (salt 1) the credit and reversal paths
+/// take, so it serializes with them; it never takes the user lock, so it cannot
+/// deadlock against a concurrent credit. Returns how many tombstones were stamped
+/// (0 when there was no stale flag to clear).
+pub async fn mark_intent_reversals_applied(
+    pool: &PgPool,
+    payment_intent_id: &str,
+) -> Result<u64, sqlx::Error> {
+    if payment_intent_id.trim().is_empty() {
+        return Err(sqlx::Error::Protocol(
+            "stamping observed reversals requires a payment intent id".to_owned(),
+        ));
+    }
+
+    let mut transaction = pool.begin().await?;
+    sqlx::query("SET LOCAL lock_timeout = '5s'")
+        .execute(&mut *transaction)
+        .await?;
+    lock_payment_intent(&mut transaction, payment_intent_id).await?;
+    let stamped = sqlx::query(
+        r#"
+        UPDATE stripe_observed_reversals
+        SET applied_at = NOW()
+        WHERE payment_intent_id = $1
+          AND applied_at IS NULL
+        "#,
+    )
+    .bind(payment_intent_id)
+    .execute(&mut *transaction)
+    .await?
+    .rows_affected();
+    transaction.commit().await?;
+    Ok(stamped)
+}
+
+/// Bring a just-applied credit to the same end state a reversal arriving AFTER
+/// it would have produced, for every reversal this deployment observed BEFORE
+/// the credit existed (migration 0017, HIGH-1).
+///
+/// Runs INSIDE the credit path's transaction, which already holds the per-user
+/// advisory lock, so the credit and its compensating reversal commit together
+/// and no window exists where the credit is spendable. It mirrors the webhook
+/// reversal path rather than inventing new logic:
+///
+/// - a dispute tombstone FREEZES the account (inline, idempotent), exactly as
+///   the normal dispute path does — even when the amount does not cover the
+///   credit, because the freeze is the half that cannot wait;
+/// - a reversal is applied to the credit only when it COVERS the whole credit
+///   and only once per intent — the same two guards [`reverse_purchase`]
+///   enforces; a partial / foreign-currency / amount-less tombstone reverses
+///   nothing (an operator reconciles it), and a second covering tombstone for
+///   the same intent finds the reversal already present and skips it;
+/// - the reversal accounting is the same shape as [`reverse_purchase`] (a
+///   `refund` ledger row anchored on the object id and the intent, snapshotting
+///   the balance), done inline because [`reverse_purchase`] and
+///   [`freeze_account`] each open their own pool connection and would deadlock
+///   against the advisory lock this transaction holds.
+///
+/// Every consumed tombstone is stamped `applied_at`, so it is applied exactly
+/// once no matter how the credit is later replayed.
+async fn apply_observed_reversals(
+    conn: &mut sqlx_postgres::PgConnection,
+    user_id: Uuid,
+    payment_intent_id: &str,
+    credited_amount_usd: Decimal,
+) -> Result<(), sqlx::Error> {
+    // Claim every unapplied tombstone for this intent, oldest first. `covers`
+    // is computed in SQL so the cents comparison happens in the same numeric
+    // domain the amounts are stored in; COALESCE guarantees a non-NULL bool
+    // even when currency or amount is missing.
+    let tombstones = sqlx::query_as::<_, (String, bool, bool)>(
+        r#"
+        SELECT object_id,
+               is_dispute,
+               COALESCE(
+                   currency = 'usd'
+                   AND reversed_cents IS NOT NULL
+                   AND reversed_cents >= ROUND($2 * 100)::bigint,
+                   FALSE
+               ) AS covers
+        FROM stripe_observed_reversals
+        WHERE payment_intent_id = $1 AND applied_at IS NULL
+        ORDER BY observed_at, object_id
+        FOR UPDATE
+        "#,
+    )
+    .bind(payment_intent_id)
+    .bind(credited_amount_usd)
+    .fetch_all(&mut *conn)
+    .await?;
+    if tombstones.is_empty() {
+        return Ok(());
+    }
+
+    // A reversal may drive the balance below zero when the account already
+    // carried a receivable; declare this transaction to the 0009 overdraft
+    // trigger exactly as reverse_purchase does. SET LOCAL is discarded at
+    // commit, so it never leaks to the next transaction on a pooled connection.
+    sqlx::query("SET LOCAL zerorouter.credit_reversal = 'on'")
+        .execute(&mut *conn)
+        .await?;
+
+    for (object_id, is_dispute, covers) in tombstones {
+        if is_dispute {
+            // Inline freeze mirroring freeze_account: idempotent
+            // (first-writer-wins on frozen_at), and the account must stop
+            // spending even when the reversal cannot be computed.
+            sqlx::query(
+                r#"
+                UPDATE users
+                SET frozen_at = NOW(), frozen_reason = 'dispute'
+                WHERE id = $1 AND frozen_at IS NULL
+                "#,
+            )
+            .bind(user_id)
+            .execute(&mut *conn)
+            .await?;
+        }
+
+        if covers {
+            // The same "already reversed?" check reverse_purchase makes: a
+            // redelivered object (anchor 1) or any prior refund on this intent
+            // (anchor 2) means the credit is already taken back, so a second
+            // covering tombstone reverses nothing.
+            let already_reversed = sqlx::query_scalar::<_, i32>(
+                r#"
+                SELECT 1 FROM credit_ledger
+                WHERE stripe_session_id = $1
+                   OR (entry_type = 'refund' AND stripe_payment_intent_id = $2)
+                LIMIT 1
+                "#,
+            )
+            .bind(&object_id)
+            .bind(payment_intent_id)
+            .fetch_optional(&mut *conn)
+            .await?
+            .is_some();
+            if !already_reversed {
+                let balance_after = sqlx::query_scalar::<_, Decimal>(
+                    r#"
+                    UPDATE users
+                    SET credit_balance_usd = credit_balance_usd - $2
+                    WHERE id = $1
+                    RETURNING credit_balance_usd
+                    "#,
+                )
+                .bind(user_id)
+                .bind(credited_amount_usd)
+                .fetch_one(&mut *conn)
+                .await?;
+                let note = if is_dispute {
+                    format!("chargeback reversal ({object_id}); reversal observed before credit")
+                } else {
+                    format!("refund reversal ({object_id}); reversal observed before credit")
+                };
+                sqlx::query(
+                    r#"
+                    INSERT INTO credit_ledger (
+                        user_id,
+                        entry_type,
+                        amount_usd,
+                        balance_after_usd,
+                        stripe_session_id,
+                        stripe_payment_intent_id,
+                        note
+                    )
+                    VALUES ($1, 'refund', $2, $3, $4, $5, $6)
+                    "#,
+                )
+                .bind(user_id)
+                .bind(-credited_amount_usd)
+                .bind(balance_after)
+                .bind(&object_id)
+                .bind(payment_intent_id)
+                .bind(&note)
+                .execute(&mut *conn)
+                .await?;
+            }
+        }
+
+        // Stamp the tombstone applied ONLY when its obligation is discharged, so
+        // the operator's unapplied index stays honest (FIX C):
+        //   - a DISPUTE's obligation is the freeze, which always ran above, so a
+        //     dispute tombstone is consumed here whether or not it also covered;
+        //   - a REFUND's obligation is the reversal, so it is consumed only when
+        //     it covered. A NON-COVERING refund stays unapplied — an
+        //     operator-visible reconciliation flag that a later cumulative refund
+        //     event can still merge into, rather than being lost as "applied".
+        let discharged = is_dispute || covers;
+        if discharged {
+            sqlx::query(
+                "UPDATE stripe_observed_reversals SET applied_at = NOW() WHERE object_id = $1",
+            )
+            .bind(&object_id)
+            .execute(&mut *conn)
+            .await?;
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1203,6 +1667,34 @@ pub async fn record_recovery(
 // Autopay (migration 0008)
 // ---------------------------------------------------------------------------
 
+/// The account-state half of "may this account be auto-charged?", as one SQL
+/// fragment (bare `users` column names, so it drops into any query that has the
+/// row in scope). It is asserted at EVERY boundary that can reach an
+/// off-session charge — `autopay_candidates`, `claim_autopay_attempt`,
+/// `replay_charge`, and `autopay_still_armed` — so the invariant cannot be
+/// stated once and silently dropped downstream (HIGH-2).
+///
+/// - `frozen_at IS NULL`: a frozen account is never charged (migration 0009).
+///   The freeze exists to STOP the spend on a disputing customer; charging the
+///   saved card of a customer fresh off a dispute is how the next dispute is
+///   manufactured.
+/// - `credit_balance_usd >= 0`: nor is an account that OWES money. Since
+///   0009/0013 a negative balance means a reversal receivable — money already
+///   clawed back through Stripe — and such an account is maximally eligible on
+///   every other predicate (its balance is furthest below the threshold), so
+///   re-entry into autopay must be a deliberate operator decision (`admin
+///   disputes resolve`), never a side effect of a sweep.
+/// - `autopay_consecutive_failures < 3`: a dead card gets three attempts, not a
+///   retry loop.
+///
+/// Each site combines this with its own flag/amount/threshold checks. The
+/// freeze webhook and a balance reversal can commit AFTER selection but before
+/// the charge, so re-reading this fragment at the later boundaries — above all
+/// immediately before the POST in `replay_charge` — is what closes the
+/// freeze-vs-charge race (both the live sweep and the reconciliation replay).
+pub const AUTOPAY_ELIGIBILITY_PREDICATE: &str =
+    "frozen_at IS NULL AND credit_balance_usd >= 0 AND autopay_consecutive_failures < 3";
+
 /// A user the autopay sweep should recharge: enabled, configured, under
 /// threshold, not mid-charge, and not disabled by consecutive failures.
 #[derive(Clone, Debug)]
@@ -1219,44 +1711,27 @@ pub async fn autopay_candidates(
     pool: &PgPool,
     limit: i64,
 ) -> Result<Vec<AutopayCandidate>, sqlx::Error> {
-    let rows = sqlx::query_as::<_, (Uuid, String, Decimal)>(
+    let rows = sqlx::query_as::<_, (Uuid, String, Decimal)>(&format!(
         r#"
         SELECT u.id, u.stripe_customer_id, u.autopay_topup_usd
         FROM users u
         WHERE u.autopay_enabled
-          AND u.autopay_consecutive_failures < 3
           AND u.credit_balance_usd < u.autopay_threshold_usd
           AND u.stripe_customer_id IS NOT NULL
-          -- A frozen account is never charged (migration 0009). Without this
-          -- the freeze would be self-defeating in the worst possible way: a
-          -- chargeback reverses the credit, the balance drops through the
-          -- autopay threshold — often into the negative the receivable lives
-          -- in — and the very next sweep charges the disputing customer's
-          -- saved card again, off-session. This narrows the candidate set and
-          -- writes nothing; the claim machinery (HANDOFF §6d) is untouched.
-          AND u.frozen_at IS NULL
-          -- Nor is an account that OWES money, whether or not it is still
-          -- frozen. Since 0009/0013 a negative balance has exactly one
-          -- meaning: a reversal receivable — money already clawed back
-          -- through Stripe and not yet settled. Such an account is
-          -- maximally eligible on every other predicate (its balance is the
-          -- furthest below the threshold, so it even sorts first), which
-          -- makes the debtor whose freeze has been lifted the very next
-          -- card this sweep would charge off-session. Auto-charging the
-          -- saved card of a customer fresh off a payment dispute is how the
-          -- next dispute is manufactured. Re-entry into autopay is
-          -- therefore an explicit human decision — `admin disputes resolve`
-          -- (write off or record the recovery) brings the balance back to
-          -- zero — and never a side effect of a sweep.
-          AND u.credit_balance_usd >= 0
+          -- The account-state eligibility set — frozen / receivable / failure
+          -- cap — as ONE shared fragment, asserted identically at the claim,
+          -- replay, and still-armed boundaries so a later stage cannot drop it
+          -- (HIGH-2). See AUTOPAY_ELIGIBILITY_PREDICATE for why each of the
+          -- three disqualifies an account from an off-session charge.
+          AND ({AUTOPAY_ELIGIBILITY_PREDICATE})
           AND NOT EXISTS (
               SELECT 1 FROM stripe_autopay_intents i
               WHERE i.user_id = u.id AND i.status = 'pending'
           )
         ORDER BY u.credit_balance_usd ASC
         LIMIT $1
-        "#,
-    )
+        "#
+    ))
     .bind(limit)
     .fetch_all(pool)
     .await?;
@@ -1296,7 +1771,7 @@ pub async fn claim_autopay_attempt(
     // user lowered cannot be charged at its old size. `amount_usd` is the NET
     // credit re-read from the row; `charge_amount_usd` is the GROSS the caller
     // priced from that same net topup.
-    let claimed = sqlx::query(
+    let claimed = sqlx::query(&format!(
         r#"
         INSERT INTO stripe_autopay_intents
             (payment_intent_id, user_id, amount_usd, charge_amount_usd)
@@ -1310,9 +1785,15 @@ pub async fn claim_autopay_attempt(
           -- charge too (sol review).
           AND autopay_threshold_usd IS NOT NULL
           AND credit_balance_usd < autopay_threshold_usd
+          -- HIGH-2: re-assert the SAME frozen / receivable / failure-cap set
+          -- autopay_candidates selected on. A dispute freeze and a balance
+          -- reversal can commit between selection and this claim; without this
+          -- the INSERT still matches (a negative balance is only FURTHER below
+          -- the threshold) and the disputing customer is charged.
+          AND ({AUTOPAY_ELIGIBILITY_PREDICATE})
         ON CONFLICT DO NOTHING
-        "#,
-    )
+        "#
+    ))
     .bind(format!("local_{idempotency_key}"))
     .bind(user_id)
     .bind(amount_usd)
@@ -1323,19 +1804,25 @@ pub async fn claim_autopay_attempt(
     Ok(claimed > 0)
 }
 
-/// Whether a user still wants autopay, read at the moment of use.
+/// Whether a user is still eligible for autopay, read at the moment of use.
 ///
 /// The reconciliation pass replays a stranded local claim under its
-/// original idempotency key up to half an hour later; by then the user may
-/// have opted out, and replaying would charge someone who has already left
-/// (sol review). A claim whose owner has since disabled autopay is dropped
-/// rather than replayed.
+/// original idempotency key up to ~20 hours later; by then the user may
+/// have opted out, or — the HIGH-2 case — been frozen and driven into a
+/// receivable by a dispute. Replaying either charges someone who must not be
+/// charged, so this is the full eligibility gate, not just the enabled flag:
+/// enabled AND the shared frozen / receivable / failure-cap predicate. A
+/// `false` result routes the reconciliation pass to KEEP (not delete) the
+/// claim, which is correct for a stranded charge that may already have
+/// happened.
 pub async fn autopay_still_armed(pool: &PgPool, user_id: Uuid) -> Result<bool, sqlx::Error> {
-    sqlx::query_scalar::<_, bool>("SELECT autopay_enabled FROM users WHERE id = $1")
-        .bind(user_id)
-        .fetch_optional(pool)
-        .await
-        .map(|armed| armed.unwrap_or(false))
+    sqlx::query_scalar::<_, bool>(&format!(
+        "SELECT autopay_enabled AND ({AUTOPAY_ELIGIBILITY_PREDICATE}) FROM users WHERE id = $1"
+    ))
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await
+    .map(|armed| armed.unwrap_or(false))
 }
 
 /// Attach the real PaymentIntent id to a claim once Stripe has answered.
@@ -1425,6 +1912,29 @@ pub async fn overdue_autopay_intents(
     .await
 }
 
+/// Autopay charges collected at Stripe whose credit was WITHHELD at settlement
+/// because the account had become ineligible in the charge's send window (FIX
+/// 1). Each row is money taken from a card that must be REFUNDED — never
+/// credited to a frozen / indebted account — so it is surfaced here for an
+/// operator to refund out of band, the same shape as `overdue_autopay_intents`
+/// surfaces claims automation must not touch. Returns (payment_intent_id,
+/// user_id, charge_amount_usd): the GROSS Stripe collected, which is the amount
+/// to refund.
+pub async fn withheld_autopay_intents(
+    pool: &PgPool,
+) -> Result<Vec<(String, Uuid, Decimal)>, sqlx::Error> {
+    sqlx::query_as::<_, (String, Uuid, Decimal)>(
+        r#"
+        SELECT payment_intent_id, user_id, charge_amount_usd
+        FROM stripe_autopay_intents
+        WHERE status = 'withheld'
+        ORDER BY updated_at
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+}
+
 /// What settling an autopay charge did.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AutopayOutcome {
@@ -1433,6 +1943,14 @@ pub enum AutopayOutcome {
     /// No intent row and no metadata to recover one from — acknowledged and
     /// ignored (some other system's payment intent).
     Unknown,
+    /// The charge succeeded at Stripe, but the account had become INELIGIBLE
+    /// (frozen / indebted / max-failed) between the pre-POST guard and this
+    /// settlement, so the credit is WITHHELD (FIX 1): no balance credit and no
+    /// `autopay` ledger row. The intent moves to the durable `withheld` state —
+    /// money collected at Stripe that must be refunded — surfaced for an
+    /// operator (`withheld_autopay_intents`) rather than credited to an account
+    /// that must not be charged.
+    Withheld,
 }
 
 /// Credit a succeeded off-session charge, exactly once.
@@ -1531,19 +2049,91 @@ pub async fn settle_autopay_intent(
         .bind(user_id.to_string())
         .execute(&mut *transaction)
         .await?;
-    let balance_after = sqlx::query_scalar::<_, Decimal>(
+    // FIX A (HIGH-1 round 2): the intent lock, AFTER the user lock, so this
+    // recharge serializes with a reversal for the same PaymentIntent that has no
+    // user to lock on. The autopay intent id is always present here.
+    lock_payment_intent(&mut transaction, payment_intent_id).await?;
+
+    // FIX 1' (settlement-side re-check, round 4): the eligibility check and the
+    // credit are now ONE conditional statement, not a separate `SELECT
+    // (eligibility)` followed by an unconditional `UPDATE users SET
+    // credit_balance_usd = …`. A dispute-freeze on an OLDER intent — and the
+    // balance reversal that drives the account into a receivable — can commit
+    // during the charge's `send().await` window (pool acquire + DNS/TCP/TLS +
+    // transmit, up to the 15s HTTP timeout), AFTER the pre-POST guard passed AND
+    // after this settlement transaction has already begun and taken its locks;
+    // that freeze belongs to a DIFFERENT intent than this new autopay charge, so
+    // nothing else catches it. The charge itself is best-effort and a card may
+    // rarely be charged in that race, but the CREDIT must never land on a frozen /
+    // indebted account — the exact catastrophe the freeze exists to prevent.
+    //
+    // A separate SELECT-then-UPDATE is a TOCTOU: under READ COMMITTED the credit
+    // UPDATE is a new statement that DOES see a freeze committed after the SELECT,
+    // but with no predicate it credits anyway. Folding the SAME eligibility
+    // predicate into the UPDATE's WHERE closes that intra-transaction window with
+    // no reliance on the freezer taking a lock: Postgres locks the users row, and
+    // when a freeze committed underneath it re-evaluates the predicate against the
+    // freshly-committed row version (EvalPlanQual), so an account that turned
+    // ineligible anywhere inside the window matches ZERO rows. This is the exact
+    // pattern the revoked-key admission fix uses (`db.rs`, `UPDATE … WHERE NOT
+    // disabled`). It is deliberately NOT "make freeze_account take the advisory
+    // lock": the conditional update is the stronger, LOCAL guarantee — it does not
+    // depend on every present and future writer of `frozen_at` remembering to lock.
+    //
+    // Zero rows returned == ineligible == WITHHOLD: no balance credit, no `autopay`
+    // ledger row, and no observed-reversal application; the intent moves to the
+    // durable `withheld` state instead of `succeeded`. The money WAS collected at
+    // Stripe, so it must be refunded — surfaced to an operator via
+    // `withheld_autopay_intents`, NEVER silently kept and NEVER credited. The
+    // Stripe refund is deliberately NOT issued inline: that would hold this
+    // advisory lock across an external HTTP call, the very anti-pattern we avoid;
+    // an operator / out-of-lock refund path settles the actual refund. Idempotent
+    // by the same pending→terminal guard as crediting: that transition already ran
+    // exactly once above, so a redelivered success finds no pending row and returns
+    // AlreadySettled — it neither double-withholds nor double-credits.
+    // The charge-time predicate is the account-state fragment AND `autopay_enabled`:
+    // an opt-out that commits during the charge window (the portal's off switch)
+    // must WITHHOLD the credit exactly like a freeze, never credit an account that
+    // told us to stop. This mirrors the `autopay_enabled AND (…)` gate the claim,
+    // replay, and still-armed boundaries apply; folding it into the conditional
+    // UPDATE lets EvalPlanQual re-check it against a freshly-committed opt-out too.
+    // The current-threshold / top-up-amount checks are NOT re-asserted here: they
+    // are enforced at `claim_autopay_attempt` (the row's amount/threshold at claim
+    // time is what was charged), and re-reading them at settlement would wrongly
+    // withhold a legitimately-collected credit when a concurrent top-up merely
+    // lifted the balance back above threshold.
+    let balance_after = sqlx::query_scalar::<_, Decimal>(&format!(
         r#"
         UPDATE users
         SET credit_balance_usd = credit_balance_usd + $2,
             autopay_consecutive_failures = 0
-        WHERE id = $1
+        WHERE id = $1 AND autopay_enabled AND ({AUTOPAY_ELIGIBILITY_PREDICATE})
         RETURNING credit_balance_usd
-        "#,
-    )
+        "#
+    ))
     .bind(user_id)
     .bind(amount_usd)
-    .fetch_one(&mut *transaction)
+    .fetch_optional(&mut *transaction)
     .await?;
+    let Some(balance_after) = balance_after else {
+        sqlx::query(
+            r#"
+            UPDATE stripe_autopay_intents
+            SET status = 'withheld', updated_at = NOW()
+            WHERE payment_intent_id = $1
+            "#,
+        )
+        .bind(payment_intent_id)
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        tracing::error!(
+            %user_id,
+            payment_intent = %payment_intent_id,
+            "autopay charge collected at Stripe but the account is ineligible (frozen / indebted / max-failed) at settlement; credit WITHHELD and the charge marked needs-refund — an operator must refund it out of band"
+        );
+        return Ok(AutopayOutcome::Withheld);
+    };
     sqlx::query(
         r#"
         INSERT INTO credit_ledger
@@ -1557,6 +2147,13 @@ pub async fn settle_autopay_intent(
     .bind(payment_intent_id)
     .execute(&mut *transaction)
     .await?;
+    // HIGH-1 (migration 0017): an autopay recharge is credited by exactly the
+    // same PaymentIntent id a reversal would name, so a refund/dispute observed
+    // before this credit landed is consumed here — under the advisory lock this
+    // transaction already holds — reversing the credit and freezing on a
+    // dispute, so an off-session recharge can never leave spendable reversed
+    // money either.
+    apply_observed_reversals(&mut transaction, user_id, payment_intent_id, amount_usd).await?;
     transaction.commit().await?;
     Ok(AutopayOutcome::Credited)
 }

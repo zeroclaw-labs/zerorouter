@@ -35,8 +35,9 @@ use zerorouter::{
     app,
     auth::{generate_api_key, hash_api_key},
     billing::{
-        FreezeReason, autopay_candidates, balance, credit_purchase, freeze_account, grant_promo,
-        unfreeze_account, write_off_receivable,
+        AutopayOutcome, FreezeReason, autopay_candidates, balance, credit_purchase, freeze_account,
+        grant_promo, resolve_reversal_against_credit, settle_autopay_intent, unfreeze_account,
+        withheld_autopay_intents, write_off_receivable,
     },
     config::ResolvedRoute,
     db::{KeyMintAdmission, admit_key_mint, migrate},
@@ -531,6 +532,1283 @@ async fn an_unsigned_or_mis_signed_dispute_does_nothing() {
         freeze_of(&pool, user_id).await,
         (None, None),
         "no unsigned event may freeze an account"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// HIGH-1: a reversal observed BEFORE its credit must converge to the same end
+// state as a reversal after the credit (migration 0017)
+// ---------------------------------------------------------------------------
+
+/// The tombstone's state for a reversal object: `None` when no row exists,
+/// `Some(applied)` where `applied` is whether a credit has consumed it.
+async fn observed_reversal(pool: &PgPool, object_id: &str) -> Option<bool> {
+    query_scalar::<_, bool>(
+        "SELECT applied_at IS NOT NULL FROM stripe_observed_reversals WHERE object_id = $1",
+    )
+    .bind(object_id)
+    .fetch_optional(pool)
+    .await
+    .expect("tombstone state must query")
+}
+
+/// The `purchase`/`autopay` credit rows for a user, so a test can confirm the
+/// credit itself was still recorded (the reversal takes it back; it does not
+/// suppress the credit — the full history stays in the ledger).
+async fn purchase_rows(pool: &PgPool, user_id: Uuid) -> i64 {
+    query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM credit_ledger WHERE user_id = $1 AND entry_type IN ('purchase', 'autopay')",
+    )
+    .bind(user_id)
+    .fetch_one(pool)
+    .await
+    .expect("purchase rows must query")
+}
+
+/// A dispute that arrives before the credit exists is recorded, and when the
+/// delayed success finally credits the PaymentIntent the account converges to
+/// EXACTLY the reversal-after-credit end state: the credit is taken back (no
+/// spendable refunded money), a reversal ledger row exists anchored on the
+/// dispute, and the account is frozen. Consumed exactly once.
+#[tokio::test]
+async fn a_dispute_observed_before_the_credit_reverses_and_freezes_when_it_lands() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let user_id = create_user(&pool, "pre-dispute").await;
+    let session_id = format!("cs_test_{}", Uuid::new_v4().simple());
+    let payment_intent = format!("pi_test_{}", Uuid::new_v4().simple());
+    let dispute_id = format!("dp_test_{}", Uuid::new_v4().simple());
+
+    // The reversal arrives first — before any credit for this intent exists.
+    let (status, _) = post_webhook(
+        &pool,
+        &dispute_event(&dispute_id, &payment_intent, 2_500, "usd"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "the reversal is acknowledged");
+    // Nothing has moved: there is no credit to reverse and no user to freeze.
+    assert_eq!(
+        balance(&pool, user_id).await.expect("balance must query"),
+        Decimal::ZERO
+    );
+    assert!(reversals(&pool, user_id).await.is_empty());
+    assert_eq!(freeze_of(&pool, user_id).await, (None, None));
+    // But it is durably recorded, unapplied — no longer forgotten.
+    assert_eq!(
+        observed_reversal(&pool, &dispute_id).await,
+        Some(false),
+        "the reversal is recorded and not yet applied"
+    );
+
+    // The delayed / retried success now credits the same PaymentIntent.
+    credit_purchase(
+        &pool,
+        user_id,
+        Decimal::from(25),
+        &session_id,
+        Some(payment_intent.as_str()),
+    )
+    .await
+    .expect("the delayed credit must apply");
+
+    // Converged to the reversal-after-credit end state.
+    assert_eq!(
+        balance(&pool, user_id).await.expect("balance must query"),
+        Decimal::ZERO,
+        "no spendable refunded credit remains"
+    );
+    assert_eq!(
+        purchase_rows(&pool, user_id).await,
+        1,
+        "the credit itself is still recorded; the reversal takes it back"
+    );
+    assert_eq!(
+        reversals(&pool, user_id).await,
+        vec![(Decimal::from(-25), Decimal::ZERO, dispute_id.clone())],
+        "a reversal ledger entry exists, anchored on the dispute object"
+    );
+    let (frozen_at, reason) = freeze_of(&pool, user_id).await;
+    assert!(frozen_at.is_some(), "a disputed account ends frozen");
+    assert_eq!(reason.as_deref(), Some("dispute"));
+    assert_eq!(
+        observed_reversal(&pool, &dispute_id).await,
+        Some(true),
+        "the tombstone is consumed exactly once"
+    );
+}
+
+/// A refund observed before the credit reverses the credit when it lands, but
+/// — like the normal refund path — does NOT freeze.
+#[tokio::test]
+async fn a_refund_observed_before_the_credit_reverses_without_freezing() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let user_id = create_user(&pool, "pre-refund").await;
+    let session_id = format!("cs_test_{}", Uuid::new_v4().simple());
+    let payment_intent = format!("pi_test_{}", Uuid::new_v4().simple());
+    let charge_id = format!("ch_test_{}", Uuid::new_v4().simple());
+
+    let (status, _) = post_webhook(
+        &pool,
+        &refund_event(&charge_id, &payment_intent, 1_000, "usd"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(observed_reversal(&pool, &charge_id).await, Some(false));
+
+    // A $10 credit; the refund fully covers it.
+    credit_purchase(
+        &pool,
+        user_id,
+        Decimal::from(10),
+        &session_id,
+        Some(payment_intent.as_str()),
+    )
+    .await
+    .expect("the delayed credit must apply");
+
+    assert_eq!(
+        balance(&pool, user_id).await.expect("balance must query"),
+        Decimal::ZERO,
+        "the refunded credit is not spendable"
+    );
+    assert_eq!(
+        reversals(&pool, user_id).await,
+        vec![(Decimal::from(-10), Decimal::ZERO, charge_id.clone())]
+    );
+    assert_eq!(
+        freeze_of(&pool, user_id).await,
+        (None, None),
+        "a refund must not freeze the account"
+    );
+    assert_eq!(observed_reversal(&pool, &charge_id).await, Some(true));
+}
+
+/// Redelivery is a no-op in BOTH directions. Once the credit has consumed the
+/// tombstone (reversed + froze), a redelivered reversal webhook now finds the
+/// credit row and takes the normal path, whose own idempotence (object-id
+/// anchor + per-intent already-reversed check + first-writer-wins freeze) means
+/// no second reversal and no restamped freeze.
+#[tokio::test]
+async fn a_reversal_redelivered_after_the_credit_auto_reversed_does_not_double() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let user_id = create_user(&pool, "redeliver").await;
+    let session_id = format!("cs_test_{}", Uuid::new_v4().simple());
+    let payment_intent = format!("pi_test_{}", Uuid::new_v4().simple());
+    let dispute_id = format!("dp_test_{}", Uuid::new_v4().simple());
+    let event = dispute_event(&dispute_id, &payment_intent, 2_500, "usd");
+
+    // Reversal before credit, then the credit consumes the tombstone.
+    let (status, _) = post_webhook(&pool, &event).await;
+    assert_eq!(status, StatusCode::OK);
+    credit_purchase(
+        &pool,
+        user_id,
+        Decimal::from(25),
+        &session_id,
+        Some(payment_intent.as_str()),
+    )
+    .await
+    .expect("the delayed credit must apply");
+    let frozen_first = freeze_of(&pool, user_id).await.0.expect("frozen");
+    assert_eq!(reversals(&pool, user_id).await.len(), 1);
+
+    // Stripe redelivers the SAME dispute. It now finds the credit row.
+    let (status, _) = post_webhook(&pool, &event).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        balance(&pool, user_id).await.expect("balance must query"),
+        Decimal::ZERO,
+        "a redelivered reversal must not reverse twice"
+    );
+    assert_eq!(
+        reversals(&pool, user_id).await.len(),
+        1,
+        "still exactly one reversal ledger row"
+    );
+    assert_eq!(
+        freeze_of(&pool, user_id).await.0,
+        Some(frozen_first),
+        "the redelivery must not restamp the freeze"
+    );
+}
+
+/// Two distinct reversal objects naming the same intent (a dispute AND a refund
+/// of the same charge) both recorded before the credit must reverse the credit
+/// at most once — the per-intent already-reversed guard makes the second a
+/// no-op — while the dispute still freezes.
+#[tokio::test]
+async fn two_reversal_objects_for_one_intent_do_not_double_count() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let user_id = create_user(&pool, "two-objects").await;
+    let session_id = format!("cs_test_{}", Uuid::new_v4().simple());
+    let payment_intent = format!("pi_test_{}", Uuid::new_v4().simple());
+    let dispute_id = format!("dp_test_{}", Uuid::new_v4().simple());
+    let charge_id = format!("ch_test_{}", Uuid::new_v4().simple());
+
+    // Both reversals land before the credit, each covering the full $25.
+    let (status, _) = post_webhook(
+        &pool,
+        &dispute_event(&dispute_id, &payment_intent, 2_500, "usd"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = post_webhook(
+        &pool,
+        &refund_event(&charge_id, &payment_intent, 2_500, "usd"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    credit_purchase(
+        &pool,
+        user_id,
+        Decimal::from(25),
+        &session_id,
+        Some(payment_intent.as_str()),
+    )
+    .await
+    .expect("the delayed credit must apply");
+
+    assert_eq!(
+        balance(&pool, user_id).await.expect("balance must query"),
+        Decimal::ZERO,
+        "the credit is reversed once, not twice"
+    );
+    assert_eq!(
+        reversals(&pool, user_id).await.len(),
+        1,
+        "exactly one reversal ledger row despite two reversal objects"
+    );
+    assert!(
+        freeze_of(&pool, user_id).await.0.is_some(),
+        "the dispute among them still freezes"
+    );
+    // Both tombstones are consumed.
+    assert_eq!(observed_reversal(&pool, &dispute_id).await, Some(true));
+    assert_eq!(observed_reversal(&pool, &charge_id).await, Some(true));
+}
+
+// ---------------------------------------------------------------------------
+// FIX A (HIGH-1 round 2): the credit and reversal paths for one PaymentIntent
+// serialize on the intent-keyed advisory lock (salt 1), so a credit and a
+// reversal racing for the same intent converge instead of missing each other.
+// ---------------------------------------------------------------------------
+
+/// The reversed-cents recorded on a tombstone, or `None` when no row exists.
+async fn tombstone_reversed_cents(pool: &PgPool, object_id: &str) -> Option<i64> {
+    query_scalar::<_, Option<i64>>(
+        "SELECT reversed_cents FROM stripe_observed_reversals WHERE object_id = $1",
+    )
+    .bind(object_id)
+    .fetch_optional(pool)
+    .await
+    .expect("tombstone cents must query")
+    .flatten()
+}
+
+/// Credit-first: while a credit transaction holds the intent lock (standing in
+/// for a credit mid-flight, its ledger row inserted but not committed), a
+/// reversal for the SAME intent must BLOCK on that lock rather than racing ahead
+/// to write an orphan tombstone. Once the credit commits, the reversal sees it
+/// and records nothing — the normal reverse-after-credit path takes over.
+#[tokio::test]
+async fn a_reversal_blocks_on_the_intent_lock_a_racing_credit_holds() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let user_id = create_user(&pool, "race-credit-first").await;
+    let session_id = format!("cs_test_{}", Uuid::new_v4().simple());
+    let payment_intent = format!("pi_test_{}", Uuid::new_v4().simple());
+    let dispute_id = format!("dp_test_{}", Uuid::new_v4().simple());
+
+    // A credit transaction mid-flight: holds the intent lock (salt 1) and has
+    // inserted, but not committed, its purchase credit row.
+    let mut credit_tx = pool.begin().await.expect("credit tx");
+    query("SELECT pg_advisory_xact_lock(hashtextextended($1::TEXT, 1))")
+        .bind(&payment_intent)
+        .execute(&mut *credit_tx)
+        .await
+        .expect("credit holds the intent lock");
+    query(
+        r#"
+        INSERT INTO credit_ledger
+            (user_id, entry_type, amount_usd, balance_after_usd,
+             stripe_session_id, stripe_payment_intent_id)
+        VALUES ($1, 'purchase', $2, $2, $3, $4)
+        "#,
+    )
+    .bind(user_id)
+    .bind(Decimal::from(25))
+    .bind(&session_id)
+    .bind(&payment_intent)
+    .execute(&mut *credit_tx)
+    .await
+    .expect("uncommitted credit row");
+
+    // The reversal races on its own connection; it must not complete while the
+    // credit holds the lock.
+    let mut reversal = tokio::spawn({
+        let pool = pool.clone();
+        let object_id = dispute_id.clone();
+        let intent = payment_intent.clone();
+        async move {
+            resolve_reversal_against_credit(
+                &pool,
+                &object_id,
+                &intent,
+                true,
+                Some(2_500),
+                Some("usd"),
+            )
+            .await
+        }
+    });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(750), &mut reversal)
+            .await
+            .is_err(),
+        "the reversal blocks on the intent lock the credit holds"
+    );
+    assert_eq!(
+        observed_reversal(&pool, &dispute_id).await,
+        None,
+        "no orphan tombstone is written while the reversal is blocked"
+    );
+
+    // The credit commits, releasing the lock; the reversal now sees the credit.
+    credit_tx.commit().await.expect("commit credit");
+    let resolved = reversal
+        .await
+        .expect("reversal task joins")
+        .expect("resolve succeeds");
+    assert!(
+        resolved.is_some(),
+        "the unblocked reversal sees the committed credit"
+    );
+    assert_eq!(
+        observed_reversal(&pool, &dispute_id).await,
+        None,
+        "credit-first: the reversal records NO tombstone (it takes the normal path)"
+    );
+}
+
+/// Reversal-first: while the reversal path holds the intent lock (its tombstone
+/// written but not committed), a credit for the SAME intent must BLOCK rather
+/// than committing spendable money that misses the tombstone. Once the reversal
+/// commits, the credit proceeds under the lock, consumes the tombstone, and
+/// converges to the reversed + frozen end state. This is the exact schedule the
+/// round-1 fix could still lose.
+#[tokio::test]
+async fn a_credit_blocks_on_the_intent_lock_a_racing_reversal_holds_then_converges() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let user_id = create_user(&pool, "race-reversal-first").await;
+    let session_id = format!("cs_test_{}", Uuid::new_v4().simple());
+    let payment_intent = format!("pi_test_{}", Uuid::new_v4().simple());
+    let dispute_id = format!("dp_test_{}", Uuid::new_v4().simple());
+
+    // The reversal path mid-flight: holds the intent lock and has written, but
+    // not committed, the dispute tombstone (covering the full $25 credit).
+    let mut reversal_tx = pool.begin().await.expect("reversal tx");
+    query("SELECT pg_advisory_xact_lock(hashtextextended($1::TEXT, 1))")
+        .bind(&payment_intent)
+        .execute(&mut *reversal_tx)
+        .await
+        .expect("reversal holds the intent lock");
+    query(
+        r#"
+        INSERT INTO stripe_observed_reversals
+            (object_id, payment_intent_id, is_dispute, reversed_cents, currency)
+        VALUES ($1, $2, TRUE, 2500, 'usd')
+        "#,
+    )
+    .bind(&dispute_id)
+    .bind(&payment_intent)
+    .execute(&mut *reversal_tx)
+    .await
+    .expect("uncommitted tombstone");
+
+    // The credit races on its own connection; it must block rather than commit.
+    let mut credit = tokio::spawn({
+        let pool = pool.clone();
+        let session = session_id.clone();
+        let intent = payment_intent.clone();
+        async move {
+            credit_purchase(
+                &pool,
+                user_id,
+                Decimal::from(25),
+                &session,
+                Some(intent.as_str()),
+            )
+            .await
+        }
+    });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(750), &mut credit)
+            .await
+            .is_err(),
+        "the credit blocks on the intent lock the reversal holds"
+    );
+    assert_eq!(
+        balance(&pool, user_id).await.expect("balance must query"),
+        Decimal::ZERO,
+        "no spendable credit is committed while the reversal holds the lock"
+    );
+
+    // The reversal commits its tombstone, releasing the lock.
+    reversal_tx.commit().await.expect("commit reversal");
+
+    // The credit proceeds under the intent lock and converges.
+    credit
+        .await
+        .expect("credit task joins")
+        .expect("the delayed credit applies");
+    assert_eq!(
+        balance(&pool, user_id).await.expect("balance must query"),
+        Decimal::ZERO,
+        "converged: no spendable refunded credit remains"
+    );
+    assert!(
+        freeze_of(&pool, user_id).await.0.is_some(),
+        "the racing dispute froze the account"
+    );
+    assert_eq!(
+        reversals(&pool, user_id).await.len(),
+        1,
+        "exactly one reversal ledger row"
+    );
+    assert_eq!(
+        observed_reversal(&pool, &dispute_id).await,
+        Some(true),
+        "the tombstone is consumed exactly once"
+    );
+}
+
+/// The autopay credit path (`settle_autopay_intent`) takes the SAME intent lock
+/// after its user lock, so an off-session recharge racing a reversal for its
+/// PaymentIntent serializes exactly as the checkout credit does. While the
+/// reversal holds the lock (covering dispute tombstone uncommitted), the settle
+/// must block rather than credit spendable money; once the reversal commits, the
+/// settle consumes the tombstone and converges to reversed + frozen.
+#[tokio::test]
+async fn an_autopay_settle_blocks_on_the_intent_lock_a_racing_reversal_holds_then_converges() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let user_id = create_user(&pool, "race-autopay-settle").await;
+    // The settlement credit UPDATE now gates on `autopay_enabled` too, so the
+    // account must be a genuinely armed autopay user for the credit path to run;
+    // the sole disqualifier under test here is the racing reversal, not opt-out.
+    arm_autopay(&pool, user_id).await;
+    let payment_intent = format!("pi_test_{}", Uuid::new_v4().simple());
+    let dispute_id = format!("dp_test_{}", Uuid::new_v4().simple());
+
+    // A pending autopay claim awaiting its terminal webhook.
+    query(
+        r#"
+        INSERT INTO stripe_autopay_intents
+            (payment_intent_id, user_id, amount_usd, charge_amount_usd)
+        VALUES ($1, $2, 25, 26.38)
+        "#,
+    )
+    .bind(&payment_intent)
+    .bind(user_id)
+    .execute(&pool)
+    .await
+    .expect("pending autopay intent must insert");
+
+    // The reversal path mid-flight: holds the intent lock with an uncommitted
+    // covering dispute tombstone.
+    let mut reversal_tx = pool.begin().await.expect("reversal tx");
+    query("SELECT pg_advisory_xact_lock(hashtextextended($1::TEXT, 1))")
+        .bind(&payment_intent)
+        .execute(&mut *reversal_tx)
+        .await
+        .expect("reversal holds the intent lock");
+    query(
+        r#"
+        INSERT INTO stripe_observed_reversals
+            (object_id, payment_intent_id, is_dispute, reversed_cents, currency)
+        VALUES ($1, $2, TRUE, 2500, 'usd')
+        "#,
+    )
+    .bind(&dispute_id)
+    .bind(&payment_intent)
+    .execute(&mut *reversal_tx)
+    .await
+    .expect("uncommitted tombstone");
+
+    let mut settle = tokio::spawn({
+        let pool = pool.clone();
+        let intent = payment_intent.clone();
+        async move { settle_autopay_intent(&pool, &intent, None).await }
+    });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(750), &mut settle)
+            .await
+            .is_err(),
+        "the autopay settle blocks on the intent lock the reversal holds"
+    );
+    assert_eq!(
+        balance(&pool, user_id).await.expect("balance must query"),
+        Decimal::ZERO,
+        "no autopay credit is committed while the reversal holds the lock"
+    );
+
+    reversal_tx.commit().await.expect("commit reversal");
+    settle
+        .await
+        .expect("settle task joins")
+        .expect("the recharge settles");
+    assert_eq!(
+        balance(&pool, user_id).await.expect("balance must query"),
+        Decimal::ZERO,
+        "converged: the recharge credit is reversed, nothing spendable"
+    );
+    assert!(
+        freeze_of(&pool, user_id).await.0.is_some(),
+        "the racing dispute froze the account"
+    );
+    assert_eq!(
+        observed_reversal(&pool, &dispute_id).await,
+        Some(true),
+        "the tombstone is consumed exactly once"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// FIX 1 (High): a frozen / indebted account is never CREDITED by autopay. A
+// freeze that commits in the charge's send window — after the pre-POST guard,
+// before settlement — makes settle_autopay_intent WITHHOLD the credit and move
+// the collected charge to a durable needs-refund state instead of crediting it.
+// ---------------------------------------------------------------------------
+
+/// The headline FIX 1 case. A pending autopay charge has landed at Stripe. A
+/// dispute-freeze on an OLDER intent commits before the terminal webhook is
+/// settled. `settle_autopay_intent` re-checks eligibility under the per-user
+/// lock and withholds: no credit, no `autopay` ledger row, the account stays
+/// frozen, and the intent is recorded `withheld` (needs refund) and surfaced for
+/// an operator. A redelivered success neither double-withholds nor credits.
+#[tokio::test]
+async fn an_autopay_charge_on_an_account_frozen_mid_charge_is_withheld_not_credited() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let user_id = create_user(&pool, "withheld-frozen").await;
+    // Armed autopay user, so the ONLY reason the settlement withholds is the
+    // freeze — not the `autopay_enabled` gate the credit UPDATE now also applies.
+    arm_autopay(&pool, user_id).await;
+    let payment_intent = format!("pi_test_{}", Uuid::new_v4().simple());
+
+    // A pending autopay claim whose charge succeeded at Stripe, awaiting its
+    // terminal webhook. The gross Stripe collected is 26.38 for a net 25 credit.
+    query(
+        r#"
+        INSERT INTO stripe_autopay_intents
+            (payment_intent_id, user_id, amount_usd, charge_amount_usd)
+        VALUES ($1, $2, 25, 26.38)
+        "#,
+    )
+    .bind(&payment_intent)
+    .bind(user_id)
+    .execute(&pool)
+    .await
+    .expect("pending autopay intent must insert");
+
+    // The freeze committed during the charge's send window (a dispute on an
+    // older intent), so by settlement the account is frozen.
+    freeze_account(&pool, user_id, FreezeReason::Dispute)
+        .await
+        .expect("freeze must apply");
+
+    let outcome = settle_autopay_intent(&pool, &payment_intent, None)
+        .await
+        .expect("settle must run");
+    assert_eq!(
+        outcome,
+        AutopayOutcome::Withheld,
+        "the charge on a frozen account is withheld, not credited"
+    );
+    assert_eq!(
+        balance(&pool, user_id).await.expect("balance must query"),
+        Decimal::ZERO,
+        "the frozen account is NOT credited"
+    );
+    assert!(
+        freeze_of(&pool, user_id).await.0.is_some(),
+        "the account stays frozen"
+    );
+    let status = query_scalar::<_, String>(
+        "SELECT status FROM stripe_autopay_intents WHERE payment_intent_id = $1",
+    )
+    .bind(&payment_intent)
+    .fetch_one(&pool)
+    .await
+    .expect("status must query");
+    assert_eq!(
+        status, "withheld",
+        "the collected charge is recorded as needs-refund"
+    );
+    let autopay_rows = query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM credit_ledger WHERE user_id = $1 AND entry_type = 'autopay'",
+    )
+    .bind(user_id)
+    .fetch_one(&pool)
+    .await
+    .expect("ledger must query");
+    assert_eq!(autopay_rows, 0, "no autopay credit row is written");
+
+    // The withheld charge is surfaced for an out-of-band operator refund, with
+    // the GROSS Stripe collected as the amount to refund.
+    let withheld = withheld_autopay_intents(&pool)
+        .await
+        .expect("withheld list must query");
+    assert!(
+        withheld
+            .iter()
+            .any(|(intent, uid, gross)| intent == &payment_intent
+                && *uid == user_id
+                && *gross == Decimal::from_str("26.38").expect("gross parses")),
+        "the withheld charge is surfaced for refund with its gross amount"
+    );
+
+    // A redelivered success is a no-op: the pending->terminal transition already
+    // ran, so it neither double-withholds nor retroactively credits.
+    let replay = settle_autopay_intent(&pool, &payment_intent, None)
+        .await
+        .expect("redelivery must run");
+    assert_eq!(
+        replay,
+        AutopayOutcome::AlreadySettled,
+        "a redelivered success for a withheld intent is a no-op"
+    );
+    assert_eq!(
+        balance(&pool, user_id).await.expect("balance must query"),
+        Decimal::ZERO,
+        "still not credited after redelivery"
+    );
+}
+
+/// The eligible path is unchanged: a healthy account's autopay settlement still
+/// credits the net top-up exactly as before.
+#[tokio::test]
+async fn an_autopay_charge_on_an_eligible_account_still_credits() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let user_id = create_user(&pool, "withheld-eligible").await;
+    // A genuinely armed autopay user: the credit UPDATE now requires
+    // `autopay_enabled`, so the eligible path only fires for an opted-in account.
+    arm_autopay(&pool, user_id).await;
+    let payment_intent = format!("pi_test_{}", Uuid::new_v4().simple());
+    query(
+        r#"
+        INSERT INTO stripe_autopay_intents
+            (payment_intent_id, user_id, amount_usd, charge_amount_usd)
+        VALUES ($1, $2, 25, 26.38)
+        "#,
+    )
+    .bind(&payment_intent)
+    .bind(user_id)
+    .execute(&pool)
+    .await
+    .expect("pending autopay intent must insert");
+
+    let outcome = settle_autopay_intent(&pool, &payment_intent, None)
+        .await
+        .expect("settle must run");
+    assert_eq!(
+        outcome,
+        AutopayOutcome::Credited,
+        "an eligible account is credited"
+    );
+    assert_eq!(
+        balance(&pool, user_id).await.expect("balance must query"),
+        Decimal::from(25),
+        "the eligible account is credited the net top-up"
+    );
+    let status = query_scalar::<_, String>(
+        "SELECT status FROM stripe_autopay_intents WHERE payment_intent_id = $1",
+    )
+    .bind(&payment_intent)
+    .fetch_one(&pool)
+    .await
+    .expect("status must query");
+    assert_eq!(status, "succeeded", "the eligible charge settles succeeded");
+    assert!(
+        withheld_autopay_intents(&pool)
+            .await
+            .expect("withheld list must query")
+            .iter()
+            .all(|(intent, _, _)| intent != &payment_intent),
+        "an eligible settlement leaves nothing in the withheld list"
+    );
+    // Leave nothing armed and below-threshold for the global sweep suite.
+    disarm_autopay(&pool, user_id).await;
+}
+
+/// FIX 1 completeness (round 5) — an autopay OPT-OUT that commits before the
+/// terminal webhook is settled must be honored at settlement exactly like a
+/// freeze: the collected charge is WITHHELD (surfaced for refund), never
+/// credited. The credit UPDATE's `WHERE` now gates on `autopay_enabled`, so a
+/// disabled account matches ZERO rows and takes the `withheld` path. Without the
+/// flag in the predicate the opted-out account would be credited — this is the
+/// mutation-checked guard.
+#[tokio::test]
+async fn an_autopay_charge_on_an_account_opted_out_mid_charge_is_withheld_not_credited() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let user_id = create_user(&pool, "withheld-optout").await;
+    // The account was a fully-armed autopay user when the charge was claimed.
+    arm_autopay(&pool, user_id).await;
+    let payment_intent = format!("pi_test_{}", Uuid::new_v4().simple());
+
+    // A pending autopay claim whose charge succeeded at Stripe (gross 26.38 for a
+    // net 25 credit), awaiting its terminal webhook.
+    query(
+        r#"
+        INSERT INTO stripe_autopay_intents
+            (payment_intent_id, user_id, amount_usd, charge_amount_usd)
+        VALUES ($1, $2, 25, 26.38)
+        "#,
+    )
+    .bind(&payment_intent)
+    .bind(user_id)
+    .execute(&pool)
+    .await
+    .expect("pending autopay intent must insert");
+
+    // The user disables autopay during the charge's send window (the portal's
+    // off switch), and that opt-out commits before the terminal webhook settles.
+    query("UPDATE users SET autopay_enabled = FALSE WHERE id = $1")
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .expect("opt-out must commit");
+
+    let outcome = settle_autopay_intent(&pool, &payment_intent, None)
+        .await
+        .expect("settle must run");
+    assert_eq!(
+        outcome,
+        AutopayOutcome::Withheld,
+        "the charge on an opted-out account is withheld, not credited"
+    );
+    assert_eq!(
+        balance(&pool, user_id).await.expect("balance must query"),
+        Decimal::ZERO,
+        "the opted-out account is NOT credited"
+    );
+    let status = query_scalar::<_, String>(
+        "SELECT status FROM stripe_autopay_intents WHERE payment_intent_id = $1",
+    )
+    .bind(&payment_intent)
+    .fetch_one(&pool)
+    .await
+    .expect("status must query");
+    assert_eq!(
+        status, "withheld",
+        "the collected charge is recorded as needs-refund"
+    );
+    let autopay_rows = query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM credit_ledger WHERE user_id = $1 AND entry_type = 'autopay'",
+    )
+    .bind(user_id)
+    .fetch_one(&pool)
+    .await
+    .expect("ledger must query");
+    assert_eq!(autopay_rows, 0, "no autopay credit row is written");
+
+    // The withheld charge is surfaced for an out-of-band operator refund, with
+    // the GROSS Stripe collected as the amount to refund.
+    let withheld = withheld_autopay_intents(&pool)
+        .await
+        .expect("withheld list must query");
+    assert!(
+        withheld
+            .iter()
+            .any(|(intent, uid, gross)| intent == &payment_intent
+                && *uid == user_id
+                && *gross == Decimal::from_str("26.38").expect("gross parses")),
+        "the withheld charge is surfaced for refund with its gross amount"
+    );
+}
+
+/// FIX 1' (round 4), test rewritten in round 5 to actually distinguish the
+/// atomic conditional UPDATE from a separate `SELECT`-then-`UPDATE`.
+///
+/// The credit is a single `UPDATE users SET ... WHERE id = $1 AND (eligibility)`.
+/// To prove that predicate is re-evaluated AFTER a wait on the users-row lock —
+/// against the newly-committed row version (EvalPlanQual), not a snapshot taken
+/// earlier — this test makes the settlement's credit UPDATE itself BLOCK on the
+/// users row:
+///
+/// 1. A second connection opens a transaction and runs an UNCOMMITTED
+///    `UPDATE users SET frozen_at = NOW() ... WHERE id = $1`, taking (and
+///    holding) the row lock without committing.
+/// 2. Settlement runs; it claims the pending->succeeded transition and takes its
+///    locks, then its credit UPDATE blocks on that held row lock.
+/// 3. The freezing transaction COMMITS. The row is now frozen; the credit UPDATE
+///    unblocks and EvalPlanQual re-checks `(eligibility)` against the committed
+///    frozen row → ZERO rows → the credit is WITHHELD.
+///
+/// This is exactly the ordering the old implementation would get WRONG: a
+/// separate `SELECT (eligibility)` runs BEFORE the credit UPDATE and does NOT
+/// wait on the row lock — it reads the last-committed (still-eligible) version,
+/// concludes "eligible", and the following unconditional `UPDATE` (which DOES
+/// wait, then proceeds after the freeze commits) credits the frozen account. So
+/// this test PASSES for the folded conditional UPDATE and would FAIL for the
+/// separate-SELECT shape, which the round-4 intent-lock version could not tell
+/// apart. The intent-lock race test above is kept — it covers a different
+/// ordering (blocking before the credit statement is ever reached).
+#[tokio::test]
+async fn a_freeze_committing_while_the_credit_update_waits_on_the_row_lock_withholds() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let user_id = create_user(&pool, "withheld-intra-txn").await;
+    // Eligible-until-the-freeze: an armed autopay user whose only disqualifier is
+    // the freeze that commits while the credit UPDATE is waiting on its row lock.
+    arm_autopay(&pool, user_id).await;
+    let payment_intent = format!("pi_test_{}", Uuid::new_v4().simple());
+
+    // A pending autopay claim whose charge succeeded at Stripe (gross 26.38 for a
+    // net 25 credit), awaiting its terminal webhook.
+    query(
+        r#"
+        INSERT INTO stripe_autopay_intents
+            (payment_intent_id, user_id, amount_usd, charge_amount_usd)
+        VALUES ($1, $2, 25, 26.38)
+        "#,
+    )
+    .bind(&payment_intent)
+    .bind(user_id)
+    .execute(&pool)
+    .await
+    .expect("pending autopay intent must insert");
+
+    // A second connection holds an UNCOMMITTED freeze on the users row: it owns
+    // the row lock but has not committed, so the row is not yet frozen to any
+    // other reader. freeze_account takes no advisory lock, so settlement still
+    // acquires its per-user lock and runs all the way to the credit UPDATE, which
+    // is where it meets this row lock.
+    let mut freezer = pool.begin().await.expect("freezer tx");
+    query("UPDATE users SET frozen_at = NOW(), frozen_reason = 'dispute' WHERE id = $1")
+        .bind(user_id)
+        .execute(&mut *freezer)
+        .await
+        .expect("freezer holds the users-row lock, uncommitted");
+
+    let mut settle = tokio::spawn({
+        let pool = pool.clone();
+        let intent = payment_intent.clone();
+        async move { settle_autopay_intent(&pool, &intent, None).await }
+    });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(750), &mut settle)
+            .await
+            .is_err(),
+        "the credit UPDATE blocks on the users-row lock the uncommitted freeze holds"
+    );
+    assert_eq!(
+        balance(&pool, user_id).await.expect("balance must query"),
+        Decimal::ZERO,
+        "nothing is credited while the credit UPDATE waits on the row lock"
+    );
+
+    // Commit the freeze NOW, while the credit UPDATE is waiting on the row lock.
+    // The UPDATE unblocks and re-evaluates its WHERE against the freshly-committed
+    // frozen row (EvalPlanQual), matches zero rows, and withholds.
+    freezer
+        .commit()
+        .await
+        .expect("commit the freeze under the waiting UPDATE");
+    let outcome = settle
+        .await
+        .expect("settle task joins")
+        .expect("settle must run");
+
+    assert_eq!(
+        outcome,
+        AutopayOutcome::Withheld,
+        "a freeze committing while the credit UPDATE waits on the row lock withholds the credit"
+    );
+    assert_eq!(
+        balance(&pool, user_id).await.expect("balance must query"),
+        Decimal::ZERO,
+        "the frozen account is NOT credited"
+    );
+    let status = query_scalar::<_, String>(
+        "SELECT status FROM stripe_autopay_intents WHERE payment_intent_id = $1",
+    )
+    .bind(&payment_intent)
+    .fetch_one(&pool)
+    .await
+    .expect("status must query");
+    assert_eq!(
+        status, "withheld",
+        "the collected charge is marked needs-refund"
+    );
+    let autopay_rows = query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM credit_ledger WHERE user_id = $1 AND entry_type = 'autopay'",
+    )
+    .bind(user_id)
+    .fetch_one(&pool)
+    .await
+    .expect("ledger must query");
+    assert_eq!(autopay_rows, 0, "no autopay credit row is written");
+    let withheld = withheld_autopay_intents(&pool)
+        .await
+        .expect("withheld list must query");
+    assert!(
+        withheld
+            .iter()
+            .any(|(intent, uid, gross)| intent == &payment_intent
+                && *uid == user_id
+                && *gross == Decimal::from_str("26.38").expect("gross parses")),
+        "the withheld charge is surfaced for refund with its gross amount"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// FIX C (Medium): cumulative refunds keyed on the charge id must merge, and a
+// non-covering refund tombstone must not be marked "applied".
+// ---------------------------------------------------------------------------
+
+/// Two `charge.refunded` events for one charge carry the CUMULATIVE
+/// `amount_refunded` under the SAME charge id. A partial $4 followed by the full
+/// $10, both before the credit, must merge to the fuller $10 (not drop the
+/// second as a duplicate), so when the $10 credit lands it is reversed in full.
+#[tokio::test]
+async fn a_partial_then_full_cumulative_refund_before_the_credit_reverses_in_full() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let user_id = create_user(&pool, "cumulative-refund").await;
+    let session_id = format!("cs_test_{}", Uuid::new_v4().simple());
+    let payment_intent = format!("pi_test_{}", Uuid::new_v4().simple());
+    let charge_id = format!("ch_test_{}", Uuid::new_v4().simple());
+
+    // Partial $4 first, then the full cumulative $10 — same charge id.
+    let (status, _) = post_webhook(
+        &pool,
+        &refund_event(&charge_id, &payment_intent, 400, "usd"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        tombstone_reversed_cents(&pool, &charge_id).await,
+        Some(400),
+        "the first, partial refund is recorded"
+    );
+    let (status, _) = post_webhook(
+        &pool,
+        &refund_event(&charge_id, &payment_intent, 1_000, "usd"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        tombstone_reversed_cents(&pool, &charge_id).await,
+        Some(1_000),
+        "the later, fuller cumulative refund is merged in, not dropped"
+    );
+    assert_eq!(
+        observed_reversal(&pool, &charge_id).await,
+        Some(false),
+        "still one unapplied tombstone for the charge"
+    );
+
+    // The delayed $10 credit lands; the merged refund now covers it in full.
+    credit_purchase(
+        &pool,
+        user_id,
+        Decimal::from(10),
+        &session_id,
+        Some(payment_intent.as_str()),
+    )
+    .await
+    .expect("the delayed credit must apply");
+
+    assert_eq!(
+        balance(&pool, user_id).await.expect("balance must query"),
+        Decimal::ZERO,
+        "the fully-refunded credit is not spendable"
+    );
+    assert_eq!(
+        reversals(&pool, user_id).await,
+        vec![(Decimal::from(-10), Decimal::ZERO, charge_id.clone())],
+        "one reversal for the full merged amount"
+    );
+    assert_eq!(
+        observed_reversal(&pool, &charge_id).await,
+        Some(true),
+        "the covering tombstone is consumed"
+    );
+}
+
+/// A single partial refund that never grows to cover the credit must NOT be
+/// stamped applied when the credit lands: the credit stays in place (partial
+/// refunds reverse nothing, per policy) and the tombstone remains an
+/// operator-visible reconciliation flag a later cumulative refund can still
+/// merge into.
+#[tokio::test]
+async fn a_non_covering_refund_tombstone_stays_unapplied_after_the_credit() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let user_id = create_user(&pool, "partial-refund").await;
+    let session_id = format!("cs_test_{}", Uuid::new_v4().simple());
+    let payment_intent = format!("pi_test_{}", Uuid::new_v4().simple());
+    let charge_id = format!("ch_test_{}", Uuid::new_v4().simple());
+
+    // A $4 partial refund against a $10 credit — it does not cover.
+    let (status, _) = post_webhook(
+        &pool,
+        &refund_event(&charge_id, &payment_intent, 400, "usd"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    credit_purchase(
+        &pool,
+        user_id,
+        Decimal::from(10),
+        &session_id,
+        Some(payment_intent.as_str()),
+    )
+    .await
+    .expect("the delayed credit must apply");
+
+    assert_eq!(
+        balance(&pool, user_id).await.expect("balance must query"),
+        Decimal::from(10),
+        "a partial refund reverses nothing; the credit stands"
+    );
+    assert!(
+        reversals(&pool, user_id).await.is_empty(),
+        "no reversal ledger row for a non-covering refund"
+    );
+    assert_eq!(
+        observed_reversal(&pool, &charge_id).await,
+        Some(false),
+        "the non-covering tombstone stays UNAPPLIED — a reconciliation flag, not lost"
+    );
+}
+
+/// FIX 3 — a non-covering refund tombstone left unapplied after the credit must
+/// not linger forever as a false "unresolved money" signal. Once a later fuller
+/// refund reverses the intent through the normal credited path, the stale
+/// tombstone is stamped applied. Partial $4 before the credit; the $10 credit
+/// lands (tombstone stays unapplied); a full $10 cumulative refund after the
+/// credit reverses it exactly once, and the original tombstone ends applied.
+#[tokio::test]
+async fn a_stale_tombstone_is_stamped_applied_once_the_credited_path_reverses() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let user_id = create_user(&pool, "stale-tombstone").await;
+    let session_id = format!("cs_test_{}", Uuid::new_v4().simple());
+    let payment_intent = format!("pi_test_{}", Uuid::new_v4().simple());
+    let charge_id = format!("ch_test_{}", Uuid::new_v4().simple());
+
+    // Partial $4 refund before the credit — recorded, non-covering.
+    let (status, _) = post_webhook(
+        &pool,
+        &refund_event(&charge_id, &payment_intent, 400, "usd"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // The $10 credit lands; the partial tombstone stays unapplied (a flag), and
+    // a partial refund reverses nothing.
+    credit_purchase(
+        &pool,
+        user_id,
+        Decimal::from(10),
+        &session_id,
+        Some(payment_intent.as_str()),
+    )
+    .await
+    .expect("the delayed credit must apply");
+    assert_eq!(
+        observed_reversal(&pool, &charge_id).await,
+        Some(false),
+        "the non-covering tombstone is still unapplied after the credit"
+    );
+    assert_eq!(
+        balance(&pool, user_id).await.expect("balance must query"),
+        Decimal::from(10),
+        "a partial refund reversed nothing"
+    );
+
+    // A later full $10 cumulative refund (same charge id) arrives AFTER the
+    // credit; it takes the normal credited path, reverses in full, and stamps
+    // the once-stale tombstone applied.
+    let (status, _) = post_webhook(
+        &pool,
+        &refund_event(&charge_id, &payment_intent, 1_000, "usd"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        balance(&pool, user_id).await.expect("balance must query"),
+        Decimal::ZERO,
+        "the full refund reverses the credit"
+    );
+    assert_eq!(
+        reversals(&pool, user_id).await,
+        vec![(Decimal::from(-10), Decimal::ZERO, charge_id.clone())],
+        "the reversal happened exactly once"
+    );
+    assert_eq!(
+        observed_reversal(&pool, &charge_id).await,
+        Some(true),
+        "the once-stale tombstone is now stamped applied"
+    );
+}
+
+/// FIX 2' (round 4) — the stale tombstone is stamped only AFTER the reversal
+/// actually lands, not prematurely inside `resolve_reversal_against_credit`. Here
+/// a covering refund arrives after the credit, but its `reverse_purchase` step
+/// FAILS (its 5s user-lock wait times out, held by a gate). The webhook 503s and
+/// NOTHING is reversed, so the tombstone must stay `applied_at IS NULL` — still
+/// surfaced for reconciliation — rather than falsely claiming the reversal was
+/// applied. (Round 3 stamped on the found lookup, before this failure, and would
+/// mark it applied here.) The successful-stamp half is covered by
+/// `a_stale_tombstone_is_stamped_applied_once_the_credited_path_reverses` above.
+#[tokio::test]
+async fn a_covering_refund_whose_reversal_fails_leaves_the_tombstone_unapplied() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let user_id = create_user(&pool, "reversal-fails").await;
+    let session_id = format!("cs_test_{}", Uuid::new_v4().simple());
+    let payment_intent = format!("pi_test_{}", Uuid::new_v4().simple());
+    let charge_id = format!("ch_test_{}", Uuid::new_v4().simple());
+
+    // A $4 partial refund before the credit — recorded, non-covering, unapplied.
+    let (status, _) = post_webhook(
+        &pool,
+        &refund_event(&charge_id, &payment_intent, 400, "usd"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // The $10 credit lands; the partial tombstone stays unapplied.
+    credit_purchase(
+        &pool,
+        user_id,
+        Decimal::from(10),
+        &session_id,
+        Some(payment_intent.as_str()),
+    )
+    .await
+    .expect("the delayed credit must apply");
+    assert_eq!(
+        observed_reversal(&pool, &charge_id).await,
+        Some(false),
+        "the non-covering tombstone is unapplied after the credit"
+    );
+
+    // Hold the per-user advisory lock (salt 0) so the covering refund's
+    // `reverse_purchase` cannot take it and times out after its 5s wait — the
+    // reversal FAILS. `resolve_reversal_against_credit` takes only the intent lock
+    // (salt 1), so the found lookup still runs; only `reverse_purchase` blocks.
+    let mut gate = pool.begin().await.expect("gate tx");
+    query("SELECT pg_advisory_xact_lock(hashtextextended($1::TEXT, 0))")
+        .bind(user_id.to_string())
+        .execute(&mut *gate)
+        .await
+        .expect("gate holds the user lock");
+
+    // A full $10 cumulative refund arrives AFTER the credit. It covers, so the
+    // handler runs `reverse_purchase`, which blocks on the held user lock and
+    // times out; the webhook 503s.
+    let (status, _) = post_webhook(
+        &pool,
+        &refund_event(&charge_id, &payment_intent, 1_000, "usd"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "a failed reversal makes the webhook ask Stripe to retry"
+    );
+
+    gate.commit().await.expect("release the user lock");
+
+    assert_eq!(
+        balance(&pool, user_id).await.expect("balance must query"),
+        Decimal::from(10),
+        "the failed reversal moved no money; the credit still stands"
+    );
+    assert!(
+        reversals(&pool, user_id).await.is_empty(),
+        "no reversal ledger row for a failed reversal"
+    );
+    assert_eq!(
+        observed_reversal(&pool, &charge_id).await,
+        Some(false),
+        "a FAILED reversal leaves the tombstone UNAPPLIED — still surfaced, not falsely cleared"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// FIX 4 (Low): an object-id reuse whose anchors disagree is refused, not merged.
+// ---------------------------------------------------------------------------
+
+/// A reused Stripe object id carrying a DIFFERENT payment intent must not merge
+/// its amount into the original tombstone. The `ON CONFLICT ... DO UPDATE WHERE`
+/// now enforces anchor equality, so the mismatch is logged and refused and the
+/// original `reversed_cents` is left untouched — a larger conflicting amount
+/// cannot raise this intent's coverage.
+#[tokio::test]
+async fn an_object_id_reuse_with_a_different_intent_does_not_merge_its_amount() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let charge_id = format!("ch_test_{}", Uuid::new_v4().simple());
+    let intent_a = format!("pi_test_{}", Uuid::new_v4().simple());
+    let intent_b = format!("pi_test_{}", Uuid::new_v4().simple());
+
+    // A $4 refund tombstone for intent A (uncredited, so it is recorded).
+    let (status, _) = post_webhook(&pool, &refund_event(&charge_id, &intent_a, 400, "usd")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(tombstone_reversed_cents(&pool, &charge_id).await, Some(400));
+
+    // The SAME charge id reused with a DIFFERENT intent and a larger $10 amount.
+    // The anchor mismatch is acknowledged (HTTP 200) but the amount is refused.
+    let (status, _) = post_webhook(&pool, &refund_event(&charge_id, &intent_b, 1_000, "usd")).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the mismatch is acknowledged, not errored"
+    );
+    assert_eq!(
+        tombstone_reversed_cents(&pool, &charge_id).await,
+        Some(400),
+        "the mismatched amount is refused, not merged"
+    );
+    let anchored_intent = query_scalar::<_, String>(
+        "SELECT payment_intent_id FROM stripe_observed_reversals WHERE object_id = $1",
+    )
+    .bind(&charge_id)
+    .fetch_one(&pool)
+    .await
+    .expect("anchor must query");
+    assert_eq!(
+        anchored_intent, intent_a,
+        "the original intent anchor is unchanged"
     );
 }
 
