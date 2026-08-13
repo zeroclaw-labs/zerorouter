@@ -1244,6 +1244,122 @@ async fn an_autopay_charge_on_an_eligible_account_still_credits() {
     );
 }
 
+/// FIX 1' (round 4) — the intra-transaction freeze race the pre-freeze test
+/// above cannot exercise. Here the freeze commits AFTER settlement has begun its
+/// transaction, claimed the pending->succeeded transition, and taken the per-user
+/// advisory lock — but BEFORE the credit lands. A separate `SELECT (eligibility)`
+/// then unconditional credit `UPDATE` would credit the account (the freeze is
+/// invisible to a check that already ran); the folded conditional `UPDATE ...
+/// WHERE id = $1 AND (eligibility)` re-evaluates the predicate against the
+/// freshly-committed freeze (EvalPlanQual) and matches ZERO rows, so the credit is
+/// withheld. Driven deterministically by holding the intent lock so settlement
+/// blocks mid-transaction, then committing the freeze on a separate connection
+/// before releasing it — mirroring the intent-lock race tests above.
+#[tokio::test]
+async fn a_freeze_committing_inside_the_settlement_window_withholds_the_credit() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let user_id = create_user(&pool, "withheld-intra-txn").await;
+    let payment_intent = format!("pi_test_{}", Uuid::new_v4().simple());
+
+    // A pending autopay claim whose charge succeeded at Stripe (gross 26.38 for a
+    // net 25 credit), awaiting its terminal webhook.
+    query(
+        r#"
+        INSERT INTO stripe_autopay_intents
+            (payment_intent_id, user_id, amount_usd, charge_amount_usd)
+        VALUES ($1, $2, 25, 26.38)
+        "#,
+    )
+    .bind(&payment_intent)
+    .bind(user_id)
+    .execute(&pool)
+    .await
+    .expect("pending autopay intent must insert");
+
+    // A gate holds the intent lock, so settlement blocks AFTER it has begun its
+    // transaction, claimed the pending->succeeded transition, and taken the
+    // per-user advisory lock — exactly the point past which a naive same-snapshot
+    // check has already read "eligible".
+    let mut gate = pool.begin().await.expect("gate tx");
+    query("SELECT pg_advisory_xact_lock(hashtextextended($1::TEXT, 1))")
+        .bind(&payment_intent)
+        .execute(&mut *gate)
+        .await
+        .expect("gate holds the intent lock");
+
+    let mut settle = tokio::spawn({
+        let pool = pool.clone();
+        let intent = payment_intent.clone();
+        async move { settle_autopay_intent(&pool, &intent, None).await }
+    });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(750), &mut settle)
+            .await
+            .is_err(),
+        "settlement blocks on the intent lock the gate holds, mid-transaction"
+    );
+
+    // The freeze commits NOW, inside the settlement window: on a separate
+    // connection, and freeze_account takes no advisory lock, so it commits
+    // straight through even while the gate holds the intent lock and settlement
+    // holds the user lock.
+    freeze_account(&pool, user_id, FreezeReason::Dispute)
+        .await
+        .expect("the freeze commits inside the settlement window");
+
+    // Release the intent lock; settlement proceeds to the folded conditional
+    // credit UPDATE, which re-evaluates eligibility against the freshly-committed
+    // freeze and withholds.
+    gate.commit().await.expect("release the intent lock");
+    let outcome = settle
+        .await
+        .expect("settle task joins")
+        .expect("settle must run");
+
+    assert_eq!(
+        outcome,
+        AutopayOutcome::Withheld,
+        "a freeze that commits inside the settlement window withholds the credit"
+    );
+    assert_eq!(
+        balance(&pool, user_id).await.expect("balance must query"),
+        Decimal::ZERO,
+        "the frozen account is NOT credited"
+    );
+    let status = query_scalar::<_, String>(
+        "SELECT status FROM stripe_autopay_intents WHERE payment_intent_id = $1",
+    )
+    .bind(&payment_intent)
+    .fetch_one(&pool)
+    .await
+    .expect("status must query");
+    assert_eq!(
+        status, "withheld",
+        "the collected charge is marked needs-refund"
+    );
+    let autopay_rows = query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM credit_ledger WHERE user_id = $1 AND entry_type = 'autopay'",
+    )
+    .bind(user_id)
+    .fetch_one(&pool)
+    .await
+    .expect("ledger must query");
+    assert_eq!(autopay_rows, 0, "no autopay credit row is written");
+    let withheld = withheld_autopay_intents(&pool)
+        .await
+        .expect("withheld list must query");
+    assert!(
+        withheld
+            .iter()
+            .any(|(intent, uid, gross)| intent == &payment_intent
+                && *uid == user_id
+                && *gross == Decimal::from_str("26.38").expect("gross parses")),
+        "the withheld charge is surfaced for refund with its gross amount"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // FIX C (Medium): cumulative refunds keyed on the charge id must merge, and a
 // non-covering refund tombstone must not be marked "applied".
@@ -1438,6 +1554,92 @@ async fn a_stale_tombstone_is_stamped_applied_once_the_credited_path_reverses() 
         observed_reversal(&pool, &charge_id).await,
         Some(true),
         "the once-stale tombstone is now stamped applied"
+    );
+}
+
+/// FIX 2' (round 4) — the stale tombstone is stamped only AFTER the reversal
+/// actually lands, not prematurely inside `resolve_reversal_against_credit`. Here
+/// a covering refund arrives after the credit, but its `reverse_purchase` step
+/// FAILS (its 5s user-lock wait times out, held by a gate). The webhook 503s and
+/// NOTHING is reversed, so the tombstone must stay `applied_at IS NULL` — still
+/// surfaced for reconciliation — rather than falsely claiming the reversal was
+/// applied. (Round 3 stamped on the found lookup, before this failure, and would
+/// mark it applied here.) The successful-stamp half is covered by
+/// `a_stale_tombstone_is_stamped_applied_once_the_credited_path_reverses` above.
+#[tokio::test]
+async fn a_covering_refund_whose_reversal_fails_leaves_the_tombstone_unapplied() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let user_id = create_user(&pool, "reversal-fails").await;
+    let session_id = format!("cs_test_{}", Uuid::new_v4().simple());
+    let payment_intent = format!("pi_test_{}", Uuid::new_v4().simple());
+    let charge_id = format!("ch_test_{}", Uuid::new_v4().simple());
+
+    // A $4 partial refund before the credit — recorded, non-covering, unapplied.
+    let (status, _) = post_webhook(
+        &pool,
+        &refund_event(&charge_id, &payment_intent, 400, "usd"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // The $10 credit lands; the partial tombstone stays unapplied.
+    credit_purchase(
+        &pool,
+        user_id,
+        Decimal::from(10),
+        &session_id,
+        Some(payment_intent.as_str()),
+    )
+    .await
+    .expect("the delayed credit must apply");
+    assert_eq!(
+        observed_reversal(&pool, &charge_id).await,
+        Some(false),
+        "the non-covering tombstone is unapplied after the credit"
+    );
+
+    // Hold the per-user advisory lock (salt 0) so the covering refund's
+    // `reverse_purchase` cannot take it and times out after its 5s wait — the
+    // reversal FAILS. `resolve_reversal_against_credit` takes only the intent lock
+    // (salt 1), so the found lookup still runs; only `reverse_purchase` blocks.
+    let mut gate = pool.begin().await.expect("gate tx");
+    query("SELECT pg_advisory_xact_lock(hashtextextended($1::TEXT, 0))")
+        .bind(user_id.to_string())
+        .execute(&mut *gate)
+        .await
+        .expect("gate holds the user lock");
+
+    // A full $10 cumulative refund arrives AFTER the credit. It covers, so the
+    // handler runs `reverse_purchase`, which blocks on the held user lock and
+    // times out; the webhook 503s.
+    let (status, _) = post_webhook(
+        &pool,
+        &refund_event(&charge_id, &payment_intent, 1_000, "usd"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "a failed reversal makes the webhook ask Stripe to retry"
+    );
+
+    gate.commit().await.expect("release the user lock");
+
+    assert_eq!(
+        balance(&pool, user_id).await.expect("balance must query"),
+        Decimal::from(10),
+        "the failed reversal moved no money; the credit still stands"
+    );
+    assert!(
+        reversals(&pool, user_id).await.is_empty(),
+        "no reversal ledger row for a failed reversal"
+    );
+    assert_eq!(
+        observed_reversal(&pool, &charge_id).await,
+        Some(false),
+        "a FAILED reversal leaves the tombstone UNAPPLIED — still surfaced, not falsely cleared"
     );
 }
 

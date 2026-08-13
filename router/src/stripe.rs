@@ -1118,6 +1118,13 @@ async fn handle_reversal_event(
             );
             StripeHttpError::DatabaseUnavailable
         })?;
+    // FIX 2' (round 4): did the reversal actually land? Only then may we discharge
+    // a stale tombstone (below). `matches!` reads `outcome` without moving it, so
+    // the `match` that logs it still owns it.
+    let reversal_landed = matches!(
+        outcome,
+        billing::ReversalOutcome::Reversed { .. } | billing::ReversalOutcome::AlreadyReversed
+    );
     match outcome {
         billing::ReversalOutcome::Reversed {
             amount_usd,
@@ -1144,6 +1151,24 @@ async fn handle_reversal_event(
             payment_intent = %payment_intent,
             "stripe reversal found no credit for an intent that had one moments earlier"
         ),
+    }
+    // FIX 2' (round 4): the reversal has now actually landed (and, for a dispute,
+    // the freeze above committed), so it is finally safe to stamp any stale
+    // non-covering tombstone for this intent applied. This runs ONLY on a
+    // successful reversal — a `reverse_purchase` that failed returned early via
+    // `?` above and never reaches here, so its tombstone stays unapplied and
+    // operator-visible. Stamping is per-intent idempotent and moves no money.
+    if reversal_landed {
+        billing::mark_intent_reversals_applied(&ctx.pool, payment_intent)
+            .await
+            .map_err(|error| {
+                tracing::warn!(
+                    stripe_object_id = %object_id,
+                    %error,
+                    "stripe reversal applied but stamping its stale tombstone failed; stripe will retry"
+                );
+                StripeHttpError::DatabaseUnavailable
+            })?;
     }
     Ok(received())
 }
