@@ -1017,6 +1017,97 @@ input {
   font-size: 0.85rem;
 }
 
+/* ── landing footer links ────────────────────────────────────────────── */
+
+.landing-foot {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 20px;
+  font-size: 13px;
+}
+
+.landing-foot a {
+  color: var(--muted);
+}
+
+.landing-foot a:hover {
+  color: var(--text);
+}
+
+.landing-foot-sep {
+  color: var(--faint);
+}
+
+/* ── legal pages (/terms, /privacy) ──────────────────────────────────── */
+
+.legal {
+  max-width: 46rem;
+  margin: 0 auto;
+  padding: 8px 0 24px;
+  line-height: 1.7;
+}
+
+.legal h1 {
+  font-size: 24px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  margin-top: 8px;
+}
+
+.legal h2 {
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  margin-top: 32px;
+  margin-bottom: 8px;
+  color: var(--text);
+}
+
+.legal p {
+  margin-top: 12px;
+  color: var(--text);
+}
+
+.legal ul {
+  margin: 12px 0 0;
+  padding-left: 1.25rem;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  color: var(--text);
+}
+
+.legal li {
+  padding-left: 4px;
+}
+
+.legal a {
+  color: var(--accent);
+}
+
+.legal .legal-meta {
+  color: var(--faint);
+  font-family: var(--mono);
+  font-size: 12px;
+  margin-top: 6px;
+}
+
+.legal .legal-draft {
+  border: 1px solid var(--border);
+  border-left: 2px solid var(--accent);
+  background: var(--accent-soft);
+  border-radius: 6px;
+  padding: 12px 16px;
+  margin-bottom: 20px;
+  font-size: 12.5px;
+  color: var(--muted);
+}
+
+.legal .legal-draft strong {
+  color: var(--accent);
+}
+
 @media (prefers-reduced-motion: reduce) {
   * {
     animation: none !important;

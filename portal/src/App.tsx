@@ -10,6 +10,8 @@ import { Credits } from './pages/Credits'
 import { Keys } from './pages/Keys'
 import { Models } from './pages/Models'
 import { Overview } from './pages/Overview'
+import { Privacy } from './pages/Privacy'
+import { Terms } from './pages/Terms'
 
 export function App() {
   return (
@@ -115,6 +117,21 @@ function Shell() {
     if (location.pathname.startsWith('/activate')) return <SignedOutActivate />
     // The catalog is a storefront: viewable before signing in.
     if (location.pathname.startsWith('/models')) return <PublicModels />
+    // Legal pages are public: readable without an account.
+    if (location.pathname.startsWith('/terms')) {
+      return (
+        <PublicLegal>
+          <Terms />
+        </PublicLegal>
+      )
+    }
+    if (location.pathname.startsWith('/privacy')) {
+      return (
+        <PublicLegal>
+          <Privacy />
+        </PublicLegal>
+      )
+    }
     return <Landing reason={auth.reason} />
   }
   return <SignedInLayout user={auth.user} />
@@ -131,6 +148,8 @@ function SignedInLayout({ user }: { user: Me }) {
           <Route path="/credits" element={<Credits />} />
           <Route path="/keys" element={<Keys />} />
           <Route path="/activate" element={<Activate />} />
+          <Route path="/terms" element={<Terms />} />
+          <Route path="/privacy" element={<Privacy />} />
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>
       </main>
@@ -187,14 +206,23 @@ function Landing({ reason }: { reason?: string }) {
     <div className="landing">
       <div className="landing-inner">
         <Wordmark large />
-        <p className="landing-tag">Prepaid inference gateway</p>
+        <p className="landing-tag">The LLM router with Zero Data Retention — always.</p>
         <p className="landing-sub">
-          One balance, one key namespace, three tiers. Sign in to manage credits, API keys, and usage.
+          ZeroRouter is structurally incapable of reading, logging, or training on your prompts and
+          completions — content-free by design, and open source so anyone can verify it. Prepaid
+          access to every major model, one balance, one key.
         </p>
         {reason && <Banner kind="error">{reason}</Banner>}
         <a className="btn btn-primary btn-lg" href="/auth/login">
           Sign in with SSO
         </a>
+        <nav className="landing-foot" aria-label="Legal">
+          <a href="/terms">Terms</a>
+          <span className="landing-foot-sep" aria-hidden="true">
+            ·
+          </span>
+          <a href="/privacy">Privacy</a>
+        </nav>
       </div>
     </div>
   )
@@ -214,6 +242,22 @@ function PublicModels() {
       <main className="main">
         <Models />
       </main>
+    </div>
+  )
+}
+
+// Legal pages before sign-in: the same slim top bar as the public catalog,
+// then the requested legal page.
+function PublicLegal({ children }: { children: ReactNode }) {
+  return (
+    <div className="public">
+      <header className="public-top">
+        <Wordmark />
+        <a className="btn btn-primary btn-sm" href="/auth/login">
+          Sign in
+        </a>
+      </header>
+      <main className="main">{children}</main>
     </div>
   )
 }
