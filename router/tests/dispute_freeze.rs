@@ -1005,6 +1005,10 @@ async fn an_autopay_settle_blocks_on_the_intent_lock_a_racing_reversal_holds_the
         return;
     };
     let user_id = create_user(&pool, "race-autopay-settle").await;
+    // The settlement credit UPDATE now gates on `autopay_enabled` too, so the
+    // account must be a genuinely armed autopay user for the credit path to run;
+    // the sole disqualifier under test here is the racing reversal, not opt-out.
+    arm_autopay(&pool, user_id).await;
     let payment_intent = format!("pi_test_{}", Uuid::new_v4().simple());
     let dispute_id = format!("dp_test_{}", Uuid::new_v4().simple());
 
@@ -1100,6 +1104,9 @@ async fn an_autopay_charge_on_an_account_frozen_mid_charge_is_withheld_not_credi
         return;
     };
     let user_id = create_user(&pool, "withheld-frozen").await;
+    // Armed autopay user, so the ONLY reason the settlement withholds is the
+    // freeze — not the `autopay_enabled` gate the credit UPDATE now also applies.
+    arm_autopay(&pool, user_id).await;
     let payment_intent = format!("pi_test_{}", Uuid::new_v4().simple());
 
     // A pending autopay claim whose charge succeeded at Stripe, awaiting its
@@ -1199,6 +1206,9 @@ async fn an_autopay_charge_on_an_eligible_account_still_credits() {
         return;
     };
     let user_id = create_user(&pool, "withheld-eligible").await;
+    // A genuinely armed autopay user: the credit UPDATE now requires
+    // `autopay_enabled`, so the eligible path only fires for an opted-in account.
+    arm_autopay(&pool, user_id).await;
     let payment_intent = format!("pi_test_{}", Uuid::new_v4().simple());
     query(
         r#"
@@ -1242,25 +1252,25 @@ async fn an_autopay_charge_on_an_eligible_account_still_credits() {
             .all(|(intent, _, _)| intent != &payment_intent),
         "an eligible settlement leaves nothing in the withheld list"
     );
+    // Leave nothing armed and below-threshold for the global sweep suite.
+    disarm_autopay(&pool, user_id).await;
 }
 
-/// FIX 1' (round 4) — the intra-transaction freeze race the pre-freeze test
-/// above cannot exercise. Here the freeze commits AFTER settlement has begun its
-/// transaction, claimed the pending->succeeded transition, and taken the per-user
-/// advisory lock — but BEFORE the credit lands. A separate `SELECT (eligibility)`
-/// then unconditional credit `UPDATE` would credit the account (the freeze is
-/// invisible to a check that already ran); the folded conditional `UPDATE ...
-/// WHERE id = $1 AND (eligibility)` re-evaluates the predicate against the
-/// freshly-committed freeze (EvalPlanQual) and matches ZERO rows, so the credit is
-/// withheld. Driven deterministically by holding the intent lock so settlement
-/// blocks mid-transaction, then committing the freeze on a separate connection
-/// before releasing it — mirroring the intent-lock race tests above.
+/// FIX 1 completeness (round 5) — an autopay OPT-OUT that commits before the
+/// terminal webhook is settled must be honored at settlement exactly like a
+/// freeze: the collected charge is WITHHELD (surfaced for refund), never
+/// credited. The credit UPDATE's `WHERE` now gates on `autopay_enabled`, so a
+/// disabled account matches ZERO rows and takes the `withheld` path. Without the
+/// flag in the predicate the opted-out account would be credited — this is the
+/// mutation-checked guard.
 #[tokio::test]
-async fn a_freeze_committing_inside_the_settlement_window_withholds_the_credit() {
+async fn an_autopay_charge_on_an_account_opted_out_mid_charge_is_withheld_not_credited() {
     let Some(pool) = connect().await else {
         return;
     };
-    let user_id = create_user(&pool, "withheld-intra-txn").await;
+    let user_id = create_user(&pool, "withheld-optout").await;
+    // The account was a fully-armed autopay user when the charge was claimed.
+    arm_autopay(&pool, user_id).await;
     let payment_intent = format!("pi_test_{}", Uuid::new_v4().simple());
 
     // A pending autopay claim whose charge succeeded at Stripe (gross 26.38 for a
@@ -1278,16 +1288,126 @@ async fn a_freeze_committing_inside_the_settlement_window_withholds_the_credit()
     .await
     .expect("pending autopay intent must insert");
 
-    // A gate holds the intent lock, so settlement blocks AFTER it has begun its
-    // transaction, claimed the pending->succeeded transition, and taken the
-    // per-user advisory lock — exactly the point past which a naive same-snapshot
-    // check has already read "eligible".
-    let mut gate = pool.begin().await.expect("gate tx");
-    query("SELECT pg_advisory_xact_lock(hashtextextended($1::TEXT, 1))")
-        .bind(&payment_intent)
-        .execute(&mut *gate)
+    // The user disables autopay during the charge's send window (the portal's
+    // off switch), and that opt-out commits before the terminal webhook settles.
+    query("UPDATE users SET autopay_enabled = FALSE WHERE id = $1")
+        .bind(user_id)
+        .execute(&pool)
         .await
-        .expect("gate holds the intent lock");
+        .expect("opt-out must commit");
+
+    let outcome = settle_autopay_intent(&pool, &payment_intent, None)
+        .await
+        .expect("settle must run");
+    assert_eq!(
+        outcome,
+        AutopayOutcome::Withheld,
+        "the charge on an opted-out account is withheld, not credited"
+    );
+    assert_eq!(
+        balance(&pool, user_id).await.expect("balance must query"),
+        Decimal::ZERO,
+        "the opted-out account is NOT credited"
+    );
+    let status = query_scalar::<_, String>(
+        "SELECT status FROM stripe_autopay_intents WHERE payment_intent_id = $1",
+    )
+    .bind(&payment_intent)
+    .fetch_one(&pool)
+    .await
+    .expect("status must query");
+    assert_eq!(
+        status, "withheld",
+        "the collected charge is recorded as needs-refund"
+    );
+    let autopay_rows = query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM credit_ledger WHERE user_id = $1 AND entry_type = 'autopay'",
+    )
+    .bind(user_id)
+    .fetch_one(&pool)
+    .await
+    .expect("ledger must query");
+    assert_eq!(autopay_rows, 0, "no autopay credit row is written");
+
+    // The withheld charge is surfaced for an out-of-band operator refund, with
+    // the GROSS Stripe collected as the amount to refund.
+    let withheld = withheld_autopay_intents(&pool)
+        .await
+        .expect("withheld list must query");
+    assert!(
+        withheld
+            .iter()
+            .any(|(intent, uid, gross)| intent == &payment_intent
+                && *uid == user_id
+                && *gross == Decimal::from_str("26.38").expect("gross parses")),
+        "the withheld charge is surfaced for refund with its gross amount"
+    );
+}
+
+/// FIX 1' (round 4), test rewritten in round 5 to actually distinguish the
+/// atomic conditional UPDATE from a separate `SELECT`-then-`UPDATE`.
+///
+/// The credit is a single `UPDATE users SET ... WHERE id = $1 AND (eligibility)`.
+/// To prove that predicate is re-evaluated AFTER a wait on the users-row lock —
+/// against the newly-committed row version (EvalPlanQual), not a snapshot taken
+/// earlier — this test makes the settlement's credit UPDATE itself BLOCK on the
+/// users row:
+///
+/// 1. A second connection opens a transaction and runs an UNCOMMITTED
+///    `UPDATE users SET frozen_at = NOW() ... WHERE id = $1`, taking (and
+///    holding) the row lock without committing.
+/// 2. Settlement runs; it claims the pending->succeeded transition and takes its
+///    locks, then its credit UPDATE blocks on that held row lock.
+/// 3. The freezing transaction COMMITS. The row is now frozen; the credit UPDATE
+///    unblocks and EvalPlanQual re-checks `(eligibility)` against the committed
+///    frozen row → ZERO rows → the credit is WITHHELD.
+///
+/// This is exactly the ordering the old implementation would get WRONG: a
+/// separate `SELECT (eligibility)` runs BEFORE the credit UPDATE and does NOT
+/// wait on the row lock — it reads the last-committed (still-eligible) version,
+/// concludes "eligible", and the following unconditional `UPDATE` (which DOES
+/// wait, then proceeds after the freeze commits) credits the frozen account. So
+/// this test PASSES for the folded conditional UPDATE and would FAIL for the
+/// separate-SELECT shape, which the round-4 intent-lock version could not tell
+/// apart. The intent-lock race test above is kept — it covers a different
+/// ordering (blocking before the credit statement is ever reached).
+#[tokio::test]
+async fn a_freeze_committing_while_the_credit_update_waits_on_the_row_lock_withholds() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let user_id = create_user(&pool, "withheld-intra-txn").await;
+    // Eligible-until-the-freeze: an armed autopay user whose only disqualifier is
+    // the freeze that commits while the credit UPDATE is waiting on its row lock.
+    arm_autopay(&pool, user_id).await;
+    let payment_intent = format!("pi_test_{}", Uuid::new_v4().simple());
+
+    // A pending autopay claim whose charge succeeded at Stripe (gross 26.38 for a
+    // net 25 credit), awaiting its terminal webhook.
+    query(
+        r#"
+        INSERT INTO stripe_autopay_intents
+            (payment_intent_id, user_id, amount_usd, charge_amount_usd)
+        VALUES ($1, $2, 25, 26.38)
+        "#,
+    )
+    .bind(&payment_intent)
+    .bind(user_id)
+    .execute(&pool)
+    .await
+    .expect("pending autopay intent must insert");
+
+    // A second connection holds an UNCOMMITTED freeze on the users row: it owns
+    // the row lock but has not committed, so the row is not yet frozen to any
+    // other reader. freeze_account takes no advisory lock, so settlement still
+    // acquires its per-user lock and runs all the way to the credit UPDATE, which
+    // is where it meets this row lock.
+    let mut freezer = pool.begin().await.expect("freezer tx");
+    query("UPDATE users SET frozen_at = NOW(), frozen_reason = 'dispute' WHERE id = $1")
+        .bind(user_id)
+        .execute(&mut *freezer)
+        .await
+        .expect("freezer holds the users-row lock, uncommitted");
 
     let mut settle = tokio::spawn({
         let pool = pool.clone();
@@ -1298,21 +1418,21 @@ async fn a_freeze_committing_inside_the_settlement_window_withholds_the_credit()
         tokio::time::timeout(Duration::from_millis(750), &mut settle)
             .await
             .is_err(),
-        "settlement blocks on the intent lock the gate holds, mid-transaction"
+        "the credit UPDATE blocks on the users-row lock the uncommitted freeze holds"
+    );
+    assert_eq!(
+        balance(&pool, user_id).await.expect("balance must query"),
+        Decimal::ZERO,
+        "nothing is credited while the credit UPDATE waits on the row lock"
     );
 
-    // The freeze commits NOW, inside the settlement window: on a separate
-    // connection, and freeze_account takes no advisory lock, so it commits
-    // straight through even while the gate holds the intent lock and settlement
-    // holds the user lock.
-    freeze_account(&pool, user_id, FreezeReason::Dispute)
+    // Commit the freeze NOW, while the credit UPDATE is waiting on the row lock.
+    // The UPDATE unblocks and re-evaluates its WHERE against the freshly-committed
+    // frozen row (EvalPlanQual), matches zero rows, and withholds.
+    freezer
+        .commit()
         .await
-        .expect("the freeze commits inside the settlement window");
-
-    // Release the intent lock; settlement proceeds to the folded conditional
-    // credit UPDATE, which re-evaluates eligibility against the freshly-committed
-    // freeze and withholds.
-    gate.commit().await.expect("release the intent lock");
+        .expect("commit the freeze under the waiting UPDATE");
     let outcome = settle
         .await
         .expect("settle task joins")
@@ -1321,7 +1441,7 @@ async fn a_freeze_committing_inside_the_settlement_window_withholds_the_credit()
     assert_eq!(
         outcome,
         AutopayOutcome::Withheld,
-        "a freeze that commits inside the settlement window withholds the credit"
+        "a freeze committing while the credit UPDATE waits on the row lock withholds the credit"
     );
     assert_eq!(
         balance(&pool, user_id).await.expect("balance must query"),

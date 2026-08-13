@@ -2034,7 +2034,10 @@ async fn replay_charge(
     // autopay_candidates nor claim_autopay_attempt re-runs at this instant.
     // Off-session charging the saved card of a customer who just disputed is
     // the exact catastrophe migration 0009 exists to prevent, so re-assert the
-    // shared eligibility predicate here.
+    // shared eligibility predicate here — AND `autopay_enabled`, so an opt-out
+    // that commits in this same window (the portal's off switch) refuses the
+    // charge too, not just a freeze / receivable. This is the same
+    // `autopay_enabled AND (…)` gate the claim and still-armed checks apply.
     //
     // A residual window remains between this SELECT and the `.send()` below — an
     // inherent local-check-vs-external-side-effect gap. It is NOT closed by
@@ -2051,7 +2054,7 @@ async fn replay_charge(
     // frozen / indebted account is therefore never CREDITED by autopay, even in
     // the rare case its card was charged in this race.
     let eligible = sqlx::query_scalar::<_, bool>(&format!(
-        "SELECT ({}) FROM users WHERE id = $1",
+        "SELECT (autopay_enabled AND ({})) FROM users WHERE id = $1",
         billing::AUTOPAY_ELIGIBILITY_PREDICATE
     ))
     .bind(user_id)

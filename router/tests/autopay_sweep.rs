@@ -513,6 +513,8 @@ enum Race {
     Freeze,
     /// The reversal drives the balance into a receivable.
     GoNegative,
+    /// The user disables autopay (the portal's off switch) after the claim.
+    Disable,
 }
 
 /// Mock Stripe whose payment-methods lookup — the round-trip the sweep makes
@@ -565,6 +567,13 @@ fn race_mock(pool: PgPool, user_id: Uuid, race: Race) -> (Router, Arc<AtomicUsiz
                             .await
                             .expect("mid-sweep reversal must apply");
                         tx.commit().await.expect("commit");
+                    }
+                    Race::Disable => {
+                        query("UPDATE users SET autopay_enabled = FALSE WHERE id = $1")
+                            .bind(state.user_id)
+                            .execute(&state.pool)
+                            .await
+                            .expect("mid-sweep opt-out must apply");
                     }
                 }
                 axum::Json(json!({"data": [{"id": "pm_test_card"}]}))
@@ -711,6 +720,67 @@ async fn a_fresh_claim_that_goes_indebted_pre_post_is_held() {
             .expect("failure count must query");
     assert_eq!(failures, 0, "holding the claim is not a strike");
 
+    query("UPDATE users SET autopay_enabled = FALSE WHERE id = $1")
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .expect("teardown disarm");
+}
+
+/// FIX 1 completeness (round 5) — an OPT-OUT in the same pre-POST window. The
+/// claim re-reads `autopay_enabled` and succeeds while the user is still armed,
+/// then the user disables autopay during the payment-methods round-trip — after
+/// the claim, before the charge. The pre-POST guard now includes `autopay_enabled`
+/// (it previously omitted it), so it refuses: nothing is POSTed and the pending
+/// claim is HELD for reconciliation, never released. Do-not-charge an opted-out
+/// account is the whole point of the flag; charging one anyway is the bug this
+/// closes. Without `autopay_enabled` in the guard the charge would be POSTed —
+/// this is the mutation-checked pre-POST guard.
+#[tokio::test]
+async fn a_fresh_claim_that_opts_out_pre_post_is_held_not_charged() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let _sweep_guard = SWEEP_LOCK.lock().await;
+    disarm_all_autopay(&pool).await;
+
+    let user_id = autopay_user(&pool, "race-optout", 10, 25).await;
+    let (app, charges) = race_mock(pool.clone(), user_id, Race::Disable);
+    let base = serve(app).await;
+
+    run_autopay_sweep_once(&pool, &settings(&base)).await;
+
+    assert_eq!(
+        charges.load(Ordering::SeqCst),
+        0,
+        "an account that opted out before the charge is never POSTed to Stripe"
+    );
+    assert_eq!(
+        balance_of(&pool, user_id).await,
+        Decimal::ZERO,
+        "nothing was credited"
+    );
+    let pending = query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM stripe_autopay_intents WHERE user_id = $1 AND status = 'pending'",
+    )
+    .bind(user_id)
+    .fetch_one(&pool)
+    .await
+    .expect("claim state must query");
+    assert_eq!(
+        pending, 1,
+        "the fresh claim is HELD, not released — the pending row stays for reconciliation"
+    );
+    let failures =
+        query_scalar::<_, i32>("SELECT autopay_consecutive_failures FROM users WHERE id = $1")
+            .bind(user_id)
+            .fetch_one(&pool)
+            .await
+            .expect("failure count must query");
+    assert_eq!(failures, 0, "holding the claim is not a strike");
+
+    // Already disarmed by the race, but keep the teardown symmetric with the
+    // sibling pre-POST tests.
     query("UPDATE users SET autopay_enabled = FALSE WHERE id = $1")
         .bind(user_id)
         .execute(&pool)

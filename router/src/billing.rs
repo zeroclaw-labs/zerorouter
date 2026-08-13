@@ -2091,12 +2091,23 @@ pub async fn settle_autopay_intent(
     // by the same pending→terminal guard as crediting: that transition already ran
     // exactly once above, so a redelivered success finds no pending row and returns
     // AlreadySettled — it neither double-withholds nor double-credits.
+    // The charge-time predicate is the account-state fragment AND `autopay_enabled`:
+    // an opt-out that commits during the charge window (the portal's off switch)
+    // must WITHHOLD the credit exactly like a freeze, never credit an account that
+    // told us to stop. This mirrors the `autopay_enabled AND (…)` gate the claim,
+    // replay, and still-armed boundaries apply; folding it into the conditional
+    // UPDATE lets EvalPlanQual re-check it against a freshly-committed opt-out too.
+    // The current-threshold / top-up-amount checks are NOT re-asserted here: they
+    // are enforced at `claim_autopay_attempt` (the row's amount/threshold at claim
+    // time is what was charged), and re-reading them at settlement would wrongly
+    // withhold a legitimately-collected credit when a concurrent top-up merely
+    // lifted the balance back above threshold.
     let balance_after = sqlx::query_scalar::<_, Decimal>(&format!(
         r#"
         UPDATE users
         SET credit_balance_usd = credit_balance_usd + $2,
             autopay_consecutive_failures = 0
-        WHERE id = $1 AND ({AUTOPAY_ELIGIBILITY_PREDICATE})
+        WHERE id = $1 AND autopay_enabled AND ({AUTOPAY_ELIGIBILITY_PREDICATE})
         RETURNING credit_balance_usd
         "#
     ))
