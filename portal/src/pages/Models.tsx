@@ -19,12 +19,15 @@ function formatContext(tokens: number): string {
 }
 
 /** The public model catalog. Reads `GET /v1/models` — the same catalog every
- * OpenAI-compatible client sees — and shows the customer-facing `zero/*`
- * tiers with their exact prices, context windows, and capabilities. */
+ * OpenAI-compatible client sees — and shows the vendor-named `{vendor}/{model}`
+ * pins with the serving vendor, their exact prices, context windows, and
+ * capabilities. Rows the router owns itself (`owned_by === 'zerorouter'`, the
+ * reserved `zero/*` routing aliases) are not real models to buy, so they are
+ * left out. */
 export function Models() {
   const models = useLoad(() => api.models(), [])
   const tiers: Model[] = (models.data ?? [])
-    .filter((m) => m.owned_by === 'zerorouter')
+    .filter((m) => m.owned_by !== 'zerorouter')
     .sort(
       (a, b) => Number.parseFloat(a.pricing.completion) - Number.parseFloat(b.pricing.completion),
     )
@@ -54,6 +57,7 @@ export function Models() {
           <table className="table">
             <thead>
               <tr>
+                <th>Vendor</th>
                 <th>Model</th>
                 <th className="num">Input</th>
                 <th className="num">Output</th>
@@ -65,6 +69,7 @@ export function Models() {
             <tbody>
               {tiers.map((m) => (
                 <tr key={m.id}>
+                  <td className="dim">{m.owned_by}</td>
                   <td>
                     <span className="mono">{m.id}</span>
                   </td>
