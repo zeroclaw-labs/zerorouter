@@ -85,6 +85,20 @@ export interface CheckoutSession {
   url: string
 }
 
+/** One row of the public catalog (`GET /v1/models`). Prices are decimal
+ * strings in USD **per single token**; the UI renders them per-Mtok. Metadata
+ * fields are optional — absent means the catalog does not publish one, never a
+ * default. */
+export interface Model {
+  id: string
+  owned_by: string
+  pricing: { prompt: string; completion: string; input_cache_read?: string }
+  context_length?: number | null
+  max_output_tokens?: number | null
+  input_modalities?: string[] | null
+  tool_call?: boolean | null
+}
+
 /** A server-priced deposit: the credit picked, the fee on top, and the gross
  * Stripe collects. All are decimal strings — the fee is never computed in TS. */
 export interface Quote {
@@ -179,6 +193,10 @@ export const api = {
   keys: () => request<{ keys: ApiKey[] }>('GET', '/api/keys').then((r) => r.keys),
   createKey: (name: string) => request<CreatedKey>('POST', '/api/keys', { name }),
   deleteKey: (id: string) => request<void>('DELETE', `/api/keys/${encodeURIComponent(id)}`),
+  // The public catalog — same endpoint any OpenAI-compatible client reads, so
+  // the storefront shows exactly what callers get. No auth: a prospective
+  // customer can see models and prices before signing in.
+  models: () => request<{ data: Model[] }>('GET', '/v1/models').then((r) => r.data),
   usage: (days: number) => request<Usage>('GET', `/api/usage?days=${days}`),
   ledger: (limit: number) =>
     request<{ limit: number; entries: LedgerEntry[] }>(

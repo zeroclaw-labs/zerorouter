@@ -8,6 +8,7 @@ import type { Auth, ToastKind } from './ui'
 import { Activate } from './pages/Activate'
 import { Credits } from './pages/Credits'
 import { Keys } from './pages/Keys'
+import { Models } from './pages/Models'
 import { Overview } from './pages/Overview'
 
 export function App() {
@@ -112,6 +113,8 @@ function Shell() {
   }
   if (auth.status === 'signed-out') {
     if (location.pathname.startsWith('/activate')) return <SignedOutActivate />
+    // The catalog is a storefront: viewable before signing in.
+    if (location.pathname.startsWith('/models')) return <PublicModels />
     return <Landing reason={auth.reason} />
   }
   return <SignedInLayout user={auth.user} />
@@ -124,6 +127,7 @@ function SignedInLayout({ user }: { user: Me }) {
       <main className="main">
         <Routes>
           <Route path="/" element={<Overview />} />
+          <Route path="/models" element={<Models />} />
           <Route path="/credits" element={<Credits />} />
           <Route path="/keys" element={<Keys />} />
           <Route path="/activate" element={<Activate />} />
@@ -144,14 +148,14 @@ function Sidebar({ user }: { user: Me }) {
         <NavLink to="/" end className={link}>
           Overview
         </NavLink>
+        <NavLink to="/models" className={link}>
+          Models
+        </NavLink>
         <NavLink to="/credits" className={link}>
           Credits
         </NavLink>
         <NavLink to="/keys" className={link}>
           Keys
-        </NavLink>
-        <NavLink to="/activate" className={link}>
-          Activate
         </NavLink>
       </nav>
       <div className="sidebar-foot">
@@ -192,6 +196,24 @@ function Landing({ reason }: { reason?: string }) {
           Sign in with SSO
         </a>
       </div>
+    </div>
+  )
+}
+
+// The catalog before sign-in: a slim top bar with the wordmark and a sign-in
+// CTA, then the same Models page the signed-in portal renders.
+function PublicModels() {
+  return (
+    <div className="public">
+      <header className="public-top">
+        <Wordmark />
+        <a className="btn btn-primary btn-sm" href="/auth/login">
+          Sign in
+        </a>
+      </header>
+      <main className="main">
+        <Models />
+      </main>
     </div>
   )
 }
