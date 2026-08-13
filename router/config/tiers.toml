@@ -5,20 +5,32 @@ schema_version = 1
 #
 # THE CATALOG HAS ONE KIND OF ENTRY: PINS.
 #
-# PINS — `zero/<model>`. You name a model, you get that model, priced at what
-# it costs. `basis == sell` on every dimension, so ZeroRouter earns nothing on
-# the spread; margin comes from the volume discounts the OpenAI and Anthropic
-# accounts earn. A pin never changes model under you.
+# PINS — keyed by the OpenRouter-standard `{vendor}/{model}` id (for example
+# `openai/gpt-5.6-luna`, `anthropic/claude-sonnet-5`). You name a model, you get
+# that model, priced at what it costs. The public id IS the vendor's id: an
+# OpenRouter user migrates by changing only the base URL and key, with no id
+# translation, and `/v1/models` reports `owned_by` as the vendor (`openai` /
+# `anthropic`), exactly as OpenRouter does. `basis == sell` on every dimension,
+# so ZeroRouter earns nothing on the spread; margin comes from the volume
+# discounts the OpenAI and Anthropic accounts earn. A pin never changes model
+# under you.
 #
-# Intent BANDS (`zero/low-cost`, `zero/optimized`, `zero/best`) were removed on
-# 2026-08-12. Each named an intent and let ZeroRouter pick, but each resolved
-# to exactly one model — identical to a pin — because the selection machinery
-# they were named for is not built (`Balanced` is identity by design, `Success`
-# is stubbed, and neither the per-task quality scores `best` implied nor the
-# promotional-rate tracking `low-cost` implied are modeled anywhere). They come
-# back when real selection lands, at which point a band gains candidates and
-# its sell rate must rise to cover the dearest one — a PRICE CHANGE that needs
-# notice, not a quiet config edit. Until then a customer names a model.
+# THE `zero/*` NAMESPACE IS RESERVED — do not delete this note; it is the
+# rationale. Until 2026-08-12 every pin was keyed `zero/<model>` and
+# `/v1/models` published BOTH that `zero/*` alias and the concrete
+# `{vendor}/{model}` candidate id, two rows per model. The pins are now keyed by
+# the vendor/model id directly and the `zero/*` alias is gone. The namespace is
+# kept, deliberately, for future ROUTED / INTENT tiers: a `zero/<intent>` that
+# names an intent and lets ZeroRouter pick among several candidates. The three
+# intent BANDS (`zero/low-cost`, `zero/optimized`, `zero/best`) that once lived
+# here were removed on 2026-08-12 — each named an intent but resolved to exactly
+# one model, identical to a pin, because the selection machinery they were named
+# for is not built (`Balanced` is identity by design, `Success` is stubbed, and
+# neither the per-task quality scores `best` implied nor the promotional-rate
+# tracking `low-cost` implied are modeled anywhere). They come back when real
+# selection lands, at which point a band gains candidates and its sell rate must
+# rise to cover the dearest one — a PRICE CHANGE that needs notice, not a quiet
+# config edit. Until then a customer names a model by its vendor/model id.
 #
 # Pricing invariant, enforced at load time by `validate_tier_catalog`
 # (`src/config.rs`): no candidate's cost basis may exceed its owning tier's
@@ -26,7 +38,9 @@ schema_version = 1
 # stays legal; only a strictly greater basis is rejected.
 #
 # Concrete candidate ids are unique file-wide and each belongs to exactly one
-# tier.
+# tier. A pin's tier id equals its single candidate's id, so the tier and the
+# model it pins are named the same thing; a reserved `zero/*` tier (when one
+# returns) is a routing alias whose id differs from every candidate's.
 #
 # Availability: every tier here has ONE upstream, so a tier is exactly as
 # available as its provider. There is no in-tier failover until a second
@@ -66,76 +80,80 @@ schema_version = 1
 # PINS — you get this model, at cost, and it does not change.
 # ---------------------------------------------------------------------------
 
-[tiers."zero/luna"]
+[tiers."openai/gpt-5.6-luna"]
 
-[tiers."zero/luna".rates]
+[tiers."openai/gpt-5.6-luna".rates]
 input_per_mtok = 0.20
 cached_input_per_mtok = 0.02
 output_per_mtok = 1.20
 
-[[tiers."zero/luna".candidates]]
+[[tiers."openai/gpt-5.6-luna".candidates]]
 id = "openai/gpt-5.6-luna"
 provider = "openai"
 model = "gpt-5.6-luna"
 
-[tiers."zero/luna".candidates.metadata]
+[tiers."openai/gpt-5.6-luna".candidates.metadata]
 context_window = 1050000
 max_output_tokens = 128000
 input_modalities = ["text", "image", "pdf"]
 tool_call = true
 
-[tiers."zero/luna".candidates.rates]
+[tiers."openai/gpt-5.6-luna".candidates.rates]
 input_per_mtok = 0.20
 cached_input_per_mtok = 0.02
 output_per_mtok = 1.20
 
-[tiers."zero/haiku-4-5"]
+[tiers."anthropic/claude-haiku-4-5"]
 
-[tiers."zero/haiku-4-5".rates]
+[tiers."anthropic/claude-haiku-4-5".rates]
 input_per_mtok = 1.00
 cached_input_per_mtok = 0.10
 output_per_mtok = 5.00
 
-[[tiers."zero/haiku-4-5".candidates]]
+[[tiers."anthropic/claude-haiku-4-5".candidates]]
 id = "anthropic/claude-haiku-4-5"
 provider = "anthropic"
 model = "claude-haiku-4-5-20251001"
 
 # The dispatched model string is a dated snapshot; models.dev catalogues the
 # undated family name, and these are that entry's limits.
-[tiers."zero/haiku-4-5".candidates.metadata]
+[tiers."anthropic/claude-haiku-4-5".candidates.metadata]
 context_window = 200000
 max_output_tokens = 64000
 input_modalities = ["text", "image", "pdf"]
 tool_call = true
 
-[tiers."zero/haiku-4-5".candidates.rates]
+[tiers."anthropic/claude-haiku-4-5".candidates.rates]
 input_per_mtok = 1.00
 cached_input_per_mtok = 0.10
 output_per_mtok = 5.00
 
-[tiers."zero/codex"]
+# terra sits between luna and sol on the OpenAI 5.6 ladder. Added 2026-08-12,
+# replacing gpt-5.3-codex (dropped the same day). Priced at cost and verified
+# against models.dev: basis == sell, pass-through, so `catalog-drift` reconciles
+# it at 1.00x.
+[tiers."openai/gpt-5.6-terra"]
 
-[tiers."zero/codex".rates]
-input_per_mtok = 1.75
-cached_input_per_mtok = 0.175
-output_per_mtok = 14.00
+[tiers."openai/gpt-5.6-terra".rates]
+input_per_mtok = 2.00
+cached_input_per_mtok = 0.20
+output_per_mtok = 12.00
 
-[[tiers."zero/codex".candidates]]
-id = "openai/gpt-5.3-codex"
+[[tiers."openai/gpt-5.6-terra".candidates]]
+id = "openai/gpt-5.6-terra"
 provider = "openai"
-model = "gpt-5.3-codex"
+model = "gpt-5.6-terra"
 
-[tiers."zero/codex".candidates.metadata]
-context_window = 400000
+[tiers."openai/gpt-5.6-terra".candidates.metadata]
+context_window = 1050000
 max_output_tokens = 128000
 input_modalities = ["text", "image", "pdf"]
 tool_call = true
 
-[tiers."zero/codex".candidates.rates]
-input_per_mtok = 1.75
-cached_input_per_mtok = 0.175
-output_per_mtok = 14.00
+[tiers."openai/gpt-5.6-terra".candidates.rates]
+input_per_mtok = 2.00
+cached_input_per_mtok = 0.20
+output_per_mtok = 12.00
 
 # Renamed from `zero/high-end` on 2026-08-07. That name promised the top of the
 # catalog and delivered the fourth rung of seven — three tiers cost more, so it
@@ -157,94 +175,94 @@ output_per_mtok = 14.00
 #
 # If you must update only one number, raise the BASIS first: basis above sell
 # withholds the tier, which fails closed. Raising sell first sells at a markup.
-[tiers."zero/sonnet-5"]
+[tiers."anthropic/claude-sonnet-5"]
 
-[tiers."zero/sonnet-5".rates]
+[tiers."anthropic/claude-sonnet-5".rates]
 input_per_mtok = 2.00
 cached_input_per_mtok = 0.20
 output_per_mtok = 10.00
 
-[[tiers."zero/sonnet-5".candidates]]
+[[tiers."anthropic/claude-sonnet-5".candidates]]
 id = "anthropic/claude-sonnet-5"
 provider = "anthropic"
 model = "claude-sonnet-5"
 
-[tiers."zero/sonnet-5".candidates.metadata]
+[tiers."anthropic/claude-sonnet-5".candidates.metadata]
 context_window = 1000000
 max_output_tokens = 128000
 input_modalities = ["text", "image", "pdf"]
 tool_call = true
 
-[tiers."zero/sonnet-5".candidates.rates]
+[tiers."anthropic/claude-sonnet-5".candidates.rates]
 input_per_mtok = 2.00
 cached_input_per_mtok = 0.20
 output_per_mtok = 10.00
 
-[tiers."zero/opus-5"]
+[tiers."anthropic/claude-opus-5"]
 
-[tiers."zero/opus-5".rates]
+[tiers."anthropic/claude-opus-5".rates]
 input_per_mtok = 5.00
 cached_input_per_mtok = 0.50
 output_per_mtok = 25.00
 
-[[tiers."zero/opus-5".candidates]]
+[[tiers."anthropic/claude-opus-5".candidates]]
 id = "anthropic/claude-opus-5"
 provider = "anthropic"
 model = "claude-opus-5"
 
-[tiers."zero/opus-5".candidates.metadata]
+[tiers."anthropic/claude-opus-5".candidates.metadata]
 context_window = 1000000
 max_output_tokens = 128000
 input_modalities = ["text", "image", "pdf"]
 tool_call = true
 
-[tiers."zero/opus-5".candidates.rates]
+[tiers."anthropic/claude-opus-5".candidates.rates]
 input_per_mtok = 5.00
 cached_input_per_mtok = 0.50
 output_per_mtok = 25.00
 
-[tiers."zero/sol"]
+[tiers."openai/gpt-5.6-sol"]
 
-[tiers."zero/sol".rates]
+[tiers."openai/gpt-5.6-sol".rates]
 input_per_mtok = 5.00
 cached_input_per_mtok = 0.50
 output_per_mtok = 30.00
 
-[[tiers."zero/sol".candidates]]
+[[tiers."openai/gpt-5.6-sol".candidates]]
 id = "openai/gpt-5.6-sol"
 provider = "openai"
 model = "gpt-5.6-sol"
 
-[tiers."zero/sol".candidates.metadata]
+[tiers."openai/gpt-5.6-sol".candidates.metadata]
 context_window = 1050000
 max_output_tokens = 128000
 input_modalities = ["text", "image", "pdf"]
 tool_call = true
 
-[tiers."zero/sol".candidates.rates]
+[tiers."openai/gpt-5.6-sol".candidates.rates]
 input_per_mtok = 5.00
 cached_input_per_mtok = 0.50
 output_per_mtok = 30.00
 
-[tiers."zero/fable-5"]
+[tiers."anthropic/claude-fable-5"]
 
-[tiers."zero/fable-5".rates]
+[tiers."anthropic/claude-fable-5".rates]
 input_per_mtok = 10.00
 cached_input_per_mtok = 1.00
 output_per_mtok = 50.00
 
-[[tiers."zero/fable-5".candidates]]
+[[tiers."anthropic/claude-fable-5".candidates]]
 id = "anthropic/claude-fable-5"
 provider = "anthropic"
 model = "claude-fable-5"
 
-[tiers."zero/fable-5".candidates.metadata]
+[tiers."anthropic/claude-fable-5".candidates.metadata]
 context_window = 1000000
 max_output_tokens = 128000
 input_modalities = ["text", "image", "pdf"]
 tool_call = true
 
-[tiers."zero/fable-5".candidates.rates]
+[tiers."anthropic/claude-fable-5".candidates.rates]
 input_per_mtok = 10.00
 cached_input_per_mtok = 1.00
 output_per_mtok = 50.00

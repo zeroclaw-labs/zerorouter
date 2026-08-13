@@ -211,7 +211,10 @@ pub enum TierConfigError {
     },
     #[error("unsupported tier configuration schema version {0}")]
     UnsupportedSchema(u32),
-    #[error("tier id must begin with 'zero/': {0}")]
+    #[error(
+        "tier id must be a reserved 'zero/…' routing alias or a '{{vendor}}/{{model}}' pin id \
+         matching one of its own candidates: {0}"
+    )]
     InvalidTierId(String),
     #[error("tier {tier} has an invalid {dimension} rate")]
     InvalidRate {
@@ -346,12 +349,15 @@ impl TierCatalog {
         }
     }
 
-    /// The public `/v1/models` catalog: every *servable* tier id and every
-    /// candidate id under it, each paired with who serves it and what it bills
-    /// at. A candidate's `sell_rates` is always its *owning* tier's rate, never
-    /// its own cost basis — mirroring `resolve`'s pinned-candidate rule above,
-    /// so a model listing can never advertise a price cheaper than what a
-    /// request for that id is actually metered at.
+    /// The public `/v1/models` catalog: every candidate id, paired with who
+    /// serves it and what it bills at, plus a row for any reserved `zero/*`
+    /// routing alias whose id differs from its candidates'. A vendor-named pin's
+    /// tier id equals its single candidate's id, so it contributes exactly one
+    /// row, owned by the vendor — no duplicate ZeroRouter-branded row. A
+    /// candidate's `sell_rates` is always its *owning* tier's rate, never its
+    /// own cost basis — mirroring `resolve`'s pinned-candidate rule above, so a
+    /// model listing can never advertise a price cheaper than what a request for
+    /// that id is actually metered at.
     ///
     /// Withheld tiers are absent from `tiers` and so are their candidates:
     /// the catalog never offers a model that a request for it would refuse.
@@ -368,14 +374,26 @@ impl TierCatalog {
     pub fn model_listing(&self) -> BTreeMap<String, ModelListing> {
         let mut models = BTreeMap::new();
         for (tier_id, definition) in &self.tiers {
-            models.insert(
-                tier_id.clone(),
-                ModelListing {
-                    owned_by: "zerorouter".to_owned(),
-                    sell_rates: definition.rates,
-                    metadata: ModelMetadata::narrowed(&definition.candidates),
-                },
-            );
+            // A vendor-named pin's tier id equals its single candidate's id, so
+            // the catalog publishes one row for it — owned by the vendor, from
+            // the candidate loop below — matching OpenRouter, where `owned_by`
+            // is the vendor and there is no separate ZeroRouter-branded row.
+            // Only a routing alias whose id differs from every candidate (the
+            // reserved `zero/*` namespace) gets its own zerorouter-owned row.
+            let is_routing_alias = definition
+                .candidates
+                .iter()
+                .all(|candidate| candidate.id != *tier_id);
+            if is_routing_alias {
+                models.insert(
+                    tier_id.clone(),
+                    ModelListing {
+                        owned_by: "zerorouter".to_owned(),
+                        sell_rates: definition.rates,
+                        metadata: ModelMetadata::narrowed(&definition.candidates),
+                    },
+                );
+            }
             for candidate in &definition.candidates {
                 models
                     .entry(candidate.id.clone())
@@ -510,7 +528,17 @@ fn validate_tier_catalog(
     let mut withheld: BTreeMap<String, TierConfigError> = BTreeMap::new();
 
     for (tier_id, definition) in &catalog.tiers {
-        if !tier_id.starts_with("zero/") || tier_id.len() == "zero/".len() {
+        // A tier id is one of two shapes. A reserved `zero/*` id names a routing
+        // alias (the namespace kept for future intent/routed tiers). A
+        // vendor-named pin is keyed by the `{vendor}/{model}` id of one of its
+        // own candidates, so the public id equals the concrete model id and
+        // OpenRouter clients address it unchanged. Anything else is neither.
+        let reserved_alias = tier_id.starts_with("zero/") && tier_id.len() > "zero/".len();
+        let vendor_pin = definition
+            .candidates
+            .iter()
+            .any(|candidate| candidate.id == *tier_id);
+        if !reserved_alias && !vendor_pin {
             return Err(TierConfigError::InvalidTierId(tier_id.clone()));
         }
         reject_priority_suffix_collision(tier_id)?;

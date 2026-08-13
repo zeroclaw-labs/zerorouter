@@ -1621,7 +1621,7 @@ mod tests {
     #[test]
     fn reservation_usage_is_conservative_and_includes_output_limit() {
         let request: ChatCompletionRequest = serde_json::from_value(json!({
-            "model": "zero/luna",
+            "model": "openai/gpt-5.6-luna",
             "messages": [{"role": "user", "content": "hello"}]
         }))
         .expect("request should parse");

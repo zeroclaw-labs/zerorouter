@@ -187,39 +187,51 @@ async fn models_are_materialized_from_tiers_toml() {
         .expect("models response should contain a data array");
 
     assert_eq!(json["object"], "list");
-    // 7 tier ids + 7 concrete candidates. Seven model PINS, each holding
-    // exactly one candidate, so every tier contributes exactly one concrete id.
-    assert_eq!(data.len(), 14);
+    // One row per model PIN, keyed by its OpenRouter-standard {vendor}/{model}
+    // id. The pre-rename catalog published a `zero/*` alias row AND a concrete
+    // candidate row per model (14 rows); each pin now equals its candidate, so
+    // it contributes exactly one row — seven models, seven rows.
+    assert_eq!(data.len(), 7);
     assert!(data.iter().all(|model| model["object"] == "model"));
-    assert!(data.iter().any(|model| model["id"] == "zero/sonnet-5"));
-    assert!(
-        data.iter()
-            .any(|model| model["id"] == "anthropic/claude-sonnet-5"),
-        "the sonnet pin's candidate is listed alongside the alias"
+
+    let ids = data
+        .iter()
+        .map(|model| {
+            model["id"]
+                .as_str()
+                .expect("every model carries a string id")
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        ids,
+        std::collections::BTreeSet::from([
+            "anthropic/claude-fable-5",
+            "anthropic/claude-haiku-4-5",
+            "anthropic/claude-opus-5",
+            "anthropic/claude-sonnet-5",
+            "openai/gpt-5.6-luna",
+            "openai/gpt-5.6-sol",
+            "openai/gpt-5.6-terra",
+        ]),
+        "exactly the seven vendor-named pins — no zero/* alias, no gpt-5.3-codex"
     );
-    assert!(data.iter().any(|model| model["id"] == "zero/fable-5"));
-    assert!(
-        data.iter()
-            .any(|model| model["id"] == "anthropic/claude-haiku-4-5")
-    );
-    assert!(
-        data.iter()
-            .any(|model| model["id"] == "openai/gpt-5.6-luna"),
-        "the luna pin's candidate is listed too"
-    );
-    assert!(data.iter().any(|model| model["id"] == "zero/opus-5"));
-    assert!(
-        data.iter()
-            .any(|model| model["id"] == "anthropic/claude-fable-5")
-    );
-    assert!(
-        data.iter()
-            .any(|model| model["id"] == "anthropic/claude-haiku-4-5")
-    );
-    assert!(
-        data.iter()
-            .any(|model| model["id"] == "openai/gpt-5.6-luna")
-    );
+
+    // `owned_by` is the vendor, matching OpenRouter — never the string
+    // "zerorouter" — and no id keeps the retired `zero/*` namespace. Combined
+    // with the count above (7 rows, 7 distinct ids), this also pins that no
+    // model is listed twice.
+    for model in data {
+        let id = model["id"].as_str().expect("id is a string");
+        let owner = model["owned_by"].as_str().expect("owned_by is a string");
+        assert!(
+            owner == "openai" || owner == "anthropic",
+            "{id} is owned_by {owner:?}, not the serving vendor"
+        );
+        assert!(
+            !id.starts_with("zero/"),
+            "{id} still carries the retired zero/* namespace"
+        );
+    }
 }
 
 #[tokio::test]
@@ -229,7 +241,7 @@ async fn model_pricing_matches_zeroclaws_model_pricing_wire_contract() {
     // (`crates/zeroclaw-api/src/model_provider.rs`) — `prompt`, `completion`,
     // `input_cache_read` — as decimal-string USD-per-single-token rates, and
     // its values must be the tier's sell rate from `config/tiers.toml`
-    // (`zero/luna`: 0.20 input / 1.20 output / 0.02 cached USD per 1M
+    // (`openai/gpt-5.6-luna`: 0.20 input / 1.20 output / 0.02 cached USD per 1M
     // tokens) converted exactly, with no binary-float artifacts.
     //
     // The snapshot is whole-row on purpose, so it also pins that no field
@@ -238,15 +250,15 @@ async fn model_pricing_matches_zeroclaws_model_pricing_wire_contract() {
 
     let tier = data
         .iter()
-        .find(|model| model["id"] == "zero/luna")
-        .expect("zero/luna tier should be listed");
+        .find(|model| model["id"] == "openai/gpt-5.6-luna")
+        .expect("openai/gpt-5.6-luna pin should be listed");
     assert_eq!(
         *tier,
         serde_json::json!({
-            "id": "zero/luna",
+            "id": "openai/gpt-5.6-luna",
             "object": "model",
             "created": 0,
-            "owned_by": "zerorouter",
+            "owned_by": "openai",
             "pricing": {
                 "prompt": "0.0000002",
                 "completion": "0.0000012",
@@ -374,15 +386,15 @@ async fn bundled_tier_catalog_has_expected_virtual_models() {
     assert_eq!(
         tiers,
         [
-            "zero/codex",
-            "zero/fable-5",
-            "zero/haiku-4-5",
-            "zero/luna",
-            "zero/opus-5",
-            "zero/sol",
-            "zero/sonnet-5",
+            "anthropic/claude-fable-5",
+            "anthropic/claude-haiku-4-5",
+            "anthropic/claude-opus-5",
+            "anthropic/claude-sonnet-5",
+            "openai/gpt-5.6-luna",
+            "openai/gpt-5.6-sol",
+            "openai/gpt-5.6-terra",
         ],
-        "the seven model pins"
+        "the seven vendor-named model pins (gpt-5.3-codex dropped, gpt-5.6-terra added)"
     );
 
     // One upstream each, and only from the two providers ZeroRouter
@@ -398,6 +410,56 @@ async fn bundled_tier_catalog_has_expected_virtual_models() {
         assert!(
             provider == "openai" || provider == "anthropic",
             "{tier_id} routes to {provider}, which is not in the MVP inventory"
+        );
+    }
+}
+
+#[tokio::test]
+async fn renamed_pins_resolve_and_the_retired_zero_ids_do_not() {
+    // The rename's contract at the routing layer. A request naming the
+    // OpenRouter-standard {vendor}/{model} id resolves to its upstream and
+    // dispatches the SAME model string as before (a customer's bill and the
+    // served model are both unchanged). The retired `zero/*` alias — and the
+    // dropped gpt-5.3-codex — resolve to nothing and are not withheld either:
+    // they are gone, not kept as hidden aliases, so an old client pinned to
+    // `zero/luna` gets a clean model_not_found rather than silently routing on.
+    let catalog = load_tier_catalog(&tier_config_path())
+        .await
+        .expect("bundled tier catalog must load");
+
+    for (id, upstream) in [
+        ("openai/gpt-5.6-luna", "gpt-5.6-luna"),
+        ("openai/gpt-5.6-terra", "gpt-5.6-terra"),
+        ("openai/gpt-5.6-sol", "gpt-5.6-sol"),
+        ("anthropic/claude-haiku-4-5", "claude-haiku-4-5-20251001"),
+        ("anthropic/claude-sonnet-5", "claude-sonnet-5"),
+        ("anthropic/claude-opus-5", "claude-opus-5"),
+        ("anthropic/claude-fable-5", "claude-fable-5"),
+    ] {
+        let route = catalog
+            .resolve(id)
+            .unwrap_or_else(|| panic!("{id} should resolve after the rename"));
+        assert_eq!(route.candidates.len(), 1, "{id} pins exactly one upstream");
+        assert_eq!(
+            route.candidates[0].model, upstream,
+            "{id} must still dispatch the unchanged upstream model"
+        );
+    }
+
+    for gone in [
+        "zero/luna",
+        "zero/sol",
+        "zero/haiku-4-5",
+        "zero/sonnet-5",
+        "zero/opus-5",
+        "zero/fable-5",
+        "zero/codex",
+        "openai/gpt-5.3-codex",
+    ] {
+        assert!(catalog.resolve(gone).is_none(), "{gone} must not resolve");
+        assert!(
+            catalog.unavailable_for(gone).is_none(),
+            "{gone} must not be kept as a hidden or withheld alias"
         );
     }
 }
@@ -497,7 +559,7 @@ async fn a_withheld_tier_is_refused_as_misconfigured_rather_than_missing_or_tran
     // a message naming the tier are what tell an operator where to look.
     let (status, body) = error_envelope(
         ApiError::ModelUnavailable {
-            tier: "zero/sonnet-5".to_owned(),
+            tier: "anthropic/claude-sonnet-5".to_owned(),
         }
         .into_response(),
     )
@@ -510,7 +572,7 @@ async fn a_withheld_tier_is_refused_as_misconfigured_rather_than_missing_or_tran
     let message = body["error"]["message"]
         .as_str()
         .expect("the error message should be a string");
-    assert!(message.contains("zero/sonnet-5"), "{message}");
+    assert!(message.contains("anthropic/claude-sonnet-5"), "{message}");
     assert!(message.contains("below its own cost basis"), "{message}");
     assert!(message.contains("not a transient outage"), "{message}");
 
@@ -587,14 +649,15 @@ async fn a_basis_hike_above_sell_withholds_that_tier_and_nothing_else() {
     // 2026-08-31, taking its basis from 2.00/0.20/10.00 to 3.00/0.30/15.00.
     // The table sells at the intro rate — we do not sell at a profit — so on
     // that day the basis crosses ABOVE sell and this mechanism is what stands
-    // between a lapsed promo and serving sonnet below cost. Both high-end candidate bases (and only they — the tier's
-    // sells stay exactly as shipped) are raised above sell, and the catalog
-    // must lose zero/sonnet-5 alone while every other tier keeps serving.
+    // between a lapsed promo and serving sonnet below cost. The sonnet candidate
+    // basis (and only it — the tier's sells stay exactly as shipped) is raised
+    // above sell, and the catalog must lose anthropic/claude-sonnet-5 alone
+    // while every other tier keeps serving.
     let shipped = tokio::fs::read_to_string(tier_config_path())
         .await
         .expect("shipped catalog should read");
     let split = shipped
-        .find(r#"[[tiers."zero/sonnet-5".candidates]]"#)
+        .find(r#"[[tiers."anthropic/claude-sonnet-5".candidates]]"#)
         .expect("the shipped catalog should define the sonnet pin candidates");
     let (head, candidates) = shipped.split_at(split);
     let lapsed = format!(
@@ -614,65 +677,64 @@ async fn a_basis_hike_above_sell_withholds_that_tier_and_nothing_else() {
         .expect("a lapsed sonnet intro price must not take the catalog down");
 
     // Every tier that has nothing to do with Sonnet's pricing still routes,
-    // through its tier id and its pinned candidate alike.
+    // addressed by its vendor/model pin id.
     assert_eq!(
         catalog.tiers.keys().map(String::as_str).collect::<Vec<_>>(),
         [
-            "zero/codex",
-            "zero/fable-5",
-            "zero/haiku-4-5",
-            "zero/luna",
-            "zero/opus-5",
-            "zero/sol"
+            "anthropic/claude-fable-5",
+            "anthropic/claude-haiku-4-5",
+            "anthropic/claude-opus-5",
+            "openai/gpt-5.6-luna",
+            "openai/gpt-5.6-sol",
+            "openai/gpt-5.6-terra",
         ]
     );
     for model in [
-        "zero/luna",
-        "zero/haiku-4-5",
         "openai/gpt-5.6-luna",
         "anthropic/claude-haiku-4-5",
+        "openai/gpt-5.6-terra",
     ] {
         assert!(
             catalog.resolve(model).is_some(),
-            "{model} must still resolve after high-end goes below cost"
+            "{model} must still resolve after sonnet goes below cost"
         );
     }
 
-    // The sonnet PIN is withheld, and says so for its tier id and for its
-    // candidate pinned directly. Withholding is the SAFE outcome of a lapsed
-    // promo: the tier stops serving rather than serving below cost.
-    for requested in ["zero/sonnet-5", "anthropic/claude-sonnet-5"] {
-        assert!(catalog.resolve(requested).is_none(), "{requested}");
-        let withheld = catalog
-            .unavailable_for(requested)
-            .unwrap_or_else(|| panic!("{requested} should report zero/sonnet-5 as withheld"));
-        assert_eq!(withheld.tier, "zero/sonnet-5");
-        assert!(
-            withheld
-                .reason
-                .contains("cost basis 3 exceeds tier sell rate 2"),
-            "{}",
-            withheld.reason
-        );
-    }
+    // The sonnet PIN is withheld. Its tier id and its pinned candidate id are
+    // now the same string, so one id answers for both. Withholding is the SAFE
+    // outcome of a lapsed promo: the tier stops serving rather than serving
+    // below cost.
+    let requested = "anthropic/claude-sonnet-5";
+    assert!(catalog.resolve(requested).is_none(), "{requested}");
+    let withheld = catalog
+        .unavailable_for(requested)
+        .unwrap_or_else(|| panic!("{requested} should report itself as withheld"));
+    assert_eq!(withheld.tier, "anthropic/claude-sonnet-5");
+    assert!(
+        withheld
+            .reason
+            .contains("cost basis 3 exceeds tier sell rate 2"),
+        "{}",
+        withheld.reason
+    );
     // The tier's own sell rates are untouched — only the cost basis moved,
     // which is exactly what the calendar does to this table on 2026-08-31.
-    let sell = catalog.unavailable["zero/sonnet-5"].definition.rates;
+    let sell = catalog.unavailable["anthropic/claude-sonnet-5"]
+        .definition
+        .rates;
     assert_eq!(sell.input_per_mtok, Some(2.00));
     assert_eq!(sell.output_per_mtok, Some(10.00));
 
     // And the public catalog stops advertising what it cannot serve: the six
-    // surviving tier ids plus their six candidates.
+    // surviving pins, one row each.
     let listed = listed_model_ids(RouterState::new(path)).await;
-    assert_eq!(listed.len(), 12);
-    assert!(listed.iter().any(|id| id == "zero/luna"));
-    assert!(listed.iter().any(|id| id == "zero/haiku-4-5"));
+    assert_eq!(listed.len(), 6);
+    assert!(listed.iter().any(|id| id == "openai/gpt-5.6-luna"));
+    assert!(listed.iter().any(|id| id == "anthropic/claude-haiku-4-5"));
 
-    // The mispriced PIN and its candidate are both gone.
+    // The mispriced PIN is gone.
     assert!(
-        !listed
-            .iter()
-            .any(|id| id == "zero/sonnet-5" || id == "anthropic/claude-sonnet-5"),
+        !listed.iter().any(|id| id == "anthropic/claude-sonnet-5"),
         "the withheld pin must not be advertised: {listed:?}"
     );
 }
@@ -702,14 +764,14 @@ async fn the_shipped_catalog_withholds_no_tier_today() {
 // provider serves a model class again.
 const ROUTED_TIERS: [&str; 0] = [];
 const PASS_THROUGH_TIERS: [&str; 7] = [
-    // Model pins.
-    "zero/luna",
-    "zero/haiku-4-5",
-    "zero/codex",
-    "zero/sonnet-5",
-    "zero/sol",
-    "zero/opus-5",
-    "zero/fable-5",
+    // Model pins, keyed by their OpenRouter-standard {vendor}/{model} ids.
+    "openai/gpt-5.6-luna",
+    "anthropic/claude-haiku-4-5",
+    "openai/gpt-5.6-terra",
+    "anthropic/claude-sonnet-5",
+    "openai/gpt-5.6-sol",
+    "anthropic/claude-opus-5",
+    "anthropic/claude-fable-5",
 ];
 
 #[tokio::test]
