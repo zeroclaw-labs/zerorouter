@@ -535,6 +535,266 @@ async fn an_unsigned_or_mis_signed_dispute_does_nothing() {
 }
 
 // ---------------------------------------------------------------------------
+// HIGH-1: a reversal observed BEFORE its credit must converge to the same end
+// state as a reversal after the credit (migration 0017)
+// ---------------------------------------------------------------------------
+
+/// The tombstone's state for a reversal object: `None` when no row exists,
+/// `Some(applied)` where `applied` is whether a credit has consumed it.
+async fn observed_reversal(pool: &PgPool, object_id: &str) -> Option<bool> {
+    query_scalar::<_, bool>(
+        "SELECT applied_at IS NOT NULL FROM stripe_observed_reversals WHERE object_id = $1",
+    )
+    .bind(object_id)
+    .fetch_optional(pool)
+    .await
+    .expect("tombstone state must query")
+}
+
+/// The `purchase`/`autopay` credit rows for a user, so a test can confirm the
+/// credit itself was still recorded (the reversal takes it back; it does not
+/// suppress the credit — the full history stays in the ledger).
+async fn purchase_rows(pool: &PgPool, user_id: Uuid) -> i64 {
+    query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM credit_ledger WHERE user_id = $1 AND entry_type IN ('purchase', 'autopay')",
+    )
+    .bind(user_id)
+    .fetch_one(pool)
+    .await
+    .expect("purchase rows must query")
+}
+
+/// A dispute that arrives before the credit exists is recorded, and when the
+/// delayed success finally credits the PaymentIntent the account converges to
+/// EXACTLY the reversal-after-credit end state: the credit is taken back (no
+/// spendable refunded money), a reversal ledger row exists anchored on the
+/// dispute, and the account is frozen. Consumed exactly once.
+#[tokio::test]
+async fn a_dispute_observed_before_the_credit_reverses_and_freezes_when_it_lands() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let user_id = create_user(&pool, "pre-dispute").await;
+    let session_id = format!("cs_test_{}", Uuid::new_v4().simple());
+    let payment_intent = format!("pi_test_{}", Uuid::new_v4().simple());
+    let dispute_id = format!("dp_test_{}", Uuid::new_v4().simple());
+
+    // The reversal arrives first — before any credit for this intent exists.
+    let (status, _) = post_webhook(
+        &pool,
+        &dispute_event(&dispute_id, &payment_intent, 2_500, "usd"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "the reversal is acknowledged");
+    // Nothing has moved: there is no credit to reverse and no user to freeze.
+    assert_eq!(
+        balance(&pool, user_id).await.expect("balance must query"),
+        Decimal::ZERO
+    );
+    assert!(reversals(&pool, user_id).await.is_empty());
+    assert_eq!(freeze_of(&pool, user_id).await, (None, None));
+    // But it is durably recorded, unapplied — no longer forgotten.
+    assert_eq!(
+        observed_reversal(&pool, &dispute_id).await,
+        Some(false),
+        "the reversal is recorded and not yet applied"
+    );
+
+    // The delayed / retried success now credits the same PaymentIntent.
+    credit_purchase(
+        &pool,
+        user_id,
+        Decimal::from(25),
+        &session_id,
+        Some(payment_intent.as_str()),
+    )
+    .await
+    .expect("the delayed credit must apply");
+
+    // Converged to the reversal-after-credit end state.
+    assert_eq!(
+        balance(&pool, user_id).await.expect("balance must query"),
+        Decimal::ZERO,
+        "no spendable refunded credit remains"
+    );
+    assert_eq!(
+        purchase_rows(&pool, user_id).await,
+        1,
+        "the credit itself is still recorded; the reversal takes it back"
+    );
+    assert_eq!(
+        reversals(&pool, user_id).await,
+        vec![(Decimal::from(-25), Decimal::ZERO, dispute_id.clone())],
+        "a reversal ledger entry exists, anchored on the dispute object"
+    );
+    let (frozen_at, reason) = freeze_of(&pool, user_id).await;
+    assert!(frozen_at.is_some(), "a disputed account ends frozen");
+    assert_eq!(reason.as_deref(), Some("dispute"));
+    assert_eq!(
+        observed_reversal(&pool, &dispute_id).await,
+        Some(true),
+        "the tombstone is consumed exactly once"
+    );
+}
+
+/// A refund observed before the credit reverses the credit when it lands, but
+/// — like the normal refund path — does NOT freeze.
+#[tokio::test]
+async fn a_refund_observed_before_the_credit_reverses_without_freezing() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let user_id = create_user(&pool, "pre-refund").await;
+    let session_id = format!("cs_test_{}", Uuid::new_v4().simple());
+    let payment_intent = format!("pi_test_{}", Uuid::new_v4().simple());
+    let charge_id = format!("ch_test_{}", Uuid::new_v4().simple());
+
+    let (status, _) = post_webhook(
+        &pool,
+        &refund_event(&charge_id, &payment_intent, 1_000, "usd"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(observed_reversal(&pool, &charge_id).await, Some(false));
+
+    // A $10 credit; the refund fully covers it.
+    credit_purchase(
+        &pool,
+        user_id,
+        Decimal::from(10),
+        &session_id,
+        Some(payment_intent.as_str()),
+    )
+    .await
+    .expect("the delayed credit must apply");
+
+    assert_eq!(
+        balance(&pool, user_id).await.expect("balance must query"),
+        Decimal::ZERO,
+        "the refunded credit is not spendable"
+    );
+    assert_eq!(
+        reversals(&pool, user_id).await,
+        vec![(Decimal::from(-10), Decimal::ZERO, charge_id.clone())]
+    );
+    assert_eq!(
+        freeze_of(&pool, user_id).await,
+        (None, None),
+        "a refund must not freeze the account"
+    );
+    assert_eq!(observed_reversal(&pool, &charge_id).await, Some(true));
+}
+
+/// Redelivery is a no-op in BOTH directions. Once the credit has consumed the
+/// tombstone (reversed + froze), a redelivered reversal webhook now finds the
+/// credit row and takes the normal path, whose own idempotence (object-id
+/// anchor + per-intent already-reversed check + first-writer-wins freeze) means
+/// no second reversal and no restamped freeze.
+#[tokio::test]
+async fn a_reversal_redelivered_after_the_credit_auto_reversed_does_not_double() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let user_id = create_user(&pool, "redeliver").await;
+    let session_id = format!("cs_test_{}", Uuid::new_v4().simple());
+    let payment_intent = format!("pi_test_{}", Uuid::new_v4().simple());
+    let dispute_id = format!("dp_test_{}", Uuid::new_v4().simple());
+    let event = dispute_event(&dispute_id, &payment_intent, 2_500, "usd");
+
+    // Reversal before credit, then the credit consumes the tombstone.
+    let (status, _) = post_webhook(&pool, &event).await;
+    assert_eq!(status, StatusCode::OK);
+    credit_purchase(
+        &pool,
+        user_id,
+        Decimal::from(25),
+        &session_id,
+        Some(payment_intent.as_str()),
+    )
+    .await
+    .expect("the delayed credit must apply");
+    let frozen_first = freeze_of(&pool, user_id).await.0.expect("frozen");
+    assert_eq!(reversals(&pool, user_id).await.len(), 1);
+
+    // Stripe redelivers the SAME dispute. It now finds the credit row.
+    let (status, _) = post_webhook(&pool, &event).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        balance(&pool, user_id).await.expect("balance must query"),
+        Decimal::ZERO,
+        "a redelivered reversal must not reverse twice"
+    );
+    assert_eq!(
+        reversals(&pool, user_id).await.len(),
+        1,
+        "still exactly one reversal ledger row"
+    );
+    assert_eq!(
+        freeze_of(&pool, user_id).await.0,
+        Some(frozen_first),
+        "the redelivery must not restamp the freeze"
+    );
+}
+
+/// Two distinct reversal objects naming the same intent (a dispute AND a refund
+/// of the same charge) both recorded before the credit must reverse the credit
+/// at most once — the per-intent already-reversed guard makes the second a
+/// no-op — while the dispute still freezes.
+#[tokio::test]
+async fn two_reversal_objects_for_one_intent_do_not_double_count() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let user_id = create_user(&pool, "two-objects").await;
+    let session_id = format!("cs_test_{}", Uuid::new_v4().simple());
+    let payment_intent = format!("pi_test_{}", Uuid::new_v4().simple());
+    let dispute_id = format!("dp_test_{}", Uuid::new_v4().simple());
+    let charge_id = format!("ch_test_{}", Uuid::new_v4().simple());
+
+    // Both reversals land before the credit, each covering the full $25.
+    let (status, _) = post_webhook(
+        &pool,
+        &dispute_event(&dispute_id, &payment_intent, 2_500, "usd"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = post_webhook(
+        &pool,
+        &refund_event(&charge_id, &payment_intent, 2_500, "usd"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    credit_purchase(
+        &pool,
+        user_id,
+        Decimal::from(25),
+        &session_id,
+        Some(payment_intent.as_str()),
+    )
+    .await
+    .expect("the delayed credit must apply");
+
+    assert_eq!(
+        balance(&pool, user_id).await.expect("balance must query"),
+        Decimal::ZERO,
+        "the credit is reversed once, not twice"
+    );
+    assert_eq!(
+        reversals(&pool, user_id).await.len(),
+        1,
+        "exactly one reversal ledger row despite two reversal objects"
+    );
+    assert!(
+        freeze_of(&pool, user_id).await.0.is_some(),
+        "the dispute among them still freezes"
+    );
+    // Both tombstones are consumed.
+    assert_eq!(observed_reversal(&pool, &dispute_id).await, Some(true));
+    assert_eq!(observed_reversal(&pool, &charge_id).await, Some(true));
+}
+
+// ---------------------------------------------------------------------------
 // What a freeze actually blocks
 // ---------------------------------------------------------------------------
 

@@ -981,6 +981,20 @@ async fn handle_reversal_event(
         return Ok(received());
     };
 
+    // The reversed amount and its currency, read once and used both for the
+    // tombstone (when no credit exists yet) and the coverage check (when one
+    // does). For a dispute the disputed `amount` is the money withdrawn; for a
+    // refund `amount_refunded` is the cumulative refunded total on the charge.
+    let reversed_cents = if is_dispute {
+        object.get("amount").and_then(Value::as_i64)
+    } else {
+        object.get("amount_refunded").and_then(Value::as_i64)
+    };
+    let currency = object
+        .get("currency")
+        .and_then(Value::as_str)
+        .map(str::to_ascii_lowercase);
+
     let Some(credited) = billing::credited_purchase(&ctx.pool, payment_intent)
         .await
         .map_err(|error| {
@@ -992,13 +1006,44 @@ async fn handle_reversal_event(
             StripeHttpError::DatabaseUnavailable
         })?
     else {
-        // A charge this deployment never credited — another integration in the
-        // same Stripe account, or a payment that never became credit.
-        // Acknowledged untouched, exactly as a foreign payment intent is.
+        // HIGH-1 (migration 0017): a reversal for a charge this deployment has
+        // NOT yet credited is no longer acknowledged-and-forgotten. It may be a
+        // foreign charge (another integration in the same Stripe account), OR
+        // our own credit that simply has not landed yet — Stripe delivers
+        // events out of order, and the credit path returns 503 and leans on
+        // redelivery, so there are real windows where the purchase/autopay row
+        // does not exist yet. We cannot tell the two apart here (with no credit
+        // row there is no user to freeze), so we durably record the reversal
+        // keyed on its object id. If a credit for this intent ever lands,
+        // `credit_purchase` / `settle_autopay_intent` consume the tombstone and
+        // converge to the reversed (and, for a dispute, frozen) end state; a
+        // foreign charge never gets a credit, so its tombstone stays inert.
+        // ON CONFLICT DO NOTHING makes a redelivery a no-op. Still HTTP 200 —
+        // the reversal is now durably recorded, so Stripe need not retry.
+        if let Err(error) = billing::record_observed_reversal(
+            &ctx.pool,
+            object_id,
+            payment_intent,
+            is_dispute,
+            reversed_cents,
+            currency.as_deref(),
+        )
+        .await
+        {
+            tracing::warn!(
+                event_type = %event.event_type,
+                stripe_object_id = %object_id,
+                %error,
+                "stripe reversal deferred: its tombstone could not be written; stripe will retry"
+            );
+            return Err(StripeHttpError::DatabaseUnavailable);
+        }
         tracing::info!(
             event_type = %event.event_type,
             stripe_object_id = %object_id,
-            "stripe reversal event references a charge this deployment never credited; ignoring"
+            payment_intent = %payment_intent,
+            is_dispute,
+            "stripe reversal observed before any matching credit; recorded, to be applied if the credit lands"
         );
         return Ok(received());
     };
@@ -1031,18 +1076,9 @@ async fn handle_reversal_event(
         );
     }
 
-    // Only a reversal that covers the whole credit is applied automatically.
-    // For a dispute the disputed `amount` is the money withdrawn; for a refund
-    // `amount_refunded` is the cumulative refunded total on the charge.
-    let reversed_cents = if is_dispute {
-        object.get("amount").and_then(Value::as_i64)
-    } else {
-        object.get("amount_refunded").and_then(Value::as_i64)
-    };
-    let currency = object
-        .get("currency")
-        .and_then(Value::as_str)
-        .map(str::to_ascii_lowercase);
+    // Only a reversal that covers the whole credit is applied automatically
+    // (`reversed_cents` and `currency` were read above, before the credit
+    // lookup, so the tombstone and this check see identical values).
     let credited_cents = usd_to_cents(credited.amount_usd);
     let covers_the_credit = match (reversed_cents, currency.as_deref(), credited_cents) {
         (Some(reversed), Some(currency), Some(credited_cents)) => {

@@ -778,7 +778,7 @@ async fn migration_chain_applies_on_a_fresh_database() {
     // struct would outlive its usefulness the moment the next migration adds
     // a probe; the tuple grows in one place and the assertions name the facts.
     #[allow(clippy::type_complexity)]
-    let outcome: anyhow::Result<(bool, bool, bool, bool, bool, bool, bool, bool, bool, i64)> = async {
+    let outcome: anyhow::Result<(bool, bool, bool, bool, bool, bool, bool, bool, bool, bool, i64)> = async {
         let pool = PgPoolOptions::new()
             .max_connections(1)
             .connect_with(PgConnectOptions::from_str(&fresh_url)?)
@@ -855,6 +855,11 @@ async fn migration_chain_applies_on_a_fresh_database() {
         )
         .fetch_one(&pool)
         .await?;
+        let observed_reversals_exists = query_scalar::<_, bool>(
+            "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'stripe_observed_reversals')",
+        )
+        .fetch_one(&pool)
+        .await?;
         let version = query_scalar::<_, i64>("SELECT MAX(version) FROM _sqlx_migrations")
             .fetch_one(&pool)
             .await?;
@@ -869,6 +874,7 @@ async fn migration_chain_applies_on_a_fresh_database() {
             dispatched_marker_exists,
             release_record_exists,
             autopay_charge_column_exists,
+            observed_reversals_exists,
             version,
         ))
     }
@@ -879,7 +885,7 @@ async fn migration_chain_applies_on_a_fresh_database() {
         .execute(&admin)
         .await;
 
-    let outcome = outcome.expect("the 0001->0016 chain must apply on a fresh database");
+    let outcome = outcome.expect("the 0001->0017 chain must apply on a fresh database");
     assert!(outcome.0, "request_attempts exists after the fresh chain");
     assert!(
         outcome.1,
@@ -913,11 +919,16 @@ async fn migration_chain_applies_on_a_fresh_database() {
         outcome.8,
         "the 0016 stripe_autopay_intents.charge_amount_usd column exists after the chain"
     );
-    // 16, not 12: 0013 (dispute resolution), 0014 (dispatched reservations),
-    // 0015 (released reservations) and 0016 (deposit fee) are numbered with a
-    // gap so 0010-0012 stay available to branches in flight. The chain's head
-    // is the highest version applied, not a count of files.
-    assert_eq!(outcome.9, 16, "the chain reaches migration version 16");
+    assert!(
+        outcome.9,
+        "the 0017 stripe_observed_reversals table exists after the chain"
+    );
+    // 17, not 13: 0013 (dispute resolution), 0014 (dispatched reservations),
+    // 0015 (released reservations), 0016 (deposit fee) and 0017 (stripe
+    // observed reversals) are numbered with a gap so 0010-0012 stay available
+    // to branches in flight. The chain's head is the highest version applied,
+    // not a count of files.
+    assert_eq!(outcome.10, 17, "the chain reaches migration version 17");
 }
 
 /// Rewrite the database name in a Postgres URL, keeping any query string
