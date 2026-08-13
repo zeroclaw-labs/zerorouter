@@ -3,35 +3,22 @@ schema_version = 1
 # This file is the sole source of truth for the public catalog, fallback order,
 # upstream model IDs, and metering rates. Prices were verified on 2026-07-11.
 #
-# THE CATALOG HAS TWO KINDS OF ENTRY (2026-08-07).
+# THE CATALOG HAS ONE KIND OF ENTRY: PINS.
 #
-# 1. PINS — `zero/<model>`. You name a model, you get that model, priced at
-#    what it costs. `basis == sell` on every dimension, so ZeroRouter earns
-#    nothing on the spread; margin comes from the volume discounts the OpenAI
-#    and Anthropic accounts earn. A pin never changes model under you.
+# PINS — `zero/<model>`. You name a model, you get that model, priced at what
+# it costs. `basis == sell` on every dimension, so ZeroRouter earns nothing on
+# the spread; margin comes from the volume discounts the OpenAI and Anthropic
+# accounts earn. A pin never changes model under you.
 #
-# 2. BANDS — `zero/low-cost`, `zero/optimized`, `zero/best`. You name an
-#    INTENT and ZeroRouter picks. A band's model is expected to change over
-#    time as models and prices move; that is the point of buying one.
-#
-# WHAT THE BANDS ACTUALLY DO TODAY, STATED PLAINLY: each resolves to exactly
-# one model. The selection machinery they are named for is not finished —
-# `Priority::Cost` orders by learned expected cost (`src/estimator.rs`), but
-# `Balanced` is identity by design and `Success` is stubbed until its
-# benchmark-aware machinery exists, and neither the per-task quality scores
-# `best` implies nor the promotional-rate tracking `low-cost` implies are
-# modeled anywhere in this system. A band with one candidate cannot route.
-#
-# The consequence is deliberate and it is the honest one: because each band
-# holds a single candidate, each band's sell rate EQUALS that candidate's
-# basis today, exactly like a pin. No customer pays a routing premium for
-# routing that is not happening.
-#
-# When real selection lands, a band gains candidates and its sell rate must
-# rise to cover the most expensive one — that is a PRICE CHANGE for anyone
-# already on the band, and it needs notice. Do not slip it in with a config
-# edit. Pins are the escape hatch: a customer who never wants a price to move
-# under them buys a pin.
+# Intent BANDS (`zero/low-cost`, `zero/optimized`, `zero/best`) were removed on
+# 2026-08-12. Each named an intent and let ZeroRouter pick, but each resolved
+# to exactly one model — identical to a pin — because the selection machinery
+# they were named for is not built (`Balanced` is identity by design, `Success`
+# is stubbed, and neither the per-task quality scores `best` implied nor the
+# promotional-rate tracking `low-cost` implied are modeled anywhere). They come
+# back when real selection lands, at which point a band gains candidates and
+# its sell rate must rise to cover the dearest one — a PRICE CHANGE that needs
+# notice, not a quiet config edit. Until then a customer names a model.
 #
 # Pricing invariant, enforced at load time by `validate_tier_catalog`
 # (`src/config.rs`): no candidate's cost basis may exceed its owning tier's
@@ -39,9 +26,7 @@ schema_version = 1
 # stays legal; only a strictly greater basis is rejected.
 #
 # Concrete candidate ids are unique file-wide and each belongs to exactly one
-# tier — that is why a band's candidate carries a `band/...` id even when it
-# dispatches the same upstream model as a pin. The two are genuinely different
-# products: same model, different promise about whether it can change.
+# tier.
 #
 # Availability: every tier here has ONE upstream, so a tier is exactly as
 # available as its provider. There is no in-tier failover until a second
@@ -60,12 +45,9 @@ schema_version = 1
 # against a real window of 1,000,000 and quietly degraded long-context work.
 #
 # Metadata attaches to the CANDIDATE, not the tier, because it describes the
-# model rather than the price. That is why a band and a pin dispatching the
-# same upstream carry identical metadata and different rates: the promise
-# about whether the model can change is a tier-level fact, the window is not.
-# A tier advertises the narrowest thing its candidates can do (minimum limits,
-# shared modalities), so a band that gains a second rung cannot keep
-# advertising the first one's window.
+# model rather than the price. A tier advertises the narrowest thing its
+# candidates can do (minimum limits, shared modalities), so a tier that gains
+# a second rung cannot keep advertising the first one's window.
 #
 # Every field is optional and absence means UNKNOWN, never a default. Deleting
 # a line here returns that model to the pre-table behaviour; writing a wrong
@@ -79,88 +61,6 @@ schema_version = 1
 # table against that same catalog on every CI run, so a window that moves
 # upstream is caught the way a price is. They are token counts and capability
 # flags, not money: nothing here changes what anyone is billed.
-
-# ---------------------------------------------------------------------------
-# BANDS — intent-priced. ZeroRouter chooses the model.
-# ---------------------------------------------------------------------------
-
-# Cheapest workable model. Intended rule: cheapest model that clears a
-# capability floor, accounting for promotional rates. Today: gpt-5.6-luna,
-# because promotional-rate tracking does not exist and luna is the floor.
-[tiers."zero/low-cost"]
-
-[tiers."zero/low-cost".rates]
-input_per_mtok = 0.20
-cached_input_per_mtok = 0.02
-output_per_mtok = 1.20
-
-[[tiers."zero/low-cost".candidates]]
-id = "band/low-cost/gpt-5.6-luna"
-provider = "openai"
-model = "gpt-5.6-luna"
-
-[tiers."zero/low-cost".candidates.metadata]
-context_window = 1050000
-max_output_tokens = 128000
-input_modalities = ["text", "image", "pdf"]
-tool_call = true
-
-[tiers."zero/low-cost".candidates.rates]
-input_per_mtok = 0.20
-cached_input_per_mtok = 0.02
-output_per_mtok = 1.20
-
-# Best value for the task. Intended rule: highest quality per dollar for the
-# request's task signature. Today: claude-sonnet-5, a fixed sensible default,
-# because per-task quality scores do not exist in this system.
-[tiers."zero/optimized"]
-
-[tiers."zero/optimized".rates]
-input_per_mtok = 2.00
-cached_input_per_mtok = 0.20
-output_per_mtok = 10.00
-
-[[tiers."zero/optimized".candidates]]
-id = "band/optimized/claude-sonnet-5"
-provider = "anthropic"
-model = "claude-sonnet-5"
-
-[tiers."zero/optimized".candidates.metadata]
-context_window = 1000000
-max_output_tokens = 128000
-input_modalities = ["text", "image", "pdf"]
-tool_call = true
-
-[tiers."zero/optimized".candidates.rates]
-input_per_mtok = 2.00
-cached_input_per_mtok = 0.20
-output_per_mtok = 10.00
-
-# Highest capability available. Intended rule: the best-benchmarking model for
-# the request's task. Today: claude-fable-5, the top of the catalog by price,
-# which is the only capability proxy on hand until benchmark data exists.
-[tiers."zero/best"]
-
-[tiers."zero/best".rates]
-input_per_mtok = 10.00
-cached_input_per_mtok = 1.00
-output_per_mtok = 50.00
-
-[[tiers."zero/best".candidates]]
-id = "band/best/claude-fable-5"
-provider = "anthropic"
-model = "claude-fable-5"
-
-[tiers."zero/best".candidates.metadata]
-context_window = 1000000
-max_output_tokens = 128000
-input_modalities = ["text", "image", "pdf"]
-tool_call = true
-
-[tiers."zero/best".candidates.rates]
-input_per_mtok = 10.00
-cached_input_per_mtok = 1.00
-output_per_mtok = 50.00
 
 # ---------------------------------------------------------------------------
 # PINS — you get this model, at cost, and it does not change.
@@ -238,8 +138,8 @@ cached_input_per_mtok = 0.175
 output_per_mtok = 14.00
 
 # Renamed from `zero/high-end` on 2026-08-07. That name promised the top of the
-# catalog and delivered the fourth rung of seven — three tiers cost more. The
-# intent it was reaching for is now `zero/best`; this is the model pin.
+# catalog and delivered the fourth rung of seven — three tiers cost more, so it
+# now carries the name of the model it actually pins.
 #
 # PRICED AT 2.00/0.20/10.00, WHICH IS SONNET'S INTRODUCTORY RATE, AND IT LAPSES
 # ON 2026-08-31. Until 2026-08-07 this table carried the post-lapse rate

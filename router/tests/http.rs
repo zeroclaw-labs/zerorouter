@@ -187,10 +187,9 @@ async fn models_are_materialized_from_tiers_toml() {
         .expect("models response should contain a data array");
 
     assert_eq!(json["object"], "list");
-    // 10 tier ids + 10 concrete candidates. Seven model PINS plus three
-    // intent BANDS, each holding exactly one candidate today, so every tier
-    // still contributes exactly one concrete id.
-    assert_eq!(data.len(), 20);
+    // 7 tier ids + 7 concrete candidates. Seven model PINS, each holding
+    // exactly one candidate, so every tier contributes exactly one concrete id.
+    assert_eq!(data.len(), 14);
     assert!(data.iter().all(|model| model["object"] == "model"));
     assert!(data.iter().any(|model| model["id"] == "zero/sonnet-5"));
     assert!(
@@ -198,14 +197,7 @@ async fn models_are_materialized_from_tiers_toml() {
             .any(|model| model["id"] == "anthropic/claude-sonnet-5"),
         "the sonnet pin's candidate is listed alongside the alias"
     );
-    // A band advertises what it currently resolves to, so a customer can see
-    // the model behind the intent rather than having to trust the name.
-    assert!(data.iter().any(|model| model["id"] == "zero/best"));
-    assert!(
-        data.iter()
-            .any(|model| model["id"] == "band/best/claude-fable-5"),
-        "a band discloses its current pick in the public catalog"
-    );
+    assert!(data.iter().any(|model| model["id"] == "zero/fable-5"));
     assert!(
         data.iter()
             .any(|model| model["id"] == "anthropic/claude-haiku-4-5")
@@ -213,7 +205,7 @@ async fn models_are_materialized_from_tiers_toml() {
     assert!(
         data.iter()
             .any(|model| model["id"] == "openai/gpt-5.6-luna"),
-        "the low-cost tier's pinned candidate is listed too"
+        "the luna pin's candidate is listed too"
     );
     assert!(data.iter().any(|model| model["id"] == "zero/opus-5"));
     assert!(
@@ -237,7 +229,7 @@ async fn model_pricing_matches_zeroclaws_model_pricing_wire_contract() {
     // (`crates/zeroclaw-api/src/model_provider.rs`) — `prompt`, `completion`,
     // `input_cache_read` — as decimal-string USD-per-single-token rates, and
     // its values must be the tier's sell rate from `config/tiers.toml`
-    // (`zero/low-cost`: 0.20 input / 1.20 output / 0.02 cached USD per 1M
+    // (`zero/luna`: 0.20 input / 1.20 output / 0.02 cached USD per 1M
     // tokens) converted exactly, with no binary-float artifacts.
     //
     // The snapshot is whole-row on purpose, so it also pins that no field
@@ -246,12 +238,12 @@ async fn model_pricing_matches_zeroclaws_model_pricing_wire_contract() {
 
     let tier = data
         .iter()
-        .find(|model| model["id"] == "zero/low-cost")
-        .expect("zero/low-cost tier should be listed");
+        .find(|model| model["id"] == "zero/luna")
+        .expect("zero/luna tier should be listed");
     assert_eq!(
         *tier,
         serde_json::json!({
-            "id": "zero/low-cost",
+            "id": "zero/luna",
             "object": "model",
             "created": 0,
             "owned_by": "zerorouter",
@@ -382,18 +374,15 @@ async fn bundled_tier_catalog_has_expected_virtual_models() {
     assert_eq!(
         tiers,
         [
-            "zero/best",
             "zero/codex",
             "zero/fable-5",
             "zero/haiku-4-5",
-            "zero/low-cost",
             "zero/luna",
-            "zero/optimized",
             "zero/opus-5",
             "zero/sol",
             "zero/sonnet-5",
         ],
-        "seven model pins plus three intent bands"
+        "the seven model pins"
     );
 
     // One upstream each, and only from the two providers ZeroRouter
@@ -625,26 +614,20 @@ async fn a_basis_hike_above_sell_withholds_that_tier_and_nothing_else() {
         .expect("a lapsed sonnet intro price must not take the catalog down");
 
     // Every tier that has nothing to do with Sonnet's pricing still routes,
-    // through its tier id and its pinned candidate alike. `zero/optimized`
-    // survives too: it dispatches the same upstream model, but it carries its
-    // own candidate on its own rates, so a hike to the PIN cannot withhold
-    // the BAND. That independence is the point of the separate entries.
+    // through its tier id and its pinned candidate alike.
     assert_eq!(
         catalog.tiers.keys().map(String::as_str).collect::<Vec<_>>(),
         [
-            "zero/best",
             "zero/codex",
             "zero/fable-5",
             "zero/haiku-4-5",
-            "zero/low-cost",
             "zero/luna",
-            "zero/optimized",
             "zero/opus-5",
             "zero/sol"
         ]
     );
     for model in [
-        "zero/low-cost",
+        "zero/luna",
         "zero/haiku-4-5",
         "openai/gpt-5.6-luna",
         "anthropic/claude-haiku-4-5",
@@ -678,11 +661,11 @@ async fn a_basis_hike_above_sell_withholds_that_tier_and_nothing_else() {
     assert_eq!(sell.input_per_mtok, Some(2.00));
     assert_eq!(sell.output_per_mtok, Some(10.00));
 
-    // And the public catalog stops advertising what it cannot serve: the nine
-    // surviving tier ids plus their nine candidates.
+    // And the public catalog stops advertising what it cannot serve: the six
+    // surviving tier ids plus their six candidates.
     let listed = listed_model_ids(RouterState::new(path)).await;
-    assert_eq!(listed.len(), 18);
-    assert!(listed.iter().any(|id| id == "zero/low-cost"));
+    assert_eq!(listed.len(), 12);
+    assert!(listed.iter().any(|id| id == "zero/luna"));
     assert!(listed.iter().any(|id| id == "zero/haiku-4-5"));
 
     // The mispriced PIN and its candidate are both gone.
@@ -692,63 +675,6 @@ async fn a_basis_hike_above_sell_withholds_that_tier_and_nothing_else() {
             .any(|id| id == "zero/sonnet-5" || id == "anthropic/claude-sonnet-5"),
         "the withheld pin must not be advertised: {listed:?}"
     );
-    // But `zero/optimized` still dispatches claude-sonnet-5 and still sells,
-    // because the band prices its own candidate. Withholding is per-tier
-    // economics, not a blanket ban on a model — a customer buying the intent
-    // is unaffected by a pin that went underwater.
-    assert!(
-        listed.iter().any(|id| id == "zero/optimized"),
-        "the band must survive a hike to the pin: {listed:?}"
-    );
-    assert!(
-        listed
-            .iter()
-            .any(|id| id == "band/optimized/claude-sonnet-5"),
-        "the band's own sonnet candidate is unaffected: {listed:?}"
-    );
-}
-
-#[tokio::test]
-async fn a_band_charges_no_routing_premium_while_it_cannot_route() {
-    // The bands are named for selection machinery that is not finished, so
-    // each holds exactly ONE candidate and therefore sells at that
-    // candidate's basis — a customer pays for routing only once routing
-    // happens. The day a band gains a second candidate its sell rate must
-    // rise to cover the dearer one, and that is a PRICE CHANGE for everyone
-    // already on the band. This test is the tripwire: it fails the moment a
-    // band gains a rung, so the pricing decision cannot be made silently in
-    // a config edit.
-    let catalog = load_tier_catalog(&tier_config_path())
-        .await
-        .expect("bundled tier catalog must load");
-
-    for band in BAND_TIERS {
-        let tier = catalog
-            .tiers
-            .get(band)
-            .unwrap_or_else(|| panic!("{band} must ship"));
-        assert_eq!(
-            tier.candidates.len(),
-            1,
-            "{band} gained a rung — it can now route, so decide its sell rate \
-             and announce the price change before updating this test"
-        );
-        let candidate = &tier.candidates[0];
-        assert_eq!(
-            (
-                candidate.rates.input_per_mtok,
-                candidate.rates.cached_input_per_mtok,
-                candidate.rates.output_per_mtok
-            ),
-            (
-                tier.rates.input_per_mtok,
-                tier.rates.cached_input_per_mtok,
-                tier.rates.output_per_mtok
-            ),
-            "{band} must sell at its single candidate's cost: no premium for \
-             a choice ZeroRouter is not yet making"
-        );
-    }
 }
 
 #[tokio::test]
@@ -765,7 +691,7 @@ async fn the_shipped_catalog_withholds_no_tier_today() {
         "the shipped catalog withholds {:?}",
         catalog.unavailable.keys().collect::<Vec<_>>()
     );
-    assert_eq!(catalog.tiers.len(), 10);
+    assert_eq!(catalog.tiers.len(), 7);
 }
 
 /// The routed tiers vs the pass-through tiers, told apart explicitly so
@@ -775,7 +701,7 @@ async fn the_shipped_catalog_withholds_no_tier_today() {
 // rungs across >=2 providers). Every tier is pass-through until a second
 // provider serves a model class again.
 const ROUTED_TIERS: [&str; 0] = [];
-const PASS_THROUGH_TIERS: [&str; 10] = [
+const PASS_THROUGH_TIERS: [&str; 7] = [
     // Model pins.
     "zero/luna",
     "zero/haiku-4-5",
@@ -784,15 +710,7 @@ const PASS_THROUGH_TIERS: [&str; 10] = [
     "zero/sol",
     "zero/opus-5",
     "zero/fable-5",
-    // Intent bands. They are pass-through TODAY only because each still
-    // holds a single candidate; see `a_band_charges_no_routing_premium`.
-    "zero/low-cost",
-    "zero/optimized",
-    "zero/best",
 ];
-
-/// The three intent bands, whose model is expected to change over time.
-const BAND_TIERS: [&str; 3] = ["zero/low-cost", "zero/optimized", "zero/best"];
 
 #[tokio::test]
 async fn every_shipped_tier_keeps_its_structural_promise() {
