@@ -1992,6 +1992,34 @@ async fn replay_charge(
         ("metadata[gross_usd]", &gross_usd),
         ("metadata[provenance]", &provenance),
     ];
+
+    // HIGH-2: the last line of defense, immediately before money moves. A
+    // dispute-freeze — and the balance reversal that drives the account into a
+    // receivable — can commit AFTER candidate selection and the claim,
+    // including during the payment-methods round-trip just above, and neither
+    // autopay_candidates nor claim_autopay_attempt re-runs at this instant.
+    // Off-session charging the saved card of a customer who just disputed is
+    // the exact catastrophe migration 0009 exists to prevent, so re-assert the
+    // shared eligibility predicate here. If it no longer holds, refuse to POST
+    // and HOLD the claim (leave the pending row for reconciliation) — never
+    // terminal-fail it, which could free the slot for a second charge or drop
+    // a claim that may already have been charged (sol review, stripe.rs
+    // hold-not-fail discipline above).
+    let eligible = sqlx::query_scalar::<_, bool>(&format!(
+        "SELECT ({}) FROM users WHERE id = $1",
+        billing::AUTOPAY_ELIGIBILITY_PREDICATE
+    ))
+    .bind(user_id)
+    .fetch_one(pool)
+    .await?;
+    if !eligible {
+        tracing::warn!(
+            %user_id,
+            "not charging a frozen / indebted / max-failed account; holding the autopay claim for reconciliation"
+        );
+        anyhow::bail!("account is no longer eligible for autopay; holding the claim");
+    }
+
     let response = client
         .post(format!("{}/v1/payment_intents", settings.api_base))
         .header("Idempotency-Key", idempotency_key)

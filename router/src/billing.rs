@@ -1414,6 +1414,34 @@ pub async fn record_recovery(
 // Autopay (migration 0008)
 // ---------------------------------------------------------------------------
 
+/// The account-state half of "may this account be auto-charged?", as one SQL
+/// fragment (bare `users` column names, so it drops into any query that has the
+/// row in scope). It is asserted at EVERY boundary that can reach an
+/// off-session charge — `autopay_candidates`, `claim_autopay_attempt`,
+/// `replay_charge`, and `autopay_still_armed` — so the invariant cannot be
+/// stated once and silently dropped downstream (HIGH-2).
+///
+/// - `frozen_at IS NULL`: a frozen account is never charged (migration 0009).
+///   The freeze exists to STOP the spend on a disputing customer; charging the
+///   saved card of a customer fresh off a dispute is how the next dispute is
+///   manufactured.
+/// - `credit_balance_usd >= 0`: nor is an account that OWES money. Since
+///   0009/0013 a negative balance means a reversal receivable — money already
+///   clawed back through Stripe — and such an account is maximally eligible on
+///   every other predicate (its balance is furthest below the threshold), so
+///   re-entry into autopay must be a deliberate operator decision (`admin
+///   disputes resolve`), never a side effect of a sweep.
+/// - `autopay_consecutive_failures < 3`: a dead card gets three attempts, not a
+///   retry loop.
+///
+/// Each site combines this with its own flag/amount/threshold checks. The
+/// freeze webhook and a balance reversal can commit AFTER selection but before
+/// the charge, so re-reading this fragment at the later boundaries — above all
+/// immediately before the POST in `replay_charge` — is what closes the
+/// freeze-vs-charge race (both the live sweep and the reconciliation replay).
+pub const AUTOPAY_ELIGIBILITY_PREDICATE: &str =
+    "frozen_at IS NULL AND credit_balance_usd >= 0 AND autopay_consecutive_failures < 3";
+
 /// A user the autopay sweep should recharge: enabled, configured, under
 /// threshold, not mid-charge, and not disabled by consecutive failures.
 #[derive(Clone, Debug)]
@@ -1430,44 +1458,27 @@ pub async fn autopay_candidates(
     pool: &PgPool,
     limit: i64,
 ) -> Result<Vec<AutopayCandidate>, sqlx::Error> {
-    let rows = sqlx::query_as::<_, (Uuid, String, Decimal)>(
+    let rows = sqlx::query_as::<_, (Uuid, String, Decimal)>(&format!(
         r#"
         SELECT u.id, u.stripe_customer_id, u.autopay_topup_usd
         FROM users u
         WHERE u.autopay_enabled
-          AND u.autopay_consecutive_failures < 3
           AND u.credit_balance_usd < u.autopay_threshold_usd
           AND u.stripe_customer_id IS NOT NULL
-          -- A frozen account is never charged (migration 0009). Without this
-          -- the freeze would be self-defeating in the worst possible way: a
-          -- chargeback reverses the credit, the balance drops through the
-          -- autopay threshold — often into the negative the receivable lives
-          -- in — and the very next sweep charges the disputing customer's
-          -- saved card again, off-session. This narrows the candidate set and
-          -- writes nothing; the claim machinery (HANDOFF §6d) is untouched.
-          AND u.frozen_at IS NULL
-          -- Nor is an account that OWES money, whether or not it is still
-          -- frozen. Since 0009/0013 a negative balance has exactly one
-          -- meaning: a reversal receivable — money already clawed back
-          -- through Stripe and not yet settled. Such an account is
-          -- maximally eligible on every other predicate (its balance is the
-          -- furthest below the threshold, so it even sorts first), which
-          -- makes the debtor whose freeze has been lifted the very next
-          -- card this sweep would charge off-session. Auto-charging the
-          -- saved card of a customer fresh off a payment dispute is how the
-          -- next dispute is manufactured. Re-entry into autopay is
-          -- therefore an explicit human decision — `admin disputes resolve`
-          -- (write off or record the recovery) brings the balance back to
-          -- zero — and never a side effect of a sweep.
-          AND u.credit_balance_usd >= 0
+          -- The account-state eligibility set — frozen / receivable / failure
+          -- cap — as ONE shared fragment, asserted identically at the claim,
+          -- replay, and still-armed boundaries so a later stage cannot drop it
+          -- (HIGH-2). See AUTOPAY_ELIGIBILITY_PREDICATE for why each of the
+          -- three disqualifies an account from an off-session charge.
+          AND ({AUTOPAY_ELIGIBILITY_PREDICATE})
           AND NOT EXISTS (
               SELECT 1 FROM stripe_autopay_intents i
               WHERE i.user_id = u.id AND i.status = 'pending'
           )
         ORDER BY u.credit_balance_usd ASC
         LIMIT $1
-        "#,
-    )
+        "#
+    ))
     .bind(limit)
     .fetch_all(pool)
     .await?;
@@ -1507,7 +1518,7 @@ pub async fn claim_autopay_attempt(
     // user lowered cannot be charged at its old size. `amount_usd` is the NET
     // credit re-read from the row; `charge_amount_usd` is the GROSS the caller
     // priced from that same net topup.
-    let claimed = sqlx::query(
+    let claimed = sqlx::query(&format!(
         r#"
         INSERT INTO stripe_autopay_intents
             (payment_intent_id, user_id, amount_usd, charge_amount_usd)
@@ -1521,9 +1532,15 @@ pub async fn claim_autopay_attempt(
           -- charge too (sol review).
           AND autopay_threshold_usd IS NOT NULL
           AND credit_balance_usd < autopay_threshold_usd
+          -- HIGH-2: re-assert the SAME frozen / receivable / failure-cap set
+          -- autopay_candidates selected on. A dispute freeze and a balance
+          -- reversal can commit between selection and this claim; without this
+          -- the INSERT still matches (a negative balance is only FURTHER below
+          -- the threshold) and the disputing customer is charged.
+          AND ({AUTOPAY_ELIGIBILITY_PREDICATE})
         ON CONFLICT DO NOTHING
-        "#,
-    )
+        "#
+    ))
     .bind(format!("local_{idempotency_key}"))
     .bind(user_id)
     .bind(amount_usd)
@@ -1534,19 +1551,25 @@ pub async fn claim_autopay_attempt(
     Ok(claimed > 0)
 }
 
-/// Whether a user still wants autopay, read at the moment of use.
+/// Whether a user is still eligible for autopay, read at the moment of use.
 ///
 /// The reconciliation pass replays a stranded local claim under its
-/// original idempotency key up to half an hour later; by then the user may
-/// have opted out, and replaying would charge someone who has already left
-/// (sol review). A claim whose owner has since disabled autopay is dropped
-/// rather than replayed.
+/// original idempotency key up to ~20 hours later; by then the user may
+/// have opted out, or — the HIGH-2 case — been frozen and driven into a
+/// receivable by a dispute. Replaying either charges someone who must not be
+/// charged, so this is the full eligibility gate, not just the enabled flag:
+/// enabled AND the shared frozen / receivable / failure-cap predicate. A
+/// `false` result routes the reconciliation pass to KEEP (not delete) the
+/// claim, which is correct for a stranded charge that may already have
+/// happened.
 pub async fn autopay_still_armed(pool: &PgPool, user_id: Uuid) -> Result<bool, sqlx::Error> {
-    sqlx::query_scalar::<_, bool>("SELECT autopay_enabled FROM users WHERE id = $1")
-        .bind(user_id)
-        .fetch_optional(pool)
-        .await
-        .map(|armed| armed.unwrap_or(false))
+    sqlx::query_scalar::<_, bool>(&format!(
+        "SELECT autopay_enabled AND ({AUTOPAY_ELIGIBILITY_PREDICATE}) FROM users WHERE id = $1"
+    ))
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await
+    .map(|armed| armed.unwrap_or(false))
 }
 
 /// Attach the real PaymentIntent id to a claim once Stripe has answered.

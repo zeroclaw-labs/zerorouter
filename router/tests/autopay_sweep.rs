@@ -19,7 +19,12 @@ use std::str::FromStr;
 use sqlx_core::{query::query, query_as::query_as, query_scalar::query_scalar};
 use sqlx_postgres::{PgConnectOptions, PgPool, PgPoolOptions};
 use uuid::Uuid;
-use zerorouter::{db::migrate, stripe::run_autopay_sweep_once, web::StripeSettings};
+use zerorouter::{
+    billing::{FreezeReason, autopay_still_armed, claim_autopay_attempt, freeze_account},
+    db::migrate,
+    stripe::run_autopay_sweep_once,
+    web::StripeSettings,
+};
 
 async fn connect() -> Option<PgPool> {
     let database_url = std::env::var("DATABASE_URL").ok()?;
@@ -494,4 +499,342 @@ async fn the_sweep_charges_gross_and_credits_net() {
         .execute(&pool)
         .await
         .expect("teardown disarm");
+}
+
+// ---------------------------------------------------------------------------
+// HIGH-2: the freeze/debt/failure eligibility predicate is re-asserted at
+// every boundary that can reach the charge, not only at candidate selection.
+// ---------------------------------------------------------------------------
+
+/// What a racing dispute does to the account mid-sweep.
+#[derive(Clone, Copy)]
+enum Race {
+    /// The dispute freeze commits (like the webhook's freeze_account).
+    Freeze,
+    /// The reversal drives the balance into a receivable.
+    GoNegative,
+}
+
+/// Mock Stripe whose payment-methods lookup — the round-trip the sweep makes
+/// AFTER claiming but BEFORE the charge POST — commits the racing state change,
+/// so the freeze/reversal lands in exactly the window HIGH-2 is about: past
+/// candidate selection and the claim, immediately before money would move.
+/// Only `replay_charge`'s pre-charge guard stands between it and the POST.
+#[derive(Clone)]
+struct RaceMock {
+    pool: PgPool,
+    user_id: Uuid,
+    charges: Arc<AtomicUsize>,
+    race: Race,
+}
+
+fn race_mock(pool: PgPool, user_id: Uuid, race: Race) -> (Router, Arc<AtomicUsize>) {
+    let charges = Arc::new(AtomicUsize::new(0));
+    let state = RaceMock {
+        pool,
+        user_id,
+        charges: charges.clone(),
+        race,
+    };
+    let app = Router::new()
+        .route(
+            "/v1/customers/{customer}/payment_methods",
+            get(|State(state): State<RaceMock>| async move {
+                match state.race {
+                    Race::Freeze => {
+                        query(
+                            "UPDATE users SET frozen_at = NOW(), frozen_reason = 'dispute' WHERE id = $1",
+                        )
+                        .bind(state.user_id)
+                        .execute(&state.pool)
+                        .await
+                        .expect("mid-sweep freeze must apply");
+                    }
+                    Race::GoNegative => {
+                        // The 0009 overdraft trigger only permits a negative
+                        // balance under a declared reversal, exactly as
+                        // reverse_purchase declares it.
+                        let mut tx = state.pool.begin().await.expect("tx");
+                        query("SET LOCAL zerorouter.credit_reversal = 'on'")
+                            .execute(&mut *tx)
+                            .await
+                            .expect("reversal flag");
+                        query("UPDATE users SET credit_balance_usd = -1 WHERE id = $1")
+                            .bind(state.user_id)
+                            .execute(&mut *tx)
+                            .await
+                            .expect("mid-sweep reversal must apply");
+                        tx.commit().await.expect("commit");
+                    }
+                }
+                axum::Json(json!({"data": [{"id": "pm_test_card"}]}))
+            }),
+        )
+        .route(
+            "/v1/payment_intents",
+            post(|State(state): State<RaceMock>| async move {
+                state.charges.fetch_add(1, Ordering::SeqCst);
+                axum::Json(json!({
+                    "id": format!("pi_mock_{}", Uuid::new_v4().simple()),
+                    "status": "succeeded",
+                }))
+            }),
+        )
+        .with_state(state);
+    (app, charges)
+}
+
+/// The account is clean at selection and at the claim, then a dispute freeze
+/// commits during the payment-methods round-trip — after the claim, before the
+/// charge. The pre-charge guard must refuse the POST and HOLD the claim (leave
+/// it pending for reconciliation), never terminal-fail it.
+#[tokio::test]
+async fn a_freeze_between_selection_and_charge_holds_the_claim_and_charges_nothing() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let _sweep_guard = SWEEP_LOCK.lock().await;
+    disarm_all_autopay(&pool).await;
+
+    let user_id = autopay_user(&pool, "race-freeze", 10, 25).await;
+    let (app, charges) = race_mock(pool.clone(), user_id, Race::Freeze);
+    let base = serve(app).await;
+
+    run_autopay_sweep_once(&pool, &settings(&base)).await;
+
+    assert_eq!(
+        charges.load(Ordering::SeqCst),
+        0,
+        "an account frozen before the charge is never POSTed to Stripe"
+    );
+    assert_eq!(
+        balance_of(&pool, user_id).await,
+        Decimal::ZERO,
+        "nothing was credited"
+    );
+    let pending = query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM stripe_autopay_intents WHERE user_id = $1 AND status = 'pending'",
+    )
+    .bind(user_id)
+    .fetch_one(&pool)
+    .await
+    .expect("claim state must query");
+    assert_eq!(
+        pending, 1,
+        "the claim is HELD for reconciliation, not terminal-failed"
+    );
+    let failures =
+        query_scalar::<_, i32>("SELECT autopay_consecutive_failures FROM users WHERE id = $1")
+            .bind(user_id)
+            .fetch_one(&pool)
+            .await
+            .expect("failure count must query");
+    assert_eq!(failures, 0, "holding the claim is not a strike");
+
+    query("UPDATE users SET autopay_enabled = FALSE WHERE id = $1")
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .expect("teardown disarm");
+}
+
+/// The same window, but the racing event drives the balance into a receivable
+/// (a negative balance is only FURTHER below the autopay threshold, so every
+/// amount/threshold check still passes — only the `>= 0` half of the shared
+/// predicate catches it). The charge is refused and the claim held.
+#[tokio::test]
+async fn a_negative_balance_between_selection_and_charge_holds_the_claim_and_charges_nothing() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let _sweep_guard = SWEEP_LOCK.lock().await;
+    disarm_all_autopay(&pool).await;
+
+    let user_id = autopay_user(&pool, "race-negative", 10, 25).await;
+    let (app, charges) = race_mock(pool.clone(), user_id, Race::GoNegative);
+    let base = serve(app).await;
+
+    run_autopay_sweep_once(&pool, &settings(&base)).await;
+
+    assert_eq!(
+        charges.load(Ordering::SeqCst),
+        0,
+        "an indebted account is never POSTed to Stripe"
+    );
+    let pending = query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM stripe_autopay_intents WHERE user_id = $1 AND status = 'pending'",
+    )
+    .bind(user_id)
+    .fetch_one(&pool)
+    .await
+    .expect("claim state must query");
+    assert_eq!(pending, 1, "the claim is held, not failed");
+    let failures =
+        query_scalar::<_, i32>("SELECT autopay_consecutive_failures FROM users WHERE id = $1")
+            .bind(user_id)
+            .fetch_one(&pool)
+            .await
+            .expect("failure count must query");
+    assert_eq!(failures, 0, "holding the claim is not a strike");
+
+    query("UPDATE users SET autopay_enabled = FALSE WHERE id = $1")
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .expect("teardown disarm");
+}
+
+/// The claim gate re-asserts the full eligibility set. A freeze / receivable /
+/// max-failures that commits between selection and the claim makes the claim
+/// match nothing, so no charge is ever attempted — this is the boundary that
+/// closes the window before Stripe is even contacted.
+#[tokio::test]
+async fn claim_autopay_attempt_refuses_a_frozen_indebted_or_maxed_out_account() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let _sweep_guard = SWEEP_LOCK.lock().await;
+
+    // A clean, under-threshold account claims.
+    let clean = autopay_user(&pool, "claim-clean", 10, 25).await;
+    assert!(
+        claim_autopay_attempt(
+            &pool,
+            clean,
+            Decimal::from(25),
+            Decimal::from_str("26.38").expect("literal"),
+            &Uuid::new_v4().simple().to_string(),
+        )
+        .await
+        .expect("claim must query"),
+        "a clean under-threshold account is claimed"
+    );
+
+    // Frozen: refused, even though the amount and threshold still match.
+    let frozen = autopay_user(&pool, "claim-frozen", 10, 25).await;
+    freeze_account(&pool, frozen, FreezeReason::Dispute)
+        .await
+        .expect("freeze must apply");
+    assert!(
+        !claim_autopay_attempt(
+            &pool,
+            frozen,
+            Decimal::from(25),
+            Decimal::from_str("26.38").expect("literal"),
+            &Uuid::new_v4().simple().to_string(),
+        )
+        .await
+        .expect("claim must query"),
+        "a frozen account is not claimed"
+    );
+
+    // Negative balance: refused. It is further below the threshold, so the
+    // amount/threshold checks pass; only the `>= 0` predicate stops it.
+    let debtor = autopay_user(&pool, "claim-debtor", 10, 25).await;
+    let mut tx = pool.begin().await.expect("tx");
+    query("SET LOCAL zerorouter.credit_reversal = 'on'")
+        .execute(&mut *tx)
+        .await
+        .expect("reversal flag");
+    query("UPDATE users SET credit_balance_usd = -1 WHERE id = $1")
+        .bind(debtor)
+        .execute(&mut *tx)
+        .await
+        .expect("receivable must apply");
+    tx.commit().await.expect("commit");
+    assert!(
+        !claim_autopay_attempt(
+            &pool,
+            debtor,
+            Decimal::from(25),
+            Decimal::from_str("26.38").expect("literal"),
+            &Uuid::new_v4().simple().to_string(),
+        )
+        .await
+        .expect("claim must query"),
+        "an indebted account is not claimed"
+    );
+
+    // Three consecutive failures: refused.
+    let maxed = autopay_user(&pool, "claim-maxed", 10, 25).await;
+    query("UPDATE users SET autopay_consecutive_failures = 3 WHERE id = $1")
+        .bind(maxed)
+        .execute(&pool)
+        .await
+        .expect("strike count must apply");
+    assert!(
+        !claim_autopay_attempt(
+            &pool,
+            maxed,
+            Decimal::from(25),
+            Decimal::from_str("26.38").expect("literal"),
+            &Uuid::new_v4().simple().to_string(),
+        )
+        .await
+        .expect("claim must query"),
+        "a struck-out account is not claimed"
+    );
+}
+
+/// The reconciliation-replay gate (`autopay_still_armed`) is the full
+/// eligibility test, not just the enabled flag: a stranded claim on an account
+/// that has since been frozen, driven negative, or struck out must not be
+/// replayed up to ~20 hours later.
+#[tokio::test]
+async fn autopay_still_armed_is_false_when_frozen_negative_or_maxed_out() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let _sweep_guard = SWEEP_LOCK.lock().await;
+
+    let clean = autopay_user(&pool, "armed-clean", 10, 25).await;
+    assert!(
+        autopay_still_armed(&pool, clean)
+            .await
+            .expect("still-armed must query"),
+        "a clean enabled account is armed"
+    );
+
+    let frozen = autopay_user(&pool, "armed-frozen", 10, 25).await;
+    freeze_account(&pool, frozen, FreezeReason::Dispute)
+        .await
+        .expect("freeze must apply");
+    assert!(
+        !autopay_still_armed(&pool, frozen)
+            .await
+            .expect("still-armed must query"),
+        "a frozen account is not armed"
+    );
+
+    let debtor = autopay_user(&pool, "armed-debtor", 10, 25).await;
+    let mut tx = pool.begin().await.expect("tx");
+    query("SET LOCAL zerorouter.credit_reversal = 'on'")
+        .execute(&mut *tx)
+        .await
+        .expect("reversal flag");
+    query("UPDATE users SET credit_balance_usd = -1 WHERE id = $1")
+        .bind(debtor)
+        .execute(&mut *tx)
+        .await
+        .expect("receivable must apply");
+    tx.commit().await.expect("commit");
+    assert!(
+        !autopay_still_armed(&pool, debtor)
+            .await
+            .expect("still-armed must query"),
+        "an indebted account is not armed"
+    );
+
+    let maxed = autopay_user(&pool, "armed-maxed", 10, 25).await;
+    query("UPDATE users SET autopay_consecutive_failures = 3 WHERE id = $1")
+        .bind(maxed)
+        .execute(&pool)
+        .await
+        .expect("strike count must apply");
+    assert!(
+        !autopay_still_armed(&pool, maxed)
+            .await
+            .expect("still-armed must query"),
+        "a struck-out account is not armed"
+    );
 }
