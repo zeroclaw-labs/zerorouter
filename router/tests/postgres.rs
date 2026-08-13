@@ -778,7 +778,20 @@ async fn migration_chain_applies_on_a_fresh_database() {
     // struct would outlive its usefulness the moment the next migration adds
     // a probe; the tuple grows in one place and the assertions name the facts.
     #[allow(clippy::type_complexity)]
-    let outcome: anyhow::Result<(bool, bool, bool, bool, bool, bool, bool, bool, bool, bool, i64)> = async {
+    let outcome: anyhow::Result<(
+        bool,
+        bool,
+        bool,
+        bool,
+        bool,
+        bool,
+        bool,
+        bool,
+        bool,
+        bool,
+        bool,
+        i64,
+    )> = async {
         let pool = PgPoolOptions::new()
             .max_connections(1)
             .connect_with(PgConnectOptions::from_str(&fresh_url)?)
@@ -860,6 +873,15 @@ async fn migration_chain_applies_on_a_fresh_database() {
         )
         .fetch_one(&pool)
         .await?;
+        let autopay_withheld_status_exists = query_scalar::<_, bool>(
+            r#"
+            SELECT pg_get_constraintdef(oid) LIKE '%withheld%'
+            FROM pg_constraint
+            WHERE conname = 'stripe_autopay_status_is_known'
+            "#,
+        )
+        .fetch_one(&pool)
+        .await?;
         let version = query_scalar::<_, i64>("SELECT MAX(version) FROM _sqlx_migrations")
             .fetch_one(&pool)
             .await?;
@@ -875,6 +897,7 @@ async fn migration_chain_applies_on_a_fresh_database() {
             release_record_exists,
             autopay_charge_column_exists,
             observed_reversals_exists,
+            autopay_withheld_status_exists,
             version,
         ))
     }
@@ -885,7 +908,7 @@ async fn migration_chain_applies_on_a_fresh_database() {
         .execute(&admin)
         .await;
 
-    let outcome = outcome.expect("the 0001->0017 chain must apply on a fresh database");
+    let outcome = outcome.expect("the 0001->0018 chain must apply on a fresh database");
     assert!(outcome.0, "request_attempts exists after the fresh chain");
     assert!(
         outcome.1,
@@ -923,12 +946,16 @@ async fn migration_chain_applies_on_a_fresh_database() {
         outcome.9,
         "the 0017 stripe_observed_reversals table exists after the chain"
     );
-    // 17, not 13: 0013 (dispute resolution), 0014 (dispatched reservations),
-    // 0015 (released reservations), 0016 (deposit fee) and 0017 (stripe
-    // observed reversals) are numbered with a gap so 0010-0012 stay available
-    // to branches in flight. The chain's head is the highest version applied,
-    // not a count of files.
-    assert_eq!(outcome.10, 17, "the chain reaches migration version 17");
+    assert!(
+        outcome.10,
+        "the 0018 withheld autopay status is permitted by the constraint after the chain"
+    );
+    // 18, not 14: 0013 (dispute resolution), 0014 (dispatched reservations),
+    // 0015 (released reservations), 0016 (deposit fee), 0017 (stripe observed
+    // reversals) and 0018 (autopay withheld state) are numbered with a gap so
+    // 0010-0012 stay available to branches in flight. The chain's head is the
+    // highest version applied, not a count of files.
+    assert_eq!(outcome.11, 18, "the chain reaches migration version 18");
 }
 
 /// Rewrite the database name in a Postgres URL, keeping any query string

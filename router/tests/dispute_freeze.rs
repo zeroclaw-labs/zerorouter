@@ -35,9 +35,9 @@ use zerorouter::{
     app,
     auth::{generate_api_key, hash_api_key},
     billing::{
-        FreezeReason, autopay_candidates, balance, credit_purchase, freeze_account, grant_promo,
-        resolve_reversal_against_credit, settle_autopay_intent, unfreeze_account,
-        write_off_receivable,
+        AutopayOutcome, FreezeReason, autopay_candidates, balance, credit_purchase, freeze_account,
+        grant_promo, resolve_reversal_against_credit, settle_autopay_intent, unfreeze_account,
+        withheld_autopay_intents, write_off_receivable,
     },
     config::ResolvedRoute,
     db::{KeyMintAdmission, admit_key_mint, migrate},
@@ -1082,6 +1082,169 @@ async fn an_autopay_settle_blocks_on_the_intent_lock_a_racing_reversal_holds_the
 }
 
 // ---------------------------------------------------------------------------
+// FIX 1 (High): a frozen / indebted account is never CREDITED by autopay. A
+// freeze that commits in the charge's send window — after the pre-POST guard,
+// before settlement — makes settle_autopay_intent WITHHOLD the credit and move
+// the collected charge to a durable needs-refund state instead of crediting it.
+// ---------------------------------------------------------------------------
+
+/// The headline FIX 1 case. A pending autopay charge has landed at Stripe. A
+/// dispute-freeze on an OLDER intent commits before the terminal webhook is
+/// settled. `settle_autopay_intent` re-checks eligibility under the per-user
+/// lock and withholds: no credit, no `autopay` ledger row, the account stays
+/// frozen, and the intent is recorded `withheld` (needs refund) and surfaced for
+/// an operator. A redelivered success neither double-withholds nor credits.
+#[tokio::test]
+async fn an_autopay_charge_on_an_account_frozen_mid_charge_is_withheld_not_credited() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let user_id = create_user(&pool, "withheld-frozen").await;
+    let payment_intent = format!("pi_test_{}", Uuid::new_v4().simple());
+
+    // A pending autopay claim whose charge succeeded at Stripe, awaiting its
+    // terminal webhook. The gross Stripe collected is 26.38 for a net 25 credit.
+    query(
+        r#"
+        INSERT INTO stripe_autopay_intents
+            (payment_intent_id, user_id, amount_usd, charge_amount_usd)
+        VALUES ($1, $2, 25, 26.38)
+        "#,
+    )
+    .bind(&payment_intent)
+    .bind(user_id)
+    .execute(&pool)
+    .await
+    .expect("pending autopay intent must insert");
+
+    // The freeze committed during the charge's send window (a dispute on an
+    // older intent), so by settlement the account is frozen.
+    freeze_account(&pool, user_id, FreezeReason::Dispute)
+        .await
+        .expect("freeze must apply");
+
+    let outcome = settle_autopay_intent(&pool, &payment_intent, None)
+        .await
+        .expect("settle must run");
+    assert_eq!(
+        outcome,
+        AutopayOutcome::Withheld,
+        "the charge on a frozen account is withheld, not credited"
+    );
+    assert_eq!(
+        balance(&pool, user_id).await.expect("balance must query"),
+        Decimal::ZERO,
+        "the frozen account is NOT credited"
+    );
+    assert!(
+        freeze_of(&pool, user_id).await.0.is_some(),
+        "the account stays frozen"
+    );
+    let status = query_scalar::<_, String>(
+        "SELECT status FROM stripe_autopay_intents WHERE payment_intent_id = $1",
+    )
+    .bind(&payment_intent)
+    .fetch_one(&pool)
+    .await
+    .expect("status must query");
+    assert_eq!(
+        status, "withheld",
+        "the collected charge is recorded as needs-refund"
+    );
+    let autopay_rows = query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM credit_ledger WHERE user_id = $1 AND entry_type = 'autopay'",
+    )
+    .bind(user_id)
+    .fetch_one(&pool)
+    .await
+    .expect("ledger must query");
+    assert_eq!(autopay_rows, 0, "no autopay credit row is written");
+
+    // The withheld charge is surfaced for an out-of-band operator refund, with
+    // the GROSS Stripe collected as the amount to refund.
+    let withheld = withheld_autopay_intents(&pool)
+        .await
+        .expect("withheld list must query");
+    assert!(
+        withheld
+            .iter()
+            .any(|(intent, uid, gross)| intent == &payment_intent
+                && *uid == user_id
+                && *gross == Decimal::from_str("26.38").expect("gross parses")),
+        "the withheld charge is surfaced for refund with its gross amount"
+    );
+
+    // A redelivered success is a no-op: the pending->terminal transition already
+    // ran, so it neither double-withholds nor retroactively credits.
+    let replay = settle_autopay_intent(&pool, &payment_intent, None)
+        .await
+        .expect("redelivery must run");
+    assert_eq!(
+        replay,
+        AutopayOutcome::AlreadySettled,
+        "a redelivered success for a withheld intent is a no-op"
+    );
+    assert_eq!(
+        balance(&pool, user_id).await.expect("balance must query"),
+        Decimal::ZERO,
+        "still not credited after redelivery"
+    );
+}
+
+/// The eligible path is unchanged: a healthy account's autopay settlement still
+/// credits the net top-up exactly as before.
+#[tokio::test]
+async fn an_autopay_charge_on_an_eligible_account_still_credits() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let user_id = create_user(&pool, "withheld-eligible").await;
+    let payment_intent = format!("pi_test_{}", Uuid::new_v4().simple());
+    query(
+        r#"
+        INSERT INTO stripe_autopay_intents
+            (payment_intent_id, user_id, amount_usd, charge_amount_usd)
+        VALUES ($1, $2, 25, 26.38)
+        "#,
+    )
+    .bind(&payment_intent)
+    .bind(user_id)
+    .execute(&pool)
+    .await
+    .expect("pending autopay intent must insert");
+
+    let outcome = settle_autopay_intent(&pool, &payment_intent, None)
+        .await
+        .expect("settle must run");
+    assert_eq!(
+        outcome,
+        AutopayOutcome::Credited,
+        "an eligible account is credited"
+    );
+    assert_eq!(
+        balance(&pool, user_id).await.expect("balance must query"),
+        Decimal::from(25),
+        "the eligible account is credited the net top-up"
+    );
+    let status = query_scalar::<_, String>(
+        "SELECT status FROM stripe_autopay_intents WHERE payment_intent_id = $1",
+    )
+    .bind(&payment_intent)
+    .fetch_one(&pool)
+    .await
+    .expect("status must query");
+    assert_eq!(status, "succeeded", "the eligible charge settles succeeded");
+    assert!(
+        withheld_autopay_intents(&pool)
+            .await
+            .expect("withheld list must query")
+            .iter()
+            .all(|(intent, _, _)| intent != &payment_intent),
+        "an eligible settlement leaves nothing in the withheld list"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // FIX C (Medium): cumulative refunds keyed on the charge id must merge, and a
 // non-covering refund tombstone must not be marked "applied".
 // ---------------------------------------------------------------------------
@@ -1203,6 +1366,127 @@ async fn a_non_covering_refund_tombstone_stays_unapplied_after_the_credit() {
         observed_reversal(&pool, &charge_id).await,
         Some(false),
         "the non-covering tombstone stays UNAPPLIED — a reconciliation flag, not lost"
+    );
+}
+
+/// FIX 3 — a non-covering refund tombstone left unapplied after the credit must
+/// not linger forever as a false "unresolved money" signal. Once a later fuller
+/// refund reverses the intent through the normal credited path, the stale
+/// tombstone is stamped applied. Partial $4 before the credit; the $10 credit
+/// lands (tombstone stays unapplied); a full $10 cumulative refund after the
+/// credit reverses it exactly once, and the original tombstone ends applied.
+#[tokio::test]
+async fn a_stale_tombstone_is_stamped_applied_once_the_credited_path_reverses() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let user_id = create_user(&pool, "stale-tombstone").await;
+    let session_id = format!("cs_test_{}", Uuid::new_v4().simple());
+    let payment_intent = format!("pi_test_{}", Uuid::new_v4().simple());
+    let charge_id = format!("ch_test_{}", Uuid::new_v4().simple());
+
+    // Partial $4 refund before the credit — recorded, non-covering.
+    let (status, _) = post_webhook(
+        &pool,
+        &refund_event(&charge_id, &payment_intent, 400, "usd"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // The $10 credit lands; the partial tombstone stays unapplied (a flag), and
+    // a partial refund reverses nothing.
+    credit_purchase(
+        &pool,
+        user_id,
+        Decimal::from(10),
+        &session_id,
+        Some(payment_intent.as_str()),
+    )
+    .await
+    .expect("the delayed credit must apply");
+    assert_eq!(
+        observed_reversal(&pool, &charge_id).await,
+        Some(false),
+        "the non-covering tombstone is still unapplied after the credit"
+    );
+    assert_eq!(
+        balance(&pool, user_id).await.expect("balance must query"),
+        Decimal::from(10),
+        "a partial refund reversed nothing"
+    );
+
+    // A later full $10 cumulative refund (same charge id) arrives AFTER the
+    // credit; it takes the normal credited path, reverses in full, and stamps
+    // the once-stale tombstone applied.
+    let (status, _) = post_webhook(
+        &pool,
+        &refund_event(&charge_id, &payment_intent, 1_000, "usd"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        balance(&pool, user_id).await.expect("balance must query"),
+        Decimal::ZERO,
+        "the full refund reverses the credit"
+    );
+    assert_eq!(
+        reversals(&pool, user_id).await,
+        vec![(Decimal::from(-10), Decimal::ZERO, charge_id.clone())],
+        "the reversal happened exactly once"
+    );
+    assert_eq!(
+        observed_reversal(&pool, &charge_id).await,
+        Some(true),
+        "the once-stale tombstone is now stamped applied"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// FIX 4 (Low): an object-id reuse whose anchors disagree is refused, not merged.
+// ---------------------------------------------------------------------------
+
+/// A reused Stripe object id carrying a DIFFERENT payment intent must not merge
+/// its amount into the original tombstone. The `ON CONFLICT ... DO UPDATE WHERE`
+/// now enforces anchor equality, so the mismatch is logged and refused and the
+/// original `reversed_cents` is left untouched — a larger conflicting amount
+/// cannot raise this intent's coverage.
+#[tokio::test]
+async fn an_object_id_reuse_with_a_different_intent_does_not_merge_its_amount() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let charge_id = format!("ch_test_{}", Uuid::new_v4().simple());
+    let intent_a = format!("pi_test_{}", Uuid::new_v4().simple());
+    let intent_b = format!("pi_test_{}", Uuid::new_v4().simple());
+
+    // A $4 refund tombstone for intent A (uncredited, so it is recorded).
+    let (status, _) = post_webhook(&pool, &refund_event(&charge_id, &intent_a, 400, "usd")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(tombstone_reversed_cents(&pool, &charge_id).await, Some(400));
+
+    // The SAME charge id reused with a DIFFERENT intent and a larger $10 amount.
+    // The anchor mismatch is acknowledged (HTTP 200) but the amount is refused.
+    let (status, _) = post_webhook(&pool, &refund_event(&charge_id, &intent_b, 1_000, "usd")).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the mismatch is acknowledged, not errored"
+    );
+    assert_eq!(
+        tombstone_reversed_cents(&pool, &charge_id).await,
+        Some(400),
+        "the mismatched amount is refused, not merged"
+    );
+    let anchored_intent = query_scalar::<_, String>(
+        "SELECT payment_intent_id FROM stripe_observed_reversals WHERE object_id = $1",
+    )
+    .bind(&charge_id)
+    .fetch_one(&pool)
+    .await
+    .expect("anchor must query");
+    assert_eq!(
+        anchored_intent, intent_a,
+        "the original intent anchor is unchanged"
     );
 }
 

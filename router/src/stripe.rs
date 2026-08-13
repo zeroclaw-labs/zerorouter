@@ -1776,6 +1776,18 @@ async fn reconcile_stale_intents(pool: &crate::sqlx::PgPool, settings: &StripeSe
         Ok(_) => {}
         Err(error) => tracing::warn!(%error, "could not list overdue autopay claims"),
     }
+    // Charges collected at Stripe whose credit was WITHHELD at settlement (FIX 1)
+    // are money owed back to a frozen / indebted account. Surface them loudly on
+    // every pass until an operator refunds them out of band; automation must not
+    // credit them, and deliberately does not refund inline.
+    match billing::withheld_autopay_intents(pool).await {
+        Ok(withheld) if !withheld.is_empty() => tracing::error!(
+            count = withheld.len(),
+            "autopay charges were collected but withheld from a frozen / indebted account and need an operator refund"
+        ),
+        Ok(_) => {}
+        Err(error) => tracing::warn!(%error, "could not list withheld autopay charges"),
+    }
     let stale = match billing::stale_autopay_intents(
         pool,
         AUTOPAY_RECONCILE_AFTER_MINUTES,
@@ -1809,15 +1821,7 @@ async fn reconcile_stale_intents(pool: &crate::sqlx::PgPool, settings: &StripeSe
                     Ok(())
                 }
                 Ok(true) => {
-                    replay_charge(
-                        pool,
-                        settings,
-                        user_id,
-                        amount_usd,
-                        idempotency_key,
-                        AutopayClaimOrigin::Reconciliation,
-                    )
-                    .await
+                    replay_charge(pool, settings, user_id, amount_usd, idempotency_key).await
                 }
                 Err(error) => Err(anyhow::Error::from(error)),
             }
@@ -1907,24 +1911,8 @@ async fn charge_candidate(
         candidate.user_id,
         candidate.topup_usd,
         &idempotency_key,
-        AutopayClaimOrigin::FreshSweep,
     )
     .await
-}
-
-/// Whether a claim reaching [`replay_charge`] has provably not been submitted to
-/// Stripe yet. It decides what pre-POST ineligibility does to the claim (FIX D).
-#[derive(Clone, Copy, Debug)]
-enum AutopayClaimOrigin {
-    /// A claim this sweep JUST created in `charge_candidate` and has not POSTed.
-    /// Pre-POST ineligibility RELEASES it (no strike), so it cannot wedge the
-    /// user's one-pending slot forever.
-    FreshSweep,
-    /// A stranded claim from an earlier sweep, replayed by reconciliation and
-    /// POSSIBLY already submitted to Stripe under this idempotency key. Pre-POST
-    /// ineligibility HOLDS it — its key is the only durable handle on a charge
-    /// that might have happened.
-    Reconciliation,
 }
 
 /// Create (or idempotently re-create) the off-session charge for a claim.
@@ -1936,7 +1924,6 @@ async fn replay_charge(
     user_id: Uuid,
     topup_usd: Decimal,
     idempotency_key: &str,
-    origin: AutopayClaimOrigin,
 ) -> anyhow::Result<()> {
     let client = stripe_client().map_err(|_| anyhow::anyhow!("stripe client"))?;
     let Some(customer) = sqlx::query_scalar::<_, Option<String>>(
@@ -2024,18 +2011,20 @@ async fn replay_charge(
     // the exact catastrophe migration 0009 exists to prevent, so re-assert the
     // shared eligibility predicate here.
     //
-    // FIX B (documented, not locked): a residual window remains between this
-    // SELECT and the `.send()` below — an inherent local-check-vs-external-
-    // side-effect gap, now bounded to the ~microseconds between the read and the
-    // outbound write rather than the ~20h it once was. It is DELIBERATELY not
-    // closed by holding a DB advisory lock across the Stripe POST: that would
-    // pin a pooled connection for up to the 15s HTTP timeout and block the
-    // freeze webhook itself, trading a vanishingly rare race for a real
-    // availability and lock-contention hazard. If a freeze commits inside that
-    // ~µs window and the POST still lands, Stripe's dispute/refund process is
-    // the backstop — the reversal path (now serialized on the intent lock, FIX
-    // A) converges the account to reversed/frozen when that charge's credit
-    // lands.
+    // A residual window remains between this SELECT and the `.send()` below — an
+    // inherent local-check-vs-external-side-effect gap. It is NOT closed by
+    // holding a DB advisory lock across the Stripe POST: `send().await` spans
+    // pool acquisition, DNS/TCP/TLS, and request transmission under a 15s HTTP
+    // timeout, and pinning a pooled connection (and blocking the freeze webhook)
+    // for that long is the anti-pattern we refuse. So the CHARGE here is
+    // best-effort: if a freeze commits inside that window and the POST still
+    // lands, a card may rarely be charged. What is NOT best-effort is the CREDIT.
+    // `settle_autopay_intent` re-checks this SAME eligibility predicate under the
+    // per-user advisory lock before crediting (FIX 1) and WITHHOLDS the credit
+    // for an account frozen / indebted mid-charge, moving the intent to the
+    // `withheld` (needs-refund) state for an operator to refund out of band. A
+    // frozen / indebted account is therefore never CREDITED by autopay, even in
+    // the rare case its card was charged in this race.
     let eligible = sqlx::query_scalar::<_, bool>(&format!(
         "SELECT ({}) FROM users WHERE id = $1",
         billing::AUTOPAY_ELIGIBILITY_PREDICATE
@@ -2044,36 +2033,25 @@ async fn replay_charge(
     .fetch_one(pool)
     .await?;
     if !eligible {
-        // FIX D: what happens to the claim depends on whether it could already
-        // have been submitted to Stripe.
-        match origin {
-            AutopayClaimOrigin::FreshSweep => {
-                // This claim was created moments ago in `charge_candidate` and
-                // has POSTed nothing, so releasing it charges nothing and frees
-                // the one-pending slot for a later, eligible sweep. Holding it
-                // (right only for a possibly-submitted reconciliation claim)
-                // would otherwise wedge this user's autopay forever. No strike:
-                // nothing was attempted.
-                billing::release_autopay_claim(pool, idempotency_key).await?;
-                tracing::warn!(
-                    %user_id,
-                    "not charging a frozen / indebted / max-failed account; releasing the fresh autopay claim (nothing was submitted)"
-                );
-                return Ok(());
-            }
-            AutopayClaimOrigin::Reconciliation => {
-                // A reconciliation claim may already have been submitted under
-                // this idempotency key, so it must be HELD, never released or
-                // terminal-failed — its key is the only durable handle on a
-                // charge that might have happened. Leave the pending row for the
-                // next reconciliation pass.
-                tracing::warn!(
-                    %user_id,
-                    "not charging a frozen / indebted / max-failed account; holding the reconciliation claim"
-                );
-                anyhow::bail!("account is no longer eligible for autopay; holding the claim");
-            }
-        }
+        // FIX 2: HOLD the claim, never release it here. Round 2's FIX D deleted
+        // a claim it believed was fresh-and-unsubmitted, but that judgment came
+        // from `AutopayClaimOrigin` — the CALLER's local history, not the claim's
+        // GLOBAL submission state. A genuinely fresh claim that paused past the
+        // stale threshold can be picked up and POSTed by a reconciliation replay
+        // on another instance, so deleting the pending row here can drop the only
+        // durable idempotency handle on a charge that may already have happened —
+        // reintroducing the known "opt-out deletes an ambiguous autopay claim
+        // that may already be charged" bug. A safe hold beats an unsafe delete:
+        // bail without deleting and leave the pending row for reconciliation. The
+        // resulting block-until-resolved (one-pending-per-user wedged until an
+        // operator acts) is intentionally deferred to the operator-resolution
+        // feature (`v2-overdue-autopay-claims-have-no-resolution-path`), not
+        // closed by a delete that can lose a customer's money.
+        tracing::warn!(
+            %user_id,
+            "not charging a frozen / indebted / max-failed account; holding the autopay claim for reconciliation (never deleted — it may already have been submitted)"
+        );
+        anyhow::bail!("account is no longer eligible for autopay; holding the claim");
     }
 
     let response = client

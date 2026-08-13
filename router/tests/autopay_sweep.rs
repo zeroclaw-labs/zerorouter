@@ -584,15 +584,19 @@ fn race_mock(pool: PgPool, user_id: Uuid, race: Race) -> (Router, Arc<AtomicUsiz
     (app, charges)
 }
 
-/// FIX D — a FRESH sweep claim that turns ineligible before its first POST has
-/// provably submitted nothing, so it is RELEASED (dropped, no strike), not held:
-/// holding a definitely-unsubmitted claim would wedge the user's one-pending
-/// slot forever. The account is clean at selection and at the claim, then a
-/// dispute freeze commits during the payment-methods round-trip — after the
-/// claim, before the charge. Nothing is POSTed, the claim is gone, and once the
-/// account recovers a later sweep can recharge through the freed slot.
+/// FIX 2 — a FRESH sweep claim that turns ineligible before its first POST is
+/// HELD, not released. Round 2's FIX D treated a fresh claim as
+/// provably-unsubmitted and DELETED it, but "fresh" was the caller's local
+/// history, not the claim's GLOBAL submission state: a paused fresh claim can be
+/// picked up and POSTed by a reconciliation replay on another instance, so
+/// deleting the pending row could drop the only durable idempotency handle on a
+/// charge that already happened. A safe hold beats an unsafe delete. The account
+/// is clean at selection and at the claim, then a dispute freeze commits during
+/// the payment-methods round-trip — after the claim, before the charge. Nothing
+/// is POSTed and the pending claim stays put; the resulting block-until-resolved
+/// is intentionally deferred to the operator-resolution feature.
 #[tokio::test]
-async fn a_fresh_claim_that_turns_ineligible_pre_post_is_released_so_a_later_sweep_can_recharge() {
+async fn a_fresh_claim_that_turns_ineligible_pre_post_is_held_not_released() {
     let Some(pool) = connect().await else {
         return;
     };
@@ -615,15 +619,16 @@ async fn a_fresh_claim_that_turns_ineligible_pre_post_is_released_so_a_later_swe
         Decimal::ZERO,
         "nothing was credited"
     );
-    let claims =
-        query_scalar::<_, i64>("SELECT COUNT(*) FROM stripe_autopay_intents WHERE user_id = $1")
-            .bind(user_id)
-            .fetch_one(&pool)
-            .await
-            .expect("claim state must query");
+    let pending = query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM stripe_autopay_intents WHERE user_id = $1 AND status = 'pending'",
+    )
+    .bind(user_id)
+    .fetch_one(&pool)
+    .await
+    .expect("claim state must query");
     assert_eq!(
-        claims, 0,
-        "the fresh, definitely-unsubmitted claim is RELEASED, not held — the slot is free"
+        pending, 1,
+        "the fresh claim is HELD, not released — the pending row stays for reconciliation"
     );
     let failures =
         query_scalar::<_, i32>("SELECT autopay_consecutive_failures FROM users WHERE id = $1")
@@ -631,10 +636,13 @@ async fn a_fresh_claim_that_turns_ineligible_pre_post_is_released_so_a_later_swe
             .fetch_one(&pool)
             .await
             .expect("failure count must query");
-    assert_eq!(failures, 0, "releasing the claim is not a strike");
+    assert_eq!(failures, 0, "holding the claim is not a strike");
 
-    // The account recovers (the dispute was resolved and the freeze lifted). A
-    // later eligible sweep must be able to recharge through the freed slot.
+    // The account recovers (the dispute resolved and the freeze lifted), but the
+    // held pending claim still occupies the one-pending slot, so a later sweep
+    // does NOT recharge: the block-until-resolved is intentional and deferred to
+    // the operator-resolution feature, never closed by a delete that could lose a
+    // charge that may already have happened.
     query("UPDATE users SET frozen_at = NULL, frozen_reason = NULL WHERE id = $1")
         .bind(user_id)
         .execute(&pool)
@@ -645,13 +653,13 @@ async fn a_fresh_claim_that_turns_ineligible_pre_post_is_released_so_a_later_swe
     run_autopay_sweep_once(&pool, &settings(&base)).await;
     assert_eq!(
         charges.load(Ordering::SeqCst),
-        1,
-        "a later eligible sweep recharges through the freed slot"
+        0,
+        "the held pending claim blocks a later sweep until an operator resolves it"
     );
     assert_eq!(
         balance_of(&pool, user_id).await,
-        Decimal::from(25),
-        "the recharge credits the net top-up"
+        Decimal::ZERO,
+        "still nothing credited while the claim is held"
     );
 
     query("UPDATE users SET autopay_enabled = FALSE WHERE id = $1")
@@ -664,9 +672,9 @@ async fn a_fresh_claim_that_turns_ineligible_pre_post_is_released_so_a_later_swe
 /// The same window, but the racing event drives the balance into a receivable
 /// (a negative balance is only FURTHER below the autopay threshold, so every
 /// amount/threshold check still passes — only the `>= 0` half of the shared
-/// predicate catches it). The fresh claim is likewise RELEASED, no strike.
+/// predicate catches it). The fresh claim is likewise HELD, no strike (FIX 2).
 #[tokio::test]
-async fn a_fresh_claim_that_goes_indebted_pre_post_is_released_not_held() {
+async fn a_fresh_claim_that_goes_indebted_pre_post_is_held() {
     let Some(pool) = connect().await else {
         return;
     };
@@ -684,15 +692,16 @@ async fn a_fresh_claim_that_goes_indebted_pre_post_is_released_not_held() {
         0,
         "an indebted account is never POSTed to Stripe"
     );
-    let claims =
-        query_scalar::<_, i64>("SELECT COUNT(*) FROM stripe_autopay_intents WHERE user_id = $1")
-            .bind(user_id)
-            .fetch_one(&pool)
-            .await
-            .expect("claim state must query");
+    let pending = query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM stripe_autopay_intents WHERE user_id = $1 AND status = 'pending'",
+    )
+    .bind(user_id)
+    .fetch_one(&pool)
+    .await
+    .expect("claim state must query");
     assert_eq!(
-        claims, 0,
-        "the fresh claim is released, not held — nothing was submitted"
+        pending, 1,
+        "the fresh claim is HELD, not released — nothing was submitted, so the row stays for reconciliation"
     );
     let failures =
         query_scalar::<_, i32>("SELECT autopay_consecutive_failures FROM users WHERE id = $1")
@@ -700,7 +709,7 @@ async fn a_fresh_claim_that_goes_indebted_pre_post_is_released_not_held() {
             .fetch_one(&pool)
             .await
             .expect("failure count must query");
-    assert_eq!(failures, 0, "releasing the claim is not a strike");
+    assert_eq!(failures, 0, "holding the claim is not a strike");
 
     query("UPDATE users SET autopay_enabled = FALSE WHERE id = $1")
         .bind(user_id)

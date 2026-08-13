@@ -874,6 +874,13 @@ pub async fn migrate(pool: &PgPool) -> Result<()> {
                 )),
                 false,
             ),
+            Migration::new(
+                18,
+                Cow::Borrowed("autopay withheld state"),
+                MigrationType::Simple,
+                Cow::Borrowed(include_str!("../migrations/0018_autopay_withheld.sql")),
+                false,
+            ),
         ]),
         ignore_missing: false,
         locking: true,

@@ -659,14 +659,19 @@ pub async fn reverse_purchase(
 /// the serialization point between a credit and a reversal for the SAME
 /// PaymentIntent (migration 0017, HIGH-1 round 2 / FIX A).
 ///
-/// Salt **1** keeps it disjoint from the per-user advisory lock (salt 0) that
-/// admission, settlement, and the credit paths take, so the two lock spaces can
-/// never collide. LOCK ORDER, everywhere both are held: the USER lock (salt 0)
-/// FIRST, then this intent lock — so no cycle is possible. The reversal path
-/// takes ONLY this lock (it has no user to lock on until it finds a credit);
-/// the credit paths take the user lock and then this one before checking and
-/// crediting. That makes "credit vs reversal for one intent" a race exactly one
-/// side wins, and the loser sees the winner's committed effect.
+/// Salt **1** selects a DIFFERENT `hashtextextended` hash function than the
+/// per-user lock's salt 0 — NOT a disjoint output range. The two 64-bit spaces
+/// therefore overlap, and a user-lock key can occasionally collide with an
+/// intent-lock key. That collision is harmless: it only adds extra advisory-lock
+/// contention (resolved by the 5s `lock_timeout` every holder sets), and it
+/// cannot lose same-intent serialization or move money, because correctness
+/// rests on both sides of ONE intent taking the SAME key, never on user and
+/// intent keys being distinct. LOCK ORDER, everywhere both are held: the USER
+/// lock (salt 0) FIRST, then this intent lock — so no cycle is possible. The
+/// reversal path takes ONLY this lock (it has no user to lock on until it finds
+/// a credit); the credit paths take the user lock and then this one before
+/// checking and crediting. That makes "credit vs reversal for one intent" a race
+/// exactly one side wins, and the loser sees the winner's committed effect.
 async fn lock_payment_intent(
     conn: &mut sqlx_postgres::PgConnection,
     payment_intent_id: &str,
@@ -711,9 +716,15 @@ async fn insert_observed_reversal(
         ));
     }
     // A reused object id whose anchoring fields disagree is a data error we
-    // record but refuse to act on: the DO UPDATE below touches only
-    // reversed_cents, so the original row's intent/type/currency stand, and we
-    // surface the collision for reconciliation instead of guessing.
+    // record but refuse to act on. The DO UPDATE below touches only
+    // reversed_cents, so the original row's intent/type/currency always stand;
+    // and its WHERE now ALSO requires the anchors to match, so a mismatched
+    // event cannot even merge its amount in (a larger conflicting amount must
+    // not raise this intent's coverage). The equality is enforced atomically in
+    // the ON CONFLICT clause rather than trusting the SELECT above — that SELECT
+    // is only for the operator log, and is racy because two conflicting intents
+    // take different intent locks. We surface the collision for reconciliation
+    // instead of guessing.
     if let Some((existing_intent, existing_is_dispute, existing_currency)) =
         sqlx::query_as::<_, (String, bool, Option<String>)>(
             "SELECT payment_intent_id, is_dispute, currency \
@@ -747,6 +758,9 @@ async fn insert_observed_reversal(
                     COALESCE(stripe_observed_reversals.reversed_cents, EXCLUDED.reversed_cents)
                 )
             WHERE stripe_observed_reversals.applied_at IS NULL
+              AND stripe_observed_reversals.payment_intent_id = EXCLUDED.payment_intent_id
+              AND stripe_observed_reversals.is_dispute = EXCLUDED.is_dispute
+              AND stripe_observed_reversals.currency IS NOT DISTINCT FROM EXCLUDED.currency
         "#,
     )
     .bind(object_id)
@@ -832,7 +846,41 @@ pub async fn resolve_reversal_against_credit(
     if let Some((user_id, amount_usd, entry_type)) = credited {
         // The credit is committed — and, because we hold the intent lock, fully
         // committed, not a half-applied credit still inside its transaction.
-        // Nothing to record; the caller reverses/freezes on the returned credit.
+        // The caller reverses/freezes on the returned credit.
+        //
+        // FIX 3: a non-covering refund tombstone left unapplied when the credit
+        // landed is an operator-visible reconciliation flag. Once a later fuller
+        // refund for the same charge arrives it takes THIS found path and the
+        // credited normal path reverses it — but the original tombstone would
+        // otherwise sit in the unapplied index forever as a false
+        // "unresolved money" signal. So when this event COVERS the credit (the
+        // same coverage rule `apply_observed_reversals` and the webhook apply —
+        // usd, amount present, at least the credited cents), the obligation is
+        // discharged through the credited path; stamp every still-unapplied
+        // tombstone for this intent applied. Done under the intent lock the found
+        // path holds. A non-covering event stamps nothing (the flag stands). This
+        // moves no money — the caller's `reverse_purchase` is per-intent
+        // idempotent — it only clears a stale signal.
+        sqlx::query(
+            r#"
+            UPDATE stripe_observed_reversals
+            SET applied_at = NOW()
+            WHERE payment_intent_id = $1
+              AND applied_at IS NULL
+              AND COALESCE(
+                      $2 = 'usd'
+                      AND $3 IS NOT NULL
+                      AND $3 >= ROUND($4 * 100)::bigint,
+                      FALSE
+                  )
+            "#,
+        )
+        .bind(payment_intent_id)
+        .bind(currency)
+        .bind(reversed_cents)
+        .bind(amount_usd)
+        .execute(&mut *transaction)
+        .await?;
         transaction.commit().await?;
         return Ok(Some(CreditedPurchase {
             user_id,
@@ -1779,32 +1827,6 @@ pub async fn attach_autopay_intent(
     Ok(())
 }
 
-/// Release a claim the sweep took but has provably NOT submitted to Stripe —
-/// the fresh-claim counterpart of the hold-not-fail discipline (FIX D).
-///
-/// A fresh sweep claim that turns ineligible BEFORE its first POST has charged
-/// nothing, so holding it (correct for a possibly-already-submitted
-/// reconciliation claim) is wrong here: combined with one-pending-per-user, the
-/// count-only overdue path, and the ~20h replay window, a permanently-held
-/// fresh claim would block every future recharge for that user. Dropping the
-/// pending `local_<key>` row frees the slot with NO failure strike — nothing
-/// was attempted, so it is not a failure — exactly as [`attach_autopay_intent`]
-/// drops a superseded local claim. Scoped to a still-pending local claim, so it
-/// can never delete a row that has been renamed to a real PaymentIntent or
-/// already settled.
-pub async fn release_autopay_claim(
-    pool: &PgPool,
-    idempotency_key: &str,
-) -> Result<(), sqlx::Error> {
-    sqlx::query(
-        "DELETE FROM stripe_autopay_intents WHERE payment_intent_id = $1 AND status = 'pending'",
-    )
-    .bind(format!("local_{idempotency_key}"))
-    .execute(pool)
-    .await?;
-    Ok(())
-}
-
 /// Pending intents older than the cutoff, for the sweep's reconciliation
 /// pass: local claims whose Stripe response was lost (retried by
 /// idempotency key) and real intents whose terminal webhook never arrived
@@ -1860,6 +1882,29 @@ pub async fn overdue_autopay_intents(
     .await
 }
 
+/// Autopay charges collected at Stripe whose credit was WITHHELD at settlement
+/// because the account had become ineligible in the charge's send window (FIX
+/// 1). Each row is money taken from a card that must be REFUNDED — never
+/// credited to a frozen / indebted account — so it is surfaced here for an
+/// operator to refund out of band, the same shape as `overdue_autopay_intents`
+/// surfaces claims automation must not touch. Returns (payment_intent_id,
+/// user_id, charge_amount_usd): the GROSS Stripe collected, which is the amount
+/// to refund.
+pub async fn withheld_autopay_intents(
+    pool: &PgPool,
+) -> Result<Vec<(String, Uuid, Decimal)>, sqlx::Error> {
+    sqlx::query_as::<_, (String, Uuid, Decimal)>(
+        r#"
+        SELECT payment_intent_id, user_id, charge_amount_usd
+        FROM stripe_autopay_intents
+        WHERE status = 'withheld'
+        ORDER BY updated_at
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+}
+
 /// What settling an autopay charge did.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AutopayOutcome {
@@ -1868,6 +1913,14 @@ pub enum AutopayOutcome {
     /// No intent row and no metadata to recover one from — acknowledged and
     /// ignored (some other system's payment intent).
     Unknown,
+    /// The charge succeeded at Stripe, but the account had become INELIGIBLE
+    /// (frozen / indebted / max-failed) between the pre-POST guard and this
+    /// settlement, so the credit is WITHHELD (FIX 1): no balance credit and no
+    /// `autopay` ledger row. The intent moves to the durable `withheld` state —
+    /// money collected at Stripe that must be refunded — surfaced for an
+    /// operator (`withheld_autopay_intents`) rather than credited to an account
+    /// that must not be charged.
+    Withheld,
 }
 
 /// Credit a succeeded off-session charge, exactly once.
@@ -1970,6 +2023,54 @@ pub async fn settle_autopay_intent(
     // recharge serializes with a reversal for the same PaymentIntent that has no
     // user to lock on. The autopay intent id is always present here.
     lock_payment_intent(&mut transaction, payment_intent_id).await?;
+
+    // FIX 1 (settlement-side re-check): a dispute-freeze on an OLDER intent — and
+    // the balance reversal that drives the account into a receivable — can commit
+    // during the charge's `send().await` window (pool acquire + DNS/TCP/TLS +
+    // transmit, up to the 15s HTTP timeout), AFTER the pre-POST eligibility guard
+    // already passed, and that freeze belongs to a DIFFERENT intent than this new
+    // autopay charge, so nothing else catches it. The charge itself is
+    // best-effort and a card may rarely be charged in that race, but the CREDIT
+    // must never land on a frozen / indebted account — that is the exact
+    // catastrophe the freeze exists to prevent. Re-assert the SAME eligibility
+    // predicate here, under the per-user advisory lock this transaction already
+    // holds. On INELIGIBLE, WITHHOLD: apply no balance credit, no `autopay`
+    // ledger row, and no observed-reversal application; move the intent to the
+    // durable `withheld` state instead of `succeeded`. The money WAS collected at
+    // Stripe, so it must be refunded — surfaced to an operator via
+    // `withheld_autopay_intents`, NEVER silently kept and NEVER credited. The
+    // Stripe refund is deliberately NOT issued inline: that would hold this
+    // advisory lock across an external HTTP call, the very anti-pattern we avoid;
+    // an operator / out-of-lock refund path settles the actual refund. Idempotent
+    // by the same pending→terminal guard as crediting: that transition already
+    // ran exactly once above, so a redelivered success finds no pending row and
+    // returns AlreadySettled — it neither double-withholds nor double-credits.
+    let still_eligible = sqlx::query_scalar::<_, bool>(&format!(
+        "SELECT ({AUTOPAY_ELIGIBILITY_PREDICATE}) FROM users WHERE id = $1"
+    ))
+    .bind(user_id)
+    .fetch_one(&mut *transaction)
+    .await?;
+    if !still_eligible {
+        sqlx::query(
+            r#"
+            UPDATE stripe_autopay_intents
+            SET status = 'withheld', updated_at = NOW()
+            WHERE payment_intent_id = $1
+            "#,
+        )
+        .bind(payment_intent_id)
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        tracing::error!(
+            %user_id,
+            payment_intent = %payment_intent_id,
+            "autopay charge collected at Stripe but the account is ineligible (frozen / indebted / max-failed) at settlement; credit WITHHELD and the charge marked needs-refund — an operator must refund it out of band"
+        );
+        return Ok(AutopayOutcome::Withheld);
+    }
+
     let balance_after = sqlx::query_scalar::<_, Decimal>(
         r#"
         UPDATE users
