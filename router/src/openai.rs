@@ -1621,7 +1621,7 @@ mod tests {
     #[test]
     fn reservation_usage_is_conservative_and_includes_output_limit() {
         let request: ChatCompletionRequest = serde_json::from_value(json!({
-            "model": "zero/low-cost",
+            "model": "zero/luna",
             "messages": [{"role": "user", "content": "hello"}]
         }))
         .expect("request should parse");
