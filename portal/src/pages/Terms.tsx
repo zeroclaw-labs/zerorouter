@@ -16,12 +16,12 @@ export function Terms() {
       </div>
 
       <h1>Terms of Service</h1>
-      <p className="legal-meta">Effective date: [TBD] · Last updated: [TBD]</p>
+      <p className="legal-meta">Effective date: August 14, 2026 · Last updated: August 14, 2026</p>
 
       <h2>1. Agreement &amp; who we are</h2>
       <p>
         These Terms of Service (the “Terms”) are a binding agreement between you and{' '}
-        [ZeroClaw Labs — legal entity TBD] (“ZeroRouter”, “we”, “us”, or “our”), the operator of the
+        ZeroClaw Labs (“ZeroRouter”, “we”, “us”, or “our”), the operator of the
         ZeroRouter service (the “Service”). By creating an account, adding credits, or otherwise using
         the Service, you agree to these Terms. If you use the Service on behalf of an organization,
         you represent that you have authority to bind that organization, and “you” refers to that
@@ -44,7 +44,7 @@ export function Terms() {
         the Service. You are responsible for your account and for all activity that occurs under it,
         including all usage under your API keys. You must keep your API keys secret: anyone holding a
         key can spend your credits. You are liable for all usage under your keys until you revoke them
-        through the portal. Notify us promptly at [legal@zerorouter.ai] if you suspect unauthorized
+        through the portal. Notify us promptly at support@zerorouter.ai if you suspect unauthorized
         use of your account or keys.
       </p>
 
@@ -73,8 +73,9 @@ export function Terms() {
           changes apply to usage occurring after they take effect.
         </li>
         <li>
-          <strong>Refunds.</strong> Unused credits may be refunded at our discretion or as required by
-          law; [refund terms TBD].
+          <strong>Refunds.</strong> Unused credits are refundable on request within 30 days of
+          purchase, less the non-refundable deposit fee, at our discretion. Refunds required by
+          applicable law are honored.
         </li>
         <li>
           <strong>Chargebacks &amp; disputes.</strong> Initiating a chargeback or payment dispute may
@@ -147,7 +148,7 @@ export function Terms() {
 
       <h2>11. Indemnification</h2>
       <p>
-        You agree to indemnify and hold harmless [ZeroClaw Labs — legal entity TBD] and its affiliates
+        You agree to indemnify and hold harmless ZeroClaw Labs and its affiliates
         from and against any claims, damages, liabilities, and expenses (including reasonable legal
         fees) arising out of your use of the Service, your inputs and content, your violation of these
         Terms or of an upstream provider’s policies, or your violation of any law or third-party
@@ -156,8 +157,8 @@ export function Terms() {
 
       <h2>12. Governing law &amp; disputes</h2>
       <p>
-        These Terms are governed by the laws of [Jurisdiction TBD], without regard to its
-        conflict-of-laws rules. The courts located in [Jurisdiction TBD] will have exclusive
+        These Terms are governed by the laws of [your state or country], without regard to its
+        conflict-of-laws rules. The courts located in [your state or country] will have exclusive
         jurisdiction over any dispute arising out of or relating to these Terms or the Service, except
         where prohibited by applicable law. [Dispute-resolution / arbitration terms TBD.]
       </p>
@@ -171,7 +172,7 @@ export function Terms() {
 
       <h2>14. Contact</h2>
       <p>
-        Questions about these Terms can be sent to [legal@zerorouter.ai].
+        Questions about these Terms can be sent to support@zerorouter.ai.
       </p>
     </article>
   )

@@ -18,11 +18,11 @@ export function Privacy() {
       </div>
 
       <h1>Privacy Policy</h1>
-      <p className="legal-meta">Effective date: [TBD] · Last updated: [TBD]</p>
+      <p className="legal-meta">Effective date: August 14, 2026 · Last updated: August 14, 2026</p>
 
       <h2>1. Overview &amp; scope</h2>
       <p>
-        This Privacy Policy explains how [ZeroClaw Labs — legal entity TBD] (“ZeroRouter”, “we”,
+        This Privacy Policy explains how ZeroClaw Labs (“ZeroRouter”, “we”,
         “us”, or “our”) handles information in connection with the ZeroRouter service (the “Service”).
         It covers the data that ZeroRouter’s own systems collect and process. It does not govern the
         third-party model providers that fulfil your inference requests; each of those providers
@@ -132,7 +132,7 @@ export function Privacy() {
         Depending on where you live, you may have rights to access, correct, or delete the personal
         data we hold about you, and to request information about how it is processed. We intend to
         honor these rights and, where applicable, to support portability and objection. To make a
-        request, contact us at [privacy@zerorouter.ai]; we may need to verify your identity before
+        request, contact us at support@zerorouter.ai; we may need to verify your identity before
         acting. This section describes the rights we intend to offer; specific statutory compliance
         commitments are pending review by counsel.
       </p>
@@ -161,7 +161,7 @@ export function Privacy() {
       <h2>13. Contact</h2>
       <p>
         Questions about this Privacy Policy, or requests to exercise your rights, can be sent to{' '}
-        [privacy@zerorouter.ai].
+        support@zerorouter.ai.
       </p>
     </article>
   )
