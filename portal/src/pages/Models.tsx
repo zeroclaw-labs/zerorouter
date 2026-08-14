@@ -28,8 +28,13 @@ export function Models() {
   const models = useLoad(() => api.models(), [])
   const tiers: Model[] = (models.data ?? [])
     .filter((m) => m.owned_by !== 'zerorouter')
-    .sort(
-      (a, b) => Number.parseFloat(a.pricing.completion) - Number.parseFloat(b.pricing.completion),
+    // Group by vendor, then cheapest -> premium by output price within each
+    // vendor, so the catalog reads as tidy per-provider blocks rather than a
+    // vendor-mixed price ladder.
+    .sort((a, b) =>
+      a.owned_by !== b.owned_by
+        ? a.owned_by.localeCompare(b.owned_by)
+        : Number.parseFloat(a.pricing.completion) - Number.parseFloat(b.pricing.completion),
     )
 
   return (
