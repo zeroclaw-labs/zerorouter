@@ -21,7 +21,7 @@ export function Terms() {
       <h2>1. Agreement &amp; who we are</h2>
       <p>
         These Terms of Service (the “Terms”) are a binding agreement between you and{' '}
-        ZeroClaw Labs (“ZeroRouter”, “we”, “us”, or “our”), the operator of the
+        ZeroClaw Labs PBC (“ZeroRouter”, “we”, “us”, or “our”), the operator of the
         ZeroRouter service (the “Service”). By creating an account, adding credits, or otherwise using
         the Service, you agree to these Terms. If you use the Service on behalf of an organization,
         you represent that you have authority to bind that organization, and “you” refers to that
@@ -149,7 +149,7 @@ export function Terms() {
 
       <h2>11. Indemnification</h2>
       <p>
-        You agree to indemnify and hold harmless ZeroClaw Labs and its affiliates
+        You agree to indemnify and hold harmless ZeroClaw Labs PBC and its affiliates
         from and against any claims, damages, liabilities, and expenses (including reasonable legal
         fees) arising out of your use of the Service, your inputs and content, your violation of these
         Terms or of an upstream provider’s policies, or your violation of any law or third-party

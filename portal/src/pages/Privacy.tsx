@@ -22,7 +22,7 @@ export function Privacy() {
 
       <h2>1. Overview &amp; scope</h2>
       <p>
-        This Privacy Policy explains how ZeroClaw Labs (“ZeroRouter”, “we”,
+        This Privacy Policy explains how ZeroClaw Labs PBC (“ZeroRouter”, “we”,
         “us”, or “our”) handles information in connection with the ZeroRouter service (the “Service”).
         It covers the data that ZeroRouter’s own systems collect and process. It does not govern the
         third-party model providers that fulfil your inference requests; each of those providers
