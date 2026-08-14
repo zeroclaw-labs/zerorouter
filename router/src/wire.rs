@@ -1715,29 +1715,29 @@ mod review_fix_tests {
     }
 
     #[test]
-    fn the_streaming_client_carries_an_idle_ceiling_the_chat_client_does_not() {
+    fn the_stream_idle_ceiling_is_pinned_and_both_wires_build() {
         // Live failure injection found the gap: an upstream that stops
         // mid-stream WITHOUT closing held the customer's connection and its
         // reservation for the router's whole 15-minute budget. The idle
         // ceiling belongs only to the streaming client — a long
         // non-streaming completion legitimately sends nothing until it is
-        // done, so the same ceiling there would kill honest requests.
+        // done, so the same ceiling there would kill honest requests. Only the
+        // `stream_http` arm sets `.read_timeout(STREAM_IDLE_TIMEOUT)`; `http`
+        // does not (see `shared_upstream_clients`).
         assert_eq!(STREAM_IDLE_TIMEOUT, Duration::from_secs(120));
-        let responses = OpenAiResponsesWire::new("openai", "k", None, Some(64), 900);
-        let anthropic = AnthropicWire::new("anthropic", "k", None, 64, 900);
-        // The clients are distinct objects: the streaming one is built with
-        // read_timeout, the chat one without (reqwest exposes no getter, so
-        // the pin is structural — a refactor that collapses them back into
-        // one client fails here).
-        for (chat, stream) in [
-            (&responses.http, &responses.stream_http),
-            (&anthropic.http, &anthropic.stream_http),
-        ] {
-            assert!(
-                !std::ptr::eq(chat, stream),
-                "streaming and non-streaming clients must not be the same client"
-            );
-        }
+        // Smoke-test that both wire kinds build through the shared pool without
+        // panicking. We deliberately do NOT assert here that `stream_http`
+        // carries the ceiling and `http` does not, nor that two wires share a
+        // pool: reqwest 0.12 exposes no getter for `read_timeout` and no client
+        // identity, so neither is expressible against its public API. A prior
+        // `std::ptr::eq(&self.http, &self.stream_http)` check looked like a pin
+        // but compared two distinct struct-field addresses — always unequal —
+        // so it guarded nothing; removed rather than kept as false confidence.
+        // The distinction is enforced structurally in `shared_upstream_clients`
+        // and end-to-end by the out-of-process fault-injection harness (the
+        // `ZEROROUTER_PROVIDER_BASE_URL_*` seam).
+        let _responses = OpenAiResponsesWire::new("openai", "k", None, Some(64), 900);
+        let _anthropic = AnthropicWire::new("anthropic", "k", None, 64, 900);
     }
 
     #[test]
