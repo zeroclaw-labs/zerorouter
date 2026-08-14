@@ -73,9 +73,10 @@ export function Terms() {
           changes apply to usage occurring after they take effect.
         </li>
         <li>
-          <strong>Refunds.</strong> Unused credits are refundable on request within 30 days of
-          purchase, less the non-refundable deposit fee, at our discretion. Refunds required by
-          applicable law are honored.
+          <strong>Refunds.</strong> Credits are non-refundable except where required by applicable
+          law. We may, in our sole discretion, refund unused credits (less the non-refundable deposit
+          fee) as a one-time courtesy; any such refund is not an obligation and does not create a
+          right to future refunds.
         </li>
         <li>
           <strong>Chargebacks &amp; disputes.</strong> Initiating a chargeback or payment dispute may
@@ -157,8 +158,8 @@ export function Terms() {
 
       <h2>12. Governing law &amp; disputes</h2>
       <p>
-        These Terms are governed by the laws of [your state or country], without regard to its
-        conflict-of-laws rules. The courts located in [your state or country] will have exclusive
+        These Terms are governed by the laws of the Commonwealth of Massachusetts, United States, without regard to its
+        conflict-of-laws rules. The courts located in the Commonwealth of Massachusetts, United States will have exclusive
         jurisdiction over any dispute arising out of or relating to these Terms or the Service, except
         where prohibited by applicable law. [Dispute-resolution / arbitration terms TBD.]
       </p>
