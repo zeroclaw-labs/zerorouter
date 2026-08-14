@@ -43,6 +43,8 @@
 //! bill at full input rate here; Anthropic charges 1.25× for them — a COGS
 //! rounding this router accepts.)
 
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use crate::provider::ChatMessage;
@@ -142,6 +144,42 @@ pub struct OpenAiResponsesWire {
     stream_http: reqwest::Client,
 }
 
+/// Shared upstream HTTP clients, keyed by request timeout budget (seconds).
+///
+/// `reqwest::Client` owns an `Arc`'d connection pool, so a fresh client keeps no
+/// keep-alive connections. The per-request provider construction in
+/// `providers::create_provider` builds a new wire — and thus new clients — on
+/// every request, which discarded connection reuse and forced a fresh TCP+TLS
+/// handshake to the upstream on each call (invisible against a localhost mock,
+/// tens of milliseconds against a real TLS provider). Building the pair once and
+/// cloning it into each wire preserves the pool across requests; cloning a
+/// `Client` is a cheap `Arc` bump. Connections are pooled per host internally,
+/// so one shared pair correctly serves every upstream (OpenAI, Anthropic, and
+/// the test seams). Keyed by `timeout_secs` — the only knob the wires vary; the
+/// streaming client additionally caps idle time at `STREAM_IDLE_TIMEOUT`, so the
+/// pair stays distinct exactly as the per-wire construction made it.
+fn shared_upstream_clients(timeout_secs: u64) -> (reqwest::Client, reqwest::Client) {
+    static POOL: OnceLock<Mutex<HashMap<u64, (reqwest::Client, reqwest::Client)>>> =
+        OnceLock::new();
+    let pool = POOL.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut clients = pool.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    clients
+        .entry(timeout_secs)
+        .or_insert_with(|| {
+            let http = reqwest::Client::builder()
+                .timeout(Duration::from_secs(timeout_secs))
+                .build()
+                .unwrap_or_default();
+            let stream_http = reqwest::Client::builder()
+                .timeout(Duration::from_secs(timeout_secs))
+                .read_timeout(STREAM_IDLE_TIMEOUT)
+                .build()
+                .unwrap_or_default();
+            (http, stream_http)
+        })
+        .clone()
+}
+
 impl OpenAiResponsesWire {
     #[must_use]
     pub fn new(
@@ -151,6 +189,7 @@ impl OpenAiResponsesWire {
         max_tokens: Option<u32>,
         timeout_secs: u64,
     ) -> Self {
+        let (http, stream_http) = shared_upstream_clients(timeout_secs);
         Self {
             alias: alias.to_owned(),
             api_url: api_url
@@ -158,15 +197,8 @@ impl OpenAiResponsesWire {
                 .unwrap_or_else(|| RESPONSES_URL.to_owned()),
             credential: credential.to_owned(),
             max_tokens,
-            http: reqwest::Client::builder()
-                .timeout(Duration::from_secs(timeout_secs))
-                .build()
-                .unwrap_or_default(),
-            stream_http: reqwest::Client::builder()
-                .timeout(Duration::from_secs(timeout_secs))
-                .read_timeout(STREAM_IDLE_TIMEOUT)
-                .build()
-                .unwrap_or_default(),
+            http,
+            stream_http,
         }
     }
 
@@ -734,6 +766,7 @@ impl AnthropicWire {
         max_tokens: u32,
         timeout_secs: u64,
     ) -> Self {
+        let (http, stream_http) = shared_upstream_clients(timeout_secs);
         Self {
             alias: alias.to_owned(),
             api_url: api_url
@@ -741,15 +774,8 @@ impl AnthropicWire {
                 .unwrap_or_else(|| MESSAGES_URL.to_owned()),
             credential: credential.to_owned(),
             max_tokens,
-            http: reqwest::Client::builder()
-                .timeout(Duration::from_secs(timeout_secs))
-                .build()
-                .unwrap_or_default(),
-            stream_http: reqwest::Client::builder()
-                .timeout(Duration::from_secs(timeout_secs))
-                .read_timeout(STREAM_IDLE_TIMEOUT)
-                .build()
-                .unwrap_or_default(),
+            http,
+            stream_http,
         }
     }
 
