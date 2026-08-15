@@ -459,13 +459,27 @@ print(json.dumps({
 reset_usage_state(){
   # request_attempts rides along: it holds a foreign key into usage_events,
   # so the two must truncate together.
+  #
+  # usage_key_month_spend (migration 0019) rides along too, for a different
+  # reason: it is a rollup DERIVED from usage_events, maintained by an accrual
+  # trigger and fenced by a guard that refuses direct writes and TRUNCATE.
+  # This replica-mode reset silences the accrual trigger and the guard
+  # together — exactly the restore-shaped bypass 0019's own comments call out
+  # — and the migration's rule for that case is that the rollup must be
+  # REBUILT from usage_events afterwards, never patched. Truncating both in
+  # the same statement satisfies that rule in its degenerate form: the ledger
+  # is empty, so the correct rebuild of the rollup is the empty table it just
+  # became. Leaving the rollup standing instead would strand phantom spend
+  # that admission would then enforce against a ledger with no rows behind it.
   psql_bench -v ON_ERROR_STOP=1 \
-    -c "SET session_replication_role = replica; TRUNCATE usage_events, usage_reservations, request_attempts;" \
+    -c "SET session_replication_role = replica; TRUNCATE usage_events, usage_reservations, request_attempts, usage_key_month_spend;" \
     >/dev/null || die "usage-state reset failed"
-  local left
+  local left rollup_left
   left=$(psql_bench -c "SELECT count(*) FROM usage_events;")
   [ "$left" = "0" ] || die "usage-state reset left $left usage_events rows"
-  psql_bench -c "ANALYZE usage_events; ANALYZE usage_reservations; ANALYZE request_attempts;" >/dev/null
+  rollup_left=$(psql_bench -c "SELECT count(*) FROM usage_key_month_spend;")
+  [ "$rollup_left" = "0" ] || die "usage-state reset left $rollup_left rollup rows against an empty ledger"
+  psql_bench -c "ANALYZE usage_events; ANALYZE usage_reservations; ANALYZE request_attempts; ANALYZE usage_key_month_spend;" >/dev/null
   psql_bench -c "CHECKPOINT;" >/dev/null
 }
 
@@ -520,12 +534,18 @@ cmd_report(){
 }
 
 # --- deliberate measurement of the month-to-date history cost ---------------
-# Admission's cap check scans the user's whole month-to-date usage_events
-# history per request (src/db.rs, "Access path" comment). That cost exists on
-# BOTH lanes and grows with the user's accumulated rows. The main matrix
-# resets usage state per cell so the cells stay comparable; this command
-# measures the growth itself, on purpose: sequential single-connection
-# latency on the free lane with an empty month vs. with 30k seeded rows.
+# Before migration 0019, admission's cap check scanned the user's whole
+# month-to-date usage_events history per request, on BOTH lanes — this
+# command measured 0.86 ms -> 18.07 ms (sequential p50, 0 vs 30k rows) on
+# that code, and that measurement is what motivated the rollup. Since 0019
+# admission reads one usage_key_month_spend row per key instead, so the same
+# two points should now sit on a FLAT line; this command stays in the matrix
+# as the regression tripwire for exactly that property.
+#
+# The seeding INSERT below is an ordinary origin-mode statement, so the 0019
+# accrual trigger fires for every seeded row and the rollup is populated the
+# same way production writes populate it; the seed asserts the accrued total
+# afterwards.
 HISTORY_ROWS=30000
 HISTORY_REQS=500
 
@@ -560,7 +580,11 @@ cmd_history(){
            'mock-model', 12, 0, 9, 0.0000132, 5, 200,
            NOW() - ((i + 120) || ' seconds')::interval
     FROM generate_series(1, $HISTORY_ROWS) AS i;" >/dev/null || die "history seed failed"
-  psql_bench -c "ANALYZE usage_events; CHECKPOINT;" >/dev/null
+  local accrued
+  accrued=$(psql_bench -c "SELECT COALESCE(SUM(spend_usd),0) FROM usage_key_month_spend WHERE api_key_id = '$keyid';")
+  log "history: rollup accrued \$$accrued for the seeded key (trigger-maintained)"
+  [ "$accrued" != "0" ] || die "history seed did not accrue into usage_key_month_spend; the accrual trigger did not fire"
+  psql_bench -c "ANALYZE usage_events; ANALYZE usage_key_month_spend; CHECKPOINT;" >/dev/null
   log "history: $HISTORY_REQS sequential free-lane requests, $HISTORY_ROWS-row month-to-date"
   history_case "${HISTORY_ROWS}-rows" >> "$BENCH/results/history.jsonl"
   reset_usage_state
