@@ -29,8 +29,9 @@ use zerorouter::provider::ModelRates;
 use zerorouter::{
     auth::{AuthenticatedKey, generate_api_key, hash_api_key},
     db::{
-        KEY_CREATION_WINDOW_HOURS, MAX_KEYS_CREATED_PER_WINDOW, RequestTelemetry, ReservationSize,
-        ReservationSizing, UsageAdmission, UsageRecord, begin_usage_session, migrate,
+        KEY_CREATION_WINDOW_HOURS, MAX_KEYS_CREATED_PER_WINDOW, MeteringLane, RequestTelemetry,
+        ReservationSize, ReservationSizing, UsageAdmission, UsageRecord, begin_usage_session,
+        migrate,
     },
     device,
     openai::{
@@ -186,6 +187,7 @@ async fn admit(
         cold_sizing(reserved_tokens, reserved_tokens.min(64), reserved_cost_usd),
         test_signature(),
         false,
+        MeteringLane::Reserved,
     )
     .await
     .expect("admission must query")

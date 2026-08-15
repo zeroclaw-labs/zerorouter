@@ -79,31 +79,23 @@ pub struct TierCandidate {
 }
 
 impl TierCandidate {
-    /// Whether this candidate's PRICE is zero — the tier-file half of "free".
+    /// Whether this candidate's COST BASIS is zero — the tier-file half of
+    /// "free", and a claim about what ZeroRouter pays, never about what the
+    /// customer is charged (that is the owning tier's sell rate; see
+    /// [`ResolvedRoute::sells_free`]).
     ///
-    /// Zero means the two REQUIRED dimensions are declared and exactly zero,
-    /// and the optional cached-input dimension is either absent or zero. The
-    /// asymmetry follows the file's existing convention rather than inventing
-    /// one: `input_per_mtok` and `output_per_mtok` are mandatory (an absent one
-    /// is a load error), while an absent `cached_input_per_mtok` means "unknown
-    /// here" — the bedrock shape, kept because an upstream that reports no
-    /// cached tokens has no cached rate to state. A local server has no cache
-    /// pricing either, so requiring the operator to write `= 0` for it would
-    /// make the commonest honest config silently *not* free, which is a worse
-    /// failure than the one strictness buys. A DECLARED nonzero cached rate is
-    /// still money, and still disqualifies.
+    /// The arithmetic, and why the cached dimension may be absent, is
+    /// [`ModelRates::are_zero`] — one definition, read from both sides of the
+    /// money. A local server has no cache pricing, so requiring the operator
+    /// to write `= 0` for it would make the commonest honest config silently
+    /// *not* free, which is a worse failure than the one strictness buys.
     ///
     /// On its own this says nothing about whether anyone is billed — a rate
     /// table can be wrong, and a zero in it is as likely to be a typo as a
     /// claim. [`Self::is_free`] is the question with an answer.
     #[must_use]
     pub fn rates_are_zero(&self) -> bool {
-        self.rates.input_per_mtok == Some(0.0)
-            && self.rates.output_per_mtok == Some(0.0)
-            && self
-                .rates
-                .cached_input_per_mtok
-                .is_none_or(|rate| rate == 0.0)
+        self.rates.are_zero()
     }
 
     /// Whether this candidate is a **$0 rung** (edge mode, stage 2:
@@ -313,6 +305,41 @@ pub struct ResolvedRoute {
     pub requested_model: String,
     pub candidates: Vec<TierCandidate>,
     pub sell_rates: ModelRates,
+}
+
+impl ResolvedRoute {
+    /// Whether serving this route bills the CUSTOMER nothing (edge mode,
+    /// stage 3: `docs/design/edge-mode-local-rung.md`).
+    ///
+    /// The sell-side half of the metering skip, and the half
+    /// [`TierCandidate::is_free`] cannot answer. `is_free` says ZeroRouter's
+    /// COST is zero; every candidate bills at its owning TIER's sell rate
+    /// whichever one serves ([`TierCatalog::resolve`]), and
+    /// `validate_candidate_margin` only forbids a basis ABOVE the sell rate —
+    /// so a $0 basis under a $3.00 sell rate is a legal, deliberate,
+    /// 100%-margin configuration. Reading candidate freeness as customer
+    /// freeness would hand that tier away for nothing.
+    ///
+    /// Two shapes make the difference reachable rather than theoretical:
+    ///
+    /// - A single-candidate priced tier over a local rung — margin by
+    ///   construction, exactly what the pricing model invites.
+    /// - A MIXED tier (paid cloud rung + free local rung) whose cloud rung is
+    ///   dropped for a missing credential. [`crate::providers::ProviderRoute`]
+    ///   removes a candidate whose credential is absent from the environment,
+    ///   so an unset environment variable can collapse a mixed route to an
+    ///   all-free one. A skip keyed on candidates alone would turn a
+    ///   deployment mistake into free paid-tier inference; this conjunct means
+    ///   it can only ever turn into a cloud outage, which is what it is.
+    ///
+    /// Conjoining this NARROWS the skip and can never widen it. What survives
+    /// is exactly the set of routes on which the metered path provably prices
+    /// `cost_usd = 0` and debits nothing — so the skip is a latency change
+    /// and never a billing one.
+    #[must_use]
+    pub fn sells_free(&self) -> bool {
+        self.sell_rates.are_zero()
+    }
 }
 
 #[derive(Debug, Deserialize)]

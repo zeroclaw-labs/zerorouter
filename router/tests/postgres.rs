@@ -11,8 +11,8 @@ use zerorouter::{
         AuthenticatedKey, AuthenticationError, KeyAuthenticator, generate_api_key, hash_api_key,
     },
     db::{
-        AttemptRecord, AttemptTokens, RequestTelemetry, ReservationSize, ReservationSizing,
-        UsageAdmission, UsageRecord, UsageSession, begin_usage_session, migrate,
+        AttemptRecord, AttemptTokens, MeteringLane, RequestTelemetry, ReservationSize,
+        ReservationSizing, UsageAdmission, UsageRecord, UsageSession, begin_usage_session, migrate,
         output_token_percentiles, provider_cogs, segment_clamp_stats, user_clamp_loss,
     },
     openai::{OpenAiUsage, TASK_SIGNATURE_SCHEME, TaskSignature, tool_names_digest, usage_cost},
@@ -116,6 +116,7 @@ async fn postgres_enforces_reservations_revocation_and_append_only_usage() {
         cold_sizing(1_000, 500, Decimal::ONE),
         test_signature("0123456789abcdef"),
         false,
+        MeteringLane::Reserved,
     )
     .await
     .expect("first admission must query")
@@ -130,6 +131,7 @@ async fn postgres_enforces_reservations_revocation_and_append_only_usage() {
             cold_sizing(1_000, 500, Decimal::from(20)),
             test_signature("0123456789abcdef"),
             false,
+            MeteringLane::Reserved
         )
         .await
         .expect("second admission must query"),
@@ -183,6 +185,7 @@ async fn postgres_enforces_reservations_revocation_and_append_only_usage() {
             cold_sizing(800, 400, Decimal::ZERO),
             test_signature("0123456789abcdef"),
             false,
+            MeteringLane::Reserved
         ),
         begin_usage_session(
             &pool,
@@ -190,6 +193,7 @@ async fn postgres_enforces_reservations_revocation_and_append_only_usage() {
             cold_sizing(800, 400, Decimal::ZERO),
             test_signature("0123456789abcdef"),
             false,
+            MeteringLane::Reserved
         ),
     );
     let mut admitted = 0;
@@ -242,6 +246,7 @@ async fn postgres_enforces_reservations_revocation_and_append_only_usage() {
             cold_sizing(1, 1, Decimal::ZERO),
             test_signature("0123456789abcdef"),
             false,
+            MeteringLane::Reserved
         )
         .await
         .expect("revoked admission must query"),
@@ -297,6 +302,7 @@ async fn admit(pool: &PgPool, key: &AuthenticatedKey) -> UsageSession {
         cold_sizing(4_596, 500, Decimal::ONE),
         test_signature("00112233aabbccdd"),
         false,
+        MeteringLane::Reserved,
     )
     .await
     .expect("admission must query")

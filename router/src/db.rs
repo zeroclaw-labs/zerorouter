@@ -569,18 +569,46 @@ pub enum UsageAdmission {
 
 pub struct UsageSession {
     pool: PgPool,
-    reservation_id: Uuid,
+    /// The id this request is known by end to end: the `x-request-id` the
+    /// response carries, and the `usage_events.request_id` its row is keyed by.
+    ///
+    /// On the RESERVED lane it is also the `usage_reservations` row's own id,
+    /// and that identity is load-bearing — the settle `DELETE ... RETURNING`
+    /// and the UNIQUE metering key are the same value, which is the whole of
+    /// exactly-once. On the FREE lane (edge mode, stage 3) no reservation row
+    /// exists, so the id is minted at admission and means only "this request";
+    /// the shape is deliberately identical so nothing downstream can tell the
+    /// lanes apart by their ids.
+    request_id: Uuid,
     api_key_id: Uuid,
     user_id: Uuid,
     require_credits: bool,
-    // Reservation provenance copied into the ledger at settle: the
-    // usage_reservations row is destroyed by the settle DELETE...RETURNING, so
-    // these must be carried in memory from admission. The signature travels as
-    // a whole [`TaskSignature`] so the scheme that computed it and the tool
-    // digest it was computed from land on the same row as the key itself
-    // (migration 0007) — a key with no provenance cannot be re-keyed later.
+    /// The output-token bound this request is measured against — what
+    /// admission reserved on the reserved lane, and the request's own
+    /// requested ceiling on the free lane.
+    output_bound: i32,
+    /// The reservation this session must settle, or `None` on the FREE lane,
+    /// where admission took none (edge mode, stage 3:
+    /// `docs/design/edge-mode-local-rung.md`).
+    ///
+    /// `None` is the single structural fact the free lane rests on: settlement
+    /// is reached only through [`Reservation`], so a session that holds no
+    /// reservation cannot debit a balance, cannot write a settled row, and
+    /// cannot consume a reservation that does not exist. It is not a flag that
+    /// a later branch consults and might forget — there is nothing to settle
+    /// WITH.
+    reservation: Option<Reservation>,
+}
+
+/// Reservation provenance copied into the ledger at settle.
+///
+/// The `usage_reservations` row is destroyed by the settle DELETE...RETURNING,
+/// so these must be carried in memory from admission. The signature travels as
+/// a whole [`TaskSignature`] so the scheme that computed it and the tool digest
+/// it was computed from land on the same row as the key itself (migration
+/// 0007) — a key with no provenance cannot be re-keyed later.
+struct Reservation {
     task_signature: TaskSignature,
-    reserved_output_tokens: i32,
     reserved_cost_usd: Decimal,
     estimator_basis: ReservationBasis,
 }
@@ -892,13 +920,68 @@ pub async fn migrate(pool: &PgPool) -> Result<()> {
         .context("database migration failed")
 }
 
+/// Which metering lane an admission is for (edge mode, stage 3:
+/// `docs/design/edge-mode-local-rung.md`).
+///
+/// The lane is decided in `api::chat_completions`, from server-side
+/// configuration alone, BEFORE admission runs — see `api::free_lane_admissible`
+/// for the predicate and why it is what it is. This enum only carries that
+/// verdict into the admission it changes.
+///
+/// # What the free lane keeps
+///
+/// Every GATE, unchanged and in the same order: the presenting key's liveness,
+/// the account freeze, both spend ceilings, both velocity ceilings, and the
+/// prepaid-credit check when `require_credits` is on. A free lane that skipped
+/// rate limiting would be an unmetered, unthrottled inference endpoint behind
+/// an API key — a denial-of-service invitation aimed at the operator's own
+/// hardware — so the token-denominated velocity cap in particular stays
+/// binding. It is the abuse control, and $0 does not make abuse free.
+///
+/// # What the free lane drops, and what that costs
+///
+/// The per-user `pg_advisory_xact_lock`, the expiry sweep, the learned sizing
+/// choice, and the `usage_reservations` INSERT. Dropping the lock is the point
+/// of the stage — it is the serialization that makes one user's concurrent
+/// requests queue behind each other — and it has a real, bounded cost: the
+/// gates above are evaluated against a snapshot that a concurrent sibling can
+/// invalidate, so k simultaneous free requests can each pass a velocity check
+/// that their sum would fail. Two properties bound it. Nothing is encumbered,
+/// so no race can overdraw a balance or lose money; and the settled usage the
+/// cap reads is append-only, so the overshoot is one in-flight batch and the
+/// next minute's window sees every token of it. That is the honest shape of a
+/// rate limit without a lock: approximate at the boundary, exact in aggregate.
+///
+/// Sizing is always the full requested ceiling on the free lane. The learned
+/// sizing exists to encumber less of a customer's balance, there is nothing to
+/// encumber, and the concurrency gate that makes learned sizing safe is only
+/// trustworthy under the lock this lane does not take — so offering it here
+/// would trade a benefit that does not apply for a guarantee that does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MeteringLane {
+    /// Take the lock, reserve, and settle: every request that is or may become
+    /// a charge. The permanent default and the only lane a priced route may
+    /// take.
+    Reserved,
+    /// Gate, then dispatch: a route the metered path would provably settle at
+    /// exactly zero.
+    Free,
+}
+
 pub async fn begin_usage_session(
     pool: &PgPool,
     key: &AuthenticatedKey,
     sizing: ReservationSizing,
     task_signature: TaskSignature,
     require_credits: bool,
+    lane: MeteringLane,
 ) -> Result<UsageAdmission, sqlx::Error> {
+    // No learned sizing off the lock. Forced here rather than trusted from the
+    // caller so the invariant holds against every call site there will ever be.
+    let sizing = match lane {
+        MeteringLane::Reserved => sizing,
+        MeteringLane::Free => ReservationSizing::cold(sizing.full),
+    };
     for size in [Some(sizing.full), sizing.learned].into_iter().flatten() {
         if size.total_tokens < 0 || size.output_tokens < 0 || size.cost_usd < Decimal::ZERO {
             return Err(sqlx::Error::Protocol(
@@ -914,10 +997,19 @@ pub async fn begin_usage_session(
     // Serialize admission per USER (not per key) so concurrent requests
     // across a user's keys observe each other's reservations and cannot
     // jointly overdraw the prepaid balance.
-    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1::TEXT, 0))")
-        .bind(key.user_id.to_string())
-        .execute(&mut *transaction)
-        .await?;
+    //
+    // Not taken on the free lane, which creates no reservation and so has no
+    // encumbrance for a sibling to observe and nothing to overdraw. See
+    // [`MeteringLane`] for what that costs the gates below and why the cost is
+    // bounded. Lock ordering is unaffected: this lane takes only the api_keys
+    // row lock, exactly like the two revocation paths, so it can no more
+    // deadlock than they can.
+    if lane == MeteringLane::Reserved {
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1::TEXT, 0))")
+            .bind(key.user_id.to_string())
+            .execute(&mut *transaction)
+            .await?;
+    }
 
     // The presenting key's liveness and both ceilings, atomically, in one round
     // trip. `spend_cap_usd` / `velocity_cap_tokens_per_min` are the presenting
@@ -1086,24 +1178,36 @@ pub async fn begin_usage_session(
     // released row can match the predicate below today. The filter is stated
     // anyway, because "the record of a forgiven charge outlives the sweep" is
     // too important to hold only by way of a constraint in another file.
-    sqlx::query(
-        r#"
+    //
+    // Both sweep statements are maintenance rather than gates, and the free
+    // lane skips them: it holds no lock, so a reclaim racing another user's
+    // admission is exactly the interleaving the lock exists to forbid, and a
+    // lane that never creates a reservation has no claim on tidying anyone
+    // else's. Skipping costs the arithmetic below nothing — its two aggregates
+    // already exclude a reclaimable row by predicate (`expires_at > NOW() OR
+    // settlement_intent IS NOT NULL`), so whether the DELETE has run yet
+    // changes no cap and no balance. A deployment whose traffic is entirely
+    // free therefore never sweeps, and correctly so: it has never reserved.
+    if lane == MeteringLane::Reserved {
+        sqlx::query(
+            r#"
         DELETE FROM usage_reservations
         WHERE expires_at <= NOW()
           AND settlement_intent IS NULL
           AND dispatched_at IS NULL
           AND released_at IS NULL
         "#,
-    )
-    .execute(&mut *transaction)
-    .await?;
-    // Both quarantine classes in one statement, so the reason a row was parked
-    // travels with the parking. `last_settle_error` is the only free-text
-    // column `admin owed-settlements` prints, and an intentless row has no
-    // settle error to report, so it carries the explanation instead —
-    // COALESCEd, so a genuine settle failure is never overwritten.
-    sqlx::query(
-        r#"
+        )
+        .execute(&mut *transaction)
+        .await?;
+        // Both quarantine classes in one statement, so the reason a row was
+        // parked travels with the parking. `last_settle_error` is the only
+        // free-text column `admin owed-settlements` prints, and an intentless
+        // row has no settle error to report, so it carries the explanation
+        // instead — COALESCEd, so a genuine settle failure is never
+        // overwritten.
+        sqlx::query(
+            r#"
         UPDATE usage_reservations
         SET quarantined_at = NOW(),
             last_settle_error = CASE
@@ -1115,10 +1219,11 @@ pub async fn begin_usage_session(
           AND quarantined_at IS NULL
           AND (settlement_intent IS NOT NULL OR dispatched_at IS NOT NULL)
         "#,
-    )
-    .bind(DISPATCHED_WITHOUT_INTENT)
-    .execute(&mut *transaction)
-    .await?;
+        )
+        .bind(DISPATCHED_WITHOUT_INTENT)
+        .execute(&mut *transaction)
+        .await?;
+    }
 
     // Settled usage, aggregated across EVERY key the user owns (disabled ones
     // included — a disabled key's history is still the user's spend) and, in
@@ -1379,12 +1484,23 @@ pub async fn begin_usage_session(
     let reserved_output_tokens = i32::try_from(reserved_output_tokens).map_err(|_| {
         sqlx::Error::Protocol("reserved output tokens exceed the database integer range".to_owned())
     })?;
-    let reservation_id = Uuid::new_v4();
-    let reservation_ttl_seconds = i64::try_from(RESERVATION_TTL.as_secs()).map_err(|_| {
-        sqlx::Error::Protocol("usage reservation lifetime exceeds the database range".to_owned())
-    })?;
-    sqlx::query(
-        r#"
+    // The request's id on both lanes; on the reserved lane it is also the
+    // reservation row's own id (see [`UsageSession::request_id`]).
+    let request_id = Uuid::new_v4();
+    // The one write that distinguishes the lanes. The free lane commits the
+    // same gated transaction with no encumbrance in it: `last_used_at` is
+    // stamped, the key's liveness was proved under its row lock, and nothing
+    // holds the customer's credit — because nothing is going to spend it.
+    let reservation = match lane {
+        MeteringLane::Reserved => {
+            let reservation_ttl_seconds =
+                i64::try_from(RESERVATION_TTL.as_secs()).map_err(|_| {
+                    sqlx::Error::Protocol(
+                        "usage reservation lifetime exceeds the database range".to_owned(),
+                    )
+                })?;
+            sqlx::query(
+                r#"
         INSERT INTO usage_reservations (
             id,
             api_key_id,
@@ -1394,36 +1510,54 @@ pub async fn begin_usage_session(
         )
         VALUES ($1, $2, NOW() + ($3 * INTERVAL '1 second'), $4, $5)
         "#,
-    )
-    .bind(reservation_id)
-    .bind(key.id)
-    .bind(reservation_ttl_seconds)
-    .bind(reserved_tokens)
-    .bind(reserved_cost_usd)
-    .execute(&mut *transaction)
-    .await?;
+            )
+            .bind(request_id)
+            .bind(key.id)
+            .bind(reservation_ttl_seconds)
+            .bind(reserved_tokens)
+            .bind(reserved_cost_usd)
+            .execute(&mut *transaction)
+            .await?;
+            Some(Reservation {
+                task_signature,
+                reserved_cost_usd,
+                estimator_basis,
+            })
+        }
+        MeteringLane::Free => None,
+    };
     transaction.commit().await?;
 
     Ok(UsageAdmission::Allowed(UsageSession {
         pool: pool.clone(),
-        reservation_id,
+        request_id,
         api_key_id: key.id,
         user_id: key.user_id,
         require_credits,
-        task_signature,
-        reserved_output_tokens,
-        reserved_cost_usd,
-        estimator_basis,
+        output_bound: reserved_output_tokens,
+        reservation,
     }))
 }
 
 impl UsageSession {
+    /// The id this request answers under, in the wire's own shape.
+    ///
+    /// One format for both lanes, and deliberately so: `x-request-id` is a
+    /// customer-facing identifier that support tickets, client logs, and the
+    /// portal's usage table are all keyed by, and a free-lane request that
+    /// announced itself differently would be telling the customer which
+    /// billing lane served them — a detail that is ours, not theirs, and one
+    /// that would make every consumer of this string learn a second shape.
+    /// What the id refers to differs (a reservation on one lane, only the
+    /// request on the other); what it looks like, and the `usage_events` row it
+    /// leads to, does not.
     #[must_use]
     pub fn request_id(&self) -> String {
-        format!("chatcmpl-{}", self.reservation_id.simple())
+        format!("chatcmpl-{}", self.request_id.simple())
     }
 
-    /// The output-token bound admission actually reserved against.
+    /// The output-token bound admission actually reserved against — or, on the
+    /// free lane, the request's own requested ceiling.
     ///
     /// Which of the offered sizings won is decided inside admission, under the
     /// per-user lock, so the caller has to read it back rather than assume it.
@@ -1435,14 +1569,19 @@ impl UsageSession {
     pub fn reserved_output_tokens(&self) -> u32 {
         // Non-negative by construction: every offered sizing is validated at
         // the top of `begin_usage_session`.
-        self.reserved_output_tokens.unsigned_abs()
+        self.output_bound.unsigned_abs()
     }
 
     /// Which sizing admission chose. `Learned` only when the estimator's
-    /// sizing survived the concurrency gate.
+    /// sizing survived the concurrency gate; always `Cold` on the free lane,
+    /// which is offered no learned sizing at all ([`MeteringLane`]).
     #[must_use]
     pub fn estimator_basis(&self) -> ReservationBasis {
-        self.estimator_basis
+        self.reservation
+            .as_ref()
+            .map_or(ReservationBasis::Cold, |reservation| {
+                reservation.estimator_basis
+            })
     }
 
     /// Record that this request has begun an upstream call.
@@ -1477,12 +1616,19 @@ impl UsageSession {
     /// `tokio::select!` whose other arm moves the session into a settle
     /// terminal. The marker owns everything it needs, so recording a dispatch
     /// never contends with settling one.
+    ///
+    /// Inert on the free lane. The marker's entire purpose is to stop the
+    /// expiry sweep reclaiming a reservation whose inference was delivered; a
+    /// lane with no reservation has no row to stamp, nothing for the sweep to
+    /// reclaim, and no charge that could be silently forgiven.
     #[must_use]
     pub fn dispatch_marker(&self) -> DispatchMarker {
         DispatchMarker {
-            pool: self.pool.clone(),
-            reservation_id: self.reservation_id,
-            api_key_id: self.api_key_id,
+            reservation: self.reservation.as_ref().map(|_| MarkedReservation {
+                pool: self.pool.clone(),
+                reservation_id: self.request_id,
+                api_key_id: self.api_key_id,
+            }),
             fired: AtomicBool::new(false),
         }
     }
@@ -1508,8 +1654,21 @@ impl UsageSession {
     /// Takes `&self`. The old signature consumed the session, so the single
     /// settle attempt it ran was also the last one that could ever be made:
     /// any failure after that point returned an error with the payload gone.
+    ///
+    /// # The free lane never reaches any of it
+    ///
+    /// A session holding no reservation (edge mode, stage 3) leaves through
+    /// [`Self::observe_free_usage`] instead, before the first line of the
+    /// settle machinery runs. There is no intent, no settle transaction, no
+    /// advisory lock and no debit — not suppressed, but unreachable, because
+    /// every one of those steps is expressed in terms of a [`Reservation`]
+    /// that does not exist.
     pub async fn record(&self, record: &UsageRecord) -> Result<(), sqlx::Error> {
-        let intent = SettlementIntent::new(self, record);
+        let Some(reservation) = &self.reservation else {
+            self.observe_free_usage(record);
+            return Ok(());
+        };
+        let intent = SettlementIntent::new(self, reservation, record);
         // The intent is this request's only safety net: the customer may
         // already hold streamed output, and without a stored payload a
         // failed settle leaves nothing to replay — the reservation is later
@@ -1526,7 +1685,7 @@ impl UsageSession {
                         // Reported at the level of a lost charge, because
                         // that is what it may become.
                         tracing::error!(
-                            request_id = %self.reservation_id,
+                            request_id = %self.request_id,
                             attempt,
                             transient,
                             error = %error,
@@ -1539,7 +1698,7 @@ impl UsageSession {
                 }
             }
         }
-        settle_with_retry(&self.pool, self.reservation_id, self.api_key_id, &intent).await
+        settle_with_retry(&self.pool, self.request_id, self.api_key_id, &intent).await
     }
 
     /// Write the settle payload onto the reservation row that carries it.
@@ -1560,12 +1719,189 @@ impl UsageSession {
             WHERE id = $1 AND api_key_id = $2
             "#,
         )
-        .bind(self.reservation_id)
+        .bind(self.request_id)
         .bind(self.api_key_id)
         .bind(payload)
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    /// Record that a free-lane request happened, off the response path (edge
+    /// mode, stage 3: *"Token usage is still recorded (asynchronously,
+    /// off-path) so hybrid usage stays visible in one dashboard"*).
+    ///
+    /// # This is observability, and it is only observability
+    ///
+    /// The design's own security requirement — *"async usage recording must not
+    /// become a billing input"* — is met structurally rather than by
+    /// convention, because a rule that lives only in a comment is a rule that
+    /// a later query will break. The row is written so that every consumer
+    /// that could influence money either sees zero or cannot see it at all:
+    ///
+    /// - **Balance math never reads `usage_events`.** A balance moves through
+    ///   `credit_ledger` and `users.credit_balance_usd`, written by
+    ///   [`settle_once`] and the purchase paths. This function touches neither,
+    ///   so no free row can debit, credit, or clamp anything.
+    /// - **Autopay never reads `usage_events` either.**
+    ///   [`crate::billing::AUTOPAY_ELIGIBILITY_PREDICATE`] and
+    ///   `autopay_candidates` read `users` and `stripe_autopay_intents` only.
+    ///   Eligibility for an off-session charge cannot be moved from here.
+    /// - **The spend caps sum `cost_usd`,** which is bound to literal zero
+    ///   below rather than copied from the record. Adding zero to a sum is the
+    ///   strongest form of inert.
+    /// - **The estimator cannot see the row at all.** `task_signature`,
+    ///   `task_signature_scheme` and `tool_names_sha256` are left NULL, and
+    ///   every estimator query is an equality on the signature — so a free row
+    ///   matches none of them. That is deliberate and it is the sharpest edge
+    ///   here: the segment key omits the model, so a local 8B rung and a cloud
+    ///   flagship share a segment, and letting local output lengths train the
+    ///   percentiles that SIZE METERED RESERVATIONS would put this lane's
+    ///   measurements on the money path by the back door. `estimator_basis` is
+    ///   NULL for the same reason and because it is true: no sizing produced
+    ///   this row, so the clamp-loss aggregates that key on `'learned'` skip it
+    ///   twice over.
+    /// - **The velocity cap DOES count it,** through `input_tokens` and
+    ///   `output_tokens`, and that is the one deliberate exception. The cap is
+    ///   abuse control denominated in tokens, not money; free inference still
+    ///   burns the operator's own GPU, and a lane exempt from rate limiting
+    ///   would be the cheapest denial-of-service in the product. Counting is
+    ///   the safe direction to be wrong in — it can only ever refuse traffic,
+    ///   never authorize a charge.
+    ///
+    /// The free row is identifiable without a schema change, by the two columns
+    /// only a reservation can fill: `reserved_cost_usd IS NULL AND
+    /// estimator_basis IS NULL` on a row this build wrote. (Rows predating
+    /// migration 0004 share that shape, which is why the convention is stated
+    /// as "no reservation existed" rather than sold as a marker column.)
+    ///
+    /// # Why it may be lost, and why that is acceptable
+    ///
+    /// Spawned and never awaited, exactly like [`DispatchMarker::fire`], for
+    /// the same reason: the response path may not grow a round trip that can
+    /// fail a request. A failure is a WARN. The metered lane cannot make that
+    /// trade — a lost settle is a lost charge, which is why it has a durable
+    /// intent and a recovery sweep — but a lost free row costs a line in a
+    /// dashboard, and buying it back with a synchronous write would spend the
+    /// whole latency win this stage exists for.
+    fn observe_free_usage(&self, record: &UsageRecord) {
+        if !record.cost_usd.is_zero() {
+            // Unreachable by construction — `api::free_lane_admissible`
+            // requires the route's SELL rates to be zero, and `cost_usd` is
+            // priced from exactly those rates — so reaching it means the skip
+            // predicate admitted a priced route and inference has already been
+            // given away. Logged at ERROR with the amount, and the row is still
+            // written at zero: the charge is gone either way, and a row that
+            // lied about the price would only hide it.
+            tracing::error!(
+                request_id = %self.request_id,
+                cost_usd = %record.cost_usd,
+                "free-lane request priced above zero; the metering skip admitted a route \
+                 that should have reserved and settled"
+            );
+        }
+        let (Ok(input_tokens), Ok(cached_input_tokens), Ok(output_tokens)) = (
+            checked_token_count(record.usage.prompt_tokens, "prompt_tokens"),
+            checked_token_count(record.usage.cached_input_tokens(), "cached_input_tokens"),
+            checked_token_count(record.usage.completion_tokens, "completion_tokens"),
+        ) else {
+            tracing::warn!(
+                request_id = %self.request_id,
+                "free-lane usage counts exceed the database integer range; no observability row written"
+            );
+            return;
+        };
+        let pool = self.pool.clone();
+        let request_id = self.request_id;
+        let api_key_id = self.api_key_id;
+        let telemetry = &record.telemetry;
+        let tier = record.tier.clone();
+        let upstream_provider = record.upstream_provider.clone();
+        let upstream_model = record.upstream_model.clone();
+        let candidate_id = telemetry.candidate_id.clone();
+        let cost_basis_usd = telemetry.cost_basis(record);
+        let sell_rates = rates_snapshot(&telemetry.sell_rates);
+        let basis_rates = telemetry.basis_rates.as_ref().map(rates_snapshot);
+        let finish_reason = telemetry.finish_reason.clone();
+        let finish_reason_source = finish_reason.as_ref().map(|_| "synthetic");
+        let attempt_count = i16::try_from(record.attempts.len())
+            .ok()
+            .filter(|count| *count >= 1);
+        let telemetry = telemetry.clone();
+        let latency_ms = record.latency_ms;
+        let status = record.status;
+        tokio::spawn(async move {
+            let written = sqlx::query(
+                r#"
+                INSERT INTO usage_events (
+                    request_id,
+                    api_key_id,
+                    tier,
+                    upstream_provider,
+                    upstream_model,
+                    input_tokens,
+                    cached_input_tokens,
+                    output_tokens,
+                    cost_usd,
+                    latency_ms,
+                    status,
+                    candidate_id,
+                    cost_basis_usd,
+                    sell_rates,
+                    basis_rates,
+                    finish_reason,
+                    finish_reason_source,
+                    requested_max_tokens,
+                    stream,
+                    prompt_bytes,
+                    message_count,
+                    tool_count,
+                    attempt_count,
+                    shape_ok,
+                    priority
+                )
+                VALUES (
+                    $1, $2, $3, $4, $5, $6, $7, $8, 0, $9, $10,
+                    $11, $12, $13::JSONB, $14::JSONB, $15, $16, $17, $18, $19,
+                    $20, $21, $22, $23, $24
+                )
+                "#,
+            )
+            .bind(request_id)
+            .bind(api_key_id)
+            .bind(tier)
+            .bind(upstream_provider)
+            .bind(upstream_model)
+            .bind(input_tokens)
+            .bind(cached_input_tokens.min(input_tokens))
+            .bind(output_tokens)
+            .bind(latency_ms)
+            .bind(status)
+            .bind(candidate_id)
+            .bind(cost_basis_usd)
+            .bind(sell_rates)
+            .bind(basis_rates)
+            .bind(finish_reason)
+            .bind(finish_reason_source)
+            .bind(telemetry.requested_max_tokens)
+            .bind(telemetry.stream)
+            .bind(telemetry.prompt_bytes)
+            .bind(telemetry.message_count)
+            .bind(telemetry.tool_count)
+            .bind(attempt_count)
+            .bind(telemetry.shape_ok)
+            .bind(telemetry.priority.map(Priority::as_str))
+            .execute(&pool)
+            .await;
+            if let Err(error) = written {
+                tracing::warn!(
+                    request_id = %request_id,
+                    error = %error,
+                    "free-lane usage row could not be written; this request is invisible to the \
+                     dashboard, and nothing about it was billable"
+                );
+            }
+        });
     }
 }
 
@@ -1579,10 +1915,18 @@ impl UsageSession {
 /// each copy its own latch.
 #[derive(Debug)]
 pub struct DispatchMarker {
+    /// The reservation to stamp, or `None` on the free lane — where there is
+    /// no reservation, nothing for the expiry sweep to reclaim, and so nothing
+    /// this marker could protect. See [`UsageSession::dispatch_marker`].
+    reservation: Option<MarkedReservation>,
+    fired: AtomicBool,
+}
+
+#[derive(Debug)]
+struct MarkedReservation {
     pool: PgPool,
     reservation_id: Uuid,
     api_key_id: Uuid,
-    fired: AtomicBool,
 }
 
 impl DispatchMarker {
@@ -1598,12 +1942,17 @@ impl DispatchMarker {
     /// match zero rows, and it would still cost a pooled connection at the
     /// exact moment the walk is retrying and the settle is coming.
     pub fn fire(&self) {
+        // Checked before the latch so a free-lane marker stays cheap however
+        // many times a walk fires it.
+        let Some(marked) = &self.reservation else {
+            return;
+        };
         if self.fired.swap(true, Ordering::Relaxed) {
             return;
         }
-        let pool = self.pool.clone();
-        let reservation_id = self.reservation_id;
-        let api_key_id = self.api_key_id;
+        let pool = marked.pool.clone();
+        let reservation_id = marked.reservation_id;
+        let api_key_id = marked.api_key_id;
         tokio::spawn(async move {
             let marked = sqlx::query(
                 r#"
@@ -2789,17 +3138,21 @@ struct AttemptTokensPayload {
 }
 
 impl SettlementIntent {
-    fn new(session: &UsageSession, record: &UsageRecord) -> Self {
+    /// Built from a session AND the reservation it settles. The reservation is
+    /// a separate argument rather than read back off the session because a
+    /// free-lane session holds none — so there is no intent to build, and the
+    /// type system says so at the only call site.
+    fn new(session: &UsageSession, reservation: &Reservation, record: &UsageRecord) -> Self {
         Self {
             version: SETTLEMENT_INTENT_VERSION,
             user_id: session.user_id,
             require_credits: session.require_credits,
-            task_signature: session.task_signature.hex.clone(),
-            task_signature_scheme: Some(session.task_signature.scheme),
-            tool_names_sha256: Some(session.task_signature.tool_names_sha256.clone()),
-            reserved_output_tokens: session.reserved_output_tokens,
-            reserved_cost_usd: session.reserved_cost_usd.to_string(),
-            estimator_basis: session.estimator_basis.as_str().to_owned(),
+            task_signature: reservation.task_signature.hex.clone(),
+            task_signature_scheme: Some(reservation.task_signature.scheme),
+            tool_names_sha256: Some(reservation.task_signature.tool_names_sha256.clone()),
+            reserved_output_tokens: session.output_bound,
+            reserved_cost_usd: reservation.reserved_cost_usd.to_string(),
+            estimator_basis: reservation.estimator_basis.as_str().to_owned(),
             tier: record.tier.clone(),
             upstream_provider: record.upstream_provider.clone(),
             upstream_model: record.upstream_model.clone(),
