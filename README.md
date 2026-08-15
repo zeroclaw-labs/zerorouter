@@ -22,7 +22,8 @@ Security posture: [`docs/SECURITY.md`](docs/SECURITY.md). Operations:
 deliberately not built yet: [`docs/ROADMAP.md`](docs/ROADMAP.md).
 
 **Provenance:** this repository is seeded verbatim from the B0 inference
-router (`zeroclaw-labs/zerorouter`, branch `feat/rust-b0`). Bifrost
+router (`zeroclaw-labs/zerorouter-ts`, branch `feat/rust-b0` — that repo
+held the `zerorouter` name until this repository took it over). Bifrost
 (`maximhq/bifrost`) and FrankenGate (`pierretokns/frankengate`) were studied
 as behavioral references; no code was copied from either.
 

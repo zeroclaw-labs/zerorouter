@@ -54,16 +54,17 @@ changes are picked up on the next deploy without workflow edits.
 > deploy workflow (or `aws ecs update-service --force-new-deployment`) to
 > pick up rotated values.
 
-## Cutover checklist: old `zerorouter` repo → this repo
+## Cutover checklist: old `zerorouter-ts` repo → this repo
 
 The beta environment currently deploys from the old TypeScript-era
-`zeroclaw-labs/zerorouter` repository. To cut it over:
+repository, now `zeroclaw-labs/zerorouter-ts` (it held the `zerorouter`
+name until this repository took it over). To cut it over:
 
 1. **Infrastructure repo** (`zeroclaw-labs/zeroclaw-infrastructure`,
    `environments/zerorouter-beta`):
    - point the `sources/zerorouter` submodule at this repository;
    - extend the GitHub-OIDC deploy-role trust policy to accept
-     `repo:zeroclaw-labs/<this repo>:ref:refs/heads/main` as a subject
+     `repo:zeroclaw-labs/zerorouter:ref:refs/heads/main` as a subject
      (keep or drop the old repo's subject as desired — the trust policy is
      the only thing binding "who may deploy").
 2. **This repo**: set the repository variable `AWS_DEPLOY_ROLE_ARN` to the
