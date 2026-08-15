@@ -96,6 +96,13 @@ sell rates; `GET /v1/models` is materialized from it.
 A candidate is only usable when its provider credential is present in the
 environment; a tier still needs at least one credential-backed candidate.
 
+### Hosted service
+
+To use the hosted deployment instead of running your own: sign in at
+[zerorouter.ai](https://zerorouter.ai), add credits, create a key, and point
+any OpenAI-compatible client at `https://zerorouter.ai/v1`. Step by step:
+[`docs/getting-started-hosted.md`](docs/getting-started-hosted.md).
+
 ### Local models (edge mode)
 
 A self-hosted router can route to models on your own hardware — llama.cpp,
