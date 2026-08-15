@@ -95,6 +95,51 @@ sell rates; `GET /v1/models` is materialized from it.
 A candidate is only usable when its provider credential is present in the
 environment; a tier still needs at least one credential-backed candidate.
 
+### Local models (edge mode)
+
+A self-hosted router can route to models on your own hardware — llama.cpp,
+vLLM, Ollama, LM Studio — and burst to the cloud when they cannot take the
+request. Design: [`docs/design/edge-mode-local-rung.md`](docs/design/edge-mode-local-rung.md).
+Two config files, no code:
+
+1. **Declare the upstream.** Point `ZEROROUTER_PROVIDERS_PATH` at a JSON file
+   in the shape of `router/config/providers.json`. Its entries are *added* to
+   the shipped inventory; an entry whose `key` matches a shipped provider is
+   refused, so nothing on disk can repoint `openai` or `anthropic`.
+
+   ```json
+   {"providers": [{
+     "key": "local-llama",
+     "adapter": "chat_completions",
+     "credential": "none",
+     "display_name": "llama.cpp (local)",
+     "base_url": "http://127.0.0.1:8080/v1/chat/completions"
+   }]}
+   ```
+
+   `"credential": "none"` is how an upstream that takes no API key says so —
+   it is then never skipped for a missing credential, and no `Authorization`
+   header is sent. It is legal *only* on `chat_completions`, the adapter with
+   no implied endpoint; a keyless entry must still name its `base_url`.
+
+2. **Declare the candidates.** In your `tiers.toml`, a candidate on that
+   provider priced at `0` is a **$0 rung**, and cost-led requests
+   (`:cost`, or a key defaulting to cost) order $0 rungs first — no estimator
+   warm-up needed, because free is cheapest at any length. Declare what the
+   model can actually take: a request whose prompt overflows the declared
+   `context_window`, or that needs tools a candidate declared it lacks, sinks
+   behind the rungs that can serve it and the existing failover walk bursts to
+   cloud. An *undeclared* capability means unknown and never excludes anything.
+   Selection is mechanical only — the router never predicts answer quality.
+
+   A `$0` basis is refused on any provider that is not on the
+   `chat_completions` adapter: on a paid upstream it would record zero cost
+   against real spend. And a candidate is billed at its **tier's** sell rate,
+   so a $0 rung inside a mixed tier is free for the operator, not for the
+   customer; to sell a local model for nothing, pin it in a tier whose sell
+   rate is `0`. $0 routes are still metered end to end today (reserve → settle
+   at zero); skipping that is a later stage.
+
 ## Environment variables
 
 Absence disables a feature; misconfiguration aborts startup. See the
@@ -106,6 +151,7 @@ fail-closed inventory in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 |---|---|---|---|
 | `ZEROROUTER_BIND` | no | `0.0.0.0:8080` | listen address |
 | `ZEROROUTER_TIERS_PATH` | no | `config/tiers.toml` | tier catalog (container ships `/etc/zerorouter/tiers.toml`) |
+| `ZEROROUTER_PROVIDERS_PATH` | no | — | operator-declared upstreams, **added to** the shipped inventory (see below). Unreadable, invalid, or shadowing a shipped key aborts startup |
 | `DATABASE_URL` | yes* | — | explicit connection string, for local development |
 | `DB_HOST` / `DB_PORT` / `DB_NAME` / `DB_USERNAME` / `DB_PASSWORD` / `DB_SSL_ROOT_CERT` | yes* | — | production path; always connects with `verify-full` TLS |
 | `ANTHROPIC_API_KEY` | no | — | enables `anthropic/*` candidates |

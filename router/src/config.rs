@@ -11,7 +11,7 @@ use thiserror::Error;
 use crate::{
     openai::{MAX_RATE_PER_MTOK, billable_rate},
     priority::Priority,
-    providers::is_supported_provider,
+    providers::{is_supported_provider, provider_allows_zero_price},
 };
 
 pub const DEFAULT_TIER_CONFIG_PATH: &str = "config/tiers.toml";
@@ -78,6 +78,64 @@ pub struct TierCandidate {
     pub metadata: ModelMetadata,
 }
 
+impl TierCandidate {
+    /// Whether this candidate is a **$0 rung** (edge mode, stage 2:
+    /// `docs/design/edge-mode-local-rung.md`).
+    ///
+    /// This is the *one place* zero-cost is defined. Cost-mode ordering reads
+    /// it to put free rungs first, `validate_tier_catalog` reads it to refuse a
+    /// $0 basis on a paid adapter, and `drift.rs` reads it to know which
+    /// candidates a public model catalog cannot speak to. Stage 3's metering
+    /// skip is specified to key on "the candidate's configured price at
+    /// selection time, in one place" — this is that place, and it is a property
+    /// of server-side configuration only: nothing about a request, a header, or
+    /// a model alias can reach it.
+    ///
+    /// Free means the two REQUIRED dimensions are declared and exactly zero,
+    /// and the optional cached-input dimension is either absent or zero. The
+    /// asymmetry follows the file's existing convention rather than inventing
+    /// one: `input_per_mtok` and `output_per_mtok` are mandatory (an absent one
+    /// is a load error), while an absent `cached_input_per_mtok` means "unknown
+    /// here" — the bedrock shape, kept because an upstream that reports no
+    /// cached tokens has no cached rate to state. A local server has no cache
+    /// pricing either, so requiring the operator to write `= 0` for it would
+    /// make the commonest honest config silently *not* free, which is a worse
+    /// failure than the one strictness buys. A DECLARED nonzero cached rate is
+    /// still money, and still disqualifies.
+    #[must_use]
+    pub fn is_free(&self) -> bool {
+        self.rates.input_per_mtok == Some(0.0)
+            && self.rates.output_per_mtok == Some(0.0)
+            && self
+                .rates
+                .cached_input_per_mtok
+                .is_none_or(|rate| rate == 0.0)
+    }
+}
+
+/// What a request mechanically needs from whatever serves it (edge mode,
+/// stage 2).
+///
+/// Every field is a fact about the request as received — how much prompt it
+/// carries, whether it declares tools, which input modalities it contains.
+/// Nothing here is, or may become, a judgment about how *well* a model would
+/// answer: that is the design's B-line ("No quality prediction. No cascades.
+/// No judge models."), and the reason this type carries measurements rather
+/// than scores. A candidate is eligible or it is not, and the answer is a
+/// comparison against what the operator declared in `tiers.toml`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RequestNeeds {
+    /// The byte-length prompt bound — the same number admission reserves
+    /// against (`ChatCompletionRequest::reservation_usage`), deliberately, so
+    /// selection and reservation describe the same request.
+    pub prompt_bound: u64,
+    /// Whether the request declares tools.
+    pub tools: bool,
+    /// Input modalities present in the request, in models.dev's vocabulary —
+    /// the vocabulary `tiers.toml` declares in.
+    pub modalities: BTreeSet<String>,
+}
+
 /// What a model can take and produce, as declared in `config/tiers.toml`.
 ///
 /// Every field is optional and every one of them means *unknown* when absent,
@@ -107,6 +165,61 @@ pub struct ModelMetadata {
 }
 
 impl ModelMetadata {
+    /// Whether a candidate declaring this metadata can mechanically serve a
+    /// request (edge mode, stage 2).
+    ///
+    /// The rule the design doc states in full: *"Selection inputs are
+    /// mechanical only: does the request fit context, need tools/modalities
+    /// the candidate lacks, is the endpoint healthy."* Health lives in
+    /// [`crate::health`]; the other three are here.
+    ///
+    /// **Unknown is never a refusal.** An undeclared field means no one has
+    /// described that model, which is exactly the state every candidate was in
+    /// before the metadata table existed — so a silent candidate is eligible
+    /// for everything, precisely as it is today. Only a *declared* limit can
+    /// exclude a candidate, and only against a fact about the request. That
+    /// keeps the operator in charge: the router never decides a model is
+    /// unsuitable, it only believes what the operator wrote down.
+    ///
+    /// Two deliberate conservatisms in the context comparison:
+    ///
+    /// - `prompt_bound` is a BYTE bound, not a token count. There is no
+    ///   tokenizer on this path — billing policy is metered actuals only, and
+    ///   the only prompt measure the router has is the byte bound admission
+    ///   reserves against — so it over-counts tokens by roughly 3-4x and a
+    ///   local rung yields to cloud earlier than it strictly must. That is the
+    ///   right direction to be wrong in: the walk's response to an upstream
+    ///   context rejection is to truncate the prompt in place and retry, so an
+    ///   over-eager local rung would silently drop the customer's content,
+    ///   while an over-cautious one only spends money.
+    /// - `max_output_tokens` is NOT part of eligibility. Every request carries
+    ///   an output limit (defaulted to the baseline when absent), so gating on
+    ///   it would exclude any local model whose declared ceiling sits under
+    ///   that default for every request, including the ones that would have
+    ///   generated forty tokens. Servers on this wire stop at their own limit;
+    ///   overflowing it is not a refusal the way an oversized prompt is.
+    #[must_use]
+    pub fn can_serve(&self, needs: &RequestNeeds) -> bool {
+        if self
+            .context_window
+            .is_some_and(|window| needs.prompt_bound > window)
+        {
+            return false;
+        }
+        if needs.tools && self.tool_call == Some(false) {
+            return false;
+        }
+        if let Some(declared) = &self.input_modalities
+            && !needs
+                .modalities
+                .iter()
+                .all(|modality| declared.contains(modality))
+        {
+            return false;
+        }
+        true
+    }
+
     /// The metadata a *tier* may honestly advertise, given every candidate a
     /// request for that tier could land on.
     ///
@@ -258,6 +371,17 @@ pub enum TierConfigError {
          omit the field to say the modalities are unknown"
     )]
     InvalidModalities { tier: String, candidate: String },
+    #[error(
+        "candidate {candidate} in tier {tier} is priced at $0 on provider {provider}, whose \
+         adapter owns a cloud endpoint: a $0 cost basis is only legal on a chat_completions \
+         provider — the operator-declared local rung. On a paid upstream it records zero COGS \
+         against real spend, which no ledger ever notices"
+    )]
+    ZeroPriceOnPaidProvider {
+        tier: String,
+        candidate: String,
+        provider: String,
+    },
     #[error(
         "candidate {candidate} in tier {tier} costs more than the tier sells: \
          {dimension} cost basis {basis} exceeds tier sell rate {sell}"
@@ -571,6 +695,7 @@ fn validate_tier_catalog(
             }
             validate_rates(tier_id, candidate.rates)?;
             validate_metadata(tier_id, candidate)?;
+            validate_zero_price(tier_id, candidate)?;
             if let Err(error) = validate_candidate_margin(tier_id, definition.rates, candidate) {
                 // The first violating candidate becomes the tier's reason, but
                 // the walk continues: a later candidate in the same tier can
@@ -683,6 +808,40 @@ fn validate_candidate_margin(
                 sell,
             });
         }
+    }
+    Ok(())
+}
+
+/// Reject a $0 candidate that does not sit on the local rung, on the
+/// *structural* side of the split described on [`validate_tier_catalog`].
+///
+/// A $0 basis says "serving this candidate costs ZeroRouter nothing", which is
+/// true of exactly one thing: an upstream the operator runs themselves, on the
+/// chat-completions adapter, at an endpoint they had to name. On a paid
+/// provider the same three characters mean one of two things, and the file
+/// cannot tell them apart — a fat-fingered rate, which records zero COGS
+/// against real spend and reports a healthy margin until the invoice arrives,
+/// or a deliberate attempt to file a paid model under the free rung. Both are
+/// refused, whole-file, and the operator's fix is one line either way.
+///
+/// This is the structural half of the design's free-lane rule — *"no paid model
+/// may be reachable through the free lane"* — landed a stage early, and
+/// deliberately: stage 3's metering skip will key on [`TierCandidate::is_free`],
+/// and it is far easier to prove that skip safe if a $0 candidate cannot name a
+/// cloud model in the first place. The adapter question is answered by
+/// [`provider_allows_zero_price`] against the inventory itself, so there is no
+/// second list of vendor names to drift.
+///
+/// It is whole-file rather than tier-scoped for the same reason an unsupported
+/// provider is: the file is wrong about the world, not merely mispriced, and
+/// withholding one tier is precisely how it would go unnoticed.
+fn validate_zero_price(tier: &str, candidate: &TierCandidate) -> Result<(), TierConfigError> {
+    if candidate.is_free() && !provider_allows_zero_price(&candidate.provider) {
+        return Err(TierConfigError::ZeroPriceOnPaidProvider {
+            tier: tier.to_owned(),
+            candidate: candidate.id.clone(),
+            provider: candidate.provider.clone(),
+        });
     }
     Ok(())
 }
@@ -1499,6 +1658,174 @@ output_per_mtok = 8.00
             matches!(error, TierConfigError::NegativeMargin { .. }),
             "unexpected error {error:?}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Edge mode, stage 2: the $0 rung's configuration surface
+    // (`docs/design/edge-mode-local-rung.md`). The ACCEPTING half of these
+    // rules needs an operator provider inventory installed, which is
+    // process-global, so it is exercised end to end in
+    // `tests/local_candidates.rs`; what is unit-testable here is every way the
+    // file is refused, plus the two pure predicates.
+    // -----------------------------------------------------------------------
+
+    fn priced(input: Option<f64>, cached: Option<f64>, output: Option<f64>) -> TierCandidate {
+        TierCandidate {
+            id: "local/model".to_owned(),
+            provider: "local-llama".to_owned(),
+            model: "qwen3-8b".to_owned(),
+            rates: ModelRates {
+                input_per_mtok: input,
+                cached_input_per_mtok: cached,
+                output_per_mtok: output,
+            },
+            metadata: ModelMetadata::default(),
+        }
+    }
+
+    #[test]
+    fn free_means_the_required_dimensions_are_declared_zero() {
+        // The single definition of $0 that ordering, validation, and the drift
+        // reconciliation all read — and that stage 3's metering skip will key
+        // on. It reads configuration and nothing else.
+        assert!(
+            priced(Some(0.0), None, Some(0.0)).is_free(),
+            "an omitted cached rate is the local shape: nothing to state"
+        );
+        assert!(priced(Some(0.0), Some(0.0), Some(0.0)).is_free());
+
+        // Anything actually priced is not free, on any dimension. The last
+        // case is the one worth being explicit about: a rung that is free to
+        // read and charged to write is a PAID rung, and treating it as free
+        // would put a real cost basis in front of the cheapest cloud rung.
+        assert!(!priced(Some(0.0), Some(0.1), Some(0.0)).is_free());
+        assert!(!priced(Some(0.0), None, Some(2.0)).is_free());
+        assert!(!priced(Some(1.0), None, Some(0.0)).is_free());
+    }
+
+    #[test]
+    fn a_zero_priced_candidate_on_a_paid_provider_refuses_the_file() {
+        // The free-lane rule's structural half, landed a stage early: a $0
+        // basis on a cloud adapter is either a fat-fingered rate that records
+        // zero COGS against real spend, or a paid model filed under the free
+        // rung. Both refuse the whole file — a withheld tier is exactly how
+        // this would go unnoticed.
+        let catalog = catalog_with(
+            "input_per_mtok = 2.00\noutput_per_mtok = 10.00",
+            "input_per_mtok = 0.00\noutput_per_mtok = 0.00",
+        );
+        let error = validate_tier_catalog(&catalog)
+            .expect_err("a $0 basis on a paid provider must refuse the catalog");
+        assert!(
+            matches!(
+                error,
+                TierConfigError::ZeroPriceOnPaidProvider { ref provider, .. } if provider == "openai"
+            ),
+            "unexpected error {error:?}"
+        );
+
+        // A single free dimension is not a $0 rung and is left exactly as it
+        // was — this stage narrows nothing it was not asked to narrow.
+        validate_tier_catalog(&catalog_with(
+            "input_per_mtok = 2.00\noutput_per_mtok = 10.00",
+            "input_per_mtok = 0.00\noutput_per_mtok = 1.00",
+        ))
+        .expect("a partly-free basis keeps loading");
+    }
+
+    #[test]
+    fn a_negative_rate_refuses_the_file() {
+        // Pins a rule that predates this stage and now guards the $0 surface
+        // too: "cheaper than free" is not a discount, it is a number that
+        // would pay the customer to send traffic.
+        for (label, sell, basis) in [
+            (
+                "sell",
+                "input_per_mtok = -1.00\noutput_per_mtok = 10.00",
+                "input_per_mtok = 0.10\noutput_per_mtok = 0.20",
+            ),
+            (
+                "basis",
+                "input_per_mtok = 2.00\noutput_per_mtok = 10.00",
+                "input_per_mtok = -0.01\noutput_per_mtok = 0.20",
+            ),
+        ] {
+            let error = validate_tier_catalog(&catalog_with(sell, basis))
+                .expect_err(&format!("a negative {label} rate must refuse the catalog"));
+            assert!(
+                matches!(error, TierConfigError::InvalidRate { .. }),
+                "{label}: unexpected error {error:?}"
+            );
+        }
+    }
+
+    /// A request that fits any plausible model: small prompt, no tools, text.
+    fn modest_needs() -> RequestNeeds {
+        RequestNeeds {
+            prompt_bound: 1_000,
+            tools: false,
+            modalities: ["text".to_owned()].into_iter().collect(),
+        }
+    }
+
+    #[test]
+    fn an_undeclared_capability_never_makes_a_candidate_ineligible() {
+        // The rule that keeps this mechanical rather than judgmental: silence
+        // is not evidence. A candidate nobody has described serves everything,
+        // exactly as it did before the metadata table existed — including
+        // requests carrying tools and a large prompt.
+        let unknown = ModelMetadata::default();
+        assert!(unknown.can_serve(&modest_needs()));
+        assert!(
+            unknown.can_serve(&RequestNeeds {
+                prompt_bound: 10_000_000,
+                tools: true,
+                modalities: ["text".to_owned(), "image".to_owned()]
+                    .into_iter()
+                    .collect(),
+            })
+        );
+    }
+
+    #[test]
+    fn a_declared_limit_excludes_only_the_requests_it_actually_bounds() {
+        let declared = ModelMetadata {
+            context_window: Some(32_000),
+            max_output_tokens: Some(4_096),
+            input_modalities: Some(vec!["text".to_owned()]),
+            tool_call: Some(false),
+        };
+
+        assert!(declared.can_serve(&modest_needs()));
+        // The boundary is exclusive: a prompt bound EQUAL to the declared
+        // window still fits, because the window is what the model takes.
+        assert!(declared.can_serve(&RequestNeeds {
+            prompt_bound: 32_000,
+            ..modest_needs()
+        }));
+        assert!(!declared.can_serve(&RequestNeeds {
+            prompt_bound: 32_001,
+            ..modest_needs()
+        }));
+        assert!(!declared.can_serve(&RequestNeeds {
+            tools: true,
+            ..modest_needs()
+        }));
+        assert!(
+            !declared.can_serve(&RequestNeeds {
+                modalities: ["text".to_owned(), "image".to_owned()]
+                    .into_iter()
+                    .collect(),
+                ..modest_needs()
+            }),
+            "a declared modality list that lacks what the request carries excludes it"
+        );
+
+        // A declared output ceiling is deliberately NOT an eligibility input:
+        // every request carries an output limit, so gating on it would exclude
+        // a small local model from requests that would have generated forty
+        // tokens.
+        assert!(declared.can_serve(&modest_needs()));
     }
 
     #[test]

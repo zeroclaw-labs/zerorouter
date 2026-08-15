@@ -1,0 +1,11 @@
+{
+  "providers": [
+    {
+      "key": "local-llama",
+      "adapter": "chat_completions",
+      "credential": "none",
+      "display_name": "llama.cpp (local)",
+      "base_url": "http://127.0.0.1:8080/v1/chat/completions"
+    }
+  ]
+}

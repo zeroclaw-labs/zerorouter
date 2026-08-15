@@ -1,0 +1,142 @@
+schema_version = 1
+
+# Fixture catalog for tests/local_candidates.rs: an EDGE deployment's tier
+# table, of the shape `docs/design/edge-mode-local-rung.md` describes. Kept out
+# of config/tiers.toml deliberately — the shipped catalog ships no local rung,
+# and this stage builds the capability for an operator to declare one, not a
+# product change.
+#
+# Both tiers list the CLOUD rung first. That is the point: table order is not
+# $0-first order, so a cost-led request serving the local rung is observable as
+# a flip rather than as the file's own ordering.
+#
+# The tier sell rate covers the dearest rung, as the margin rule requires. A $0
+# candidate does not make the tier free — it makes ZeroRouter's cost zero on
+# the requests it serves. Skipping the reservation for those is stage 3, with
+# its own adversarial review; nothing here touches metering.
+
+# ---------------------------------------------------------------------------
+# zero/edge — the local rung declares a small window, so a long prompt is
+# mechanically ineligible for it and bursts to the cloud rung.
+# ---------------------------------------------------------------------------
+
+[tiers."zero/edge"]
+
+[tiers."zero/edge".rates]
+input_per_mtok = 3.00
+cached_input_per_mtok = 0.60
+output_per_mtok = 6.00
+
+[[tiers."zero/edge".candidates]]
+id = "openai/edge-burst"
+provider = "openai"
+model = "upstream/edge-burst"
+
+[tiers."zero/edge".candidates.metadata]
+context_window = 1000000
+max_output_tokens = 128000
+input_modalities = ["text", "image"]
+tool_call = true
+
+[tiers."zero/edge".candidates.rates]
+input_per_mtok = 1.00
+cached_input_per_mtok = 0.20
+output_per_mtok = 2.00
+
+[[tiers."zero/edge".candidates]]
+id = "local-llama/qwen3-8b"
+provider = "local-llama"
+model = "qwen3-8b"
+
+# What the operator says their own server can take. A real 8B model on a 4k
+# context is unusual; it is small here so a test prompt can overflow it without
+# carrying a megabyte of filler.
+[tiers."zero/edge".candidates.metadata]
+context_window = 4096
+max_output_tokens = 2048
+input_modalities = ["text"]
+tool_call = true
+
+[tiers."zero/edge".candidates.rates]
+input_per_mtok = 0.00
+output_per_mtok = 0.00
+
+# ---------------------------------------------------------------------------
+# zero/edge-toolless — the local rung has a wide window but no tool calling, so
+# a request carrying tools bursts and everything else stays local.
+# ---------------------------------------------------------------------------
+
+[tiers."zero/edge-toolless"]
+
+[tiers."zero/edge-toolless".rates]
+input_per_mtok = 3.00
+cached_input_per_mtok = 0.60
+output_per_mtok = 6.00
+
+[[tiers."zero/edge-toolless".candidates]]
+id = "openai/toolless-burst"
+provider = "openai"
+model = "upstream/toolless-burst"
+
+[tiers."zero/edge-toolless".candidates.metadata]
+context_window = 1000000
+max_output_tokens = 128000
+input_modalities = ["text", "image"]
+tool_call = true
+
+[tiers."zero/edge-toolless".candidates.rates]
+input_per_mtok = 1.00
+cached_input_per_mtok = 0.20
+output_per_mtok = 2.00
+
+[[tiers."zero/edge-toolless".candidates]]
+id = "local-llama/gemma3-4b"
+provider = "local-llama"
+model = "gemma3-4b"
+
+[tiers."zero/edge-toolless".candidates.metadata]
+context_window = 128000
+max_output_tokens = 8192
+input_modalities = ["text"]
+tool_call = false
+
+[tiers."zero/edge-toolless".candidates.rates]
+input_per_mtok = 0.00
+cached_input_per_mtok = 0.00
+output_per_mtok = 0.00
+
+# ---------------------------------------------------------------------------
+# local-llama/phi4-mini — a local model exposed as a PIN, the shape that makes
+# `/v1/models` publish $0.
+#
+# A candidate is always advertised, and metered, at its OWNING TIER's sell rate
+# (`TierCatalog::model_listing` / `resolve`), so a $0 rung inside a mixed tier
+# lists at that tier's price — which is the truth about what a request for it
+# costs the customer, and the listing must never quote less than that. The way
+# to sell a local model for nothing is therefore to say so: a pin whose sell
+# rate IS zero. Basis == sell == 0 satisfies the margin rule exactly as a
+# 0%-markup flagship does.
+# ---------------------------------------------------------------------------
+
+[tiers."local-llama/phi4-mini"]
+
+[tiers."local-llama/phi4-mini".rates]
+input_per_mtok = 0.00
+cached_input_per_mtok = 0.00
+output_per_mtok = 0.00
+
+[[tiers."local-llama/phi4-mini".candidates]]
+id = "local-llama/phi4-mini"
+provider = "local-llama"
+model = "phi4-mini"
+
+[tiers."local-llama/phi4-mini".candidates.metadata]
+context_window = 128000
+max_output_tokens = 4096
+input_modalities = ["text"]
+tool_call = true
+
+[tiers."local-llama/phi4-mini".candidates.rates]
+input_per_mtok = 0.00
+cached_input_per_mtok = 0.00
+output_per_mtok = 0.00
