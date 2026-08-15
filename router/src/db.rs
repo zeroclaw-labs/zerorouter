@@ -947,10 +947,19 @@ pub async fn migrate(pool: &PgPool) -> Result<()> {
 /// gates above are evaluated against a snapshot that a concurrent sibling can
 /// invalidate, so k simultaneous free requests can each pass a velocity check
 /// that their sum would fail. Two properties bound it. Nothing is encumbered,
-/// so no race can overdraw a balance or lose money; and the settled usage the
-/// cap reads is append-only, so the overshoot is one in-flight batch and the
-/// next minute's window sees every token of it. That is the honest shape of a
-/// rate limit without a lock: approximate at the boundary, exact in aggregate.
+/// so no race can overdraw a balance or lose money; and the usage the cap reads
+/// is append-only, so the overshoot is one in-flight batch and the next
+/// minute's window sees every token of every row that landed.
+///
+/// "That landed" is doing real work in that sentence, and it is the second
+/// slippage rather than a restatement of the first: this lane's usage row is
+/// written off-path and warn-and-drop
+/// ([`UsageSession::observe_free_usage`]), so a row lost to a database blip or
+/// to the process dying is inference that was delivered and will never count
+/// against anyone's cap. So the honest claim is narrower than "exact in
+/// aggregate": approximate at the boundary, exact over the rows that landed.
+/// Both slippages cost the operator throughput rather than money, which is why
+/// they are acceptable here and would not be for a moment on the metered lane.
 ///
 /// Sizing is always the full requested ceiling on the free lane. The learned
 /// sizing exists to encumber less of a customer's balance, there is nothing to
@@ -2901,7 +2910,8 @@ pub async fn release_quarantined_reservation(
         return Ok(ReservationRelease::Refused {
             reason: format!(
                 "no reservation {request_id} exists; a settled or reclaimed \
-                 request leaves no row, and only a quarantined one can be released"
+                 request leaves no row, a free-lane request never had one, and \
+                 only a quarantined one can be released"
             ),
         });
     };
@@ -2956,7 +2966,8 @@ pub async fn release_quarantined_reservation(
         return Ok(ReservationRelease::Refused {
             reason: format!(
                 "no reservation {request_id} exists; a settled or reclaimed \
-                 request leaves no row, and only a quarantined one can be released"
+                 request leaves no row, a free-lane request never had one, and \
+                 only a quarantined one can be released"
             ),
         });
     };

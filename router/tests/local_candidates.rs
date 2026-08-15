@@ -183,6 +183,115 @@ model = "probe"
     load_tier_catalog(&path).await
 }
 
+/// Write a one-tier catalog with explicit sell rates AND candidate rates, so a
+/// test can put either side's cached dimension in any state it likes.
+async fn load_catalog_rates(
+    name: &str,
+    provider: &str,
+    sell: &str,
+    basis: &str,
+) -> Result<zerorouter::TierCatalog, zerorouter::config::TierConfigError> {
+    let path = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("{name}.toml"));
+    tokio::fs::write(
+        &path,
+        format!(
+            r#"
+schema_version = 1
+[tiers."zero/{name}"]
+[tiers."zero/{name}".rates]
+{sell}
+[[tiers."zero/{name}".candidates]]
+id = "{provider}/probe"
+provider = "{provider}"
+model = "probe"
+[tiers."zero/{name}".candidates.rates]
+{basis}
+"#
+        ),
+    )
+    .await
+    .expect("the fixture should write");
+    load_tier_catalog(&path).await
+}
+
+/// The three shapes an absent cached rate used to smuggle through validation,
+/// all of them variations on one mistake: a `None` was read as "skip this
+/// comparison" when [`usage_cost`] reads it as "bill this at the input rate".
+///
+/// Grouped because they are one defect with three faces, and because each is a
+/// FAIL-BEFORE case — every one of them loaded happily before this change.
+///
+/// [`usage_cost`]: zerorouter::openai::usage_cost
+#[tokio::test]
+async fn an_absent_cached_rate_may_not_bypass_a_comparison_billing_will_make() {
+    operator_inventory();
+
+    // 1. A cloud candidate that says the traffic every request generates is
+    //    free, and hides behind a declared cached rate so the "is it free?"
+    //    question answers no. Structural: it condemns the whole file, because
+    //    the file is wrong about the world rather than merely mispriced.
+    let error = load_catalog_rates(
+        "cached-zero-cloak",
+        "openai",
+        "input_per_mtok = 2.00\noutput_per_mtok = 10.00",
+        "input_per_mtok = 0.00\noutput_per_mtok = 0.00\ncached_input_per_mtok = 5.00",
+    )
+    .await
+    .expect_err("a $0 input+output basis on a billing upstream must refuse the catalog");
+    let detail = error.to_string();
+    assert!(detail.contains("openai/probe"), "{detail}");
+    assert!(detail.contains("settlement"), "{detail}");
+
+    // 2. The candidate declares a cached rate and the tier does not, so the
+    //    tier sells cached tokens at its INPUT rate — 3.00 — while they cost
+    //    5.00. Economic: the tier is withheld, and with only one tier in the
+    //    file that surfaces as a load error naming the dimension.
+    let error = load_catalog_rates(
+        "cached-basis-above-fallback",
+        "openai",
+        "input_per_mtok = 3.00\noutput_per_mtok = 6.00",
+        "input_per_mtok = 1.00\noutput_per_mtok = 2.00\ncached_input_per_mtok = 5.00",
+    )
+    .await
+    .expect_err("a cached basis above the tier's effective cached rate must withhold the tier");
+    let detail = error.to_string();
+    assert!(detail.contains("cached_input_per_mtok"), "{detail}");
+    assert!(
+        detail.contains("costs more than the tier sells"),
+        "{detail}"
+    );
+
+    // 3. The mirror image: the tier advertises a cached DISCOUNT the candidate
+    //    cannot honour, because the candidate has no cached rate and so bills
+    //    cached tokens at its full input rate. The discount is real for the
+    //    customer and imaginary for ZeroRouter — the leak runs the other way
+    //    and is just as silent.
+    let error = load_catalog_rates(
+        "cached-discount-unbacked",
+        "openai",
+        "input_per_mtok = 3.00\noutput_per_mtok = 6.00\ncached_input_per_mtok = 0.60",
+        "input_per_mtok = 3.00\noutput_per_mtok = 6.00",
+    )
+    .await
+    .expect_err("a cached discount no candidate can honour must withhold the tier");
+    let detail = error.to_string();
+    assert!(detail.contains("cached_input_per_mtok"), "{detail}");
+
+    // The control, and the reason this is a comparison rather than a ban: when
+    // NEITHER side declares the dimension, both fall back to their own input
+    // rate and an at-cost flagship is still exactly at cost. This is the shape
+    // every rate table that predates cached pricing has, and it must keep
+    // loading.
+    load_catalog_rates(
+        "cached-absent-both-sides",
+        "openai",
+        "input_per_mtok = 3.00\noutput_per_mtok = 6.00",
+        "input_per_mtok = 3.00\noutput_per_mtok = 6.00",
+    )
+    .await
+    .expect("an absent cached dimension on both sides is at cost, not over it");
+}
+
 /// The blocker the adversarial review found. `chat_completions` is dual-use by
 /// the design's own scope — the keyless local rung AND a credentialed hosted
 /// ZeroRouter taking metered burst traffic — so keying "may be $0" on the

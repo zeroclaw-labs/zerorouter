@@ -402,6 +402,28 @@ impl StreamDelivery {
     /// never be all-zero (`OpenAiUsage::try_from_provider` rejects it), and
     /// `request_attempts.served` is set only on the attempt whose output the
     /// customer received.
+    ///
+    /// # What this query does NOT see, since edge mode's stage 3
+    ///
+    /// **Free-lane gaps are invisible to it.** The join is on
+    /// `request_attempts`, and the free lane writes no attempt rows — its
+    /// observability row rides no settle transaction to insert them in. So a
+    /// local upstream that answers without reporting usage produces a $0 row
+    /// with zero tokens and NOTHING to join against, and drops out of the audit
+    /// entirely. That is tolerable only because the amount at stake is
+    /// definitionally zero: a free-lane gap is a hole in a dashboard, not in a
+    /// bill, and this query exists to find unbilled revenue. It is recorded
+    /// here rather than left to be rediscovered, because the query reads like a
+    /// complete census and is no longer one.
+    ///
+    /// The related asymmetry on the same rows: `usage_events.attempt_count` IS
+    /// written on a free-lane row (the walk really did consume that many
+    /// positions), while the `request_attempts` rows it counts do not exist. A
+    /// query that treats `attempt_count` as a row count against that table will
+    /// come up short on exactly these rows. Both are one decision — attempts
+    /// are deliberately not written off-path — and closing it would mean a
+    /// second async insert on the free lane's hot path, which is a trade worth
+    /// making only if free-lane attempt detail is wanted for its own sake.
     fn settled_usage(self, usage: Option<OpenAiUsage>) -> OpenAiUsage {
         if !self.model_output_sent {
             return OpenAiUsage::default();

@@ -233,6 +233,41 @@ impl ModelRates {
             && self.cached_input_per_mtok.is_none()
     }
 
+    /// The cached-input rate this table will actually be BILLED at.
+    ///
+    /// An absent `cached_input_per_mtok` is not "no cached charge" — it falls
+    /// back to the input rate, because that is precisely what
+    /// [`crate::openai::usage_cost`] does with it. Every comparison between
+    /// two rate tables has to be made on these values rather than on the
+    /// declared ones, or a `None` silently skips a comparison that settlement
+    /// will later make real: a candidate that omits the dimension is billed at
+    /// its input rate, not at nothing.
+    ///
+    /// `None` only when the input rate is absent too, which catalog validation
+    /// refuses before any comparison runs (`validate_rates`, required
+    /// dimensions). Kept as an `Option` anyway so "genuinely unknown" stays
+    /// distinguishable from "known to be zero" — the distinction this whole
+    /// type exists to preserve.
+    #[must_use]
+    pub fn effective_cached_input_per_mtok(&self) -> Option<f64> {
+        self.cached_input_per_mtok.or(self.input_per_mtok)
+    }
+
+    /// Whether the two REQUIRED dimensions are declared and exactly zero.
+    ///
+    /// Weaker than [`Self::are_zero`] on purpose, and used for a different
+    /// question. This one asks "does this table CLAIM that the traffic every
+    /// request generates costs nothing" — input and output tokens exist on
+    /// every request, cached ones do not — which is the claim
+    /// `validate_zero_price` refuses to accept about an upstream that bills.
+    /// A table reading `{input: 0, output: 0, cached_input: 5.00}` is not
+    /// free, but it still makes that claim, and a rule that only looked at
+    /// [`Self::are_zero`] let it through.
+    #[must_use]
+    pub fn required_rates_are_zero(&self) -> bool {
+        self.input_per_mtok == Some(0.0) && self.output_per_mtok == Some(0.0)
+    }
+
     /// Whether this table prices every dimension at exactly zero.
     ///
     /// The mechanical half of "free", stated once and read on both sides of
@@ -242,21 +277,17 @@ impl ModelRates {
     /// [`crate::config::ResolvedRoute::sells_free`]). Those are different
     /// claims about different money; they are the same arithmetic.
     ///
-    /// The two REQUIRED dimensions must be declared and exactly zero; the
-    /// optional cached-input dimension may be absent OR zero. That asymmetry
-    /// is the tier file's own convention rather than an invention here —
-    /// `input_per_mtok` and `output_per_mtok` are mandatory (an absent one is
-    /// a load error) while an absent `cached_input_per_mtok` means "unknown
-    /// here", the bedrock shape. It also matches exactly what
-    /// [`crate::openai::usage_cost`] does with the same table: an absent
-    /// cached rate is priced at the input rate, so an absent cached rate over
-    /// a zero input rate prices at zero. A DECLARED nonzero cached rate is
+    /// Zero means all three EFFECTIVE rates are zero — so an absent
+    /// cached-input dimension is read as the input rate, exactly as
+    /// [`crate::openai::usage_cost`] reads it, and an absent cached rate over
+    /// a zero input rate therefore prices at zero. That is what lets the
+    /// commonest honest local config (no cache pricing at all, because the
+    /// server has no cache) be free without the operator writing `= 0` for a
+    /// dimension their server does not have. A DECLARED nonzero cached rate is
     /// still money, and still disqualifies.
     #[must_use]
     pub fn are_zero(&self) -> bool {
-        self.input_per_mtok == Some(0.0)
-            && self.output_per_mtok == Some(0.0)
-            && self.cached_input_per_mtok.is_none_or(|rate| rate == 0.0)
+        self.required_rates_are_zero() && self.effective_cached_input_per_mtok() == Some(0.0)
     }
 }
 

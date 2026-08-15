@@ -116,10 +116,34 @@ The unmetered path is an attack surface against the money path. Hard rules:
 - **Classification is server-side config only.** Whether a route is free is a
   property of the tier/candidate configuration on disk — never influenced by
   request contents, headers, model-id aliasing, or client hints.
-- **No paid model may be reachable through the free lane.** A candidate with a
-  nonzero price must be structurally incapable of being selected by the
-  $0-skip path; the skip predicate keys on the candidate's configured price at
-  selection time, in one place.
+- **No paid model may be reachable through the free lane *by accident*.** The
+  skip predicate keys on server-side configuration at selection time, in one
+  place (`api::free_lane_admissible`), and it takes TWO independent
+  declarations in TWO files to enter the lane: the provider's
+  `"settlement": "free"` and the candidate's $0 price. Neither a typo in a
+  rate, nor picking the chat-completions adapter, nor a forgotten credential
+  can produce one on its own.
+
+  **What this does not achieve, stated plainly, because an earlier draft of
+  this line overclaimed it.** A candidate with a nonzero price is *not*
+  structurally incapable of reaching the lane, because nothing in the router
+  can know what an arbitrary endpoint charges. `chat_completions` is dual-use
+  by this document's own scope — it serves both the operator's local models and
+  a hosted ZeroRouter taking metered burst traffic — and `settlement: free` on
+  a credentialed `chat_completions` provider whose `base_url` points at a paid
+  upstream will be believed. That is an operator lying to their own
+  configuration, it is undetectable by any validation short of the invoice, and
+  the harm lands on the operator who wrote it (their own bill, unrecorded)
+  rather than on a customer or on ZeroRouter's ledger. The guarantee is the
+  explicit double declaration, never inference.
+
+  **Open question, flagged rather than closed:** whether a better discriminator
+  than "the operator said so" exists. Keying on keyless-only was considered and
+  rejected — it breaks the legitimate, common case of a local vLLM behind a
+  bearer token — and no other candidate discriminator has been found that does
+  not either break that case or amount to guessing. Tracked as an open finding;
+  it is a hardening question, not a blocker, precisely because the failure mode
+  is self-inflicted and self-absorbed.
 - **Free-lane requests still authenticate.** Cached-key auth applies; the free
   rung is not an anonymous proxy.
 - **Async usage recording must not become a billing input.** $0 usage rows are
@@ -139,8 +163,14 @@ The unmetered path is an attack surface against the money path. Hard rules:
   safe direction to be wrong in, since it can refuse traffic but never
   authorize a charge. Without the per-user advisory lock the cap is
   approximate at the boundary (k simultaneous requests can each pass a check
-  their sum would fail) and exact in aggregate, because settled usage is
-  append-only and the next window sees every token of it.
+  their sum would fail) and exact **over the rows that landed** — the next
+  window sees every token of every row that was written, because
+  `usage_events` is append-only. It is not exact over traffic served: the
+  free-lane insert is warn-and-drop, so a row lost to a database blip or to
+  the process dying is usage that was delivered and never counted against the
+  cap. Both slippages are bounded and both cost the operator throughput rather
+  than money, which is why the trade is acceptable on this lane and would not
+  be on the metered one.
 - The seam lands as its own PR with adversarial review, same bar as the
   reserve→settle work.
 
