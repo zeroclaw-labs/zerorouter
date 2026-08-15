@@ -61,6 +61,29 @@
 //! `[DONE]` — while still accepting a socket that closes after a
 //! `finish_reason` without one, since that is a completed generation missing
 //! a framing marker rather than a broken stream.
+//!
+//! That soft close has one accepted cost, recorded here rather than left for
+//! someone to rediscover from a revenue graph. On a stream whose only output
+//! was TOOL CALLS, a soft close flushes the assembled calls, reports whatever
+//! usage arrived (often none), and settles — where the strict rule its
+//! siblings use would have failed the attempt and let the walk re-serve it on
+//! the next candidate, which would then have billed. So the soft close can
+//! convert a billable retry into a free delivery. It is still the right
+//! trade: the strict rule pays for that revenue by discarding completed
+//! answers on every server that ends its streams this way, and a duplicate
+//! tool call re-served against a candidate that already ran the tool is worse
+//! for the customer than an unbilled one. The case is made observable instead
+//! — a soft close carrying no usage logs a distinct `done_missing` gap
+//! (`ChatCompletionsStreamMachine::usage_gap`), so a truncating middlebox
+//! cannot hide inside the ordinary "this server ignores `include_usage`"
+//! shrug.
+//!
+//! One more divergence from the Anthropic machine, and it is deliberate:
+//! usage MERGE policy. Anthropic streams cumulative counters, so a per-field
+//! maximum is the honest reading. This dialect streams absolute snapshots,
+//! where a per-field maximum can synthesize a pair no chunk ever sent. The
+//! rule here is whole-report; see
+//! `ChatCompletionsStreamMachine::absorb_usage`.
 
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
@@ -1821,25 +1844,38 @@ struct ChatCompletionsEnvelope {
     usage: Option<ChatCompletionsUsage>,
 }
 
+/// `function.arguments` in ZeroRouter's JSON-STRING convention.
+///
+/// The dialect specifies a string and the hosted providers send one, but
+/// heterogeneous local servers sometimes send the parsed OBJECT instead.
+/// Reading only `as_str` turned those into the empty string, which downstream
+/// reads as "the model called this tool with no arguments" — a silently wrong
+/// tool call rather than a visible failure. Serializing the object back is
+/// exact, since it is the same JSON the string form would have carried.
+/// `null` stays absent so the caller can apply its own default.
+fn tool_arguments_text(function: Option<&Value>) -> Option<String> {
+    match function.and_then(|function| function.get("arguments"))? {
+        Value::String(text) => Some(text.clone()),
+        Value::Null => None,
+        structured => Some(structured.to_string()),
+    }
+}
+
 /// Lift a `tool_calls[]` entry in this dialect's shape into ZR's `ToolCall`.
 fn parse_chat_tool_call(call: &Value) -> ToolCall {
-    let function = call.get("function");
     ToolCall {
         id: call
             .get("id")
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_owned(),
-        name: function
+        name: call
+            .get("function")
             .and_then(|function| function.get("name"))
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_owned(),
-        arguments: function
-            .and_then(|function| function.get("arguments"))
-            .and_then(Value::as_str)
-            .unwrap_or("{}")
-            .to_owned(),
+        arguments: tool_arguments_text(call.get("function")).unwrap_or_else(|| "{}".to_owned()),
         extra_content: None,
     }
 }
@@ -1921,6 +1957,77 @@ fn chat_completions_upstream_error(
     )
 }
 
+/// One usage report exactly as a single upstream chunk stated it — the unit
+/// this dialect's merge policy operates on.
+///
+/// Flat, unlike the `ChatCompletionsUsage` the buffered path deserializes,
+/// because the merge rules compare the cached dimension field-to-field
+/// alongside the other two rather than through a nested option.
+#[derive(Clone, Copy, Default)]
+struct ChatUsageReport {
+    prompt_tokens: Option<u64>,
+    completion_tokens: Option<u64>,
+    cached_tokens: Option<u64>,
+}
+
+impl ChatUsageReport {
+    fn from_value(usage: &Value) -> Self {
+        Self {
+            prompt_tokens: usage.get("prompt_tokens").and_then(Value::as_u64),
+            completion_tokens: usage.get("completion_tokens").and_then(Value::as_u64),
+            cached_tokens: usage
+                .get("prompt_tokens_details")
+                .and_then(|details| details.get("cached_tokens"))
+                .and_then(Value::as_u64),
+        }
+    }
+
+    fn is_empty(self) -> bool {
+        self.prompt_tokens.is_none()
+            && self.completion_tokens.is_none()
+            && self.cached_tokens.is_none()
+    }
+
+    fn fields(self) -> [Option<u64>; 3] {
+        [
+            self.prompt_tokens,
+            self.completion_tokens,
+            self.cached_tokens,
+        ]
+    }
+
+    /// Whether `self` contradicts `accepted` by stating LESS on any dimension
+    /// both of them set. Dimensions only one of them sets cannot contradict.
+    fn shrinks_against(self, accepted: Self) -> bool {
+        self.fields()
+            .into_iter()
+            .zip(accepted.fields())
+            .any(|(incoming, accepted)| match (incoming, accepted) {
+                (Some(incoming), Some(accepted)) => incoming < accepted,
+                _ => false,
+            })
+    }
+
+    /// Take `incoming` wholesale, keeping only the dimensions it declines to
+    /// state. Applied ONLY to a report that does not shrink, so every value
+    /// this returns either came from `incoming` or was never contested.
+    fn replaced_by(self, incoming: Self) -> Self {
+        Self {
+            prompt_tokens: incoming.prompt_tokens.or(self.prompt_tokens),
+            completion_tokens: incoming.completion_tokens.or(self.completion_tokens),
+            cached_tokens: incoming.cached_tokens.or(self.cached_tokens),
+        }
+    }
+
+    fn into_token_usage(self) -> Option<TokenUsage> {
+        believable(TokenUsage {
+            input_tokens: self.prompt_tokens,
+            output_tokens: self.completion_tokens,
+            cached_input_tokens: self.cached_tokens,
+        })
+    }
+}
+
 /// A tool call under assembly across `delta.tool_calls[].function.arguments`
 /// fragments, keyed by the fragment's `index`.
 struct PendingChatTool {
@@ -1944,7 +2051,13 @@ struct PendingChatTool {
 /// settled unbilled.
 #[derive(Default)]
 struct ChatCompletionsStreamMachine {
-    usage: ChatCompletionsUsage,
+    /// The one usage report currently accepted — always a report some chunk
+    /// actually sent, never a blend of two. See [`Self::absorb_usage`].
+    usage: ChatUsageReport,
+    /// Whether any usage was ever accepted. Separate from `usage` because
+    /// [`Self::partial_usage`] takes that field, and the metering-gap label
+    /// still has to be answerable afterwards.
+    usage_reported: bool,
     open_tools: std::collections::BTreeMap<u64, PendingChatTool>,
     /// Cumulative tool-argument bytes across the whole stream.
     tool_argument_bytes: usize,
@@ -1954,6 +2067,10 @@ struct ChatCompletionsStreamMachine {
     /// that closes without `[DONE]` as a finished stream rather than a broken
     /// one.
     finish_reason: Option<String>,
+    /// Whether the `[DONE]` sentinel actually arrived, as opposed to the
+    /// socket closing after a `finish_reason`. Same billing outcome, different
+    /// diagnosis — see [`Self::usage_gap`].
+    saw_done: bool,
     finished: bool,
 }
 
@@ -1980,42 +2097,69 @@ impl ChatCompletionsStreamMachine {
         self.finish_reason.is_some()
     }
 
-    fn absorb_usage(&mut self, value: Option<&Value>) {
-        let Some(usage) = value else { return };
-        // Field-by-field and monotone, for the same reason the Anthropic
-        // machine does it: a stale, replayed, or simply wrong later frame
-        // reporting fewer tokens than an earlier one must not shrink the bill
-        // or the velocity window. Chat-completions usage is absolute rather
-        // than incremental, so in a well-behaved stream the maximum IS the
-        // last value; the rule only bites on a misbehaving one.
-        let raise = |slot: &mut Option<u64>, tokens: Option<u64>| {
-            if let Some(tokens) = tokens {
-                *slot = Some(slot.map_or(tokens, |seen: u64| seen.max(tokens)));
-            }
-        };
-        raise(
-            &mut self.usage.prompt_tokens,
-            usage.get("prompt_tokens").and_then(Value::as_u64),
-        );
-        raise(
-            &mut self.usage.completion_tokens,
-            usage.get("completion_tokens").and_then(Value::as_u64),
-        );
-        let cached = usage
-            .get("prompt_tokens_details")
-            .and_then(|details| details.get("cached_tokens"))
-            .and_then(Value::as_u64);
-        if cached.is_some() {
-            let mut slot = self
-                .usage
-                .prompt_tokens_details
-                .as_ref()
-                .and_then(|details| details.cached_tokens);
-            raise(&mut slot, cached);
-            self.usage.prompt_tokens_details = Some(ChatCompletionsPromptDetails {
-                cached_tokens: slot,
-            });
+    /// Why this stream has no usage to settle, or `None` if it has some.
+    ///
+    /// Both answers bill nothing, and that is exactly why they must be
+    /// distinguishable in the log. `include_usage_ignored` is ordinary: the
+    /// stream framed itself correctly and simply never sent the optional
+    /// usage chunk, which several local servers do on every request.
+    /// `done_missing` is not ordinary: the socket closed after a
+    /// `finish_reason` without the sentinel AND without usage, which is what
+    /// a truncating proxy in front of an upstream that DOES report usage
+    /// looks like. Folding the second into the first would let a fleet-wide
+    /// middlebox quietly erase revenue while looking like a known,
+    /// tolerated limitation.
+    fn usage_gap(&self) -> Option<&'static str> {
+        if self.usage_reported {
+            return None;
         }
+        Some(if self.saw_done {
+            "include_usage_ignored"
+        } else {
+            "done_missing"
+        })
+    }
+
+    /// Merge policy for a usage report — deliberately NOT the per-field
+    /// maximum its Anthropic sibling uses.
+    ///
+    /// The dialects differ in kind. Anthropic streams CUMULATIVE counters, so
+    /// a per-field high-water mark is the honest reading of them. Chat
+    /// completions streams absolute SNAPSHOTS, and taking the maximum of two
+    /// snapshots field by field can synthesize a pair no chunk ever sent: a
+    /// chunk stating `{prompt: 2_000_000_000, completion: 1}` followed by a
+    /// corrected `{prompt: 500, completion: 400}` would bill
+    /// `{2_000_000_000, 400}`, overcharging the prompt side four-million-fold
+    /// against a figure the upstream had already retracted.
+    ///
+    /// So the unit here is the whole report:
+    ///
+    /// * A report that states LESS than the accepted one on any dimension
+    ///   both set is a contradiction. The accepted report is kept entire —
+    ///   fills it carried included, or the mixing would come back through the
+    ///   side door — and the disagreement is logged.
+    /// * Any other report replaces the accepted one wholesale, keeping only
+    ///   the dimensions the newcomer declines to state.
+    ///
+    /// The result is always a report the upstream actually sent, extended at
+    /// most by dimensions NO report has ever contested.
+    fn absorb_usage(&mut self, alias: &str, value: Option<&Value>) {
+        let Some(incoming) = value.map(ChatUsageReport::from_value) else {
+            return;
+        };
+        if incoming.is_empty() {
+            return;
+        }
+        if incoming.shrinks_against(self.usage) {
+            tracing::warn!(
+                provider = alias,
+                "upstream contradicted an earlier usage report with a smaller one; \
+                 keeping the earlier report"
+            );
+            return;
+        }
+        self.usage = self.usage.replaced_by(incoming);
+        self.usage_reported = true;
     }
 
     /// One `data:` payload, including the non-JSON `[DONE]` sentinel this
@@ -2023,6 +2167,7 @@ impl ChatCompletionsStreamMachine {
     /// owns the parse.
     fn handle_payload(&mut self, alias: &str, data: &str) -> Result<Vec<StreamEvent>, StreamError> {
         if data.trim() == "[DONE]" {
+            self.saw_done = true;
             return Ok(self.terminate());
         }
         let value: Value = serde_json::from_str(data).map_err(StreamError::Json)?;
@@ -2074,46 +2219,53 @@ impl ChatCompletionsStreamMachine {
 
         // Usage rides on the chunk itself, not on a choice. With
         // `include_usage` honored it arrives on a final choice-less chunk;
-        // some servers attach it to every chunk instead, which the monotone
-        // absorb handles.
-        self.absorb_usage(value.get("usage"));
+        // some servers attach it to every chunk instead, which the merge
+        // policy handles.
+        self.absorb_usage(alias, value.get("usage"));
 
         let mut events = Vec::new();
-        let Some(choices) = value.get("choices").and_then(Value::as_array) else {
+        // The FIRST choice only, matching what the buffered path reads. `n` is
+        // not a field ZeroRouter's compat surface accepts — it lands in
+        // `extra` and is 400-rejected as an unsupported extension — so a
+        // conforming response has exactly one choice, and streaming every
+        // choice would let a nonconforming upstream interleave two answers
+        // into one customer stream, character by character, with no way to
+        // separate them afterwards. Reading position 0 rather than filtering
+        // on `index == 0` also keeps an upstream that numbers its single
+        // choice oddly from silently returning nothing.
+        let Some(choice) = value
+            .get("choices")
+            .and_then(Value::as_array)
+            .and_then(|choices| choices.first())
+        else {
             return Ok(events);
         };
-        for choice in choices {
-            // Every choice is processed rather than only `index == 0`.
-            // ZeroRouter never asks for more than one, so in practice there is
-            // exactly one; filtering on the index would mean an upstream that
-            // numbers its single choice oddly silently returns nothing.
-            if let Some(delta) = choice.get("delta") {
-                if let Some(content) = delta.get("content").and_then(Value::as_str)
-                    && !content.is_empty()
-                {
-                    let mut chunk = StreamChunk::delta(content);
-                    if self.count_tokens {
-                        // The ZR-documented per-chunk floor convention:
-                        // len()/4, a labeled lower bound, never billing.
-                        chunk.token_count = content.len() / 4;
-                    }
-                    events.push(StreamEvent::TextDelta(chunk));
+        if let Some(delta) = choice.get("delta") {
+            if let Some(content) = delta.get("content").and_then(Value::as_str)
+                && !content.is_empty()
+            {
+                let mut chunk = StreamChunk::delta(content);
+                if self.count_tokens {
+                    // The ZR-documented per-chunk floor convention: len()/4, a
+                    // labeled lower bound, never billing.
+                    chunk.token_count = content.len() / 4;
                 }
-                if let Some(reasoning) = delta.get("reasoning_content").and_then(Value::as_str)
-                    && !reasoning.is_empty()
-                {
-                    // No token_count: the estimate is defined over content,
-                    // so a reasoning-only chunk contributes nothing to it.
-                    events.push(StreamEvent::TextDelta(StreamChunk::reasoning(reasoning)));
-                }
-                if let Some(fragments) = delta.get("tool_calls").and_then(Value::as_array) {
-                    self.absorb_tool_fragments(alias, fragments)?;
-                }
+                events.push(StreamEvent::TextDelta(chunk));
             }
-            if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
-                note_finish_reason(alias, Some(reason));
-                self.finish_reason = Some(reason.to_owned());
+            if let Some(reasoning) = delta.get("reasoning_content").and_then(Value::as_str)
+                && !reasoning.is_empty()
+            {
+                // No token_count: the estimate is defined over content, so a
+                // reasoning-only chunk contributes nothing to it.
+                events.push(StreamEvent::TextDelta(StreamChunk::reasoning(reasoning)));
             }
+            if let Some(fragments) = delta.get("tool_calls").and_then(Value::as_array) {
+                self.absorb_tool_fragments(alias, fragments)?;
+            }
+        }
+        if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
+            note_finish_reason(alias, Some(reason));
+            self.finish_reason = Some(reason.to_owned());
         }
         Ok(events)
     }
@@ -2129,14 +2281,40 @@ impl ChatCompletionsStreamMachine {
         fragments: &[Value],
     ) -> Result<(), StreamError> {
         for (position, fragment) in fragments.iter().enumerate() {
-            // A missing `index` is nonconforming but common on small servers.
-            // Falling back to the fragment's POSITION rather than a constant
-            // keeps a single delta carrying several complete calls from
-            // collapsing them all onto one slot.
-            let index = fragment
-                .get("index")
-                .and_then(Value::as_u64)
-                .unwrap_or_else(|| u64::try_from(position).unwrap_or_default());
+            let id = fragment.get("id").and_then(Value::as_str).unwrap_or("");
+            let index = match fragment.get("index").and_then(Value::as_u64) {
+                Some(index) => index,
+                None => {
+                    // A missing `index` is nonconforming but common on small
+                    // servers. Position disambiguates the fragments WITHIN one
+                    // delta, which is why it is the fallback rather than a
+                    // constant — but position does not disambiguate ACROSS
+                    // frames, and two complete indexless calls arriving in two
+                    // separate chunks would both select slot 0: the second
+                    // overwrites the first's id and name and appends its
+                    // arguments onto the first's, yielding one call whose body
+                    // is two concatenated JSON objects. Early Ollama and
+                    // Mistral-compat builds emit exactly that shape. A
+                    // non-empty id that disagrees with the one already in the
+                    // selected slot is proof the fragment belongs to a
+                    // DIFFERENT call, so it opens a fresh slot above every
+                    // slot in use instead of corrupting that one.
+                    let fallback = u64::try_from(position).unwrap_or_default();
+                    let collides = !id.is_empty()
+                        && self
+                            .open_tools
+                            .get(&fallback)
+                            .is_some_and(|pending| !pending.id.is_empty() && pending.id != id);
+                    if collides {
+                        self.open_tools
+                            .keys()
+                            .next_back()
+                            .map_or(0, |highest| highest.saturating_add(1))
+                    } else {
+                        fallback
+                    }
+                }
+            };
             if !self.open_tools.contains_key(&index) {
                 // The per-event cap bounds one frame; this bounds what a
                 // stream can accrete across legitimately terminated frames.
@@ -2155,15 +2333,12 @@ impl ChatCompletionsStreamMachine {
                 );
             }
             let function = fragment.get("function");
-            let id = fragment.get("id").and_then(Value::as_str).unwrap_or("");
             let name = function
                 .and_then(|function| function.get("name"))
                 .and_then(Value::as_str)
                 .unwrap_or("");
-            let arguments = function
-                .and_then(|function| function.get("arguments"))
-                .and_then(Value::as_str)
-                .unwrap_or("");
+            let arguments = tool_arguments_text(function).unwrap_or_default();
+            let arguments = arguments.as_str();
             if !arguments.is_empty() {
                 // Cumulative across every open block: a stream that appends
                 // forever must not grow the process.
@@ -2376,10 +2551,26 @@ impl ModelProvider for ChatCompletionsWire {
                     // failing it would discard an answer the customer was
                     // already streamed. The sentinel is framing, the
                     // finish_reason is the protocol's completion signal.
-                    tracing::debug!(
-                        provider = %alias,
-                        "chat completions stream closed after finish_reason without [DONE]"
-                    );
+                    //
+                    // A soft close that ALSO carries no usage is louder than
+                    // that, though: it is indistinguishable at this layer from
+                    // a truncating middlebox eating the tail of a stream whose
+                    // upstream does report usage, and it bills nothing either
+                    // way. It must not settle behind the same label as a
+                    // server that merely ignores `include_usage`.
+                    match machine.usage_gap() {
+                        Some(gap @ "done_missing") => tracing::warn!(
+                            provider = %alias,
+                            usage_gap = gap,
+                            "chat completions stream closed without [DONE] and without usage; \
+                             settling unbilled"
+                        ),
+                        gap => tracing::debug!(
+                            provider = %alias,
+                            usage_gap = gap.unwrap_or("none"),
+                            "chat completions stream closed after finish_reason without [DONE]"
+                        ),
+                    }
                     for event in machine.terminate() {
                         yield event;
                     }
@@ -3555,6 +3746,65 @@ mod chat_completions_tests {
     }
 
     #[test]
+    fn two_indexless_calls_in_separate_frames_stay_two_calls() {
+        // Position disambiguates indexless fragments WITHIN one frame; across
+        // frames it does not, and both of these would otherwise land on slot
+        // 0 — the second overwriting the first's id and name and appending its
+        // arguments onto the first's, producing one call with the body
+        // `{"x":1}{"y":2}`, which is not even valid JSON. Early Ollama and
+        // Mistral-compat builds emit exactly this shape. A non-empty id that
+        // disagrees with the slot's own is proof the fragment belongs to a
+        // different call.
+        let mut machine = ChatCompletionsStreamMachine::new(false);
+        let delivered = run(
+            &mut machine,
+            &[
+                r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"id":"call_a","type":"function","function":{"name":"first","arguments":"{\"x\":1}"}}]}}]}"#,
+                r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"id":"call_b","type":"function","function":{"name":"second","arguments":"{\"y\":2}"}}]}}]}"#,
+                r#"{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#,
+                "[DONE]",
+            ],
+        );
+        assert_eq!(
+            delivered.tool_calls.len(),
+            2,
+            "two indexless calls across two frames are two calls"
+        );
+        assert_eq!(delivered.tool_calls[0].id, "call_a");
+        assert_eq!(delivered.tool_calls[0].name, "first");
+        assert_eq!(delivered.tool_calls[0].arguments, r#"{"x":1}"#);
+        assert_eq!(delivered.tool_calls[1].id, "call_b");
+        assert_eq!(delivered.tool_calls[1].name, "second");
+        assert_eq!(delivered.tool_calls[1].arguments, r#"{"y":2}"#);
+    }
+
+    #[test]
+    fn an_indexless_continuation_still_joins_its_own_call() {
+        // The other half of the rule: a fragment with no id, or one repeating
+        // the id already in the slot, is a CONTINUATION and must keep
+        // accumulating rather than opening a second call.
+        for second_fragment in [
+            r#"{"function":{"arguments":"2}"}}"#,
+            r#"{"id":"call_a","function":{"arguments":"2}"}}"#,
+        ] {
+            let mut machine = ChatCompletionsStreamMachine::new(false);
+            let delivered = run(
+                &mut machine,
+                &[
+                    r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"id":"call_a","function":{"name":"only","arguments":"{\"y\":"}}]}}]}"#,
+                    &format!(
+                        r#"{{"choices":[{{"index":0,"delta":{{"tool_calls":[{second_fragment}]}}}}]}}"#
+                    ),
+                    "[DONE]",
+                ],
+            );
+            assert_eq!(delivered.tool_calls.len(), 1, "{second_fragment}");
+            assert_eq!(delivered.tool_calls[0].id, "call_a");
+            assert_eq!(delivered.tool_calls[0].arguments, r#"{"y":2}"#);
+        }
+    }
+
+    #[test]
     fn reasoning_deltas_stream_without_a_token_estimate() {
         // The dialect's thinking models put chain-of-thought in
         // `delta.reasoning_content`, and ZeroRouter's own stream shape has a
@@ -3643,6 +3893,121 @@ mod chat_completions_tests {
             assert_eq!(delivered.text, "hi");
             assert_eq!(delivered.finals, 1);
         }
+    }
+
+    #[test]
+    fn a_soft_close_without_usage_gets_its_own_gap_label() {
+        // Both of these settle unbilled, which is exactly why the log must
+        // tell them apart. A server that framed its stream correctly and
+        // simply ignored include_usage is a known, tolerated limitation; a
+        // socket that vanished before the sentinel AND before any usage is
+        // what a truncating middlebox looks like, and letting it wear the
+        // first label would hide fleet-wide revenue loss behind a shrug.
+        let mut machine = ChatCompletionsStreamMachine::new(false);
+        run(
+            &mut machine,
+            &[
+                r#"{"choices":[{"index":0,"delta":{"content":"answer"}}]}"#,
+                r#"{"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
+                "[DONE]",
+            ],
+        );
+        assert_eq!(machine.usage_gap(), Some("include_usage_ignored"));
+
+        let mut machine = ChatCompletionsStreamMachine::new(false);
+        run(
+            &mut machine,
+            &[
+                r#"{"choices":[{"index":0,"delta":{"content":"answer"}}]}"#,
+                r#"{"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
+            ],
+        );
+        assert_eq!(
+            machine.usage_gap(),
+            Some("done_missing"),
+            "a stream that lost its tail is not a stream that lacks a feature"
+        );
+
+        // And a stream that DID report usage has no gap to label at all —
+        // before or after the terminal takes the value.
+        let mut machine = ChatCompletionsStreamMachine::new(false);
+        run(
+            &mut machine,
+            &[
+                r#"{"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":2}}"#,
+            ],
+        );
+        assert_eq!(machine.usage_gap(), None);
+        machine.terminate();
+        assert_eq!(machine.usage_gap(), None, "the label survives the take");
+    }
+
+    #[test]
+    fn only_the_first_choice_is_streamed() {
+        // The buffered path deliberately reads choices[0]; streaming every
+        // choice would let a nonconforming upstream interleave two answers
+        // into one customer stream character by character, unseparable after
+        // the fact. ZeroRouter never asks for more than one choice — `n` is
+        // 400-rejected as an unsupported extension — so nothing legitimate is
+        // lost.
+        let mut machine = ChatCompletionsStreamMachine::new(false);
+        let delivered = run(
+            &mut machine,
+            &[
+                r#"{"choices":[{"index":0,"delta":{"content":"first"}},{"index":1,"delta":{"content":"SECOND"}}]}"#,
+                r#"{"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
+                "[DONE]",
+            ],
+        );
+        assert_eq!(delivered.text, "first");
+        assert!(
+            !delivered.text.contains("SECOND"),
+            "a second choice must not interleave into the customer's stream"
+        );
+    }
+
+    #[test]
+    fn object_valued_tool_arguments_are_serialized_not_dropped() {
+        // The dialect says `arguments` is a JSON string, but heterogeneous
+        // local servers sometimes send the parsed object. Reading only
+        // `as_str` turned that into "" — downstream, a tool call with no
+        // arguments, which is a silently wrong call rather than a visible
+        // failure.
+        let envelope: ChatCompletionsEnvelope = serde_json::from_value(json!({
+            "choices": [{"message": {"role": "assistant", "content": null,
+                "tool_calls": [{"id": "a", "type": "function",
+                    "function": {"name": "shell", "arguments": {"command": "pwd"}}}]},
+                "finish_reason": "tool_calls"}]
+        }))
+        .expect("envelope parses");
+        let response = parse_chat_completions_envelope("local", envelope);
+        let arguments: Value = serde_json::from_str(&response.tool_calls[0].arguments)
+            .expect("the object round-trips as a JSON string");
+        assert_eq!(arguments["command"], "pwd");
+
+        // Same on the streaming path, where a whole call arrives in one frame.
+        let mut machine = ChatCompletionsStreamMachine::new(false);
+        let delivered = run(
+            &mut machine,
+            &[
+                r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"a","function":{"name":"shell","arguments":{"command":"pwd"}}}]}}]}"#,
+                "[DONE]",
+            ],
+        );
+        assert_eq!(delivered.tool_calls.len(), 1);
+        let arguments: Value = serde_json::from_str(&delivered.tool_calls[0].arguments)
+            .expect("the object round-trips as a JSON string");
+        assert_eq!(arguments["command"], "pwd");
+
+        // A genuinely absent `arguments` still defaults, rather than becoming
+        // the string "null".
+        let envelope: ChatCompletionsEnvelope = serde_json::from_value(json!({
+            "choices": [{"message": {"tool_calls": [{"id": "a",
+                "function": {"name": "ping", "arguments": null}}]}}]
+        }))
+        .expect("envelope parses");
+        let response = parse_chat_completions_envelope("local", envelope);
+        assert_eq!(response.tool_calls[0].arguments, "{}");
     }
 
     #[test]
@@ -4204,41 +4569,101 @@ mod hostile_upstream_tests {
         assert_eq!(usage.cached_input_tokens, Some(400));
     }
 
-    #[test]
-    fn chat_completions_cumulative_counters_never_move_backwards() {
-        // Chat-completions usage is absolute rather than incremental, so in a
-        // well-behaved stream the last value IS the maximum. The rule exists
-        // for the misbehaving one: a stale or replayed frame reporting less
-        // must not shrink the bill, or the velocity window.
+    /// Drive usage chunks through the machine and read the terminal's report.
+    fn billed_usage(reports: &[Value]) -> Option<TokenUsage> {
         let mut machine = ChatCompletionsStreamMachine::new(false);
+        for usage in reports {
+            machine
+                .handle("local", &json!({"choices": [], "usage": usage}))
+                .expect("a usage chunk is not an error");
+        }
         machine
-            .handle(
-                "local",
-                &json!({"choices": [], "usage": {"prompt_tokens": 900, "completion_tokens": 10_000,
-                        "prompt_tokens_details": {"cached_tokens": 500}}}),
-            )
-            .expect("first usage chunk");
-        machine
-            .handle(
-                "local",
-                &json!({"choices": [], "usage": {"prompt_tokens": 1, "completion_tokens": 1,
-                        "prompt_tokens_details": {"cached_tokens": 1}}}),
-            )
-            .expect("stale usage chunk");
-        let events = machine.terminate();
-        let usage = events
-            .iter()
+            .terminate()
+            .into_iter()
             .find_map(|event| match event {
                 StreamEvent::Usage(usage) => Some(usage),
                 _ => None,
             })
-            .expect("the terminal carries usage");
+    }
+
+    #[test]
+    fn a_shrinking_usage_report_keeps_the_earlier_report_whole() {
+        // Chat-completions usage reports are absolute SNAPSHOTS, not the
+        // cumulative counters the Anthropic dialect sends, so a later report
+        // that is smaller is a contradiction rather than a rewind. The earlier
+        // report is kept ENTIRE — not merged with the later one field by
+        // field, which is what the franken-merge test below exists to forbid.
+        let usage = billed_usage(&[
+            json!({"prompt_tokens": 900, "completion_tokens": 10_000,
+                    "prompt_tokens_details": {"cached_tokens": 500}}),
+            json!({"prompt_tokens": 1, "completion_tokens": 1,
+                    "prompt_tokens_details": {"cached_tokens": 1}}),
+        ])
+        .expect("the terminal carries usage");
         assert_eq!(usage.input_tokens, Some(900));
         assert_eq!(usage.output_tokens, Some(10_000));
+        assert_eq!(usage.cached_input_tokens, Some(500));
+    }
+
+    #[test]
+    fn a_later_non_shrinking_report_replaces_the_earlier_one_whole() {
+        // The ordinary case: a server that restates usage as the stream
+        // progresses. The last complete report wins, in one piece.
+        let usage = billed_usage(&[
+            json!({"prompt_tokens": 500, "completion_tokens": 1}),
+            json!({"prompt_tokens": 500, "completion_tokens": 400}),
+        ])
+        .expect("the terminal carries usage");
+        assert_eq!(usage.input_tokens, Some(500));
+        assert_eq!(usage.output_tokens, Some(400));
+    }
+
+    #[test]
+    fn a_corrected_report_never_bills_a_pair_no_report_ever_sent() {
+        // THE invariant this dialect's merge policy exists for. A per-field
+        // maximum would take the prompt count from the first report and the
+        // completion count from the second and bill {2_000_000_000, 400} — a
+        // pair no chunk ever contained, and one that overcharges the prompt
+        // side by four million times the corrected figure. Whatever is billed
+        // must be a report the upstream actually sent.
+        let usage = billed_usage(&[
+            json!({"prompt_tokens": 2_000_000_000_u64, "completion_tokens": 1}),
+            json!({"prompt_tokens": 500, "completion_tokens": 400}),
+        ])
+        .expect("the terminal carries usage");
         assert_eq!(
-            usage.cached_input_tokens,
-            Some(500),
-            "the cached high-water mark survives a stale frame too"
+            (usage.input_tokens, usage.output_tokens),
+            (Some(2_000_000_000), Some(1)),
+            "the billed pair must equal one report the upstream sent, whole"
+        );
+    }
+
+    #[test]
+    fn usage_fields_no_report_has_set_are_filled_across_chunks() {
+        // The one sanctioned cross-chunk combination: neither report contested
+        // the other's field, so there is no competing value to choose between.
+        // A server that states the prompt side early and the completion side
+        // at the end meters correctly.
+        let usage = billed_usage(&[
+            json!({"prompt_tokens": 500}),
+            json!({"completion_tokens": 400}),
+        ])
+        .expect("the terminal carries usage");
+        assert_eq!(usage.input_tokens, Some(500));
+        assert_eq!(usage.output_tokens, Some(400));
+
+        // But a fill riding along with a SHRINKING field is refused with the
+        // rest of its report — that would be field mixing through the back
+        // door.
+        let usage = billed_usage(&[
+            json!({"prompt_tokens": 500}),
+            json!({"prompt_tokens": 400, "completion_tokens": 900}),
+        ])
+        .expect("the terminal carries usage");
+        assert_eq!(usage.input_tokens, Some(500));
+        assert_eq!(
+            usage.output_tokens, None,
+            "the whole contradicting report is dropped, fills included"
         );
     }
 
@@ -4280,5 +4705,39 @@ mod hostile_upstream_tests {
             }
         }
         assert!(refused, "cumulative tool arguments are capped");
+    }
+
+    #[test]
+    fn chat_completions_tool_bytes_are_capped_across_blocks_not_per_block() {
+        // The sibling test above appends everything to ONE index, so it passes
+        // just as happily against a cap tracked per block — 64 blocks would
+        // then buy 64× the ceiling. Spreading the same bytes round-robin over
+        // eight indices pins that the budget is one budget for the whole
+        // stream.
+        let mut machine = ChatCompletionsStreamMachine::new(false);
+        let chunk = "x".repeat(64 * 1024);
+        let mut written = 0_usize;
+        let mut refused = false;
+        for round in 0..(MAX_TOOL_ARGUMENT_BYTES / chunk.len() + 16) {
+            let index = round % 8;
+            if machine
+                .handle(
+                    "local",
+                    &json!({"choices": [{"index": 0, "delta": {"tool_calls": [
+                        {"index": index, "function": {"arguments": chunk}}]}}]}),
+                )
+                .is_err()
+            {
+                refused = true;
+                break;
+            }
+            written += chunk.len();
+        }
+        assert!(refused, "the argument budget spans every open block");
+        assert!(
+            written <= MAX_TOOL_ARGUMENT_BYTES,
+            "refusal came at the cumulative ceiling, not a multiple of it \
+             (wrote {written} bytes across 8 blocks)"
+        );
     }
 }

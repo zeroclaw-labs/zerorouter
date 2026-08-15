@@ -96,11 +96,9 @@ impl ProviderInventory {
             }
             // Neither adapter in the SHIPPED inventory takes a base_url
             // override: both of those wires own their endpoints, and the only
-            // override is the documented test seam. The chat-completions
-            // adapter is the exception by design — it has no implied endpoint
-            // — but an entry selecting it still may not declare an EMPTY one.
-            // The per-adapter validation this replaced covered aggregator and
-            // Bedrock shapes that no longer exist.
+            // override is the documented test seam. The per-adapter validation
+            // this replaced covered aggregator and Bedrock shapes that no
+            // longer exist.
             if provider
                 .base_url
                 .as_deref()
@@ -108,6 +106,27 @@ impl ProviderInventory {
             {
                 return Err(ProviderBuildError::InvalidInventory {
                     detail: format!("provider {} has an empty base_url", provider.key),
+                });
+            }
+            // The chat-completions adapter is the exception, and it is a
+            // CREDENTIAL-SAFETY rule rather than a tidiness one. That wire
+            // defaults to `https://api.openai.com/v1/chat/completions` when no
+            // endpoint is given, because that is the right default for the
+            // hosted dialect owner. An operator adding a local entry —
+            // llama.cpp on a LAN address, say — who forgets `base_url` would
+            // otherwise get a silently valid inventory that ships their
+            // credential and their prompts to OpenAI, which is the exact
+            // opposite of what running a model locally is for. There is no
+            // sensible default for an adapter with no implied endpoint, so the
+            // entry must state one.
+            if provider.adapter == ProviderAdapter::ChatCompletions && provider.base_url.is_none() {
+                return Err(ProviderBuildError::InvalidInventory {
+                    detail: format!(
+                        "provider {} uses the chat_completions adapter and must declare a \
+                         base_url; it has no implied endpoint, and defaulting one would send \
+                         this provider's credential to a different host than configured",
+                        provider.key
+                    ),
                 });
             }
         }
@@ -518,6 +537,45 @@ mod tests {
             .expect("the chat-completions arm builds");
         assert_eq!(provider.alias(), "local-llama");
         assert!(provider.supports_streaming());
+    }
+
+    #[test]
+    fn a_chat_completions_entry_without_a_base_url_is_refused() {
+        // The config foot-gun this rule exists for: the wire's default
+        // endpoint is OpenAI's, so an operator's LOCAL entry that forgets
+        // base_url would validate cleanly and then ship that provider's
+        // credential and prompts to api.openai.com. An adapter with no
+        // implied endpoint has to be told its endpoint.
+        let inventory: ProviderInventory = serde_json::from_str(
+            r#"{"providers": [{
+                "key": "local-llama",
+                "adapter": "chat_completions",
+                "credential_env": "LOCAL_LLAMA_API_KEY",
+                "secret_name": "local-llama-api-key"
+            }]}"#,
+        )
+        .expect("the entry parses");
+        let error = inventory
+            .validate()
+            .expect_err("a chat_completions entry with no base_url is invalid");
+        let detail = error.to_string();
+        assert!(detail.contains("local-llama"), "{detail}");
+        assert!(detail.contains("base_url"), "{detail}");
+
+        // The other two adapters are unaffected: their wires own their
+        // endpoints, so omitting base_url is the normal case for them.
+        let inventory: ProviderInventory = serde_json::from_str(
+            r#"{"providers": [
+                {"key": "anthropic", "adapter": "anthropic",
+                 "credential_env": "A", "secret_name": "a"},
+                {"key": "openai", "adapter": "openai_responses",
+                 "credential_env": "O", "secret_name": "o"}
+            ]}"#,
+        )
+        .expect("the entries parse");
+        inventory
+            .validate()
+            .expect("the endpoint-owning adapters still need no base_url");
     }
 
     #[test]
