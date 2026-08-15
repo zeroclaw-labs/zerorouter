@@ -1,0 +1,68 @@
+# ZeroRouter edge mode: the router + its Postgres, on your box.
+# Walkthrough: docs/edge-quickstart.md (repo root).
+#
+# Topology note — the router shares the db service's network namespace
+# (`network_mode: "service:db"`). That is deliberate, not decoration: the
+# router refuses a plaintext DATABASE_URL to any non-loopback host (the only
+# remote shape it accepts is the DB_* path, which enforces verify-full TLS —
+# router/src/db.rs). Sharing the namespace keeps the database genuinely
+# loopback: the router reaches it at 127.0.0.1:5432, port 5432 is never
+# published, and nothing on your LAN can reach Postgres at all.
+#
+# One consequence: published ports live on the `db` service (a container
+# using network_mode:service cannot publish its own), which is why the
+# router's 8080 appears below under db.
+
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: zerorouter
+      # Local-only credential: Postgres is reachable only from inside this
+      # pod's network namespace (5432 is not published). Change it if you
+      # publish the port — and then read the TLS note above first.
+      POSTGRES_PASSWORD: zerorouter
+      POSTGRES_DB: zerorouter
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    # The router's API port (it shares this network namespace).
+    ports:
+      - "8080:8080"
+    # On Linux, make host.docker.internal resolve to the host so the router
+    # can reach a llama.cpp/Ollama/vLLM server running outside Docker.
+    # Docker Desktop (macOS/Windows) resolves it natively; this line is
+    # harmless there.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U zerorouter -d zerorouter"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  router:
+    build:
+      # Repo root: the Dockerfile needs router/ in its context.
+      context: ../..
+      dockerfile: examples/edge/Dockerfile
+    network_mode: "service:db"
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      # Loopback on purpose — see the topology note at the top.
+      DATABASE_URL: postgres://zerorouter:zerorouter@127.0.0.1:5432/zerorouter
+      # The two mounted files below. The providers overlay is read once at
+      # startup (edits need `docker compose restart router`); the tier
+      # catalog is re-read per request (edits are live).
+      ZEROROUTER_PROVIDERS_PATH: /etc/zerorouter/providers.edge.json
+      ZEROROUTER_TIERS_PATH: /etc/zerorouter/tiers.edge.toml
+      # Credential for the hosted-burst provider (quickstart, part 2).
+      # Empty/unset simply drops that rung from every route; nothing fails.
+      ZEROROUTER_HOSTED_API_KEY: ${ZEROROUTER_HOSTED_API_KEY:-}
+    volumes:
+      - ./providers.json:/etc/zerorouter/providers.edge.json:ro
+      - ./tiers.toml:/etc/zerorouter/tiers.edge.toml:ro
+
+volumes:
+  pgdata:

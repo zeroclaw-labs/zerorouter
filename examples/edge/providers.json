@@ -1,0 +1,12 @@
+{
+  "providers": [
+    {
+      "key": "local",
+      "adapter": "chat_completions",
+      "credential": "none",
+      "settlement": "free",
+      "display_name": "local model server (llama.cpp / Ollama / vLLM / LM Studio)",
+      "base_url": "http://host.docker.internal:11434/v1/chat/completions"
+    }
+  ]
+}
