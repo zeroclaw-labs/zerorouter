@@ -1,0 +1,48 @@
+schema_version = 1
+
+# Edge-mode tier catalog: ONE tier, selling the operator's local model for $0.
+# This file REPLACES the shipped catalog (ZEROROUTER_TIERS_PATH replaces;
+# ZEROROUTER_PROVIDERS_PATH adds) — an edge box serves exactly what its
+# operator wrote down. The walkthrough is docs/edge-quickstart.md, which also
+# shows the hosted-burst ladder this file deliberately does not ship.
+#
+# Why both the tier rates and the candidate rates are 0/0/0: the free lane
+# (the reserve/settle skip, `api::free_lane_admissible`) takes the tier
+# selling at $0 AND every candidate in the route being free — a $0-basis
+# candidate on a provider that declares `"settlement": "free"`. A $0 price on
+# a provider without that declaration refuses the whole file at load.
+#
+# Naming rule (enforced at load): a tier id either equals one of its own
+# candidate ids — the pin shape used here — or lives in the reserved `zero/*`
+# namespace for routing aliases (the quickstart's `zero/burst` ladder).
+#
+# `local/chat` is the id clients put in the request's "model" field. The
+# candidate's `model` is what gets sent upstream — set it to a model id your
+# server actually serves (llama.cpp ignores it; Ollama and vLLM do not).
+
+[tiers."local/chat"]
+
+# Sell rate: what a customer of THIS router is billed. $0 on every dimension.
+[tiers."local/chat".rates]
+input_per_mtok = 0.00
+cached_input_per_mtok = 0.00
+output_per_mtok = 0.00
+
+[[tiers."local/chat".candidates]]
+id = "local/chat"
+provider = "local"
+model = "qwen3:8b"
+
+# Declare what the model can actually take; selection is mechanical and never
+# guesses. An omitted field means UNKNOWN and excludes nothing — say nothing
+# rather than writing a number you have not checked.
+[tiers."local/chat".candidates.metadata]
+context_window = 32768
+input_modalities = ["text"]
+
+# Cost basis: what serving this rung costs the operator. $0 — it runs on
+# your hardware.
+[tiers."local/chat".candidates.rates]
+input_per_mtok = 0.00
+cached_input_per_mtok = 0.00
+output_per_mtok = 0.00

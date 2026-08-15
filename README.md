@@ -100,6 +100,13 @@ environment; a tier still needs at least one credential-backed candidate.
 A self-hosted router can route to models on your own hardware — llama.cpp,
 vLLM, Ollama, LM Studio — and burst to the cloud when they cannot take the
 request. Design: [`docs/design/edge-mode-local-rung.md`](docs/design/edge-mode-local-rung.md).
+
+**Run it in minutes:** [`docs/edge-quickstart.md`](docs/edge-quickstart.md)
+walks a ready-made `docker compose` stack ([`examples/edge/`](examples/edge/))
+from zero to chatting with a local model through the free lane, then adds the
+hosted-burst ladder. Measured overhead for both lanes:
+[`benchmarks/REPORT.md`](benchmarks/REPORT.md).
+
 Two config files, no code:
 
 1. **Declare the upstream.** Point `ZEROROUTER_PROVIDERS_PATH` at a JSON file
@@ -150,9 +157,13 @@ Two config files, no code:
 
    A candidate is billed at its **tier's** sell rate, so a $0 rung inside a
    mixed tier is free for the operator, not for the customer; to sell a local
-   model for nothing, pin it in a tier whose sell rate is `0`. $0 routes are
-   still metered end to end today (reserve → settle at zero); skipping that is
-   a later stage.
+   model for nothing, pin it in a tier whose sell rate is `0`. A route that is
+   free on **both** sides — every candidate free *and* the tier selling at $0 —
+   skips reserve/settle entirely (no advisory lock, no reservation row, no
+   ledger write), with $0 usage still recorded asynchronously for visibility.
+   A mixed ladder meters fully on every request, including the ones its local
+   rung serves: the reservation is taken at admission, before anyone knows
+   which rung will answer, and that is what makes the cloud burst billable.
 
 `zerorouter admin catalog-drift` reads the same `ZEROROUTER_PROVIDERS_PATH`
 (or `--providers`), so an edge catalog reconciles: local $0 rungs are reported
@@ -253,6 +264,7 @@ pnpm dev          # proxies /api, /auth, /webhooks to localhost:8080
 router/            Rust crate: inference plane, web plane, admin CLI, migrations
   config/tiers.toml  canonical tier catalog + sell rates
 portal/            Vite + React portal SPA
+examples/edge/     docker compose stack for edge mode (docs/edge-quickstart.md)
 docs/              ARCHITECTURE · SECURITY · DEPLOY · ZEROCLAW-INTEGRATION · ROADMAP
 Dockerfile         ARM64 image: router binary + built portal SPA
 .github/workflows  ci.yml (fmt/clippy/test with Postgres) · deploy.yml (ECS)
