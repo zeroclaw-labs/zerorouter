@@ -51,8 +51,10 @@ so inline.
 
 ## Migrations
 
-`router/migrations/` is at `0007`. Migrations are registered by hand in
-`router/src/db.rs`; a file alone does nothing.
+`router/migrations/` is the source of truth for the current head — list the
+directory rather than trusting a number written down anywhere, and expect
+gaps in the numbering (skipped numbers are burned, not missing). Migrations
+are registered by hand in `router/src/db.rs`; a file alone does nothing.
 
 **Never edit a migration that has been applied anywhere**, including its
 comments. sqlx checksums the file text, so amending it breaks every database
@@ -89,13 +91,16 @@ Each attempt's cost is counted in exactly one place: the served attempt via
 **If a change would alter what a customer is charged, stop and say so** rather
 than proceeding. That is a decision for the repo owner, not a side effect.
 
-## The pinned upstream
+## The formerly pinned upstream
 
-`router/Cargo.toml` pins `zeroclaw-api` and `zeroclaw-providers` to a git rev.
-Several private helpers from that crate are reproduced in `router/src/retry.rs`
-because they are not public. That file carries a disposition table recording
-which copies are verbatim and which have deliberately diverged. **When the pin
-moves, reconcile that table** — a silently re-imported helper can undo a fix.
+The router used to pin `zeroclaw-api` and `zeroclaw-providers` to a git rev;
+that pin has been cut and the router owns its wire. What survives from the
+pinned era is `router/src/retry.rs`: copies of failure-classification helpers
+that were private to `zeroclaw_providers::reliable`, with a disposition table
+recording which copies are verbatim and which have deliberately diverged.
+Treat that table as load-bearing — it is what makes a divergence a decision
+instead of drift — and **if a ZeroClaw dependency is ever re-introduced,
+reconcile the table first**: a silently re-imported helper can undo a fix.
 
 ## Tier catalog
 
@@ -107,8 +112,10 @@ two classes of fault:
 - **Economic** (a candidate priced above its tier's sell rate) withholds just
   that tier; the rest keep serving.
 
-Each tier's flagship is priced at cost and margin comes from routing to cheaper
-candidates, so basis == sell is legal and only strictly-greater is a violation.
+The catalog is currently pins only — each tier is one candidate sold at cost
+(the header of `tiers.toml` records why, and what the reserved `zero/*`
+namespace is for) — so basis == sell is the intended shape everywhere and only
+strictly-greater is a violation.
 
 ## Commits
 
