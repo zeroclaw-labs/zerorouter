@@ -738,10 +738,26 @@ pub const FINISH_REASON_SYNTHETIC: &str = "synthetic";
 /// # The consumption rule
 ///
 /// A real reason wins; absence falls back to the unchanged synthesis. The two
-/// stay distinguishable forever through [`Self::source`], which is what
-/// `request_attempts.finish_reason_source` and
-/// `usage_events.finish_reason_source` record — those columns were hardcoded
+/// stay distinguishable through [`Self::source`], which is what
+/// `usage_events.finish_reason_source` records — a column hardcoded
 /// `"synthetic"` before any wire could report a real one.
+///
+/// # Where provenance is NOT recorded
+///
+/// `request_attempts.finish_reason` (migration 0004) is a bare TEXT column
+/// with no `finish_reason_source` beside it. Attempt rows therefore now carry
+/// real and synthesized reasons MIXED, with nothing on the row to tell them
+/// apart. That is tolerable only because of how the column is populated: a
+/// reason is written on the SERVED attempt alone (every other `build_attempt`
+/// call passes `None`), and the served attempt's request has a `usage_events`
+/// row carrying both the same reason and its source. So provenance is
+/// recoverable by joining `request_id` — and only for the served attempt.
+///
+/// Do not read `request_attempts.finish_reason` as ground truth on its own,
+/// and never train on it without that join. The column's own migration
+/// comment still calls it "Synthesized"; correcting that text belongs to a
+/// future migration header, since an applied migration is checksummed and must
+/// not be edited.
 ///
 /// # Divergence table
 ///

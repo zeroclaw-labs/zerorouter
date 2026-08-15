@@ -804,6 +804,9 @@ async fn migration_chain_applies_on_a_fresh_database() {
         bool,
         bool,
         bool,
+        bool,
+        bool,
+        bool,
         i64,
     )> = async {
         let pool = PgPoolOptions::new()
@@ -928,6 +931,41 @@ async fn migration_chain_applies_on_a_fresh_database() {
         )
         .fetch_one(&pool)
         .await?;
+        // Which tables actually carry a `finish_reason_source`. Code comments
+        // claimed BOTH did; only one does, and a doc that names a phantom
+        // column teaches a reader to trust an attempt row's reason on its own.
+        let usage_events_has_source = query_scalar::<_, bool>(
+            r#"
+            SELECT EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_name = 'usage_events'
+                  AND column_name = 'finish_reason_source'
+            )
+            "#,
+        )
+        .fetch_one(&pool)
+        .await?;
+        let attempts_have_source = query_scalar::<_, bool>(
+            r#"
+            SELECT EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_name = 'request_attempts'
+                  AND column_name = 'finish_reason_source'
+            )
+            "#,
+        )
+        .fetch_one(&pool)
+        .await?;
+        let attempts_have_reason = query_scalar::<_, bool>(
+            r#"
+            SELECT EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_name = 'request_attempts' AND column_name = 'finish_reason'
+            )
+            "#,
+        )
+        .fetch_one(&pool)
+        .await?;
         let version = query_scalar::<_, i64>("SELECT MAX(version) FROM _sqlx_migrations")
             .fetch_one(&pool)
             .await?;
@@ -946,6 +984,9 @@ async fn migration_chain_applies_on_a_fresh_database() {
             autopay_withheld_status_exists,
             month_spend_rollup_exists,
             usage_gap_exists,
+            usage_events_has_source,
+            attempts_have_source,
+            attempts_have_reason,
             version,
         ))
     }
@@ -1006,13 +1047,38 @@ async fn migration_chain_applies_on_a_fresh_database() {
         outcome.12,
         "the 0020 usage_gap column and its label constraint exist after the chain"
     );
+    // Where a finish reason's PROVENANCE is recorded, and where it is not.
+    //
+    // Code comments in openai.rs and provider.rs used to name
+    // `request_attempts.finish_reason_source` as though it existed. It does
+    // not, and writing the doc-claimed assertion here fails on a fresh chain —
+    // which is how the drift was caught. The asymmetry is pinned rather than
+    // described, because a reader who trusts an attempt row's finish_reason on
+    // its own is now reading a MIX of upstream-reported and router-synthesized
+    // values with nothing on the row to separate them.
+    assert!(
+        outcome.13,
+        "usage_events carries finish_reason_source: the settled row is the only \
+         place provenance is recorded"
+    );
+    assert!(
+        !outcome.14,
+        "request_attempts has NO finish_reason_source — if this starts failing, \
+         a column was added and the docs saying provenance needs a join to \
+         usage_events must be corrected with it"
+    );
+    assert!(
+        outcome.15,
+        "request_attempts does carry finish_reason, which is exactly why the \
+         missing source column matters"
+    );
     // 20, not 16: 0013 (dispute resolution), 0014 (dispatched reservations),
     // 0015 (released reservations), 0016 (deposit fee), 0017 (stripe observed
     // reversals), 0018 (autopay withheld state), 0019 (monthly spend rollup)
     // and 0020 (usage gap and real finish reason) are numbered with a gap so
     // 0010-0012 stay available to branches in flight. The chain's head is the
     // highest version applied, not a count of files.
-    assert_eq!(outcome.13, 20, "the chain reaches migration version 20");
+    assert_eq!(outcome.16, 20, "the chain reaches migration version 20");
 }
 
 /// Rewrite the database name in a Postgres URL, keeping any query string

@@ -114,9 +114,13 @@ pub struct TokenUsage {
 /// `None` (absent) rather than guessed at, because the whole point of carrying
 /// a REAL stop reason is that it is the upstream's word and not the router's
 /// inference. `openai::finish_reason` still synthesizes a reason for the absent
-/// case; the two are kept distinguishable all the way to the ledger by
-/// `request_attempts.finish_reason_source` / `usage_events.finish_reason_source`
-/// (`"provider"` vs `"synthetic"`).
+/// case; the two are kept distinguishable on the settled row by
+/// `usage_events.finish_reason_source` (`"upstream"` vs `"synthetic"` — the
+/// only two tokens migration 0004's CHECK permits).
+///
+/// `request_attempts` has no such column, so attempt rows mix the two kinds
+/// with no provenance of their own; see `openai::AttemptFinishReason` for why
+/// that is recoverable for the served attempt and nowhere else.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StopReason {
     /// The model finished on its own — a natural end of turn or a stop
@@ -218,7 +222,7 @@ pub struct ChatResponse {
     ///
     /// `None` means the upstream said nothing this router could map — not that
     /// it stopped normally. The consumption rule downstream is: present wins
-    /// and is stamped `"provider"`; absent falls back to the unchanged
+    /// and is stamped `"upstream"`; absent falls back to the unchanged
     /// synthesis and is stamped `"synthetic"`.
     pub stop_reason: Option<StopReason>,
 }
