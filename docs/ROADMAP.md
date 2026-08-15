@@ -51,9 +51,10 @@ runtime exists. Each item carries the reason it was deferred.
 
 ## B0 lineage
 
-- **`feat/rust-b0` is superseded.** The B0 branch (the old `zerorouter` repo,
-  `feat/rust-b0`) shares this repo's original ZeroClaw pin but is now formally
-  retired in favor of this repo. It will **not** receive the ZeroClaw pin
+- **`feat/rust-b0` is superseded.** The B0 branch (the TypeScript-era repo,
+  now `zeroclaw-labs/zerorouter-ts`, `feat/rust-b0`) shares this repo's
+  original ZeroClaw pin but is now formally retired in favor of this repo.
+  It will **not** receive the ZeroClaw pin
   advance (the builder-rewrite / `.timeout_secs` bump landed here); all
   forward work — including the pin-advance and everything downstream of it —
   lives in this repo only. Decided in the pin-advance change per the

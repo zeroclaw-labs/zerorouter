@@ -7,8 +7,9 @@ inference surface backed by tiered multi-provider routing, plus a web plane
 It is the successor to two earlier efforts, and deliberately inherits from
 both:
 
-- the **B0 inference router** (`zeroclaw-labs/zerorouter` branch
-  `feat/rust-b0`), whose code seeds this repository verbatim: fail-closed
+- the **B0 inference router** (`zeroclaw-labs/zerorouter-ts` branch
+  `feat/rust-b0`; that repo held the `zerorouter` name until this repository
+  took it over), whose code seeds this repository verbatim: fail-closed
   auth, advisory-lock reserve→settle metering, an append-only usage ledger
   enforced by database triggers, and tier routing from `tiers.toml`;
 - the **Bifrost/FrankenGate lineage** (`maximhq/bifrost`,
