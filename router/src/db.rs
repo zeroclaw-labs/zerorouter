@@ -3383,13 +3383,23 @@ impl SettlementIntent {
                 basis_rates: self.telemetry.basis_rates.map(RatesPayload::to_rates),
                 sell_rates: self.telemetry.sell_rates.to_rates(),
                 finish_reason: self.telemetry.finish_reason.clone(),
-                // An intent whose payload predates this field carried a
+                // Two payload shapes collapse to the same answer here, and
+                // the fallback is 'synthetic' rather than NULL for both.
+                //
+                // An intent written before this field existed carried a
                 // synthesized reason by definition — nothing else could
-                // produce one then — so it replays as 'synthetic' exactly as
-                // it would have before. Only the two tokens migration 0004's
-                // CHECK permits are ever produced; anything else in a payload
-                // is treated as unrecorded rather than passed to the INSERT,
-                // where it would abort the settle transaction.
+                // produce one then — so it must replay as 'synthetic' exactly
+                // as it would have before, not lose the label it had.
+                //
+                // A payload carrying an UNRECOGNIZED token lands on the same
+                // fallback: `finish_reason_source_from_keyword` rejects it to
+                // None and `.or` then supplies 'synthetic'. That is a
+                // deliberate downgrade, not a passthrough — the alternative is
+                // handing the INSERT a value migration 0004's CHECK refuses,
+                // which would abort the settle transaction rather than
+                // mislabel one row. The guarantee this expression makes is
+                // narrow and worth stating exactly: whatever the payload says,
+                // only a CHECK-permitted token ever reaches the ledger.
                 finish_reason_source: self
                     .telemetry
                     .finish_reason_source

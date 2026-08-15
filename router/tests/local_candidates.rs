@@ -44,11 +44,12 @@ use zerorouter::{
     config::ResolvedRoute,
     db::migrate,
     load_tier_catalog,
+    provider::{StopReason, StreamFinal, UsageGap},
     providers::{
         ProviderBuildError, ProviderCandidate, ProviderRoute, is_supported_provider,
         load_operator_inventory, provider_settles_free,
     },
-    testing::{FakeModelProvider, FakeOutcome},
+    testing::{FakeModelProvider, FakeOutcome, FakeStreamStep},
 };
 
 fn fixture(name: &str) -> PathBuf {
@@ -1661,4 +1662,141 @@ async fn drift_reconciles_an_edge_catalog_and_never_fails_on_the_local_rungs() {
             .any(|found| found.verdict.is_actionable() || found.has_actionable_metadata_drift()),
         "an edge catalog that is entirely correct must not fail the command"
     );
+}
+
+/// The free lane's usage gap, on the row the free lane actually writes.
+///
+/// This is the case migration 0020's header is about. A gap on the METERED
+/// lane was always reconstructible after the fact — join a served
+/// `request_attempts` row against an all-zero settled row — but the free lane
+/// writes NO attempt rows, so its gaps had nothing to join against and existed
+/// only as a trace line. A local server behind a truncating proxy is exactly
+/// the traffic that runs here, so the one lane where the failure is most
+/// likely was the one lane where it was invisible.
+///
+/// The write path is different too, and that is the second half of what this
+/// pins: the free lane's row is an INSERT spawned off the response path, not a
+/// settle transaction, so the label has to survive a route that shares no code
+/// with the metered sibling already covered in `tests/request_path.rs`.
+#[tokio::test]
+async fn the_free_lane_records_its_usage_gap_on_the_row_it_writes() {
+    operator_inventory();
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let (api_key_id, key) = create_funded_key(&pool, "free-usage-gap").await;
+    let user_id: Uuid =
+        sqlx_core::query_scalar::query_scalar("SELECT user_id FROM api_keys WHERE id = $1")
+            .bind(api_key_id)
+            .fetch_one(&pool)
+            .await
+            .expect("owner must query");
+    let funded = balance_of(&pool, user_id).await;
+
+    // A local upstream that streams an answer and then closes after its
+    // finish_reason with neither `[DONE]` nor usage — `done_missing`.
+    let phi = FakeModelProvider::new(
+        "phi4-mini",
+        vec![FakeOutcome::Stream(vec![
+            FakeStreamStep::text("hello from the edge"),
+            FakeStreamStep::FinalWith(StreamFinal {
+                stop_reason: Some(StopReason::Stop),
+                usage_gap: Some(UsageGap::DoneMissing),
+            }),
+        ])],
+    );
+    let state = router(pool.clone(), vec![phi.clone()]);
+
+    let mut body = completion("local-llama/phi4-mini", "hello", false);
+    body["stream"] = json!(true);
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("authorization", format!("Bearer {key}"))
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .expect("stream request should build");
+    let response = app(state.clone())
+        .oneshot(request)
+        .await
+        .expect("stream should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = response
+        .into_body()
+        .collect()
+        .await
+        .expect("stream body should drain");
+    state.wait_for_background_tasks().await;
+    await_usage_rows(&pool, api_key_id, 1).await;
+
+    let (finish_reason, finish_reason_source, usage_gap) =
+        sqlx_core::query_as::query_as::<_, (Option<String>, Option<String>, Option<String>)>(
+            r#"
+        SELECT finish_reason, finish_reason_source, usage_gap
+        FROM usage_events
+        WHERE api_key_id = $1
+        "#,
+        )
+        .bind(api_key_id)
+        .fetch_one(&pool)
+        .await
+        .expect("the free lane's row must carry the finish columns");
+
+    assert_eq!(
+        usage_gap.as_deref(),
+        Some("done_missing"),
+        "the free lane's gap is countable in SQL now, not merely greppable — \
+         and this row has no request_attempts row to reconstruct it from"
+    );
+    assert_eq!(
+        attempt_rows(&pool, request_id_of(&pool, api_key_id).await).await,
+        (0, 0),
+        "which is the whole point: there is nothing here to join against"
+    );
+    // Actual behavior, pinned deliberately rather than wished into shape: an
+    // unmetered settle records NO finish reason, on this lane or any other.
+    // Every no-usage settle site passes `None` for it, and has since before
+    // the wires carried a real one — so the source is NULL too, which is the
+    // db layer refusing to label a reason that is not there.
+    //
+    // Worth noting for a later change, NOT fixed here: the terminal on this
+    // path DOES carry the upstream's real stop reason (the fake scripted
+    // `Stop`, and a live wire would report one), and it is dropped. A row
+    // reading `usage_gap = done_missing, finish_reason = NULL` could just as
+    // honestly read `finish_reason = stop, source = upstream` beside the gap —
+    // "the model finished normally and we still could not meter it" is a
+    // sharper diagnosis than the gap alone. Recording it would change what an
+    // unmetered row carries on every lane, which is a wider change than
+    // plumbing the reason, so it is left visible here instead of taken.
+    assert_eq!(
+        (finish_reason.as_deref(), finish_reason_source.as_deref()),
+        (None, None),
+        "an unmetered settle carries no finish reason, and so carries no source"
+    );
+
+    // Labelling a gap must not invent a charge on a lane that cannot bill.
+    let evidence = metering_evidence(&pool, api_key_id).await;
+    assert_eq!(evidence.cost_usd, Decimal::ZERO);
+    assert_eq!(
+        (evidence.input_tokens, evidence.output_tokens),
+        (0, 0),
+        "no usage was reported, so none is recorded — the gap is why"
+    );
+    assert!(
+        usage_ledger(&pool, user_id).await.is_empty(),
+        "no debit: the free lane never touches the balance, labelled or not"
+    );
+    assert_eq!(balance_of(&pool, user_id).await, funded);
+    assert_eq!(reservation_count(&pool, api_key_id).await, 0);
+}
+
+/// The `request_id` of the single row this key settled.
+async fn request_id_of(pool: &PgPool, api_key_id: Uuid) -> Uuid {
+    sqlx_core::query_scalar::query_scalar(
+        "SELECT request_id FROM usage_events WHERE api_key_id = $1",
+    )
+    .bind(api_key_id)
+    .fetch_one(pool)
+    .await
+    .expect("request id must query")
 }
