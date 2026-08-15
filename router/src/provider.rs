@@ -105,6 +105,106 @@ pub struct TokenUsage {
     pub cached_input_tokens: Option<u64>,
 }
 
+/// Why an upstream stopped generating, in the ONE vocabulary this router
+/// speaks — OpenAI's.
+///
+/// Every wire normalizes into this on the way in, so nothing downstream has to
+/// know which dialect answered. The variants are deliberately only the four
+/// OpenAI defines: a value that does not map onto one of them is reported as
+/// `None` (absent) rather than guessed at, because the whole point of carrying
+/// a REAL stop reason is that it is the upstream's word and not the router's
+/// inference. `openai::finish_reason` still synthesizes a reason for the absent
+/// case; the two are kept distinguishable all the way to the ledger by
+/// `request_attempts.finish_reason_source` / `usage_events.finish_reason_source`
+/// (`"provider"` vs `"synthetic"`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopReason {
+    /// The model finished on its own — a natural end of turn or a stop
+    /// sequence.
+    Stop,
+    /// Output was clipped by a token ceiling.
+    Length,
+    /// The model emitted tool calls and is waiting on their results.
+    ToolCalls,
+    /// The provider's safety layer withheld or truncated the output. The
+    /// router could not observe this state at all before the wires carried it.
+    ContentFilter,
+}
+
+impl StopReason {
+    /// The OpenAI wire spelling, which is also what is persisted and what
+    /// `openai::shape_ok` compares against.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Stop => "stop",
+            Self::Length => "length",
+            Self::ToolCalls => "tool_calls",
+            Self::ContentFilter => "content_filter",
+        }
+    }
+
+    /// Parse an OpenAI-dialect `finish_reason` string.
+    ///
+    /// `function_call` is the pre-`tool_calls` spelling several local servers
+    /// still emit and means the same thing. Anything else — including a
+    /// provider-specific extension — is `None`: an unrecognized reason is not
+    /// evidence of a normal stop, and mapping it to [`Self::Stop`] would
+    /// launder an unknown into a confident claim.
+    #[must_use]
+    pub fn from_openai(reason: &str) -> Option<Self> {
+        match reason {
+            "stop" => Some(Self::Stop),
+            "length" => Some(Self::Length),
+            "tool_calls" | "function_call" => Some(Self::ToolCalls),
+            "content_filter" => Some(Self::ContentFilter),
+            _ => None,
+        }
+    }
+}
+
+/// Why a stream settled with no usage to bill.
+///
+/// Both values bill nothing, and that is exactly why they are kept apart: one
+/// is an ordinary local-server limitation and the other is what a truncating
+/// middlebox looks like. Carried out of the wire rather than only logged so it
+/// can be COUNTED on the settled row — see `usage_events.usage_gap`
+/// (migration 0020). The free lane writes no `request_attempts` rows, so a
+/// trace line was the only record a free-lane gap left behind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UsageGap {
+    /// The stream framed itself correctly (`[DONE]` arrived) and simply never
+    /// sent the optional usage chunk. Several local servers do this on every
+    /// request.
+    IncludeUsageIgnored,
+    /// The socket closed after a real `finish_reason` without the sentinel AND
+    /// without usage — indistinguishable at this layer from a proxy eating the
+    /// tail of a stream whose upstream does report usage.
+    DoneMissing,
+}
+
+impl UsageGap {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::IncludeUsageIgnored => "include_usage_ignored",
+            Self::DoneMissing => "done_missing",
+        }
+    }
+
+    /// Parse a persisted or replayed label back. Anything unrecognized is
+    /// `None` — a settlement intent must never hand the ledger a token
+    /// migration 0020's CHECK would reject.
+    #[must_use]
+    pub fn from_keyword(label: &str) -> Option<Self> {
+        match label {
+            "include_usage_ignored" => Some(Self::IncludeUsageIgnored),
+            "done_missing" => Some(Self::DoneMissing),
+            _ => None,
+        }
+    }
+}
+
 /// A non-streaming upstream answer.
 #[derive(Debug, Clone)]
 pub struct ChatResponse {
@@ -114,6 +214,13 @@ pub struct ChatResponse {
     /// Chain-of-thought from thinking models, passed through opaquely: some
     /// providers reject tool-call history that omits it.
     pub reasoning_content: Option<String>,
+    /// The upstream's OWN stop reason, normalized, when it gave one.
+    ///
+    /// `None` means the upstream said nothing this router could map — not that
+    /// it stopped normally. The consumption rule downstream is: present wins
+    /// and is stamped `"provider"`; absent falls back to the unchanged
+    /// synthesis and is stamped `"synthetic"`.
+    pub stop_reason: Option<StopReason>,
 }
 
 impl ChatResponse {
@@ -175,6 +282,38 @@ impl StreamChunk {
     }
 }
 
+/// What the upstream said as the stream ended.
+///
+/// Carried ON the terminal rather than beside it because both fields are only
+/// knowable once the stream is over, and a separate event would let a consumer
+/// forget to wait for it. Defaults to "the upstream told us nothing", which is
+/// what every synthesized or test-authored terminal means.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StreamFinal {
+    /// The upstream's own stop reason, normalized. See [`StopReason`].
+    pub stop_reason: Option<StopReason>,
+    /// Why this stream has no usage to settle, when it has none. `None` means
+    /// usage WAS reported. See [`UsageGap`].
+    pub usage_gap: Option<UsageGap>,
+}
+
+impl StreamFinal {
+    /// A terminal carrying no upstream claims — the honest default for a
+    /// synthesized stream or a wire that reports neither field.
+    #[must_use]
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    #[must_use]
+    pub fn with_stop_reason(stop_reason: Option<StopReason>) -> Self {
+        Self {
+            stop_reason,
+            usage_gap: None,
+        }
+    }
+}
+
 /// Everything an upstream can say mid-stream.
 #[derive(Debug, Clone)]
 pub enum StreamEvent {
@@ -184,7 +323,8 @@ pub enum StreamEvent {
     /// never surface streaming usage simply omit it, which the settle path
     /// treats as the missing-usage case rather than guessing.
     Usage(TokenUsage),
-    Final,
+    /// The terminal, carrying whatever the upstream said on its way out.
+    Final(StreamFinal),
 }
 
 #[derive(Debug, Clone, Copy, Default)]

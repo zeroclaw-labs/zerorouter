@@ -58,6 +58,8 @@ fn sentinel_telemetry() -> RequestTelemetry {
         basis_rates: None,
         sell_rates: test_rates(),
         finish_reason: None,
+        finish_reason_source: None,
+        usage_gap: None,
         shape_ok: None,
         priority: Some(Priority::Balanced),
     }
@@ -383,6 +385,10 @@ async fn settled_row_carries_estimate_and_select_telemetry() {
         basis_rates: Some(basis),
         sell_rates: sell,
         finish_reason: Some("stop".to_owned()),
+        // The pre-change behavior, now carried explicitly instead of being
+        // hardcoded at the INSERT: this row must still settle as 'synthetic'.
+        finish_reason_source: Some("synthetic"),
+        usage_gap: None,
         shape_ok: Some(true),
         priority: Some(Priority::Success),
     };
@@ -797,6 +803,7 @@ async fn migration_chain_applies_on_a_fresh_database() {
         bool,
         bool,
         bool,
+        bool,
         i64,
     )> = async {
         let pool = PgPoolOptions::new()
@@ -905,6 +912,22 @@ async fn migration_chain_applies_on_a_fresh_database() {
         )
         .fetch_one(&pool)
         .await?;
+        // 0020 is only useful if the column comes with the constraint that
+        // keeps it to the two labels the wire can produce: an unconstrained
+        // text column would let a typo settle as a new, uncountable gap kind.
+        let usage_gap_exists = query_scalar::<_, bool>(
+            r#"
+            SELECT EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_name = 'usage_events' AND column_name = 'usage_gap'
+            ) AND EXISTS (
+                SELECT 1 FROM pg_constraint
+                WHERE conname = 'usage_events_usage_gap_is_known'
+            )
+            "#,
+        )
+        .fetch_one(&pool)
+        .await?;
         let version = query_scalar::<_, i64>("SELECT MAX(version) FROM _sqlx_migrations")
             .fetch_one(&pool)
             .await?;
@@ -922,6 +945,7 @@ async fn migration_chain_applies_on_a_fresh_database() {
             observed_reversals_exists,
             autopay_withheld_status_exists,
             month_spend_rollup_exists,
+            usage_gap_exists,
             version,
         ))
     }
@@ -932,7 +956,7 @@ async fn migration_chain_applies_on_a_fresh_database() {
         .execute(&admin)
         .await;
 
-    let outcome = outcome.expect("the 0001->0019 chain must apply on a fresh database");
+    let outcome = outcome.expect("the 0001->0020 chain must apply on a fresh database");
     assert!(outcome.0, "request_attempts exists after the fresh chain");
     assert!(
         outcome.1,
@@ -978,13 +1002,17 @@ async fn migration_chain_applies_on_a_fresh_database() {
         outcome.11,
         "the 0019 monthly-spend rollup and its accrual trigger exist after the chain"
     );
-    // 19, not 15: 0013 (dispute resolution), 0014 (dispatched reservations),
+    assert!(
+        outcome.12,
+        "the 0020 usage_gap column and its label constraint exist after the chain"
+    );
+    // 20, not 16: 0013 (dispute resolution), 0014 (dispatched reservations),
     // 0015 (released reservations), 0016 (deposit fee), 0017 (stripe observed
-    // reversals), 0018 (autopay withheld state) and 0019 (monthly spend
-    // rollup) are numbered with a gap so 0010-0012 stay available to branches
-    // in flight. The chain's head is the highest version applied, not a count
-    // of files.
-    assert_eq!(outcome.12, 19, "the chain reaches migration version 19");
+    // reversals), 0018 (autopay withheld state), 0019 (monthly spend rollup)
+    // and 0020 (usage gap and real finish reason) are numbered with a gap so
+    // 0010-0012 stay available to branches in flight. The chain's head is the
+    // highest version applied, not a count of files.
+    assert_eq!(outcome.13, 20, "the chain reaches migration version 20");
 }
 
 /// Rewrite the database name in a Postgres URL, keeping any query string

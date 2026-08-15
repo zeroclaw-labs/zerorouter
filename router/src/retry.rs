@@ -597,6 +597,7 @@ mod tests {
                 .collect(),
             usage: None,
             reasoning_content: reasoning.map(str::to_owned),
+            stop_reason: None,
         }
     }
 

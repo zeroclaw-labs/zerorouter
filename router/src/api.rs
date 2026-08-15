@@ -9,7 +9,9 @@ use std::{
 };
 
 use crate::provider::BASELINE_MAX_TOKENS;
-use crate::provider::{ChatRequest, ChatResponse, ModelRates, StreamEvent, StreamOptions};
+use crate::provider::{
+    ChatRequest, ChatResponse, ModelRates, StreamEvent, StreamFinal, StreamOptions, UsageGap,
+};
 use axum::{
     Json, Router,
     body::{Body, to_bytes},
@@ -43,9 +45,9 @@ use crate::{
     },
     health::{ProviderHealth, WalkLedger},
     openai::{
-        ChatCompletionRequest, ChatCompletionResponse, EmittedOutput, EstimateBasis, ModelList,
-        OpenAiUsage, StreamMetadata, TaskSignature, ZeroRouterAttempt, ZeroRouterEstimate,
-        ZeroRouterResponseMetadata, finish_reason, shape_ok, stream_delta_json,
+        AttemptFinishReason, ChatCompletionRequest, ChatCompletionResponse, EmittedOutput,
+        EstimateBasis, ModelList, OpenAiUsage, StreamMetadata, TaskSignature, ZeroRouterAttempt,
+        ZeroRouterEstimate, ZeroRouterResponseMetadata, finish_reason, shape_ok, stream_delta_json,
         stream_tool_call_delta, stream_usage_json, task_signature, tool_args_all_json, usage_cost,
     },
     priority::Priority,
@@ -1881,6 +1883,7 @@ async fn settle_walk_terminal(
         features,
         None,
         None,
+        None,
         attempts,
         started,
         terminal.status(),
@@ -1985,6 +1988,7 @@ async fn serve_completion(
             features,
             None,
             None,
+            None,
             attempts.into_rows(),
             started,
             502,
@@ -1997,11 +2001,19 @@ async fn serve_completion(
     // model that answered entirely in `reasoning_content` was labelled an empty
     // response and would have trained the success estimator to distrust it.
     let emitted = EmittedOutput::from_response(&response);
-    let synthesized_finish = finish_reason(emitted.has_tool_calls(), usage, max_tokens);
+    // The upstream's own reason when it gave one, the synthesis when it did
+    // not — and the provenance either way. See `AttemptFinishReason` for the
+    // divergence table.
+    let finish = AttemptFinishReason::resolve(
+        response.stop_reason,
+        emitted.has_tool_calls(),
+        usage,
+        max_tokens,
+    );
     let shape_label = shape_ok(
         emitted,
         tool_args_all_json(&response.tool_calls),
-        synthesized_finish,
+        finish.reason,
     );
     // The one attempt whose body becomes the 200 and whose usage prices the
     // settled row. Every other row on this request is `served = false`, and
@@ -2016,7 +2028,7 @@ async fn serve_completion(
         attempt_started,
         AttemptTokens::measured(usage),
         false,
-        Some(synthesized_finish),
+        Some(finish.reason),
         None,
     ));
     // Read from the ledger before the settle drains it, so the block and the
@@ -2032,8 +2044,9 @@ async fn serve_completion(
         usage,
         resolved.sell_rates,
         features,
-        Some(synthesized_finish),
+        Some(finish),
         Some(shape_label),
+        None,
         attempts.into_rows(),
         started,
         200,
@@ -2179,6 +2192,7 @@ async fn stream_to_channel(
                     OpenAiUsage::default(),
                     resolved.sell_rates,
                     features,
+                    None,
                     None,
                     None,
                     attempts.take_rows(),
@@ -2408,6 +2422,11 @@ async fn stream_to_channel(
         // than a transcript: a stream that emitted nothing while the upstream
         // reported output tokens labelled as a healthy response.
         let mut emitted = EmittedOutput::default();
+        // What the upstream said on its way out: its own stop reason, and why
+        // it had no usage when it had none. Stays at the empty default unless
+        // a terminal actually arrives, so a stream that broke mid-flight
+        // reports no upstream claims rather than a stale candidate's.
+        let mut stream_terminal = StreamFinal::empty();
 
         loop {
             let Some(remaining) = remaining_upstream_time(started) else {
@@ -2505,7 +2524,8 @@ async fn stream_to_channel(
                 Ok(StreamEvent::Usage(provider_usage)) => {
                     usage = OpenAiUsage::try_from_provider(Some(&provider_usage));
                 }
-                Ok(StreamEvent::Final) => {
+                Ok(StreamEvent::Final(terminal)) => {
+                    stream_terminal = terminal;
                     completed = true;
                     break;
                 }
@@ -2593,6 +2613,7 @@ async fn stream_to_channel(
                 // only to label whether the customer saw the unbilled output.
                 delivery,
                 started,
+                stream_terminal,
             )
             .await;
             return;
@@ -2652,6 +2673,7 @@ async fn stream_to_channel(
                 features,
                 None,
                 None,
+                None,
                 attempts.take_rows(),
                 started,
                 if client_connected { 502 } else { 499 },
@@ -2700,6 +2722,7 @@ async fn stream_to_channel(
             OpenAiUsage::default(),
             resolved.sell_rates,
             features,
+            None,
             None,
             None,
             attempts.take_rows(),
@@ -2806,6 +2829,7 @@ async fn settle_stream_interruption(
             features,
             None,
             None,
+            None,
             attempts,
             started,
             if client_connected {
@@ -2900,6 +2924,7 @@ async fn complete_synthetic_stream(
             features,
             None,
             None,
+            None,
             attempts.into_rows(),
             started,
             502,
@@ -2914,11 +2939,14 @@ async fn complete_synthetic_stream(
     // entirely reasoning is a non-empty response on both.
     let emitted = EmittedOutput::from_response(&response);
     let has_tool_calls = emitted.has_tool_calls();
-    let synthesized_finish = finish_reason(has_tool_calls, usage, max_tokens);
+    // Same consumption rule as the buffered sibling: this path replays a
+    // buffered response, so the reason it carries is the same one.
+    let finish =
+        AttemptFinishReason::resolve(response.stop_reason, has_tool_calls, usage, max_tokens);
     let shape_label = shape_ok(
         emitted,
         tool_args_all_json(&response.tool_calls),
-        synthesized_finish,
+        finish.reason,
     );
     attempts.push(build_attempt(
         attempt_no,
@@ -2928,7 +2956,7 @@ async fn complete_synthetic_stream(
         attempt_started,
         AttemptTokens::measured(usage),
         false,
-        Some(synthesized_finish),
+        Some(finish.reason),
         None,
     ));
     // Read before the settle drains the ledger — same rule as the buffered
@@ -2943,8 +2971,11 @@ async fn complete_synthetic_stream(
         usage,
         resolved.sell_rates,
         features,
-        Some(synthesized_finish),
+        Some(finish),
         Some(shape_label),
+        // A synthetic stream is a buffered response replayed as SSE: there was
+        // never a live stream to have a usage gap.
+        None,
         attempts.into_rows(),
         started,
         completion_status,
@@ -3027,6 +3058,9 @@ async fn finish_successful_stream(
     completion_status: i16,
     delivery: StreamDelivery,
     started: Instant,
+    // What the upstream said on its way out — its own stop reason, and why it
+    // had no usage when it had none.
+    terminal: StreamFinal,
 ) {
     let Some(session) = usage_session.take() else {
         send_stream_error(sender, &ApiError::MeteringUnavailable).await;
@@ -3071,6 +3105,11 @@ async fn finish_successful_stream(
             features,
             None,
             None,
+            // The gap this row exists to explain. This is the one settle site
+            // reached by a stream that ran to its terminal and reported no
+            // usage, so it is where `done_missing` has to land or it is lost —
+            // on the free lane there is no attempt row to reconstruct it from.
+            terminal.usage_gap,
             attempts.into_rows(),
             started,
             502,
@@ -3079,12 +3118,19 @@ async fn finish_successful_stream(
         send_stream_error(sender, &ApiError::MeteringUnavailable).await;
         return;
     };
-    let synthesized_finish = finish_reason(emitted.has_tool_calls(), usage, max_tokens);
+    // The terminal's own stop reason when the upstream sent one, the synthesis
+    // when it did not — see `AttemptFinishReason` for the divergence table.
+    let finish = AttemptFinishReason::resolve(
+        terminal.stop_reason,
+        emitted.has_tool_calls(),
+        usage,
+        max_tokens,
+    );
     // From the deltas this stream actually emitted, never from
     // `usage.completion_tokens`: the upstream's token count is its accounting,
     // and a stream that emitted nothing while reporting output tokens must
     // label as the empty response it was.
-    let shape_label = shape_ok(emitted, tool_args_ok, synthesized_finish);
+    let shape_label = shape_ok(emitted, tool_args_ok, finish.reason);
     // The attempt records what the UPSTREAM reported: we owe the provider for
     // the tokens it burned whether or not the customer stayed to read them,
     // and that is what COGS and the treasury measure. `served` is the
@@ -3098,7 +3144,7 @@ async fn finish_successful_stream(
         attempt_started,
         AttemptTokens::measured(usage),
         false,
-        Some(synthesized_finish),
+        Some(finish.reason),
         None,
     ));
     // A client that walked away is not billed for output it never received
@@ -3136,8 +3182,11 @@ async fn finish_successful_stream(
         billable,
         resolved.sell_rates,
         features,
-        Some(synthesized_finish),
+        Some(finish),
         Some(shape_label),
+        // `None` on this branch by construction: usage WAS reported, which is
+        // precisely when `usage_gap` is None.
+        terminal.usage_gap,
         attempts.into_rows(),
         started,
         completion_status,
@@ -3149,13 +3198,24 @@ async fn finish_successful_stream(
         return;
     }
 
+    // DELIBERATELY the synthesized reason, not `finish.reason`, and the one
+    // place the two can disagree on a served row.
+    //
+    // What a customer's own agent loop reads here decides whether it issues a
+    // continuation request — so switching this to the upstream's real reason
+    // would change how many requests customers send us, and therefore what
+    // they are charged. That is a product decision, not part of plumbing the
+    // ledger, so it is left alone and the divergence is recorded rather than
+    // taken. `usage_events.finish_reason_source` says which of the two any
+    // given row's persisted reason was.
+    let body_finish_reason = finish_reason(emitted.has_tool_calls(), usage, max_tokens);
     emit_stream_finish(
         sender,
         metadata,
         resolved,
         candidate,
         usage,
-        synthesized_finish,
+        body_finish_reason,
         zerorouter,
     )
     .await;
@@ -3273,8 +3333,9 @@ async fn persist_usage(
     usage: OpenAiUsage,
     sell_rates: ModelRates,
     features: RequestFeatures,
-    finish_reason: Option<&str>,
+    finish: Option<AttemptFinishReason>,
     shape_label: Option<bool>,
+    usage_gap: Option<UsageGap>,
     attempts: Vec<AttemptRecord>,
     started: Instant,
     status: i16,
@@ -3295,8 +3356,12 @@ async fn persist_usage(
         candidate_id: candidate.map(|candidate| candidate.id.clone()),
         basis_rates: candidate.map(|candidate| candidate.rates),
         sell_rates,
-        finish_reason: finish_reason.map(str::to_owned),
+        finish_reason: finish.map(|finish| finish.reason.to_owned()),
+        // Provenance rides with the value it describes, so a row can never
+        // claim a reason came from one place while carrying the other's.
+        finish_reason_source: finish.map(|finish| finish.source),
         shape_ok: shape_label,
+        usage_gap: usage_gap.map(UsageGap::as_str),
         priority: Some(features.priority),
     };
     usage_session
