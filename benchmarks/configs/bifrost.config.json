@@ -1,0 +1,10 @@
+{
+  "providers": {
+    "openai": {
+      "keys": [
+        { "name": "bench-key", "value": "dummy", "models": ["*"], "weight": 1.0 }
+      ],
+      "network_config": { "base_url": "http://127.0.0.1:9010" }
+    }
+  }
+}

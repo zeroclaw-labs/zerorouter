@@ -1,0 +1,20 @@
+{
+  "providers": [
+    {
+      "key": "local-mock",
+      "adapter": "chat_completions",
+      "credential": "none",
+      "settlement": "free",
+      "display_name": "mock upstream (free lane: keyless, settles free)",
+      "base_url": "http://127.0.0.1:9010/v1/chat/completions"
+    },
+    {
+      "key": "metered-mock",
+      "adapter": "chat_completions",
+      "credential_env": "METERED_MOCK_API_KEY",
+      "secret_name": "metered-mock-api-key",
+      "display_name": "mock upstream (metered lane: credentialed, default settlement)",
+      "base_url": "http://127.0.0.1:9010/v1/chat/completions"
+    }
+  ]
+}

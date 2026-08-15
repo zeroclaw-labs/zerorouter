@@ -1,0 +1,6 @@
+# Heavy / machine-local artifacts. Committed: scripts, configs, docs.
+.run/
+logs/
+results/
+mock-upstream/mock-upstream
+*.log
