@@ -232,6 +232,32 @@ impl ModelRates {
             && self.output_per_mtok.is_none()
             && self.cached_input_per_mtok.is_none()
     }
+
+    /// Whether this table prices every dimension at exactly zero.
+    ///
+    /// The mechanical half of "free", stated once and read on both sides of
+    /// the question: a CANDIDATE's zero basis (ZeroRouter is charged nothing
+    /// to serve it, [`crate::config::TierCandidate::rates_are_zero`]) and a
+    /// TIER's zero sell rate (the customer is charged nothing to be served,
+    /// [`crate::config::ResolvedRoute::sells_free`]). Those are different
+    /// claims about different money; they are the same arithmetic.
+    ///
+    /// The two REQUIRED dimensions must be declared and exactly zero; the
+    /// optional cached-input dimension may be absent OR zero. That asymmetry
+    /// is the tier file's own convention rather than an invention here —
+    /// `input_per_mtok` and `output_per_mtok` are mandatory (an absent one is
+    /// a load error) while an absent `cached_input_per_mtok` means "unknown
+    /// here", the bedrock shape. It also matches exactly what
+    /// [`crate::openai::usage_cost`] does with the same table: an absent
+    /// cached rate is priced at the input rate, so an absent cached rate over
+    /// a zero input rate prices at zero. A DECLARED nonzero cached rate is
+    /// still money, and still disqualifies.
+    #[must_use]
+    pub fn are_zero(&self) -> bool {
+        self.input_per_mtok == Some(0.0)
+            && self.output_per_mtok == Some(0.0)
+            && self.cached_input_per_mtok.is_none_or(|rate| rate == 0.0)
+    }
 }
 
 /// Output ceiling assumed when a request names none.

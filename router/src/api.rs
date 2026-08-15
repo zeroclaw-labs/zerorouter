@@ -30,9 +30,9 @@ use crate::{
     auth::{AuthenticatedKey, AuthenticationError, KeyAuthenticator},
     config::{RequestNeeds, ResolvedRoute, TierCandidate, TierCatalog, load_tier_catalog},
     db::{
-        AttemptRecord, AttemptTokens, RequestTelemetry, ReservationSize, ReservationSizing,
-        SegmentClampStats, SettlementRecovery, UsageAdmission, UsageRecord, UsageSession,
-        begin_usage_session, output_token_percentiles, recover_owed_settlements,
+        AttemptRecord, AttemptTokens, MeteringLane, RequestTelemetry, ReservationSize,
+        ReservationSizing, SegmentClampStats, SettlementRecovery, UsageAdmission, UsageRecord,
+        UsageSession, begin_usage_session, output_token_percentiles, recover_owed_settlements,
         segment_clamp_stats, segment_user, user_clamp_loss,
     },
     error::{ApiError, streaming_error_json},
@@ -1052,6 +1052,14 @@ async fn chat_completions(
         // and admission do, so every one of them describes the same request.
         &request.needs(reservation_usage.prompt_tokens),
     );
+    // The metering seam (edge mode, stage 3). Decided AFTER ordering, over the
+    // route the walk will actually take, and read from server-side
+    // configuration only — see [`free_lane_admissible`].
+    let lane = if free_lane_admissible(&resolved, provider_route.candidates(), &is_free) {
+        MeteringLane::Free
+    } else {
+        MeteringLane::Reserved
+    };
     let usage_session = admit_usage(
         &services.pool,
         &authenticated,
@@ -1061,6 +1069,7 @@ async fn chat_completions(
         },
         signature,
         services.require_credits,
+        lane,
     )
     .await?;
     // Re-measure against the bound admission actually took. This is what the
@@ -1097,6 +1106,62 @@ async fn chat_completions(
         )
         .await
     }
+}
+
+/// Whether this request may skip reserve, the per-user advisory lock, and
+/// settle — the metering seam (edge mode, stage 3:
+/// `docs/design/edge-mode-local-rung.md`).
+///
+/// Two conditions, both necessary, evaluated over the route the walk is about
+/// to take:
+///
+/// 1. **Every candidate is free.** Not the first one, not the one that is
+///    likely to serve — every one. The reservation is taken at ADMISSION,
+///    before anything is known about which rung will answer, so a route that
+///    holds even one metered candidate must reserve for it: a fallback that
+///    dispatches to a paid upstream without a reservation is paid inference
+///    delivered with no encumbrance, no exactly-once settle, and no way to
+///    charge for it — the precise failure this seam exists to avoid. Freeness
+///    is [`TierCandidate::is_free`], recomputed here from server-side
+///    configuration; nothing about a request, a header, or a model alias
+///    reaches it.
+/// 2. **The tier sells at zero.** [`ResolvedRoute::sells_free`] carries the
+///    argument in full: candidate freeness is a claim about ZeroRouter's cost,
+///    and the customer pays the TIER's rate, so a $0 basis under a priced tier
+///    is a legal 100%-margin configuration that this predicate must not give
+///    away.
+///
+/// Together they mean the skip engages only where the metered path would have
+/// computed `cost_usd = 0`, debited nothing, and written no ledger row — so
+/// nothing a customer is charged can change, on any route, in either
+/// direction. What changes is the reservation, the lock, and the settle
+/// transaction, which on such a route were pure overhead.
+///
+/// # The consequence, stated plainly
+///
+/// The latency win belongs to routes composed ENTIRELY of free rungs — an
+/// all-local tier, or a local model addressed as a pin. **The
+/// local-first/cloud-burst ladder keeps full metering**, on every request,
+/// including the ones the local rung serves. That is not an oversight to be
+/// optimized away later: reserving at admission is what makes the burst
+/// billable, and the burst is the whole point of a hybrid ladder.
+///
+/// # Fail-closed
+///
+/// An empty route takes the metered lane. `all()` is vacuously true over
+/// nothing, and "no candidates" must never be the way metering gets turned
+/// off — [`ProviderRoute::new`] already refuses an empty route, so this guard
+/// exists to make the reasoning independent of that.
+fn free_lane_admissible(
+    resolved: &ResolvedRoute,
+    candidates: &[ProviderCandidate],
+    is_free: &dyn Fn(&TierCandidate) -> bool,
+) -> bool {
+    resolved.sells_free()
+        && !candidates.is_empty()
+        && candidates
+            .iter()
+            .all(|candidate| is_free(candidate.definition()))
 }
 
 /// The model-suffix carrier's split: `Some((base, priority))` when the last
@@ -3161,8 +3226,9 @@ async fn admit_usage(
     sizing: ReservationSizing,
     task_signature: TaskSignature,
     require_credits: bool,
+    lane: MeteringLane,
 ) -> Result<UsageSession, ApiError> {
-    match begin_usage_session(pool, key, sizing, task_signature, require_credits)
+    match begin_usage_session(pool, key, sizing, task_signature, require_credits, lane)
         .await
         .map_err(|_| ApiError::DatabaseUnavailable)?
     {
@@ -3453,6 +3519,167 @@ mod tests {
             .iter()
             .map(|candidate| candidate.definition().id.clone())
             .collect()
+    }
+
+    // -----------------------------------------------------------------------
+    // The metering seam (edge mode, stage 3). These own the PREDICATE; that
+    // the real `TierCandidate::is_free` and a real database sit behind it is
+    // owned end to end by `tests/local_candidates.rs`.
+    //
+    // Unit tests because this is where the two conjuncts are independently
+    // observable. Through a loaded catalog they are very nearly the same
+    // question — a tier that sells at $0 forces every candidate's basis to $0
+    // (`validate_candidate_margin` refuses a basis above the sell rate, and
+    // input/output rates are mandatory), and a $0 basis in turn demands a
+    // free-settling provider. That near-equivalence is a property of today's
+    // validation rules, not of this predicate, and it is exactly why both
+    // conjuncts are written out: either rule could be relaxed by a future
+    // change that has nothing to do with edge mode, and neither half may
+    // quietly start resting on the other.
+    // -----------------------------------------------------------------------
+
+    /// A route of `definitions` under a tier selling at `sell_rates`, answered
+    /// by the predicate the request path asks.
+    fn skips_metering(definitions: Vec<TierCandidate>, sell_rates: ModelRates) -> bool {
+        let candidates: Vec<ProviderCandidate> = definitions
+            .iter()
+            .cloned()
+            .map(|definition| {
+                ProviderCandidate::against_local_upstream(definition, "http://127.0.0.1:1/unused")
+            })
+            .collect();
+        let resolved = ResolvedRoute {
+            requested_model: "zero/seam".to_owned(),
+            candidates: definitions,
+            sell_rates,
+        };
+        // Same stand-in as `ordered`, and for the same reason: the real
+        // `is_free` needs an installed operator inventory, which this binary
+        // must not install.
+        let is_free = |candidate: &TierCandidate| candidate.rates_are_zero();
+        free_lane_admissible(&resolved, &candidates, &is_free)
+    }
+
+    fn free_sell_rates() -> ModelRates {
+        ModelRates {
+            input_per_mtok: Some(0.0),
+            output_per_mtok: Some(0.0),
+            cached_input_per_mtok: Some(0.0),
+        }
+    }
+
+    fn priced_sell_rates() -> ModelRates {
+        ModelRates {
+            input_per_mtok: Some(3.0),
+            output_per_mtok: Some(6.0),
+            cached_input_per_mtok: Some(0.6),
+        }
+    }
+
+    #[test]
+    fn an_all_free_route_under_a_free_tier_skips_metering() {
+        assert!(skips_metering(
+            vec![
+                local_rung("local/qwen", local_metadata()),
+                local_rung("local/gemma", local_metadata()),
+            ],
+            free_sell_rates(),
+        ));
+    }
+
+    #[test]
+    fn one_metered_candidate_anywhere_in_the_route_keeps_full_metering() {
+        // The rule the design turns on, and the reason it is `all` and not
+        // `any`: the reservation is taken at ADMISSION, before the walk knows
+        // which rung will answer. A route holding a paid rung may reach it —
+        // that is what a fallback IS — and a paid dispatch with no reservation
+        // behind it is inference delivered with nothing to charge it against.
+        // Position is irrelevant, so both orders are stated.
+        for route in [
+            vec![
+                local_rung("local/qwen", local_metadata()),
+                cloud_rung("openai/burst"),
+            ],
+            vec![
+                cloud_rung("openai/burst"),
+                local_rung("local/qwen", local_metadata()),
+            ],
+        ] {
+            assert!(
+                !skips_metering(route, free_sell_rates()),
+                "a route that can still reach a metered rung must reserve for it"
+            );
+        }
+    }
+
+    #[test]
+    fn an_all_free_route_under_a_priced_tier_keeps_full_metering() {
+        // Candidate freeness is a claim about ZeroRouter's COST; the customer
+        // pays the TIER's rate. `validate_candidate_margin` permits a $0 basis
+        // under a priced tier — that is the intended 100%-margin shape — so
+        // reading candidate freeness as customer freeness would hand a $3/Mtok
+        // tier away for nothing. This is also the shape a MISSING CREDENTIAL
+        // produces: `ProviderRoute` drops a candidate whose credential is
+        // absent, so a mixed tier collapses to exactly this route the moment an
+        // operator's cloud key is unset.
+        assert!(!skips_metering(
+            vec![local_rung("local/qwen", local_metadata())],
+            priced_sell_rates(),
+        ));
+    }
+
+    #[test]
+    fn a_tier_priced_on_one_dimension_alone_keeps_full_metering() {
+        // Zero is not "mostly zero". Each dimension is checked, because a tier
+        // that gives away its input and charges for output is still selling
+        // something.
+        for sell_rates in [
+            ModelRates {
+                input_per_mtok: Some(0.0),
+                output_per_mtok: Some(6.0),
+                cached_input_per_mtok: Some(0.0),
+            },
+            ModelRates {
+                input_per_mtok: Some(3.0),
+                output_per_mtok: Some(0.0),
+                cached_input_per_mtok: Some(0.0),
+            },
+            ModelRates {
+                input_per_mtok: Some(0.0),
+                output_per_mtok: Some(0.0),
+                cached_input_per_mtok: Some(0.6),
+            },
+        ] {
+            assert!(!skips_metering(
+                vec![local_rung("local/qwen", local_metadata())],
+                sell_rates,
+            ));
+        }
+    }
+
+    #[test]
+    fn a_tier_that_omits_its_cached_rate_can_still_be_free() {
+        // The convention the tier file already uses and `usage_cost` already
+        // honours: an absent cached rate is priced at the input rate, so an
+        // absent cached rate over a $0 input rate prices at zero. Requiring
+        // operators to write `= 0` for a dimension their local server does not
+        // have would make the commonest honest config silently not free.
+        assert!(skips_metering(
+            vec![local_rung("local/qwen", local_metadata())],
+            ModelRates {
+                input_per_mtok: Some(0.0),
+                output_per_mtok: Some(0.0),
+                cached_input_per_mtok: None,
+            },
+        ));
+    }
+
+    #[test]
+    fn an_empty_route_never_skips_metering() {
+        // `all()` is vacuously true over nothing. "No candidates" must never be
+        // the way metering gets turned off, so the emptiness guard is stated
+        // here rather than inherited from `ProviderRoute::new`'s refusal.
+        assert!(!skips_metering(Vec::new(), free_sell_rates()));
     }
 
     /// A request that fits everything: small prompt, no tools, plain text.
@@ -3901,6 +4128,7 @@ mod tests {
             }),
             task_signature("walk-user", &[], 1, 128, true, 64),
             false,
+            MeteringLane::Reserved,
         )
         .await
         .expect("admission must query")

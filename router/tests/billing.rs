@@ -19,10 +19,10 @@ use zerorouter::{
         settle_checkout_intent,
     },
     db::{
-        LEARNED_SIZING_CONCURRENCY_LIMIT, RequestTelemetry, ReservationBasis, ReservationRelease,
-        ReservationSize, ReservationSizing, UsageAdmission, UsageRecord, UsageSession,
-        begin_usage_session, migrate, quarantined_settlements, recover_owed_settlements,
-        recover_quarantined_settlement, release_quarantined_reservation,
+        LEARNED_SIZING_CONCURRENCY_LIMIT, MeteringLane, RequestTelemetry, ReservationBasis,
+        ReservationRelease, ReservationSize, ReservationSizing, UsageAdmission, UsageRecord,
+        UsageSession, begin_usage_session, migrate, quarantined_settlements,
+        recover_owed_settlements, recover_quarantined_settlement, release_quarantined_reservation,
     },
     openai::{OpenAiUsage, TASK_SIGNATURE_SCHEME, TaskSignature, tool_names_digest},
     priority::Priority,
@@ -285,6 +285,7 @@ async fn usage_settlement_debits_the_balance_exactly_once() {
         cold_sizing(1_000, 500, Decimal::from(2)),
         test_signature(),
         true,
+        MeteringLane::Reserved,
     )
     .await
     .expect("funded admission must query")
@@ -353,6 +354,7 @@ async fn credit_admission_fails_closed_and_cannot_jointly_overdraw() {
             cold_sizing(100, 50, Decimal::from(2)),
             test_signature(),
             true,
+            MeteringLane::Reserved
         )
         .await
         .expect("underfunded admission must query"),
@@ -366,6 +368,7 @@ async fn credit_admission_fails_closed_and_cannot_jointly_overdraw() {
         cold_sizing(100, 50, Decimal::from(2)),
         test_signature(),
         false,
+        MeteringLane::Reserved,
     )
     .await
     .expect("cap-only admission must query")
@@ -394,6 +397,7 @@ async fn credit_admission_fails_closed_and_cannot_jointly_overdraw() {
             cold_sizing(100, 50, Decimal::from(2)),
             test_signature(),
             true,
+            MeteringLane::Reserved
         ),
         begin_usage_session(
             &pool,
@@ -401,6 +405,7 @@ async fn credit_admission_fails_closed_and_cannot_jointly_overdraw() {
             cold_sizing(100, 50, Decimal::from(2)),
             test_signature(),
             true,
+            MeteringLane::Reserved
         ),
     );
     let mut admitted = 0;
@@ -588,6 +593,7 @@ async fn settlement_debit_is_clamped_to_the_reservation_and_cannot_overdraw() {
         cold_sizing(1_000, 500, Decimal::from(2)),
         test_signature(),
         true,
+        MeteringLane::Reserved,
     )
     .await
     .expect("funded admission must query")
@@ -634,6 +640,7 @@ async fn cap_only_settlement_records_usage_without_touching_the_balance() {
         cold_sizing(1_000, 500, Decimal::from(2)),
         test_signature(),
         false,
+        MeteringLane::Reserved,
     )
     .await
     .expect("cap-only admission must query")
@@ -827,6 +834,7 @@ async fn admit(pool: &PgPool, key: &AuthenticatedKey, require_credits: bool) -> 
         cold_sizing(1_000, 500, Decimal::from(2)),
         test_signature(),
         require_credits,
+        MeteringLane::Reserved,
     )
     .await
     .expect("admission must query")
@@ -1380,6 +1388,7 @@ async fn admit_learned(
         learned_sizing(),
         test_signature(),
         require_credits,
+        MeteringLane::Reserved,
     )
     .await
     .expect("admission must query")
@@ -1862,6 +1871,7 @@ async fn an_owed_reservation_keeps_encumbering_the_balance_after_it_expires() {
         cold_sizing(1_000, 500, Decimal::from(2)),
         test_signature(),
         true,
+        MeteringLane::Reserved,
     )
     .await
     .expect("admission must query");
@@ -2102,6 +2112,7 @@ async fn forgiving_an_owed_reservation_is_opt_in_and_frees_the_credit_it_held() 
         cold_sizing(1_000, 500, Decimal::from(2)),
         test_signature(),
         true,
+        MeteringLane::Reserved,
     )
     .await
     .expect("admission must query");
@@ -2149,6 +2160,7 @@ async fn forgiving_an_owed_reservation_is_opt_in_and_frees_the_credit_it_held() 
         cold_sizing(1_000, 500, Decimal::from(2)),
         test_signature(),
         true,
+        MeteringLane::Reserved,
     )
     .await
     .expect("admission must query");
