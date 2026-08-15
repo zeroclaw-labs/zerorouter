@@ -38,10 +38,9 @@ defines it:
   the image at `/etc/zerorouter/rds-global-bundle.pem`.
 - **Provider keys** are injected from AWS Secrets Manager via
   task-definition `secrets`, never plain env in Terraform or the task
-  definition. The full set the shipped `providers.json` can consume:
-  `ANTHROPIC_API_KEY`, `BEDROCK_API_KEY`, `DEEPINFRA_API_KEY`,
-  `FIREWORKS_API_KEY`, `TOGETHER_API_KEY`, `OPENAI_API_KEY`,
-  `MINIMAX_API_KEY`. A provider whose key is absent is simply not a
+  definition. The set the shipped `providers.json` can consume is whatever
+  its entries' `credential_env` name — today `ANTHROPIC_API_KEY` and
+  `OPENAI_API_KEY`. A provider whose key is absent is simply not a
   candidate — set only what the catalog actually routes to.
 - **Platform**: ARM64 on Fargate; the workflow builds `linux/arm64` only.
 
