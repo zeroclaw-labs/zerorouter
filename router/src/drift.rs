@@ -91,6 +91,28 @@ pub enum Verdict {
     /// The model is not in the source catalog. Could be a rename, a
     /// retirement, or a model the source does not cover.
     Missing,
+    /// A $0 rung on an operator-declared upstream: a model running on the
+    /// operator's own hardware, which no public catalog covers and none ever
+    /// will (edge mode, stage 2: `docs/design/edge-mode-local-rung.md`).
+    ///
+    /// Reported, never actionable — the same treatment as [`Self::Unpriced`],
+    /// for the same reason. This module exists to protect margin, and there is
+    /// no margin to drift on a rung that costs nothing; meanwhile a
+    /// `NOT IN SOURCE` row that can never be fixed, on every CI run, is the
+    /// fastest way to teach an operator to stop reading this report. It still
+    /// prints, so the exemption is visible in the table rather than silently
+    /// skipping the candidate.
+    ///
+    /// The exemption needs BOTH halves and is deliberately the narrowest thing
+    /// that works. Operator-declared alone is not enough: an operator's
+    /// *priced* upstream is a real cost basis and deserves a real answer, even
+    /// if that answer is `NOT IN SOURCE`. $0 alone is very much not enough —
+    /// a fat-fingered zero on a shipped cloud provider is precisely the
+    /// silent-margin failure this module was written to catch, and exempting it
+    /// would disable the alarm at the moment it matters most. (Such a candidate
+    /// cannot load at all since stage 2 — `validate_zero_price` refuses it —
+    /// but this file does not depend on that being true.)
+    Unreconcilable,
 }
 
 impl Verdict {
@@ -101,12 +123,14 @@ impl Verdict {
             Self::BasisDrift => "BASIS DRIFT",
             Self::Unpriced => "unpriced upstream",
             Self::Missing => "NOT IN SOURCE",
+            Self::Unreconcilable => "local $0 rung",
         }
     }
 
     /// Whether this verdict should fail the command. `Unpriced` does not: the
     /// source simply has nothing to say, and failing on it would train
-    /// operators to ignore the alarm.
+    /// operators to ignore the alarm. Neither does `Unreconcilable`, for the
+    /// reason spelled out on that variant.
     #[must_use]
     pub const fn is_actionable(&self) -> bool {
         matches!(self, Self::BasisDrift | Self::Missing)
@@ -329,6 +353,22 @@ fn metadata_drift(recorded: &ModelMetadata, upstream: &ModelMetadata) -> Vec<Met
 /// is precisely the one an operator most wants an upstream number for.
 #[must_use]
 pub fn reconcile(catalog: &TierCatalog, source: &str) -> Vec<CandidateDrift> {
+    reconcile_with(catalog, source, &|candidate| {
+        crate::providers::is_operator_declared_provider(&candidate.provider)
+    })
+}
+
+/// [`reconcile`], with the "is this the operator's own upstream?" question
+/// supplied rather than read from the process-wide inventory.
+///
+/// The seam exists so the exemption can be tested for what it is — a rule
+/// about candidates — without a test having to install a global inventory to
+/// make one true, which would leak into every other test in the binary.
+fn reconcile_with(
+    catalog: &TierCatalog,
+    source: &str,
+    operator_declared: &dyn Fn(&crate::config::TierCandidate) -> bool,
+) -> Vec<CandidateDrift> {
     let providers: BTreeMap<String, SourceProvider> =
         serde_json::from_str(source).unwrap_or_default();
 
@@ -366,11 +406,18 @@ pub fn reconcile(catalog: &TierCatalog, source: &str) -> Vec<CandidateDrift> {
                 })
                 .unwrap_or_default();
 
-            let verdict = match entry {
-                None => Verdict::Missing,
-                Some(entry) if entry.cost.is_none() => Verdict::Unpriced,
-                Some(_) if rates_agree(candidate.rates, upstream_cost) => Verdict::Match,
-                Some(_) => Verdict::BasisDrift,
+            // Checked before the source is consulted at all: a $0 rung on the
+            // operator's own upstream is not a model the source failed to
+            // mention, it is a model the source is not about.
+            let verdict = if candidate.is_free() && operator_declared(candidate) {
+                Verdict::Unreconcilable
+            } else {
+                match entry {
+                    None => Verdict::Missing,
+                    Some(entry) if entry.cost.is_none() => Verdict::Unpriced,
+                    Some(_) if rates_agree(candidate.rates, upstream_cost) => Verdict::Match,
+                    Some(_) => Verdict::BasisDrift,
+                }
             };
 
             let upstream_metadata = ModelMetadata {
@@ -700,6 +747,77 @@ mod tests {
         );
         assert_eq!(reconcile(&quiet, SOURCE)[0].verdict, Verdict::Unpriced);
         assert!(!reconcile(&quiet, SOURCE)[0].verdict.is_actionable());
+    }
+
+    /// A one-candidate catalog on `provider`, priced at `basis`.
+    fn catalog_on(provider: &str, basis: ModelRates) -> TierCatalog {
+        let mut tiers = BTreeMap::new();
+        tiers.insert(
+            "zero/edge".to_owned(),
+            TierDefinition {
+                rates: rates(2.0, 0.2, 10.0),
+                candidates: vec![TierCandidate {
+                    id: format!("{provider}/qwen3-8b"),
+                    provider: provider.to_owned(),
+                    model: "qwen3-8b".to_owned(),
+                    rates: basis,
+                    metadata: ModelMetadata::default(),
+                }],
+            },
+        );
+        TierCatalog {
+            schema_version: 1,
+            tiers,
+            unavailable: BTreeMap::new(),
+        }
+    }
+
+    fn free() -> ModelRates {
+        ModelRates {
+            input_per_mtok: Some(0.0),
+            cached_input_per_mtok: None,
+            output_per_mtok: Some(0.0),
+        }
+    }
+
+    #[test]
+    fn a_local_zero_rung_is_reported_but_never_fails_the_command() {
+        // Edge mode, stage 2. A model on the operator's own hardware is absent
+        // from models.dev and always will be, so `NOT IN SOURCE` — which fails
+        // the command — would fire forever on a correct config, and an alarm
+        // that fires forever is an alarm nobody reads. It still gets a row, so
+        // the exemption is visible in the table rather than a silent skip, and
+        // there is no metadata noise to go with it: the source has nothing to
+        // say about this model, and silence upstream is never disagreement.
+        let catalog = catalog_on("local-llama", free());
+        let found = reconcile_with(&catalog, SOURCE, &|_| true);
+
+        assert_eq!(found[0].verdict, Verdict::Unreconcilable);
+        assert!(!found[0].verdict.is_actionable());
+        assert_eq!(found[0].verdict.label(), "local $0 rung");
+        assert_eq!(found[0].metadata_drift, vec![]);
+        assert!(!found[0].has_actionable_metadata_drift());
+    }
+
+    #[test]
+    fn the_exemption_needs_both_halves_or_it_would_disable_the_alarm() {
+        // A $0 basis on a SHIPPED provider is the silent-margin failure this
+        // module exists to catch — the fat-fingered rate that records zero
+        // COGS against real spend — so it must keep reconciling and keep
+        // failing. (`validate_zero_price` refuses such a file outright since
+        // stage 2; this does not depend on that.)
+        let shipped_but_free = catalog_on("anthropic", free());
+        let found = reconcile_with(&shipped_but_free, SOURCE, &|_| false);
+        assert_eq!(found[0].verdict, Verdict::Missing);
+        assert!(found[0].verdict.is_actionable());
+
+        // And an operator upstream that is PRICED is a real cost basis, so it
+        // gets a real answer even though that answer is `NOT IN SOURCE`. Only
+        // the intersection is exempt.
+        let operator_but_priced = catalog_on("local-llama", rates(1.0, 0.1, 5.0));
+        let found = reconcile_with(&operator_but_priced, SOURCE, &|_| true);
+        assert_eq!(found[0].verdict, Verdict::Missing);
+        assert!(found[0].verdict.is_actionable());
     }
 
     #[test]

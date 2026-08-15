@@ -1,5 +1,6 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
+use crate::config::RequestNeeds;
 use crate::provider::ToolSpec;
 use crate::provider::{ChatMessage, ChatResponse, ModelRates, TokenUsage, ToolCall};
 use chrono::Utc;
@@ -251,6 +252,38 @@ impl ChatCompletionRequest {
                 tool.extra.keys().any(|key| key != "cache_control")
                     || !tool.function.extra.is_empty()
             })
+    }
+
+    /// What this request mechanically needs from whatever serves it (edge
+    /// mode, stage 2: `docs/design/edge-mode-local-rung.md`).
+    ///
+    /// Measurements only — no opinion about which model would answer *better*,
+    /// which is the design's B-line. `prompt_bound` is supplied by the caller
+    /// rather than recomputed so selection and admission read the same number.
+    ///
+    /// The modality set is text-or-nothing today, and that is a fact about the
+    /// compat surface rather than a simplification:
+    /// [`Self::contains_unsupported_extensions`] refuses any message whose
+    /// `content` is not a string or null, so a request carrying image, audio,
+    /// or file parts is a 400 long before it reaches selection. This method is
+    /// the single seam that changes when that surface widens — the comparison
+    /// on the other side ([`crate::config::ModelMetadata::can_serve`]) is
+    /// already written against a set.
+    #[must_use]
+    pub fn needs(&self, prompt_bound: u64) -> RequestNeeds {
+        let mut modalities = BTreeSet::new();
+        if self
+            .messages
+            .iter()
+            .any(|message| message.content.is_string())
+        {
+            modalities.insert("text".to_owned());
+        }
+        RequestNeeds {
+            prompt_bound,
+            tools: !self.tools.is_empty(),
+            modalities,
+        }
     }
 
     #[must_use]

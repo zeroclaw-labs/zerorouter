@@ -4,11 +4,11 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use tower_http::services::{ServeDir, ServeFile};
 use zerorouter::{
-    DEFAULT_TIER_CONFIG_PATH, RouterState, TIER_CONFIG_PATH_ENV,
+    DEFAULT_TIER_CONFIG_PATH, PROVIDER_INVENTORY_PATH_ENV, RouterState, TIER_CONFIG_PATH_ENV,
     admin::{self, AdminArgs},
     app,
     db::{database_pool_from_env, migrate},
-    device, logging, oidc, portal, stripe,
+    device, logging, oidc, portal, providers, stripe,
     web::{WebConfig, WebCtx, credits_required_from_env},
 };
 
@@ -55,6 +55,21 @@ async fn serve() -> Result<()> {
     let tier_config_path = env::var_os(TIER_CONFIG_PATH_ENV)
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(DEFAULT_TIER_CONFIG_PATH));
+    // Edge mode, stage 2: the operator's own upstreams, layered over the
+    // shipped inventory. Before anything is served and before the tier catalog
+    // is first read, because a candidate naming a provider this file declares
+    // is a load error until it is installed — and fatal, so a deployment whose
+    // local rung is misconfigured fails to start rather than quietly serving
+    // every request to the cloud it was meant to keep traffic off.
+    if let Some(path) = env::var_os(PROVIDER_INVENTORY_PATH_ENV).map(PathBuf::from) {
+        let count = providers::load_operator_inventory(&path).with_context(|| {
+            format!(
+                "loading the operator provider inventory from {}",
+                path.display()
+            )
+        })?;
+        tracing::info!(path = %path.display(), providers = count, "operator providers registered");
+    }
     let require_credits = credits_required_from_env()?;
     let web_config = WebConfig::from_env()?;
     let pool = database_pool_from_env().await?;

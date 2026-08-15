@@ -27,3 +27,4 @@ pub mod wire;
 
 pub use api::{RouterState, app};
 pub use config::{DEFAULT_TIER_CONFIG_PATH, TIER_CONFIG_PATH_ENV, TierCatalog, load_tier_catalog};
+pub use providers::PROVIDER_INVENTORY_PATH_ENV;

@@ -1588,6 +1588,27 @@ impl ModelProvider for AnthropicWire {
 /// LM Studio, and a hosted ZeroRouter `/v1` alike.
 const CHAT_COMPLETIONS_URL: &str = "https://api.openai.com/v1/chat/completions";
 
+/// Attach the bearer credential, unless this upstream is keyless.
+///
+/// Most local inference servers take no credential at all, and their inventory
+/// entry says so (`"credential": "none"`, `crate::providers`), which reaches
+/// this wire as an empty credential string. Sending `Authorization: Bearer `
+/// with an empty value is noise on a server that ignores the header and a 401
+/// on one that parses it strictly, so an empty credential omits the header
+/// rather than sending an empty one.
+///
+/// Only this wire can be keyless — inventory validation refuses that
+/// declaration on the two adapters that own cloud endpoints — so its siblings
+/// keep sending the header unconditionally, and an empty credential there
+/// stays the loud upstream 401 it should be.
+fn authorized(request: reqwest::RequestBuilder, credential: &str) -> reqwest::RequestBuilder {
+    if credential.is_empty() {
+        request
+    } else {
+        request.bearer_auth(credential)
+    }
+}
+
 /// ZeroRouter's own Chat-Completions client: chat and streaming both on
 /// `/v1/chat/completions`, usage lifted from the wire on both paths.
 ///
@@ -2428,10 +2449,7 @@ impl ModelProvider for ChatCompletionsWire {
         temperature: Option<f64>,
     ) -> anyhow::Result<ChatResponse> {
         let body = self.request_body(model, request.messages, request.tools, temperature, false);
-        let response = self
-            .http
-            .post(&self.api_url)
-            .bearer_auth(&self.credential)
+        let response = authorized(self.http.post(&self.api_url), &self.credential)
             .json(&body)
             .send()
             .await?;
@@ -2474,9 +2492,7 @@ impl ModelProvider for ChatCompletionsWire {
         let count_tokens = options.count_tokens;
 
         let stream = async_stream::try_stream! {
-            let response = http
-                .post(&api_url)
-                .bearer_auth(&credential)
+            let response = authorized(http.post(&api_url), &credential)
                 .json(&body)
                 .send()
                 .await
@@ -2702,6 +2718,82 @@ mod tests {
                 crate::retry::FailureClass::ContextWindow { .. }
             ),
             "{error}"
+        );
+    }
+}
+
+/// Edge mode, stage 2: a keyless local upstream must be dialled without an
+/// `Authorization` header at all.
+#[cfg(test)]
+mod keyless_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    /// Stand up a chat-completions upstream that records the `Authorization`
+    /// header of each request it serves, and answer one minimal completion.
+    async fn recording_upstream() -> (String, Arc<Mutex<Vec<Option<String>>>>) {
+        let seen: Arc<Mutex<Vec<Option<String>>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&seen);
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(move |headers: axum::http::HeaderMap| {
+                let recorder = Arc::clone(&recorder);
+                async move {
+                    recorder.lock().expect("recorder lock").push(
+                        headers
+                            .get(axum::http::header::AUTHORIZATION)
+                            .map(|value| value.to_str().unwrap_or("<binary>").to_owned()),
+                    );
+                    axum::Json(serde_json::json!({
+                        "choices": [{"message": {"role": "assistant", "content": "hi"}}],
+                        "usage": {"prompt_tokens": 3, "completion_tokens": 1}
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("recording upstream should bind");
+        let address = listener
+            .local_addr()
+            .expect("recording upstream should report its address");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{address}/v1/chat/completions"), seen)
+    }
+
+    #[tokio::test]
+    async fn a_keyless_upstream_is_dialled_with_no_authorization_header() {
+        // llama.cpp, Ollama, and LM Studio ignore the header; a strict server
+        // (and vLLM behind a proxy) can 401 on an empty bearer. An upstream
+        // that takes no credential should be sent no credential — not an empty
+        // one — and the same wire must keep sending a real one when it has it.
+        let (url, seen) = recording_upstream().await;
+        let messages = vec![ChatMessage::user("hello")];
+        let request = || ChatRequest {
+            messages: &messages,
+            tools: None,
+        };
+
+        let keyless = ChatCompletionsWire::new("local-llama", "", Some(&url), Some(64), 30);
+        keyless
+            .chat(request(), "qwen3-8b", None)
+            .await
+            .expect("the keyless call should complete");
+
+        let credentialed =
+            ChatCompletionsWire::new("hosted", "zr-secret", Some(&url), Some(64), 30);
+        credentialed
+            .chat(request(), "qwen3-8b", None)
+            .await
+            .expect("the credentialed call should complete");
+
+        let seen = seen.lock().expect("recorder lock").clone();
+        assert_eq!(
+            seen,
+            vec![None, Some("Bearer zr-secret".to_owned())],
+            "keyless must send no Authorization header, and a credential must still be sent"
         );
     }
 }

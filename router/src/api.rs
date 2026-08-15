@@ -28,7 +28,7 @@ use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
 use crate::{
     auth::{AuthenticatedKey, AuthenticationError, KeyAuthenticator},
-    config::{ResolvedRoute, TierCandidate, TierCatalog, load_tier_catalog},
+    config::{RequestNeeds, ResolvedRoute, TierCandidate, TierCatalog, load_tier_catalog},
     db::{
         AttemptRecord, AttemptTokens, RequestTelemetry, ReservationSize, ReservationSizing,
         SegmentClampStats, SettlementRecovery, UsageAdmission, UsageRecord, UsageSession,
@@ -1043,6 +1043,9 @@ async fn chat_completions(
             input_bytes: reservation_usage.prompt_tokens,
         },
         &services.health,
+        // Mechanical eligibility reads the same byte bound the cost ordering
+        // and admission do, so every one of them describes the same request.
+        &request.needs(reservation_usage.prompt_tokens),
     );
     let usage_session = admit_usage(
         &services.pool,
@@ -1119,12 +1122,13 @@ fn model_unresolvable(catalog: &TierCatalog, requested_model: &str) -> ApiError 
 ///
 /// Since stage 3b, `cost` orders ascending by expected cost basis —
 /// estimator-backed, with a whole-route fall-through to the identity while
-/// the segment is cold (`order_by_expected_cost`). `balanced` stays the
+/// the segment is cold (`order_by_expected_cost`), and since edge mode's
+/// stage 2, with $0 rungs ahead of all of it. `balanced` stays the
 /// identity — the tiers.toml order, the human-curated prior and the frozen
 /// control group. `success` stays the identity until its estimator and
 /// escalation machinery arrive in stage 5a.
 ///
-/// Health demotion applies last, in every mode: demoted rungs sink to the
+/// Health demotion applies next, in every mode: demoted rungs sink to the
 /// back — preserving table order within each group — and never disappear.
 /// Sinking replaces the recorded skip as demotion's first line (stage 2b
 /// shipped the skip while ordering belonged to this stage); the walk-time
@@ -1132,16 +1136,35 @@ fn model_unresolvable(catalog: &TierCatalog, requested_model: &str) -> ApiError 
 /// this ordering and the walk reaching it, and its never-below-one-candidate
 /// floor is unchanged. An all-demoted route partitions to itself, so this
 /// can never manufacture an empty route.
+///
+/// **Mechanical eligibility applies last and outermost** (edge mode, stage 2:
+/// `docs/design/edge-mode-local-rung.md`). A rung whose DECLARED capabilities
+/// cannot take this request — the prompt overflows its context window, the
+/// request needs tools it does not have — sinks behind every rung that can,
+/// whatever the mode preferred and whatever health thinks. It is outermost
+/// because the two verdicts differ in kind: a demoted rung is one that has
+/// been failing and might still work, while an ineligible rung is one the
+/// operator has told us cannot take this request at all. Preferring a
+/// might-work rung over a stated-cannot one is the right order, and it is what
+/// makes "the local rung overflows, so this request bursts to cloud" fall out
+/// of the existing failover machinery rather than needing a new refusal path.
+///
+/// Sinking, never removing — the same discipline as health, and for the same
+/// reason. An all-ineligible route partitions to itself, so a single-candidate
+/// tier still dispatches and still gets whatever answer the upstream gives,
+/// exactly as it does today. Nothing here can empty a route.
 fn order_candidates(
     priority: Priority,
     candidates: &mut Vec<ProviderCandidate>,
     estimates: &CostContext<'_>,
     health: &ProviderHealth,
+    needs: &RequestNeeds,
 ) {
     match priority {
         // Since 3b, cost orders by expected cost basis (cold-fallback:
-        // identity). balanced: identity by definition, the frozen control
-        // group. success: identity until its machinery arrives in 5a.
+        // identity), with $0 rungs first since edge mode's stage 2.
+        // balanced: identity by definition, the frozen control group.
+        // success: identity until its machinery arrives in 5a.
         Priority::Cost => order_by_expected_cost(candidates, estimates),
         Priority::Balanced | Priority::Success => {}
     }
@@ -1150,6 +1173,11 @@ fn order_candidates(
         .partition(|candidate| !health.should_skip(candidate.definition()));
     candidates.extend(healthy);
     candidates.extend(demoted);
+    let (able, unable): (Vec<_>, Vec<_>) = candidates
+        .drain(..)
+        .partition(|candidate| candidate.definition().metadata.can_serve(needs));
+    candidates.extend(able);
+    candidates.extend(unable);
 }
 
 /// The request-scoped inputs cost-mode ordering reads (design doc: Engine
@@ -1183,7 +1211,38 @@ struct CostContext<'a> {
 /// every candidate bills at the same tier sell rate (sell-price invariance),
 /// so this chooses ZeroRouter's COGS and the customer's odds, never the
 /// customer's price. Billing math stays in `Decimal` (`usage_cost`).
+///
+/// **$0 rungs come first, ahead of all of that** (edge mode, stage 2). Free is
+/// free at every prompt length and every output length, so a zero-cost rung
+/// needs no estimate to be known cheapest — and making it wait for one would
+/// be the cold-start circle at its worst: the whole reason a local rung exists
+/// is to serve traffic on a router that has never served any. That is why the
+/// $0 partition sits OUTSIDE the estimator's whole-route cold fallback rather
+/// than pricing free rungs at 0.0 inside it, where one cold priced rung would
+/// return the route to table order and take the free rung's advantage with it.
+///
+/// Free rungs keep their table order among themselves: they price identically,
+/// so there is nothing to sort on, and the operator's order is the only
+/// statement of preference available. A route with no $0 rung partitions to
+/// `priced` entirely and orders bit-for-bit as it did before this existed.
+///
+/// The predicate is [`TierCandidate::is_free`] — server-side configuration
+/// only, one definition, no input from the request.
 fn order_by_expected_cost(candidates: &mut Vec<ProviderCandidate>, estimates: &CostContext<'_>) {
+    let (free, mut priced): (Vec<_>, Vec<_>) = candidates
+        .drain(..)
+        .partition(|candidate| candidate.definition().is_free());
+    order_priced_by_expected_cost(&mut priced, estimates);
+    candidates.extend(free);
+    candidates.extend(priced);
+}
+
+/// Ascending expected cost basis over the rungs that cost something — the
+/// stage-3b ordering, unchanged, now that free rungs are handled ahead of it.
+fn order_priced_by_expected_cost(
+    candidates: &mut Vec<ProviderCandidate>,
+    estimates: &CostContext<'_>,
+) {
     let shared_fallback = match estimates.signature_cell {
         CellRead::Warm(percentiles) => Some(percentiles.p50),
         CellRead::Cold => None,
@@ -3262,6 +3321,351 @@ mod tests {
         assert_eq!(normalized.prompt_tokens, 1_000);
         assert_eq!(normalized.cached_input_tokens(), 900);
         assert_eq!(normalized.completion_tokens, 20);
+    }
+
+    // -----------------------------------------------------------------------
+    // Edge mode, stage 2: selection over a $0 local rung
+    // (`docs/design/edge-mode-local-rung.md`). These drive `order_candidates`
+    // directly, which is the whole of the policy — the walk that follows is
+    // unchanged and pinned elsewhere.
+    // -----------------------------------------------------------------------
+
+    /// A priced cloud rung: 1.00/2.00, with the wide window and tool support
+    /// every shipped candidate declares.
+    fn cloud_rung(id: &str) -> TierCandidate {
+        TierCandidate {
+            id: id.to_owned(),
+            provider: "openai".to_owned(),
+            model: format!("upstream/{id}"),
+            rates: ModelRates {
+                input_per_mtok: Some(1.0),
+                output_per_mtok: Some(2.0),
+                cached_input_per_mtok: Some(0.2),
+            },
+            metadata: ModelMetadata {
+                context_window: Some(1_000_000),
+                max_output_tokens: Some(128_000),
+                input_modalities: Some(vec!["text".to_owned(), "image".to_owned()]),
+                tool_call: Some(true),
+            },
+        }
+    }
+
+    /// A $0 local rung carrying `metadata` — the operator's declaration of
+    /// what their own server can take.
+    fn local_rung(id: &str, metadata: ModelMetadata) -> TierCandidate {
+        TierCandidate {
+            id: id.to_owned(),
+            provider: "local-llama".to_owned(),
+            model: format!("local/{id}"),
+            rates: ModelRates {
+                input_per_mtok: Some(0.0),
+                output_per_mtok: Some(0.0),
+                cached_input_per_mtok: None,
+            },
+            metadata,
+        }
+    }
+
+    /// What a local model typically declares: a small window, tools, text.
+    fn local_metadata() -> ModelMetadata {
+        ModelMetadata {
+            context_window: Some(32_000),
+            max_output_tokens: Some(4_096),
+            input_modalities: Some(vec!["text".to_owned()]),
+            tool_call: Some(true),
+        }
+    }
+
+    /// The candidate ids of a route after ordering, given the request's
+    /// mechanical needs and a health registry.
+    fn ordered(
+        priority: Priority,
+        definitions: Vec<TierCandidate>,
+        needs: &RequestNeeds,
+        health: &ProviderHealth,
+    ) -> Vec<String> {
+        let estimator = EstimatorState::default();
+        let signature = TaskSignature {
+            hex: "00112233aabbccdd".to_owned(),
+            scheme: 2,
+            tool_names_sha256: String::new(),
+        };
+        let mut candidates: Vec<ProviderCandidate> = definitions
+            .into_iter()
+            // Never dispatched: these tests order a route and read the order.
+            .map(|definition| {
+                ProviderCandidate::against_local_upstream(definition, "http://127.0.0.1:1/unused")
+            })
+            .collect();
+        order_candidates(
+            priority,
+            &mut candidates,
+            &CostContext {
+                estimator: &estimator,
+                signature: &signature,
+                // Cold: the state a router that has never served has, which is
+                // exactly when a local rung most needs to be chosen.
+                signature_cell: CellRead::Cold,
+                input_bytes: needs.prompt_bound,
+            },
+            health,
+            needs,
+        );
+        candidates
+            .iter()
+            .map(|candidate| candidate.definition().id.clone())
+            .collect()
+    }
+
+    /// A request that fits everything: small prompt, no tools, plain text.
+    fn modest_needs() -> RequestNeeds {
+        RequestNeeds {
+            prompt_bound: 1_000,
+            tools: false,
+            modalities: ["text".to_owned()].into_iter().collect(),
+        }
+    }
+
+    #[test]
+    fn a_zero_cost_rung_leads_cost_mode_on_a_cold_segment() {
+        // The $0 rung's whole point. The estimator is cold — no router that
+        // has just been stood up has anything else — and cost mode's
+        // expected-cost sort falls through to the table order in that state,
+        // so a free rung that waited for an estimate would sit second behind
+        // the cloud rung the table happens to list first. Free needs no
+        // estimate: it is cheapest at every prompt length.
+        assert_eq!(
+            ordered(
+                Priority::Cost,
+                vec![
+                    cloud_rung("openai/cloud"),
+                    local_rung("local/qwen", local_metadata())
+                ],
+                &modest_needs(),
+                &ProviderHealth::default(),
+            ),
+            ["local/qwen", "openai/cloud"]
+        );
+    }
+
+    #[test]
+    fn a_route_with_no_free_rung_orders_exactly_as_it_did_before() {
+        // The no-change contract for every deployment that has no local rung:
+        // with nothing free to partition out, cost mode is the stage-3b
+        // ordering unchanged — table order on a cold segment — and balanced
+        // is the identity it has always been.
+        for priority in [Priority::Cost, Priority::Balanced, Priority::Success] {
+            assert_eq!(
+                ordered(
+                    priority,
+                    vec![cloud_rung("openai/first"), cloud_rung("openai/second")],
+                    &modest_needs(),
+                    &ProviderHealth::default(),
+                ),
+                ["openai/first", "openai/second"],
+                "{priority:?} must not reorder a route with no $0 rung"
+            );
+        }
+    }
+
+    #[test]
+    fn balanced_keeps_the_operators_table_order_even_with_a_free_rung() {
+        // $0-first is a COST-mode rule. Balanced is the frozen control group —
+        // the table order is the operator's own statement of preference, and
+        // an operator who wants their local box tried first in balanced mode
+        // says so by writing it first. Silently overriding that would make the
+        // one mode that promises "the file decides" stop meaning it.
+        assert_eq!(
+            ordered(
+                Priority::Balanced,
+                vec![
+                    cloud_rung("openai/cloud"),
+                    local_rung("local/qwen", local_metadata())
+                ],
+                &modest_needs(),
+                &ProviderHealth::default(),
+            ),
+            ["openai/cloud", "local/qwen"]
+        );
+    }
+
+    #[test]
+    fn several_free_rungs_keep_their_table_order() {
+        // They price identically, so there is nothing to sort on and the
+        // operator's order is the only preference available.
+        assert_eq!(
+            ordered(
+                Priority::Cost,
+                vec![
+                    cloud_rung("openai/cloud"),
+                    local_rung("local/first", local_metadata()),
+                    local_rung("local/second", local_metadata()),
+                ],
+                &modest_needs(),
+                &ProviderHealth::default(),
+            ),
+            ["local/first", "local/second", "openai/cloud"]
+        );
+    }
+
+    #[test]
+    fn a_prompt_past_the_local_windows_bursts_to_cloud() {
+        // Mechanical eligibility, the context half. The local rung declares a
+        // 32k window and the request's prompt bound is over it, so the free
+        // rung sinks behind the cloud rung despite costing nothing — and the
+        // existing failover machinery does the rest. Note the bound is a BYTE
+        // bound, which over-counts tokens: the burst is deliberately early
+        // rather than deliberately truncating someone's prompt.
+        let needs = RequestNeeds {
+            prompt_bound: 40_000,
+            ..modest_needs()
+        };
+        assert_eq!(
+            ordered(
+                Priority::Cost,
+                vec![
+                    cloud_rung("openai/cloud"),
+                    local_rung("local/qwen", local_metadata())
+                ],
+                &needs,
+                &ProviderHealth::default(),
+            ),
+            ["openai/cloud", "local/qwen"]
+        );
+    }
+
+    #[test]
+    fn a_tool_call_the_local_rung_lacks_bursts_to_cloud() {
+        // The tools half, and the unknown-is-not-a-refusal rule beside it. A
+        // rung that DECLARED `tool_call = false` cannot take a request that
+        // brings tools. A rung that declared nothing is not excluded: absence
+        // means unknown, which is the state every candidate was in before the
+        // metadata table existed, and inventing a refusal from silence would
+        // route around models nobody has described yet.
+        let needs = RequestNeeds {
+            tools: true,
+            ..modest_needs()
+        };
+        let toolless = ModelMetadata {
+            tool_call: Some(false),
+            ..local_metadata()
+        };
+        assert_eq!(
+            ordered(
+                Priority::Cost,
+                vec![
+                    cloud_rung("openai/cloud"),
+                    local_rung("local/qwen", toolless)
+                ],
+                &needs,
+                &ProviderHealth::default(),
+            ),
+            ["openai/cloud", "local/qwen"]
+        );
+        assert_eq!(
+            ordered(
+                Priority::Cost,
+                vec![
+                    cloud_rung("openai/cloud"),
+                    local_rung("local/qwen", ModelMetadata::default()),
+                ],
+                &needs,
+                &ProviderHealth::default(),
+            ),
+            ["local/qwen", "openai/cloud"],
+            "an undeclared capability is unknown, not a refusal"
+        );
+    }
+
+    #[test]
+    fn a_down_local_rung_bursts_to_cloud() {
+        // "Local is down" is the health registry's job, unchanged: a 429 or a
+        // run of upstream errors demotes the rung and demotion sinks it behind
+        // the cloud rung. $0-first orders it ahead first; health moves it back;
+        // the walk then dispatches to the cloud rung. No new machinery.
+        let health = ProviderHealth::default();
+        let local = local_rung("local/qwen", local_metadata());
+        health.observe(&build_attempt(
+            1,
+            &local,
+            "rate_limited",
+            false,
+            Instant::now(),
+            AttemptTokens::unknown(),
+            false,
+            None,
+            None,
+        ));
+        assert_eq!(
+            ordered(
+                Priority::Cost,
+                vec![cloud_rung("openai/cloud"), local.clone()],
+                &modest_needs(),
+                &health,
+            ),
+            ["openai/cloud", "local/qwen"]
+        );
+    }
+
+    #[test]
+    fn an_ineligible_rung_sinks_behind_a_merely_demoted_one() {
+        // The two sinks are ordered, and the order is not arbitrary. A demoted
+        // rung has been failing and might still serve; an ineligible rung is
+        // one the operator has told us cannot take this request at all. So
+        // eligibility is the outer partition: prefer might-work over
+        // stated-cannot.
+        let health = ProviderHealth::default();
+        let demoted = cloud_rung("openai/cloud");
+        health.observe(&build_attempt(
+            1,
+            &demoted,
+            "rate_limited",
+            false,
+            Instant::now(),
+            AttemptTokens::unknown(),
+            false,
+            None,
+            None,
+        ));
+        let needs = RequestNeeds {
+            prompt_bound: 40_000,
+            ..modest_needs()
+        };
+        assert_eq!(
+            ordered(
+                Priority::Cost,
+                vec![local_rung("local/qwen", local_metadata()), demoted.clone()],
+                &needs,
+                &health,
+            ),
+            ["openai/cloud", "local/qwen"]
+        );
+    }
+
+    #[test]
+    fn a_route_whose_every_rung_is_ineligible_keeps_its_order() {
+        // Sinking, never removing. An all-ineligible route partitions to
+        // itself, so a request whose prompt overflows every declared window
+        // still dispatches and still gets whatever answer the upstream gives —
+        // today's behavior for a single-candidate tier, unchanged. Nothing
+        // here can empty a route.
+        let needs = RequestNeeds {
+            prompt_bound: 40_000,
+            ..modest_needs()
+        };
+        assert_eq!(
+            ordered(
+                Priority::Cost,
+                vec![
+                    local_rung("local/first", local_metadata()),
+                    local_rung("local/second", local_metadata()),
+                ],
+                &needs,
+                &ProviderHealth::default(),
+            ),
+            ["local/first", "local/second"]
+        );
     }
 
     fn walk_candidate(id: &str) -> TierCandidate {

@@ -1,0 +1,11 @@
+{
+  "providers": [
+    {
+      "key": "openai",
+      "adapter": "chat_completions",
+      "credential": "none",
+      "display_name": "definitely not OpenAI",
+      "base_url": "http://198.51.100.7:8080/v1/chat/completions"
+    }
+  ]
+}
