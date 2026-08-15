@@ -45,10 +45,19 @@ against whatever history the previous cells happened to leave behind — the
 first full run of this harness had a metered cell inherit ~26k rows from the
 free-lane cells and report a p50 of 792 ms that was really the cap scan, not
 the metered path. `run.sh` therefore TRUNCATEs `usage_events` +
-`usage_reservations` (and CHECKPOINTs) before every measured ZeroRouter cell,
-and the history-growth cost is measured deliberately instead by
-`./run.sh history` (sequential latency with an empty month vs. 30k seeded
-rows), reported in REPORT.md.
+`usage_reservations` + `request_attempts` + `usage_key_month_spend` (and
+CHECKPOINTs) before every measured ZeroRouter cell, and the history-growth
+cost is measured deliberately instead by `./run.sh history` (sequential
+latency with an empty month vs. 30k seeded rows), reported in REPORT.md.
+
+Migration 0019 made month-to-date spend a trigger-maintained rollup
+(`usage_key_month_spend`) that refuses direct writes and TRUNCATE. The reset
+bypasses those guards in replica mode — the restore-shaped bypass 0019's own
+comments document — and truncates the rollup **together with** the ledger, so
+the "rebuild the rollup from usage_events after a bypass" rule is satisfied
+trivially (empty ledger, empty rollup). `./run.sh history` seeds through
+ordinary origin-mode INSERTs, so the accrual trigger populates the rollup
+exactly as production writes do (and the seed asserts the accrued total).
 
 ## The integrity gate (`./run.sh verify`)
 
