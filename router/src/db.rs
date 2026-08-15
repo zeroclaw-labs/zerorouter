@@ -909,6 +909,13 @@ pub async fn migrate(pool: &PgPool) -> Result<()> {
                 Cow::Borrowed(include_str!("../migrations/0018_autopay_withheld.sql")),
                 false,
             ),
+            Migration::new(
+                19,
+                Cow::Borrowed("monthly spend rollup"),
+                MigrationType::Simple,
+                Cow::Borrowed(include_str!("../migrations/0019_monthly_spend_rollup.sql")),
+                false,
+            ),
         ]),
         ignore_missing: false,
         locking: true,
@@ -1236,65 +1243,106 @@ pub async fn begin_usage_session(
 
     // Settled usage, aggregated across EVERY key the user owns (disabled ones
     // included — a disabled key's history is still the user's spend) and, in
-    // the same scan, restricted to the presenting key so the per-key ceiling
+    // the same pass, restricted to the presenting key so the per-key ceiling
     // can be checked without a second round trip.
     //
-    // Access path, measured on 500k `usage_events` with a 20-key user holding
-    // 50k of them: nested loop over `api_keys_user_id_idx` (0001), then one
-    // per-key range scan of `usage_events_key_timestamp_idx (api_key_id, ts
-    // DESC)` (0001). No sequential scan, so the existing indexes serve this and
-    // no new one is needed. The cost that DOES grow is row count — the scan
-    // reads a user's whole month-to-date history (~14 ms for 30k rows here).
-    // If that ever gets hot, the measured fix is widening the 0001 index to
-    // INCLUDE (cost_usd, input_tokens, output_tokens), which turns it into an
-    // index-only scan (0 heap fetches, ~5 ms for the same 30k rows).
+    // # Access path
+    //
+    // Two ceilings with two different shapes, so they read from two different
+    // places — still one statement and one round trip, and still one snapshot,
+    // because `NOW()` is transaction-stable and both halves see the same one.
+    //
+    // SPEND is month-to-date, and reading it from `usage_events` meant scanning
+    // every row the user had produced this month, on EVERY request and on BOTH
+    // lanes. Measured on 523k events with a 20-key user, p50 by that user's
+    // month-to-date row count: 0 -> 0.50 ms, 1k -> 0.70 ms, 10k -> 5.26 ms,
+    // 30k -> 14.69 ms. That is ~0.47 us/row of pure admission latency that
+    // grows all month and resets on the 1st: a customer's own history is what
+    // makes their next request slow. It now reads `usage_key_month_spend`
+    // (migration 0019), a per-(key, month) running total accrued by trigger as
+    // events are inserted, so the read is one index probe per key the user
+    // owns rather than one row per request they have made. Same measurement:
+    // 0.27 / 0.28 / 0.27 / 0.26 ms — flat, and 57x faster at 30k rows.
+    //
+    // An earlier note here proposed widening 0001's index to
+    // INCLUDE (cost_usd, input_tokens, output_tokens) for an index-only scan
+    // instead. That was measured and rejected on two counts. As written it does
+    // not even produce an index-only scan — the aggregate also reads
+    // `cached_input_tokens`, which the list omits, so the plan stays a bitmap
+    // heap scan touching 24,854 heap blocks. Corrected to cover all four
+    // payload columns it does reach `Heap Fetches: 0` and halves the time
+    // (14.69 -> 7.29 ms at 30k), but the cost stays linear in the user's month
+    // at ~0.23 us/row, which moves the row count where the problem returns
+    // rather than removing it.
+    //
+    // VELOCITY is a sliding one-minute window, which no monthly bucket can
+    // answer and which does not need one: the window is bounded by throughput,
+    // not by history, so `usage_events_key_timestamp_idx (api_key_id, ts DESC)`
+    // (0001) answers it as a short per-key range scan whose heap fetches are
+    // bounded by one minute of that user's traffic. No new index is added for
+    // it, deliberately — see 0019 on why claiming an index-only scan over a hot
+    // append-only table would have been a plan that quietly degrades back to
+    // heap fetches for exactly the busiest users, whose freshest rows are the
+    // ones the visibility map has not caught up with yet.
+    //
+    // # Why the ceilings still bind on exactly the same values
+    //
+    // `usage_key_month_spend` is keyed by the UTC month of the event's `ts`,
+    // and this reads every bucket from the current month UPWARD rather than
+    // just the current one. That `>=` is load-bearing: the predicate it
+    // replaces was `ts >= <start of this month>`, which counted a row whose ts
+    // landed in a later month (two routers with clocks skewed across a month
+    // boundary), so dropping it would have narrowed what the cap enforces.
+    // Migration 0019 carries the proof that the two select the same set of
+    // events for every possible `ts`.
     let (user_monthly_spend, user_recent_tokens, monthly_spend, recent_tokens) =
         sqlx::query_as::<_, (Decimal, i64, Decimal, i64)>(
             r#"
         SELECT
-            COALESCE(
-                SUM(usage_events.cost_usd) FILTER (
-                    WHERE usage_events.ts
-                        >= date_trunc('month', NOW() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'
-                ),
-                0
-            ) AS user_monthly_spend,
-            COALESCE(
-                SUM(
-                    usage_events.input_tokens::BIGINT
-                        - usage_events.cached_input_tokens::BIGINT
-                        + usage_events.output_tokens::BIGINT
-                ) FILTER (
-                    WHERE usage_events.ts >= NOW() - INTERVAL '1 minute'
-                ),
-                0
-            )::BIGINT AS user_recent_tokens,
-            COALESCE(
-                SUM(usage_events.cost_usd) FILTER (
-                    WHERE usage_events.api_key_id = $2
-                      AND usage_events.ts
-                        >= date_trunc('month', NOW() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'
-                ),
-                0
-            ) AS monthly_spend,
-            COALESCE(
-                SUM(
-                    usage_events.input_tokens::BIGINT
-                        - usage_events.cached_input_tokens::BIGINT
-                        + usage_events.output_tokens::BIGINT
-                ) FILTER (
-                    WHERE usage_events.api_key_id = $2
-                      AND usage_events.ts >= NOW() - INTERVAL '1 minute'
-                ),
-                0
-            )::BIGINT AS recent_tokens
-        FROM usage_events
-        INNER JOIN api_keys ON api_keys.id = usage_events.api_key_id
-        WHERE api_keys.user_id = $1
-          AND usage_events.ts >= LEAST(
-              date_trunc('month', NOW() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC',
-              NOW() - INTERVAL '1 minute'
-          )
+            COALESCE(spend.user_monthly_spend, 0) AS user_monthly_spend,
+            COALESCE(velocity.user_recent_tokens, 0)::BIGINT AS user_recent_tokens,
+            COALESCE(spend.monthly_spend, 0) AS monthly_spend,
+            COALESCE(velocity.recent_tokens, 0)::BIGINT AS recent_tokens
+        FROM
+            (
+                SELECT
+                    COALESCE(SUM(rollup.spend_usd), 0) AS user_monthly_spend,
+                    COALESCE(
+                        SUM(rollup.spend_usd) FILTER (
+                            WHERE rollup.api_key_id = $2
+                        ),
+                        0
+                    ) AS monthly_spend
+                FROM usage_key_month_spend AS rollup
+                INNER JOIN api_keys ON api_keys.id = rollup.api_key_id
+                WHERE api_keys.user_id = $1
+                  AND rollup.month >= usage_event_utc_month(NOW())
+            ) AS spend,
+            (
+                SELECT
+                    COALESCE(
+                        SUM(
+                            usage_events.input_tokens::BIGINT
+                                - usage_events.cached_input_tokens::BIGINT
+                                + usage_events.output_tokens::BIGINT
+                        ),
+                        0
+                    )::BIGINT AS user_recent_tokens,
+                    COALESCE(
+                        SUM(
+                            usage_events.input_tokens::BIGINT
+                                - usage_events.cached_input_tokens::BIGINT
+                                + usage_events.output_tokens::BIGINT
+                        ) FILTER (
+                            WHERE usage_events.api_key_id = $2
+                        ),
+                        0
+                    )::BIGINT AS recent_tokens
+                FROM usage_events
+                INNER JOIN api_keys ON api_keys.id = usage_events.api_key_id
+                WHERE api_keys.user_id = $1
+                  AND usage_events.ts >= NOW() - INTERVAL '1 minute'
+            ) AS velocity
         "#,
         )
         .bind(key.user_id)
