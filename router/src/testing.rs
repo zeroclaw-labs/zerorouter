@@ -17,8 +17,8 @@ use std::{
 };
 
 use crate::provider::{
-    ChatRequest, ChatResponse, ModelProvider, StreamChunk, StreamError, StreamEvent, StreamOptions,
-    StreamResult, TokenUsage, ToolCall,
+    ChatRequest, ChatResponse, ModelProvider, StopReason, StreamChunk, StreamError, StreamEvent,
+    StreamFinal, StreamOptions, StreamResult, TokenUsage, ToolCall,
 };
 use async_trait::async_trait;
 use futures_util::{
@@ -48,6 +48,9 @@ pub enum FakeOutcome {
         /// only this is a non-empty response, which is what the shape label has
         /// to see.
         reasoning_content: Option<String>,
+        /// The upstream's OWN stop reason. `None` scripts an upstream that
+        /// reported none, which is the case the synthesis path still handles.
+        stop_reason: Option<StopReason>,
     },
     /// A transport-shaped failure that the retry loop treats as retryable.
     Transport,
@@ -74,6 +77,7 @@ impl FakeOutcome {
             tool_calls: Vec::new(),
             usage: Some(usage),
             reasoning_content: None,
+            stop_reason: None,
         }
     }
 
@@ -86,7 +90,18 @@ impl FakeOutcome {
             tool_calls: Vec::new(),
             usage: Some(usage),
             reasoning_content: Some(reasoning.to_owned()),
+            stop_reason: None,
         }
+    }
+
+    /// The same completion, but from an upstream that reported its OWN stop
+    /// reason — the case where the real value wins over the synthesis.
+    #[must_use]
+    pub fn with_stop_reason(mut self, reason: StopReason) -> Self {
+        if let Self::Chat { stop_reason, .. } = &mut self {
+            *stop_reason = Some(reason);
+        }
+        self
     }
 }
 
@@ -104,7 +119,12 @@ pub enum FakeStreamStep {
     Usage(TokenUsage),
     Error(String),
     Stall(Duration),
+    /// A terminal carrying no upstream claims — the shape every pre-existing
+    /// script means.
     Final,
+    /// A terminal carrying what the upstream said on its way out: its own stop
+    /// reason, and/or why it had no usage to report.
+    FinalWith(StreamFinal),
 }
 
 impl FakeStreamStep {
@@ -266,11 +286,13 @@ impl ModelProvider for FakeModelProvider {
                 tool_calls,
                 usage,
                 reasoning_content,
+                stop_reason,
             }) => Ok(ChatResponse {
                 text,
                 tool_calls,
                 usage,
                 reasoning_content,
+                stop_reason,
             }),
             Some(FakeOutcome::Transport) => Err(anyhow::anyhow!(TRANSPORT_FAILURE)),
             Some(FakeOutcome::RateLimited) => Err(anyhow::anyhow!(RATE_LIMIT_FAILURE)),
@@ -323,7 +345,8 @@ impl ModelProvider for FakeModelProvider {
                     }
                     FakeStreamStep::Tool(call) => Ok(StreamEvent::ToolCall(call)),
                     FakeStreamStep::Usage(usage) => Ok(StreamEvent::Usage(usage)),
-                    FakeStreamStep::Final => Ok(StreamEvent::Final),
+                    FakeStreamStep::Final => Ok(StreamEvent::Final(StreamFinal::empty())),
+                    FakeStreamStep::FinalWith(final_) => Ok(StreamEvent::Final(final_)),
                     FakeStreamStep::Error(detail) => Err(StreamError::Http(detail)),
                 };
                 return Some((event, steps));

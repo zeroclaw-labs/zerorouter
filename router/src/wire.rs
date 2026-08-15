@@ -11,6 +11,18 @@
 //! owned here are billing-grade by construction: usage extraction is the
 //! point, not an afterthought.
 //!
+//! The stop-reason half of that debt is paid: `ChatResponse::stop_reason` and
+//! `StreamFinal::stop_reason` carry the upstream's OWN reason, normalized to
+//! the OpenAI vocabulary by each wire, and `content_filter` is observable for
+//! the first time. Absence stays absent — an unmapped value is reported as
+//! `None` rather than guessed — and the synthesis in `openai::finish_reason`
+//! still covers exactly that case, with
+//! `usage_events.finish_reason_source` ('upstream' vs 'synthetic') keeping the
+//! two cohorts separable. This changed no billing: nothing in the crate
+//! branches on a finish reason (see `openai::AttemptFinishReason` for the
+//! divergence table and why every row's served/billed column reads
+//! "unchanged").
+//!
 //! Scope discipline: these clients serve ZEROROUTER's traffic, not
 //! zeroclaw-general. ZeroRouter's compat layer rejects structured content
 //! and never emits multimodal markers, so the input builder handles exactly
@@ -91,8 +103,9 @@ use std::time::Duration;
 
 use crate::provider::ChatMessage;
 use crate::provider::{
-    ChatRequest, ChatResponse, ModelProvider, ProviderCapabilities, StreamChunk, StreamError,
-    StreamEvent, StreamOptions, StreamResult, TokenUsage, ToolCall,
+    ChatRequest, ChatResponse, ModelProvider, ProviderCapabilities, StopReason, StreamChunk,
+    StreamError, StreamEvent, StreamFinal, StreamOptions, StreamResult, TokenUsage, ToolCall,
+    UsageGap,
 };
 use anyhow::anyhow;
 use async_trait::async_trait;
@@ -539,12 +552,57 @@ fn parse_envelope(envelope: ResponsesEnvelope) -> ChatResponse {
     } else {
         Some(text_parts.join(""))
     };
-    let _ = (&envelope.status, &envelope.incomplete_details);
+    let stop_reason = responses_stop_reason(
+        envelope.status.as_deref(),
+        envelope.incomplete_details.as_ref(),
+        !tool_calls.is_empty(),
+    );
     ChatResponse {
         text,
         tool_calls,
         usage: envelope.usage.and_then(ResponsesUsage::into_token_usage),
         reasoning_content: None,
+        stop_reason,
+    }
+}
+
+/// The Responses API's terminal state, normalized to the router's vocabulary.
+///
+/// This dialect splits across two fields what the chat dialect says in one:
+/// `status` says whether the run finished, and `incomplete_details.reason`
+/// says why it did not. The mapping:
+///
+/// * `incomplete` + `max_output_tokens` → [`StopReason::Length`]. The clipped
+///   answer the router previously had to INFER from token arithmetic.
+/// * `incomplete` + `content_filter` → [`StopReason::ContentFilter`], a state
+///   this module's header records as structurally unobservable before now.
+/// * `completed` → [`StopReason::ToolCalls`] when the output carried function
+///   calls, else [`StopReason::Stop`]. A completed run that emitted tool calls
+///   is exactly what the chat dialect spells `tool_calls`, and reporting it as
+///   `stop` would make the two wires disagree about the same event.
+/// * anything else — `failed`, `in_progress`, an absent status, an unmapped
+///   incomplete reason — is `None`. A run the router cannot classify has no
+///   real stop reason, and the synthesis path handles it unchanged.
+fn responses_stop_reason(
+    status: Option<&str>,
+    incomplete_details: Option<&Value>,
+    has_tool_calls: bool,
+) -> Option<StopReason> {
+    match status {
+        Some("completed") => Some(if has_tool_calls {
+            StopReason::ToolCalls
+        } else {
+            StopReason::Stop
+        }),
+        Some("incomplete") => match incomplete_details
+            .and_then(|details| details.get("reason"))
+            .and_then(Value::as_str)
+        {
+            Some("max_output_tokens") => Some(StopReason::Length),
+            Some("content_filter") => Some(StopReason::ContentFilter),
+            _ => None,
+        },
+        _ => None,
     }
 }
 
@@ -655,6 +713,11 @@ impl ModelProvider for OpenAiResponsesWire {
             let mut raw_buffer: Vec<u8> = Vec::new();
             let mut buffer = String::new();
             let mut finished = false;
+            // Whether this stream emitted any function call, which is what
+            // separates a completed run's `tool_calls` terminal from its
+            // `stop` one — the buffered path reads the same fact off the
+            // assembled output items.
+            let mut saw_tool_call = false;
             while let Some(chunk) = bytes.next().await {
                 let chunk = chunk.map_err(|error| StreamError::Http(error.to_string()))?;
                 for data in drain_sse_payloads(&mut raw_buffer, &mut buffer, &chunk)? {
@@ -680,6 +743,7 @@ impl ModelProvider for OpenAiResponsesWire {
                                 && item.get("type").and_then(Value::as_str)
                                     == Some("function_call")
                             {
+                                saw_tool_call = true;
                                 yield StreamEvent::ToolCall(ToolCall {
                                     id: item
                                         .get("call_id")
@@ -724,7 +788,21 @@ impl ModelProvider for OpenAiResponsesWire {
                                 yield StreamEvent::Usage(usage);
                             }
                             finished = true;
-                            yield StreamEvent::Final;
+                            // Read from the SAME two fields the buffered path
+                            // reads, off the response object this terminal
+                            // event carries, so a clip reports `length` here
+                            // exactly as it does there.
+                            let response = value.get("response");
+                            yield StreamEvent::Final(StreamFinal::with_stop_reason(
+                                responses_stop_reason(
+                                    response
+                                        .and_then(|response| response.get("status"))
+                                        .and_then(Value::as_str),
+                                    response
+                                        .and_then(|response| response.get("incomplete_details")),
+                                    saw_tool_call,
+                                ),
+                            ));
                         }
                         Some("response.failed" | "error") => {
                             let error_value = value
@@ -1133,6 +1211,33 @@ struct MessagesEnvelope {
     content: Vec<Value>,
     #[serde(default)]
     usage: Option<AnthropicUsage>,
+    /// Anthropic's own word for why generation ended. Not deserialized at all
+    /// before the router had anywhere to put it.
+    #[serde(default)]
+    stop_reason: Option<String>,
+}
+
+/// Anthropic's stop vocabulary, normalized to the router's.
+///
+/// * `end_turn` / `stop_sequence` → [`StopReason::Stop`]. A stop sequence is
+///   still the model finishing on its own; OpenAI reports both as `stop`.
+/// * `max_tokens` → [`StopReason::Length`].
+/// * `tool_use` → [`StopReason::ToolCalls`].
+/// * `refusal` → [`StopReason::ContentFilter`]. Anthropic's refusal stop is
+///   the model's safety layer declining to produce the output, which is what
+///   `content_filter` names on the OpenAI side.
+/// * anything else — notably `pause_turn`, which means a server-tool turn is
+///   to be CONTINUED rather than ended — is `None`. Mapping a pause onto any
+///   of the four would assert a completion that did not happen; absent is the
+///   honest answer and the synthesis path handles it unchanged.
+fn anthropic_stop_reason(stop_reason: Option<&str>) -> Option<StopReason> {
+    match stop_reason? {
+        "end_turn" | "stop_sequence" => Some(StopReason::Stop),
+        "max_tokens" => Some(StopReason::Length),
+        "tool_use" => Some(StopReason::ToolCalls),
+        "refusal" => Some(StopReason::ContentFilter),
+        _ => None,
+    }
 }
 
 fn parse_messages_envelope(envelope: MessagesEnvelope) -> ChatResponse {
@@ -1172,11 +1277,13 @@ fn parse_messages_envelope(envelope: MessagesEnvelope) -> ChatResponse {
     } else {
         Some(text_parts.join(""))
     };
+    let stop_reason = anthropic_stop_reason(envelope.stop_reason.as_deref());
     ChatResponse {
         text,
         tool_calls,
         usage: envelope.usage.and_then(AnthropicUsage::into_token_usage),
         reasoning_content: None,
+        stop_reason,
     }
 }
 
@@ -1207,6 +1314,9 @@ struct AnthropicStreamMachine {
     /// Cumulative tool-argument bytes across the whole stream.
     tool_argument_bytes: usize,
     count_tokens: bool,
+    /// Anthropic's own stop reason, which arrives on `message_delta` — one
+    /// event BEFORE the `message_stop` terminal that carries it out.
+    stop_reason: Option<StopReason>,
     finished: bool,
 }
 
@@ -1361,6 +1471,18 @@ impl AnthropicStreamMachine {
             }
             Some("message_delta") => {
                 self.absorb_usage(value.get("usage"));
+                // Last writer wins: the field is stated once in a conforming
+                // stream, and a later restatement is the upstream's most
+                // recent word either way. An unmappable value leaves the slot
+                // alone rather than clearing a reason already seen.
+                if let Some(reason) = anthropic_stop_reason(
+                    value
+                        .get("delta")
+                        .and_then(|delta| delta.get("stop_reason"))
+                        .and_then(Value::as_str),
+                ) {
+                    self.stop_reason = Some(reason);
+                }
             }
             Some("message_stop") => {
                 // Idempotent terminal: a chunk carrying two message_stop
@@ -1377,7 +1499,9 @@ impl AnthropicStreamMachine {
                     events.push(StreamEvent::Usage(usage));
                 }
                 self.finished = true;
-                events.push(StreamEvent::Final);
+                events.push(StreamEvent::Final(StreamFinal::with_stop_reason(
+                    self.stop_reason,
+                )));
             }
             Some("error") => {
                 let error = value.get("error");
@@ -1901,29 +2025,7 @@ fn parse_chat_tool_call(call: &Value) -> ToolCall {
     }
 }
 
-/// Note a finish reason the router cannot otherwise observe.
-///
-/// `content_filter` is named in this module's header as a state the pinned
-/// adapters made structurally unobservable, and `length` is a clipped answer
-/// the router currently INFERS from token arithmetic (`openai::finish_reason`)
-/// rather than reads from what the upstream said. This wire reads both from
-/// the real field. Carrying them further — into `ChatResponse`, and so into
-/// `openai::finish_reason` and `request_attempts.finish_reason_source`, which
-/// is hardcoded `"synthetic"` today — means changing the shared provider
-/// contract and `openai::shape_ok`, whose verdict decides whether an attempt
-/// is served or retried. That is a money-path decision rather than part of
-/// adding a wire, so the value is logged here and left for its own change.
-fn note_finish_reason(alias: &str, finish_reason: Option<&str>) {
-    if let Some(reason @ ("content_filter" | "length")) = finish_reason {
-        tracing::debug!(
-            provider = alias,
-            finish_reason = reason,
-            "upstream reported a finish_reason the router does not yet carry"
-        );
-    }
-}
-
-fn parse_chat_completions_envelope(alias: &str, envelope: ChatCompletionsEnvelope) -> ChatResponse {
+fn parse_chat_completions_envelope(envelope: ChatCompletionsEnvelope) -> ChatResponse {
     // `n` is not a field ZeroRouter's compat surface accepts (it lands in
     // `extra` and is 400-rejected as an unsupported extension), so a
     // conforming response has exactly one choice. Reading the first rather
@@ -1931,12 +2033,14 @@ fn parse_chat_completions_envelope(alias: &str, envelope: ChatCompletionsEnvelop
     // interleaving two answers into one.
     let choice = envelope.choices.first();
     let message = choice.and_then(|choice| choice.get("message"));
-    note_finish_reason(
-        alias,
-        choice
-            .and_then(|choice| choice.get("finish_reason"))
-            .and_then(Value::as_str),
-    );
+    // This dialect already speaks the router's vocabulary, so normalization is
+    // a parse rather than a translation. The value used to be logged and
+    // dropped here (`note_finish_reason`); it is carried and persisted now, so
+    // the log said only that the router was throwing it away.
+    let stop_reason = choice
+        .and_then(|choice| choice.get("finish_reason"))
+        .and_then(Value::as_str)
+        .and_then(StopReason::from_openai);
     let text = message
         .and_then(|message| message.get("content"))
         .and_then(Value::as_str)
@@ -1963,6 +2067,7 @@ fn parse_chat_completions_envelope(alias: &str, envelope: ChatCompletionsEnvelop
             .usage
             .and_then(ChatCompletionsUsage::into_token_usage),
         reasoning_content,
+        stop_reason,
     }
 }
 
@@ -2130,14 +2235,14 @@ impl ChatCompletionsStreamMachine {
     /// looks like. Folding the second into the first would let a fleet-wide
     /// middlebox quietly erase revenue while looking like a known,
     /// tolerated limitation.
-    fn usage_gap(&self) -> Option<&'static str> {
+    fn usage_gap(&self) -> Option<UsageGap> {
         if self.usage_reported {
             return None;
         }
         Some(if self.saw_done {
-            "include_usage_ignored"
+            UsageGap::IncludeUsageIgnored
         } else {
-            "done_missing"
+            UsageGap::DoneMissing
         })
     }
 
@@ -2285,7 +2390,6 @@ impl ChatCompletionsStreamMachine {
             }
         }
         if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
-            note_finish_reason(alias, Some(reason));
             self.finish_reason = Some(reason.to_owned());
         }
         Ok(events)
@@ -2410,7 +2514,17 @@ impl ChatCompletionsStreamMachine {
             events.push(StreamEvent::Usage(usage));
         }
         self.finished = true;
-        events.push(StreamEvent::Final);
+        // Both facts ride the terminal. `usage_gap` is read AFTER
+        // `partial_usage` deliberately — it answers from `usage_reported`,
+        // which the take does not disturb, so the label is the same either
+        // way and the ordering here is the one the gap's own doc describes.
+        events.push(StreamEvent::Final(StreamFinal {
+            stop_reason: self
+                .finish_reason
+                .as_deref()
+                .and_then(StopReason::from_openai),
+            usage_gap: self.usage_gap(),
+        }));
         events
     }
 }
@@ -2474,7 +2588,7 @@ impl ModelProvider for ChatCompletionsWire {
                 self.alias
             )
         })?;
-        Ok(parse_chat_completions_envelope(&self.alias, envelope))
+        Ok(parse_chat_completions_envelope(envelope))
     }
 
     fn stream_chat(
@@ -2575,15 +2689,15 @@ impl ModelProvider for ChatCompletionsWire {
                     // way. It must not settle behind the same label as a
                     // server that merely ignores `include_usage`.
                     match machine.usage_gap() {
-                        Some(gap @ "done_missing") => tracing::warn!(
+                        Some(gap @ UsageGap::DoneMissing) => tracing::warn!(
                             provider = %alias,
-                            usage_gap = gap,
+                            usage_gap = gap.as_str(),
                             "chat completions stream closed without [DONE] and without usage; \
                              settling unbilled"
                         ),
                         gap => tracing::debug!(
                             provider = %alias,
-                            usage_gap = gap.unwrap_or("none"),
+                            usage_gap = gap.map_or("none", UsageGap::as_str),
                             "chat completions stream closed after finish_reason without [DONE]"
                         ),
                     }
@@ -2695,6 +2809,80 @@ mod tests {
         assert!(
             response.usage.is_none(),
             "no usage on the wire = None; downstream policy decides"
+        );
+    }
+
+    /// The Responses dialect's terminal state, normalized. `status` and
+    /// `incomplete_details` were read and discarded (`let _ = ...`) before the
+    /// provider contract had anywhere to carry a real stop reason.
+    #[test]
+    fn responses_terminal_states_normalize_to_the_router_vocabulary() {
+        let table = [
+            // (status, incomplete reason, has tool calls, expected)
+            (Some("completed"), None, false, Some(StopReason::Stop)),
+            (Some("completed"), None, true, Some(StopReason::ToolCalls)),
+            (
+                Some("incomplete"),
+                Some("max_output_tokens"),
+                false,
+                Some(StopReason::Length),
+            ),
+            (
+                Some("incomplete"),
+                Some("content_filter"),
+                false,
+                Some(StopReason::ContentFilter),
+            ),
+            // A clip is a clip whether or not tool calls were emitted: the
+            // incomplete reason is the upstream's own word and outranks the
+            // presence of output items.
+            (
+                Some("incomplete"),
+                Some("max_output_tokens"),
+                true,
+                Some(StopReason::Length),
+            ),
+            // Absent stays absent — never guessed into `stop`.
+            (Some("incomplete"), None, false, None),
+            (Some("incomplete"), Some("something_new"), false, None),
+            (Some("failed"), None, false, None),
+            (Some("in_progress"), None, false, None),
+            (None, None, false, None),
+        ];
+        for (status, reason, has_tool_calls, expected) in table {
+            let details = reason.map(|reason| json!({"reason": reason}));
+            assert_eq!(
+                responses_stop_reason(status, details.as_ref(), has_tool_calls),
+                expected,
+                "status={status:?} reason={reason:?} tools={has_tool_calls}"
+            );
+        }
+    }
+
+    #[test]
+    fn responses_envelope_carries_the_real_stop_reason() {
+        let envelope: ResponsesEnvelope = serde_json::from_value(json!({
+            "status": "incomplete",
+            "incomplete_details": {"reason": "max_output_tokens"},
+            "output": [{"type": "message",
+                        "content": [{"type": "output_text", "text": "clipped"}]}]
+        }))
+        .expect("envelope parses");
+        assert_eq!(
+            parse_envelope(envelope).stop_reason,
+            Some(StopReason::Length),
+            "a max_output_tokens clip is the upstream's own word, not token arithmetic"
+        );
+    }
+
+    #[test]
+    fn responses_envelope_without_a_status_reports_no_stop_reason() {
+        let envelope: ResponsesEnvelope =
+            serde_json::from_value(json!({"output": []})).expect("envelope parses");
+        assert_eq!(
+            parse_envelope(envelope).stop_reason,
+            None,
+            "absent stays None so the synthesis path still runs"
         );
     }
 
@@ -3007,6 +3195,88 @@ mod anthropic_tests {
         assert!(parse_messages_envelope(envelope).usage.is_none());
     }
 
+    /// Anthropic's stop vocabulary, normalized. `stop_reason` was not even
+    /// deserialized off this envelope before the contract could carry it.
+    #[test]
+    fn anthropic_stop_reasons_normalize_to_the_router_vocabulary() {
+        let table = [
+            (Some("end_turn"), Some(StopReason::Stop)),
+            // A stop sequence is still the model ending on its own; OpenAI
+            // reports both as `stop`.
+            (Some("stop_sequence"), Some(StopReason::Stop)),
+            (Some("max_tokens"), Some(StopReason::Length)),
+            (Some("tool_use"), Some(StopReason::ToolCalls)),
+            (Some("refusal"), Some(StopReason::ContentFilter)),
+            // `pause_turn` means a server-tool turn is to be CONTINUED, not
+            // ended. Mapping it onto any of the four would assert a completion
+            // that did not happen.
+            (Some("pause_turn"), None),
+            (Some("something_new"), None),
+            (None, None),
+        ];
+        for (reported, expected) in table {
+            assert_eq!(
+                anthropic_stop_reason(reported),
+                expected,
+                "stop_reason={reported:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn anthropic_envelope_carries_the_real_stop_reason() {
+        let envelope: MessagesEnvelope = serde_json::from_value(json!({
+            "content": [{"type": "text", "text": "clipped"}],
+            "stop_reason": "max_tokens",
+        }))
+        .expect("envelope parses");
+        assert_eq!(
+            parse_messages_envelope(envelope).stop_reason,
+            Some(StopReason::Length)
+        );
+    }
+
+    #[test]
+    fn anthropic_envelope_without_a_stop_reason_reports_none() {
+        let envelope: MessagesEnvelope =
+            serde_json::from_value(json!({"content": []})).expect("envelope parses");
+        assert_eq!(parse_messages_envelope(envelope).stop_reason, None);
+    }
+
+    /// The streaming half: Anthropic states `stop_reason` on `message_delta`,
+    /// one event BEFORE the `message_stop` terminal that has to carry it out.
+    #[test]
+    fn anthropic_stream_terminal_carries_the_stop_reason_from_message_delta() {
+        let mut machine = AnthropicStreamMachine::new(false);
+        machine
+            .handle(
+                "anthropic",
+                &json!({"type": "message_delta",
+                        "delta": {"stop_reason": "max_tokens"},
+                        "usage": {"output_tokens": 40}}),
+            )
+            .expect("message_delta is not an error");
+        let events = machine
+            .handle("anthropic", &json!({"type": "message_stop"}))
+            .expect("message_stop is not an error");
+        let Some(StreamEvent::Final(terminal)) = events.last() else {
+            panic!("message_stop must yield the terminal");
+        };
+        assert_eq!(terminal.stop_reason, Some(StopReason::Length));
+    }
+
+    #[test]
+    fn anthropic_stream_without_a_stop_reason_terminates_with_none() {
+        let mut machine = AnthropicStreamMachine::new(false);
+        let events = machine
+            .handle("anthropic", &json!({"type": "message_stop"}))
+            .expect("message_stop is not an error");
+        let Some(StreamEvent::Final(terminal)) = events.last() else {
+            panic!("message_stop must yield the terminal");
+        };
+        assert_eq!(terminal.stop_reason, None);
+    }
+
     #[test]
     fn stream_machine_assembles_the_documented_event_grammar() {
         let mut machine = AnthropicStreamMachine::new(false);
@@ -3049,7 +3319,7 @@ mod anthropic_tests {
                     StreamEvent::TextDelta(chunk) => text.push_str(&chunk.delta),
                     StreamEvent::ToolCall(call) => tool_calls.push(call),
                     StreamEvent::Usage(u) => usage = Some(u),
-                    StreamEvent::Final => finals += 1,
+                    StreamEvent::Final(_) => finals += 1,
                 }
             }
         }
@@ -3314,6 +3584,9 @@ mod chat_completions_tests {
         tool_calls: Vec<ToolCall>,
         usage: Vec<TokenUsage>,
         finals: usize,
+        /// What the last terminal carried out — the upstream's own stop reason
+        /// and its usage-gap label.
+        terminal: StreamFinal,
     }
 
     fn run(machine: &mut ChatCompletionsStreamMachine, payloads: &[&str]) -> Delivered {
@@ -3333,7 +3606,10 @@ mod chat_completions_tests {
                     }
                     StreamEvent::ToolCall(call) => delivered.tool_calls.push(call),
                     StreamEvent::Usage(usage) => delivered.usage.push(usage),
-                    StreamEvent::Final => delivered.finals += 1,
+                    StreamEvent::Final(terminal) => {
+                        delivered.finals += 1;
+                        delivered.terminal = terminal;
+                    }
                 }
             }
         }
@@ -3496,7 +3772,7 @@ mod chat_completions_tests {
                        "prompt_tokens_details": {"cached_tokens": 12}}
         }))
         .expect("envelope parses");
-        let response = parse_chat_completions_envelope("local", envelope);
+        let response = parse_chat_completions_envelope(envelope);
         assert_eq!(response.text.as_deref(), Some("hello world"));
         assert_eq!(response.reasoning_content.as_deref(), Some("let me think"));
         assert_eq!(response.tool_calls.len(), 1);
@@ -3524,7 +3800,7 @@ mod chat_completions_tests {
                     "finish_reason": "tool_calls"}]
             }))
             .expect("envelope parses");
-            let response = parse_chat_completions_envelope("local", envelope);
+            let response = parse_chat_completions_envelope(envelope);
             assert!(response.text.is_none());
             assert_eq!(response.tool_calls.len(), 1);
         }
@@ -3541,9 +3817,7 @@ mod chat_completions_tests {
             let envelope: ChatCompletionsEnvelope =
                 serde_json::from_value(body.clone()).expect("envelope parses");
             assert!(
-                parse_chat_completions_envelope("local", envelope)
-                    .usage
-                    .is_none(),
+                parse_chat_completions_envelope(envelope).usage.is_none(),
                 "no usage on the wire = None; downstream policy decides ({body})"
             );
         }
@@ -3558,7 +3832,7 @@ mod chat_completions_tests {
         // from the other two.
         let envelope: ChatCompletionsEnvelope =
             serde_json::from_value(json!({"choices": [], "usage": {}})).expect("envelope parses");
-        let usage = parse_chat_completions_envelope("local", envelope).usage;
+        let usage = parse_chat_completions_envelope(envelope).usage;
         assert_eq!(usage, Some(TokenUsage::default()));
         assert_eq!(
             usage.map(|usage| usage.input_tokens),
@@ -3579,7 +3853,7 @@ mod chat_completions_tests {
         let envelope: ChatCompletionsEnvelope =
             serde_json::from_value(json!({"choices": [], "usage": {"completion_tokens": 12}}))
                 .expect("envelope parses");
-        let usage = parse_chat_completions_envelope("local", envelope)
+        let usage = parse_chat_completions_envelope(envelope)
             .usage
             .expect("a reported half is still a report");
         assert_eq!(usage.input_tokens, None);
@@ -3784,7 +4058,7 @@ mod chat_completions_tests {
                 .iter()
                 .any(|event| matches!(event, StreamEvent::Usage(_)))
         );
-        assert!(matches!(events.last(), Some(StreamEvent::Final)));
+        assert!(matches!(events.last(), Some(StreamEvent::Final(_))));
 
         // A stream that never said anything about finishing gets no such
         // benefit — the loop fails it instead.
@@ -3935,7 +4209,7 @@ mod chat_completions_tests {
         assert_eq!(
             first
                 .iter()
-                .filter(|event| matches!(event, StreamEvent::Final))
+                .filter(|event| matches!(event, StreamEvent::Final(_)))
                 .count(),
             1
         );
@@ -4004,7 +4278,7 @@ mod chat_completions_tests {
                 "[DONE]",
             ],
         );
-        assert_eq!(machine.usage_gap(), Some("include_usage_ignored"));
+        assert_eq!(machine.usage_gap(), Some(UsageGap::IncludeUsageIgnored));
 
         let mut machine = ChatCompletionsStreamMachine::new(false);
         run(
@@ -4016,7 +4290,7 @@ mod chat_completions_tests {
         );
         assert_eq!(
             machine.usage_gap(),
-            Some("done_missing"),
+            Some(UsageGap::DoneMissing),
             "a stream that lost its tail is not a stream that lacks a feature"
         );
 
@@ -4032,6 +4306,123 @@ mod chat_completions_tests {
         assert_eq!(machine.usage_gap(), None);
         machine.terminate();
         assert_eq!(machine.usage_gap(), None, "the label survives the take");
+    }
+
+    /// The gap label has to leave the wire on the terminal, or the free lane —
+    /// which writes no attempt rows — has nowhere to record it. This is the
+    /// countability requirement at its source.
+    #[test]
+    fn the_terminal_carries_the_usage_gap_out_of_the_wire() {
+        // Framed correctly, no usage chunk: the ordinary local-server case.
+        let mut machine = ChatCompletionsStreamMachine::new(false);
+        let events = machine
+            .handle_payload("local", "[DONE]")
+            .expect("the sentinel is not an error");
+        let Some(StreamEvent::Final(terminal)) = events.last() else {
+            panic!("the sentinel must yield the terminal");
+        };
+        assert_eq!(terminal.usage_gap, Some(UsageGap::IncludeUsageIgnored));
+
+        // Soft close after a finish_reason, no sentinel and no usage: what a
+        // truncating middlebox looks like, and it must not hide inside the
+        // ordinary label.
+        let mut machine = ChatCompletionsStreamMachine::new(false);
+        run(
+            &mut machine,
+            &[r#"{"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#],
+        );
+        let events = machine.terminate();
+        let Some(StreamEvent::Final(terminal)) = events.last() else {
+            panic!("terminate must yield the terminal");
+        };
+        assert_eq!(terminal.usage_gap, Some(UsageGap::DoneMissing));
+        assert_eq!(
+            terminal.stop_reason,
+            Some(StopReason::Stop),
+            "the soft close still carries the reason the upstream did state"
+        );
+
+        // Usage reported: no gap rides out at all.
+        let mut machine = ChatCompletionsStreamMachine::new(false);
+        run(
+            &mut machine,
+            &[
+                r#"{"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":2}}"#,
+            ],
+        );
+        let events = machine.terminate();
+        let Some(StreamEvent::Final(terminal)) = events.last() else {
+            panic!("terminate must yield the terminal");
+        };
+        assert_eq!(terminal.usage_gap, None);
+    }
+
+    /// This dialect already speaks the router's vocabulary, so extraction is a
+    /// parse — but an unmapped value must still come out absent rather than be
+    /// laundered into `stop`.
+    #[test]
+    fn chat_completions_finish_reasons_normalize_to_the_router_vocabulary() {
+        let table = [
+            ("stop", Some(StopReason::Stop)),
+            ("length", Some(StopReason::Length)),
+            ("tool_calls", Some(StopReason::ToolCalls)),
+            // The pre-`tool_calls` spelling several local servers still emit.
+            ("function_call", Some(StopReason::ToolCalls)),
+            ("content_filter", Some(StopReason::ContentFilter)),
+            ("something_new", None),
+            ("", None),
+        ];
+        for (reported, expected) in table {
+            assert_eq!(
+                StopReason::from_openai(reported),
+                expected,
+                "finish_reason={reported:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn chat_completions_envelope_carries_the_real_finish_reason() {
+        let envelope: ChatCompletionsEnvelope = serde_json::from_value(json!({
+            "choices": [{"message": {"content": "clipped"}, "finish_reason": "length"}]
+        }))
+        .expect("envelope parses");
+        assert_eq!(
+            parse_chat_completions_envelope(envelope).stop_reason,
+            Some(StopReason::Length)
+        );
+    }
+
+    #[test]
+    fn chat_completions_envelope_without_a_finish_reason_reports_none() {
+        let envelope: ChatCompletionsEnvelope =
+            serde_json::from_value(json!({"choices": [{"message": {"content": "hi"}}]}))
+                .expect("envelope parses");
+        assert_eq!(
+            parse_chat_completions_envelope(envelope).stop_reason,
+            None,
+            "several servers in this dialect omit the field entirely"
+        );
+    }
+
+    #[test]
+    fn chat_completions_stream_terminal_carries_the_real_finish_reason() {
+        let mut machine = ChatCompletionsStreamMachine::new(false);
+        let delivered = run(
+            &mut machine,
+            &[
+                r#"{"choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}]}"#,
+                r#"{"choices":[{"index":0,"delta":{},"finish_reason":"content_filter"}]}"#,
+                r#"{"choices":[],"usage":{"prompt_tokens":5,"completion_tokens":2}}"#,
+                "[DONE]",
+            ],
+        );
+        assert_eq!(delivered.finals, 1);
+        assert_eq!(
+            delivered.terminal.stop_reason,
+            Some(StopReason::ContentFilter),
+            "content_filter was structurally unobservable before the wires carried it"
+        );
     }
 
     #[test]
@@ -4072,7 +4463,7 @@ mod chat_completions_tests {
                 "finish_reason": "tool_calls"}]
         }))
         .expect("envelope parses");
-        let response = parse_chat_completions_envelope("local", envelope);
+        let response = parse_chat_completions_envelope(envelope);
         let arguments: Value = serde_json::from_str(&response.tool_calls[0].arguments)
             .expect("the object round-trips as a JSON string");
         assert_eq!(arguments["command"], "pwd");
@@ -4098,7 +4489,7 @@ mod chat_completions_tests {
                 "function": {"name": "ping", "arguments": null}}]}}]
         }))
         .expect("envelope parses");
-        let response = parse_chat_completions_envelope("local", envelope);
+        let response = parse_chat_completions_envelope(envelope);
         assert_eq!(response.tool_calls[0].arguments, "{}");
     }
 
@@ -4292,7 +4683,7 @@ mod wire_property_tests {
                 match machine.handle("anthropic", value) {
                     Ok(events) => {
                         for event in events {
-                            if matches!(event, StreamEvent::Final) {
+                            if matches!(event, StreamEvent::Final(_)) {
                                 finals += 1;
                             }
                             if let StreamEvent::Usage(usage) = event {
@@ -4340,7 +4731,7 @@ mod wire_property_tests {
         assert_eq!(
             first
                 .iter()
-                .filter(|event| matches!(event, StreamEvent::Final))
+                .filter(|event| matches!(event, StreamEvent::Final(_)))
                 .count(),
             1
         );
@@ -4388,7 +4779,7 @@ mod wire_property_tests {
                     match event {
                         StreamEvent::TextDelta(chunk) => text.push_str(&chunk.delta),
                         StreamEvent::Usage(seen) => usage = Some(seen),
-                        StreamEvent::Final => finals += 1,
+                        StreamEvent::Final(_) => finals += 1,
                         StreamEvent::ToolCall(_) => {}
                     }
                 }
@@ -4433,7 +4824,7 @@ mod wire_property_tests {
                 match machine.handle_payload("local", payload) {
                     Ok(events) => {
                         for event in events {
-                            if matches!(event, StreamEvent::Final) {
+                            if matches!(event, StreamEvent::Final(_)) {
                                 finals += 1;
                             }
                             if let StreamEvent::Usage(usage) = event {

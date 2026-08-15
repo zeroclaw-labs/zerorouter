@@ -191,6 +191,7 @@ fn blank_completion() -> FakeOutcome {
         tool_calls: Vec::new(),
         usage: Some(served_usage()),
         reasoning_content: None,
+        stop_reason: None,
     }
 }
 
@@ -1448,6 +1449,7 @@ async fn synthetic_stream_serves_a_candidate_that_cannot_stream() {
             }],
             usage: Some(served_usage()),
             reasoning_content: None,
+            stop_reason: None,
         }],
     );
     let state = router(pool.clone(), vec![solo.clone()]);
@@ -1518,6 +1520,7 @@ async fn synthetic_stream_without_upstream_usage_bills_nothing() {
             tool_calls: Vec::new(),
             usage: None,
             reasoning_content: None,
+            stop_reason: None,
         }],
     );
     let state = router(pool.clone(), vec![solo.clone()]);
@@ -2033,6 +2036,7 @@ async fn non_streaming_tool_calls_only_completion_is_not_empty() {
             }],
             usage: Some(served_usage()),
             reasoning_content: None,
+            stop_reason: None,
         }],
     );
     let state = router(pool.clone(), vec![solo.clone()]);
@@ -2717,6 +2721,7 @@ async fn non_streaming_success_without_upstream_usage_bills_nothing() {
             tool_calls: Vec::new(),
             usage: None,
             reasoning_content: None,
+            stop_reason: None,
         }],
     );
     let state = router(pool.clone(), vec![solo.clone()]);
@@ -5191,4 +5196,317 @@ async fn a_client_that_disconnects_mid_stream_is_not_billed_for_lost_output() {
     // A disconnect settles through the client-closed terminal, which does
     // not carry the walk ledger — the billing fact this test pins is the
     // zero charge above.
+}
+
+// ---------------------------------------------------------------------------
+// Real upstream stop reasons, and the countable usage gap (migration 0020)
+// ---------------------------------------------------------------------------
+
+/// `(finish_reason, finish_reason_source, usage_gap)` off the settled row —
+/// the three columns the finish-reason plumbing writes.
+async fn settled_finish(
+    pool: &PgPool,
+    api_key_id: Uuid,
+) -> (Option<String>, Option<String>, Option<String>) {
+    query_as(
+        r#"
+        SELECT finish_reason, finish_reason_source, usage_gap
+        FROM usage_events
+        WHERE api_key_id = $1
+        "#,
+    )
+    .bind(api_key_id)
+    .fetch_one(pool)
+    .await
+    .expect("settled finish columns must query")
+}
+
+/// Every money column on the settled row, for twin comparison.
+async fn settled_money(
+    pool: &PgPool,
+    api_key_id: Uuid,
+) -> (Decimal, Option<Decimal>, i32, i32, i16) {
+    query_as(
+        r#"
+        SELECT cost_usd, cost_basis_usd, input_tokens, output_tokens, status
+        FROM usage_events
+        WHERE api_key_id = $1
+        "#,
+    )
+    .bind(api_key_id)
+    .fetch_one(pool)
+    .await
+    .expect("settled money columns must query")
+}
+
+/// An upstream that reports its OWN stop reason has that reason persisted, and
+/// the row says so: `finish_reason_source = 'upstream'`, the second of the two
+/// values migration 0004 reserved and the first time anything writes it.
+#[tokio::test]
+async fn a_real_upstream_stop_reason_is_persisted_and_labelled_upstream() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let (api_key_id, key) = create_funded_key(&pool, "real-finish").await;
+    // Output is far under the 4096 ceiling, so the SYNTHESIS would say "stop".
+    // The upstream says it clipped on its own, smaller ceiling.
+    let solo = FakeModelProvider::new(
+        "solo",
+        vec![
+            FakeOutcome::chat("clipped answer", served_usage())
+                .with_stop_reason(zerorouter::provider::StopReason::Length),
+        ],
+    );
+    let state = router(pool.clone(), vec![solo.clone()]);
+
+    let response = app(state.clone())
+        .oneshot(completion_request(
+            &key,
+            &completion_body("zero/test-solo", false),
+        ))
+        .await
+        .expect("completion request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    state.wait_for_background_tasks().await;
+
+    let (finish_reason, source, usage_gap) = settled_finish(&pool, api_key_id).await;
+    assert_eq!(
+        finish_reason.as_deref(),
+        Some("length"),
+        "the upstream's own word, not the token arithmetic"
+    );
+    assert_eq!(
+        source.as_deref(),
+        Some("upstream"),
+        "migration 0004 reserved exactly this token for exactly this change"
+    );
+    assert_eq!(usage_gap, None, "a buffered completion has no stream gap");
+
+    // The label the success estimator trains on follows the real reason.
+    assert_eq!(
+        settled_shape_ok(&pool, api_key_id).await,
+        Some(false),
+        "a real `length` fails the shape check the synthesized `stop` would have passed"
+    );
+
+    // And the customer-visible body deliberately still reports the SYNTHESIZED
+    // value. Changing what an agent loop reads here changes how many requests
+    // it sends, which is a product decision this change does not take.
+    assert_eq!(
+        body["choices"][0]["finish_reason"], "stop",
+        "the response body is deliberately unchanged; the ledger carries the real reason"
+    );
+
+    // The shape label is not a billing input: this row still bills in full.
+    let (cost_usd, _, input_tokens, output_tokens, status) = settled_money(&pool, api_key_id).await;
+    assert_eq!(status, 200);
+    assert_eq!((input_tokens, output_tokens), (1_000, 20));
+    assert_eq!(
+        cost_usd,
+        served_sell_cost(),
+        "a `length` label does not change what the customer is charged"
+    );
+}
+
+/// An upstream that reports NOTHING keeps the synthesis, unchanged, and the
+/// row still says `'synthetic'` — the absent case must not start claiming
+/// ground truth.
+#[tokio::test]
+async fn an_upstream_that_reports_no_stop_reason_keeps_the_synthesis() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let (api_key_id, key) = create_funded_key(&pool, "synthetic-finish").await;
+    let solo = FakeModelProvider::new("solo", vec![FakeOutcome::chat("an answer", served_usage())]);
+    let state = router(pool.clone(), vec![solo.clone()]);
+
+    let response = app(state.clone())
+        .oneshot(completion_request(
+            &key,
+            &completion_body("zero/test-solo", false),
+        ))
+        .await
+        .expect("completion request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    state.wait_for_background_tasks().await;
+
+    let (finish_reason, source, usage_gap) = settled_finish(&pool, api_key_id).await;
+    assert_eq!(finish_reason.as_deref(), Some("stop"));
+    assert_eq!(
+        source.as_deref(),
+        Some("synthetic"),
+        "no real reason means the row must keep saying the value was inferred"
+    );
+    assert_eq!(usage_gap, None);
+}
+
+/// The metered twin: a request whose REAL reason agrees with what the
+/// synthesis would have produced must bill byte-identically to one that
+/// reported no reason at all. This is the proof that carrying the value moved
+/// no money on the agreeing majority of traffic.
+#[tokio::test]
+async fn a_real_reason_that_agrees_with_the_synthesis_bills_identically() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+
+    // Twin A: upstream reports nothing, synthesis says "stop".
+    let (synthetic_key_id, synthetic_key) = create_funded_key(&pool, "twin-synthetic").await;
+    let synthetic_upstream =
+        FakeModelProvider::new("solo", vec![FakeOutcome::chat("an answer", served_usage())]);
+    let state = router(pool.clone(), vec![synthetic_upstream.clone()]);
+    let response = app(state.clone())
+        .oneshot(completion_request(
+            &synthetic_key,
+            &completion_body("zero/test-solo", false),
+        ))
+        .await
+        .expect("completion request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    state.wait_for_background_tasks().await;
+
+    // Twin B: upstream reports "stop" — the same verdict, from the wire.
+    let (real_key_id, real_key) = create_funded_key(&pool, "twin-real").await;
+    let real_upstream = FakeModelProvider::new(
+        "solo",
+        vec![
+            FakeOutcome::chat("an answer", served_usage())
+                .with_stop_reason(zerorouter::provider::StopReason::Stop),
+        ],
+    );
+    let state = router(pool.clone(), vec![real_upstream.clone()]);
+    let response = app(state.clone())
+        .oneshot(completion_request(
+            &real_key,
+            &completion_body("zero/test-solo", false),
+        ))
+        .await
+        .expect("completion request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    state.wait_for_background_tasks().await;
+
+    assert_eq!(
+        settled_money(&pool, synthetic_key_id).await,
+        settled_money(&pool, real_key_id).await,
+        "an agreeing real reason must move no money: same charge, same COGS, \
+         same tokens, same status"
+    );
+    assert_eq!(
+        settled_shape_ok(&pool, synthetic_key_id).await,
+        settled_shape_ok(&pool, real_key_id).await,
+        "and the same shape label, since the verdicts agree"
+    );
+
+    // The ONE column that differs is the provenance, which is the point.
+    let (synthetic_reason, synthetic_source, _) = settled_finish(&pool, synthetic_key_id).await;
+    let (real_reason, real_source, _) = settled_finish(&pool, real_key_id).await;
+    assert_eq!(synthetic_reason, real_reason, "the value itself agrees");
+    assert_eq!(synthetic_source.as_deref(), Some("synthetic"));
+    assert_eq!(real_source.as_deref(), Some("upstream"));
+}
+
+/// The usage gap becomes a COUNTABLE column rather than a trace line, and
+/// counting it costs nobody anything: the row still bills zero, exactly as it
+/// did when the label existed only in a log.
+#[tokio::test]
+async fn the_usage_gap_lands_on_the_settled_row_and_bills_nothing() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let (api_key_id, key) = create_funded_key(&pool, "usage-gap-countable").await;
+    // A stream that delivers output and runs to a terminal carrying the
+    // `done_missing` label — the shape a truncating middlebox produces, which
+    // must not hide inside the ordinary "this server ignores include_usage".
+    let solo = FakeModelProvider::new(
+        "solo",
+        vec![FakeOutcome::Stream(vec![
+            FakeStreamStep::text("partial"),
+            FakeStreamStep::FinalWith(zerorouter::provider::StreamFinal {
+                stop_reason: Some(zerorouter::provider::StopReason::Stop),
+                usage_gap: Some(zerorouter::provider::UsageGap::DoneMissing),
+            }),
+        ])],
+    );
+    let state = router(pool.clone(), vec![solo.clone()]);
+
+    let response = app(state.clone())
+        .oneshot(completion_request(
+            &key,
+            &completion_body("zero/test-solo", true),
+        ))
+        .await
+        .expect("stream request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = sse_chunks(response).await;
+    state.wait_for_background_tasks().await;
+
+    let (_, _, usage_gap) = settled_finish(&pool, api_key_id).await;
+    assert_eq!(
+        usage_gap.as_deref(),
+        Some("done_missing"),
+        "the gap is now countable in SQL instead of only greppable in a log"
+    );
+
+    // Inert to billing: this is the same unbilled settle it always was.
+    let (cost_usd, _, input_tokens, output_tokens, status) = settled_money(&pool, api_key_id).await;
+    assert_eq!(
+        (cost_usd, input_tokens, output_tokens, status),
+        (Decimal::ZERO, 0, 0, 502),
+        "labelling a gap must not change what a gap costs"
+    );
+    assert_eq!(
+        balance(&pool, user_of(&pool, api_key_id).await)
+            .await
+            .expect("balance must query"),
+        Decimal::from(50),
+        "an unmetered delivery must not move the balance, labelled or not"
+    );
+}
+
+/// A stream that reports usage has no gap to record — `usage_gap` is NULL, not
+/// a sentinel. NULL has to keep meaning "nothing to say" or a census over the
+/// column counts healthy rows as gaps.
+#[tokio::test]
+async fn a_metered_stream_records_no_usage_gap() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let (api_key_id, key) = create_funded_key(&pool, "usage-gap-absent").await;
+    let solo = FakeModelProvider::new(
+        "solo",
+        vec![FakeOutcome::Stream(vec![
+            FakeStreamStep::text("answer"),
+            FakeStreamStep::Usage(TokenUsage {
+                input_tokens: Some(1_000),
+                output_tokens: Some(20),
+                cached_input_tokens: None,
+            }),
+            FakeStreamStep::FinalWith(zerorouter::provider::StreamFinal {
+                stop_reason: Some(zerorouter::provider::StopReason::Stop),
+                usage_gap: None,
+            }),
+        ])],
+    );
+    let state = router(pool.clone(), vec![solo.clone()]);
+
+    let response = app(state.clone())
+        .oneshot(completion_request(
+            &key,
+            &completion_body("zero/test-solo", true),
+        ))
+        .await
+        .expect("stream request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = sse_chunks(response).await;
+    state.wait_for_background_tasks().await;
+
+    let (finish_reason, source, usage_gap) = settled_finish(&pool, api_key_id).await;
+    assert_eq!(usage_gap, None, "usage was reported, so there is no gap");
+    assert_eq!(finish_reason.as_deref(), Some("stop"));
+    assert_eq!(
+        source.as_deref(),
+        Some("upstream"),
+        "a live stream's terminal reason is the upstream's own"
+    );
 }

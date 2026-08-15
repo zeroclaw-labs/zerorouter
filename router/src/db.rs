@@ -14,14 +14,17 @@ use serde_json::json;
 // Named directly rather than through the `crate::sqlx` shim: the shim exists to
 // keep the sqlx-core/sqlx-postgres split out of call sites, and [`admit_key_mint`]
 // is the only place in the crate that needs a bare connection handle.
-use crate::provider::ModelRates;
+use crate::provider::{ModelRates, UsageGap};
 use sqlx_postgres::PgConnection;
 use uuid::Uuid;
 
 use crate::{
     auth::AuthenticatedKey,
     estimator::OutputPercentiles,
-    openai::{OpenAiUsage, PromptTokenDetails, TaskSignature, usage_cost},
+    openai::{
+        FINISH_REASON_SYNTHETIC, OpenAiUsage, PromptTokenDetails, TaskSignature,
+        finish_reason_source_from_keyword, usage_cost,
+    },
     priority::Priority,
     sqlx::{
         self, PgPool,
@@ -288,9 +291,21 @@ pub struct RequestTelemetry {
     pub candidate_id: Option<String>,
     pub basis_rates: Option<ModelRates>,
     pub sell_rates: ModelRates,
-    // Synthesized outcome labels; `None` where no completion was produced.
+    // Outcome labels; `None` where no completion was produced.
     pub finish_reason: Option<String>,
+    /// Where `finish_reason` came from: `"upstream"` when the provider gave
+    /// its own stop reason, `"synthetic"` when the router inferred one from
+    /// token arithmetic. Migration 0004 reserved exactly these two tokens and
+    /// constrains the column to them, so estimator training can separate
+    /// ground truth from the heuristic instead of silently mixing them.
+    /// `None` whenever `finish_reason` is `None`.
+    pub finish_reason_source: Option<&'static str>,
     pub shape_ok: Option<bool>,
+    /// Why a stream settled with no usage, when that is what happened
+    /// (`"include_usage_ignored"` / `"done_missing"`; migration 0020).
+    /// Written on the free lane too, which records no attempt rows and so had
+    /// nowhere else to leave the fact.
+    pub usage_gap: Option<&'static str>,
     // The resolved priority knob (rollout Stage 3a). `None` only when
     // replaying a settlement intent persisted before the knob shipped —
     // exactly migration 0004's "NULL = row predates the knob". The live path
@@ -914,6 +929,15 @@ pub async fn migrate(pool: &PgPool) -> Result<()> {
                 Cow::Borrowed("monthly spend rollup"),
                 MigrationType::Simple,
                 Cow::Borrowed(include_str!("../migrations/0019_monthly_spend_rollup.sql")),
+                false,
+            ),
+            Migration::new(
+                20,
+                Cow::Borrowed("usage gap and real finish reason"),
+                MigrationType::Simple,
+                Cow::Borrowed(include_str!(
+                    "../migrations/0020_usage_gap_and_real_finish_reason.sql"
+                )),
                 false,
             ),
         ]),
@@ -1880,7 +1904,12 @@ impl UsageSession {
         let sell_rates = rates_snapshot(&telemetry.sell_rates);
         let basis_rates = telemetry.basis_rates.as_ref().map(rates_snapshot);
         let finish_reason = telemetry.finish_reason.clone();
-        let finish_reason_source = finish_reason.as_ref().map(|_| "synthetic");
+        // Carried from the walk rather than assumed: 'upstream' when a wire
+        // reported the provider's own stop reason, 'synthetic' when the router
+        // inferred it. Hardcoded 'synthetic' until the wires could tell them
+        // apart.
+        let finish_reason_source = finish_reason.as_ref().and(telemetry.finish_reason_source);
+        let usage_gap = telemetry.usage_gap;
         let attempt_count = i16::try_from(record.attempts.len())
             .ok()
             .filter(|count| *count >= 1);
@@ -1938,12 +1967,13 @@ impl UsageSession {
                     tool_count,
                     attempt_count,
                     shape_ok,
-                    priority
+                    priority,
+                    usage_gap
                 )
                 VALUES (
                     $1, $2, $3, $4, $5, $6, $7, $8, 0, $9, $10,
                     $11, $12, $13::JSONB, $14::JSONB, $15, $16, $17, $18, $19,
-                    $20, $21, $22, $23, $24
+                    $20, $21, $22, $23, $24, $25
                 )
                 "#,
                 )
@@ -1971,6 +2001,7 @@ impl UsageSession {
                 .bind(attempt_count)
                 .bind(telemetry.shape_ok)
                 .bind(telemetry.priority.map(Priority::as_str))
+                .bind(usage_gap)
                 .execute(&mut *transaction)
                 .await?;
                 transaction.commit().await
@@ -2260,7 +2291,11 @@ async fn settle_once(
     // cost". See migration 0007 on why a partial sum must never present as a
     // total.
     let attempts_cogs = AttemptCogs::summarize(&record.attempts);
-    let finish_reason_source = telemetry.finish_reason.as_ref().map(|_| "synthetic");
+    // Carried from the walk rather than assumed — see the free-lane sibling.
+    let finish_reason_source = telemetry
+        .finish_reason
+        .as_ref()
+        .and(telemetry.finish_reason_source);
     let attempt_count = if record.attempts.is_empty() {
         None
     } else {
@@ -2304,12 +2339,13 @@ async fn settle_once(
                 attempts_cost_basis_complete,
                 task_signature_scheme,
                 tool_names_sha256,
-                priority
+                priority,
+                usage_gap
             )
             VALUES (
                 $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
                 $12, $13, $14, $15::JSONB, $16::JSONB, $17, $18, $19, $20, $21,
-                $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33
+                $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34
             )
             "#,
     )
@@ -2350,6 +2386,7 @@ async fn settle_once(
     .bind(intent.task_signature_scheme)
     .bind(intent.tool_names_sha256.as_deref())
     .bind(telemetry.priority.map(Priority::as_str))
+    .bind(telemetry.usage_gap)
     .execute(&mut *transaction)
     .await;
     if let Err(error) = settled {
@@ -3185,6 +3222,14 @@ struct TelemetryPayload {
     basis_rates: Option<RatesPayload>,
     sell_rates: RatesPayload,
     finish_reason: Option<String>,
+    /// `#[serde(default)]` for the same reason as `priority` below: an intent
+    /// written before the wires carried a real stop reason has no source
+    /// field, and replaying it must not fail. Such an intent settles as
+    /// `'synthetic'` — which is what it was — see [`Self::to_record`].
+    #[serde(default)]
+    finish_reason_source: Option<String>,
+    #[serde(default)]
+    usage_gap: Option<String>,
     shape_ok: Option<bool>,
     /// `#[serde(default)]` keeps pre-knob intents replayable; they settle
     /// with a NULL priority, which is the ledger's word for "predates the
@@ -3255,6 +3300,8 @@ impl SettlementIntent {
                 basis_rates: record.telemetry.basis_rates.map(RatesPayload::new),
                 sell_rates: RatesPayload::new(record.telemetry.sell_rates),
                 finish_reason: record.telemetry.finish_reason.clone(),
+                finish_reason_source: record.telemetry.finish_reason_source.map(str::to_owned),
+                usage_gap: record.telemetry.usage_gap.map(str::to_owned),
                 shape_ok: record.telemetry.shape_ok,
                 priority: record
                     .telemetry
@@ -3336,6 +3383,25 @@ impl SettlementIntent {
                 basis_rates: self.telemetry.basis_rates.map(RatesPayload::to_rates),
                 sell_rates: self.telemetry.sell_rates.to_rates(),
                 finish_reason: self.telemetry.finish_reason.clone(),
+                // An intent whose payload predates this field carried a
+                // synthesized reason by definition — nothing else could
+                // produce one then — so it replays as 'synthetic' exactly as
+                // it would have before. Only the two tokens migration 0004's
+                // CHECK permits are ever produced; anything else in a payload
+                // is treated as unrecorded rather than passed to the INSERT,
+                // where it would abort the settle transaction.
+                finish_reason_source: self
+                    .telemetry
+                    .finish_reason_source
+                    .as_deref()
+                    .and_then(finish_reason_source_from_keyword)
+                    .or(Some(FINISH_REASON_SYNTHETIC)),
+                usage_gap: self
+                    .telemetry
+                    .usage_gap
+                    .as_deref()
+                    .and_then(UsageGap::from_keyword)
+                    .map(UsageGap::as_str),
                 shape_ok: self.telemetry.shape_ok,
                 priority: self
                     .telemetry

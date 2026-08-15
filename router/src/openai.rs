@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::config::RequestNeeds;
 use crate::provider::ToolSpec;
-use crate::provider::{ChatMessage, ChatResponse, ModelRates, TokenUsage, ToolCall};
+use crate::provider::{ChatMessage, ChatResponse, ModelRates, StopReason, TokenUsage, ToolCall};
 use chrono::Utc;
 use rust_decimal::{Decimal, prelude::FromPrimitive};
 use serde::{Deserialize, Serialize};
@@ -720,6 +720,112 @@ pub fn finish_reason(
     }
 }
 
+/// Stamped on a row whose finish reason is the UPSTREAM's own word.
+///
+/// The spelling is `"upstream"`, not `"provider"`: migration 0004 created
+/// `finish_reason_source` with `CHECK (... IN ('synthetic', 'upstream'))` and
+/// the comment *"'synthetic' now; 'upstream' once StreamEvent/ChatResponse
+/// carry the real stop reason"*. This is that change, so it uses the token the
+/// schema reserved for it. Any other value would fail the constraint and abort
+/// the settle transaction.
+pub const FINISH_REASON_UPSTREAM: &str = "upstream";
+/// Stamped on a row whose finish reason this router inferred from token
+/// arithmetic, because the upstream reported none it could map.
+pub const FINISH_REASON_SYNTHETIC: &str = "synthetic";
+
+/// One attempt's finish reason and where it came from.
+///
+/// # The consumption rule
+///
+/// A real reason wins; absence falls back to the unchanged synthesis. The two
+/// stay distinguishable forever through [`Self::source`], which is what
+/// `request_attempts.finish_reason_source` and
+/// `usage_events.finish_reason_source` record — those columns were hardcoded
+/// `"synthetic"` before any wire could report a real one.
+///
+/// # Divergence table
+///
+/// Where the real reason and the synthesis disagree, this is the complete set
+/// of consequences. `SYNTH` is [`finish_reason`]: `tool_calls` if any tool call
+/// was emitted, else `length` if output reached the requested ceiling, else
+/// `stop`.
+///
+/// | # | real | synth | why they differ | `shape_ok` | served? | billed? |
+/// |---|------|-------|-----------------|-----------|---------|---------|
+/// | 1 | `stop` | `length` | output landed exactly on the ceiling but the model ended on its own | `false` → `true` | unchanged | unchanged |
+/// | 2 | `stop` | `tool_calls` | upstream reported a plain stop despite emitting tool calls (nonconforming) | `true` → `true` | unchanged | unchanged |
+/// | 3 | `length` | `stop` | upstream clipped on ITS own ceiling, below the one we asked for | `true` → `false` | unchanged | unchanged |
+/// | 4 | `length` | `tool_calls` | tool calls emitted AND the output was clipped | `true` → `false` | unchanged | unchanged |
+/// | 5 | `tool_calls` | `stop` | upstream reports tool calls the router parsed none of | `true` → `true` | unchanged | unchanged |
+/// | 6 | `tool_calls` | `length` | tool-call output reached the ceiling | `false` → `true` | unchanged | unchanged |
+/// | 7 | `content_filter` | `stop` | safety layer withheld output — previously unobservable | `true` → `true` | unchanged | unchanged |
+/// | 8 | `content_filter` | `length` | safety layer withheld output that also hit the ceiling | `false` → `true` | unchanged | unchanged |
+///
+/// **Every row's served and billed columns read "unchanged", and that is a
+/// verified property of this crate rather than an aspiration.** Nothing
+/// branches on a finish reason: the walk's only content-driven retry is
+/// `retry::is_empty_completion` (text/tool-calls/reasoning, never the reason),
+/// and [`shape_ok`]'s verdict is written to a telemetry column that no
+/// non-test code reads. So the change this type introduces is confined to
+/// three persisted values — `finish_reason`, `finish_reason_source`, and the
+/// `shape_ok` label — plus the response body, which deliberately continues to
+/// report the SYNTHESIZED value (see the note on `reason` below).
+///
+/// Rows 7 and 8 expose a pre-existing wrinkle this type does NOT change:
+/// `shape_ok` only rejects `length`, so a `content_filter` completion labels
+/// as a good shape. That is the existing predicate applied to a reason the
+/// router could not previously see, not a new judgment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AttemptFinishReason {
+    /// The reason to persist and to hand [`shape_ok`].
+    ///
+    /// NOT what the response body reports. The body keeps its own synthesized
+    /// value because changing it changes what customers' own agent loops see
+    /// and therefore how many requests they issue — a product decision that is
+    /// deliberately not bundled into plumbing the ledger.
+    pub reason: &'static str,
+    /// [`FINISH_REASON_UPSTREAM`] or [`FINISH_REASON_SYNTHETIC`] — the only
+    /// two values `usage_events.finish_reason_source` accepts.
+    pub source: &'static str,
+}
+
+/// Parse a persisted or replayed `finish_reason_source` back.
+///
+/// Anything outside the two tokens migration 0004's CHECK permits is `None`,
+/// so a malformed settlement payload can never carry a value into the INSERT
+/// that would abort the settle transaction.
+#[must_use]
+pub fn finish_reason_source_from_keyword(source: &str) -> Option<&'static str> {
+    match source {
+        FINISH_REASON_UPSTREAM => Some(FINISH_REASON_UPSTREAM),
+        FINISH_REASON_SYNTHETIC => Some(FINISH_REASON_SYNTHETIC),
+        _ => None,
+    }
+}
+
+impl AttemptFinishReason {
+    /// Apply the consumption rule: the upstream's own reason if it gave one,
+    /// otherwise the synthesis, with the provenance recorded either way.
+    #[must_use]
+    pub fn resolve(
+        reported: Option<StopReason>,
+        has_tool_calls: bool,
+        usage: OpenAiUsage,
+        max_tokens: Option<u32>,
+    ) -> Self {
+        reported.map_or_else(
+            || Self {
+                reason: finish_reason(has_tool_calls, usage, max_tokens),
+                source: FINISH_REASON_SYNTHETIC,
+            },
+            |reason| Self {
+                reason: reason.as_str(),
+                source: FINISH_REASON_UPSTREAM,
+            },
+        )
+    }
+}
+
 /// Which encoding produced a [`TaskSignature::hex`], stamped on every settled
 /// row (`usage_events.task_signature_scheme`, migration 0007).
 ///
@@ -925,9 +1031,21 @@ impl EmittedOutput {
 }
 
 /// The implicit shape-validator label (migration 0004): output present and
-/// non-empty, every tool-call `arguments` parses as JSON, and the synthesized
-/// finish reason is not length-truncation. Label-only — it never changes
-/// routing, and it labels 100% of served traffic for the success estimator.
+/// non-empty, every tool-call `arguments` parses as JSON, and the finish
+/// reason is not length-truncation. Label-only — it never changes routing, and
+/// it labels 100% of served traffic for the success estimator.
+///
+/// "Label-only" is load-bearing and literally true, not aspirational: every
+/// caller passes the result straight to `persist_usage` and no branch in the
+/// crate reads it back. The walk's only content-driven retry is
+/// `retry::is_empty_completion`, which inspects the response text, tool calls,
+/// and reasoning — never a finish reason and never this label. That is what
+/// makes feeding it a REAL finish reason (see [`AttemptFinishReason`]) a
+/// telemetry change rather than a billing one.
+///
+/// The reason it receives is now the upstream's own where one was reported and
+/// the synthesis otherwise; the predicate is unchanged, so a `content_filter`
+/// completion still labels TRUE — only `length` is rejected.
 ///
 /// Takes [`EmittedOutput`] rather than a bare `bool` so no caller can hand it
 /// output-presence inferred from a provider usage report.
@@ -1577,6 +1695,198 @@ mod tests {
         );
     }
 
+    /// Usage that reaches a ceiling, so the synthesis says `length`.
+    fn usage_at_ceiling() -> OpenAiUsage {
+        OpenAiUsage {
+            prompt_tokens: 10,
+            completion_tokens: 128,
+            total_tokens: 138,
+            prompt_tokens_details: None,
+        }
+    }
+
+    /// Usage well under any ceiling, so the synthesis says `stop`.
+    fn usage_under_ceiling() -> OpenAiUsage {
+        OpenAiUsage {
+            prompt_tokens: 10,
+            completion_tokens: 4,
+            total_tokens: 14,
+            prompt_tokens_details: None,
+        }
+    }
+
+    /// The consumption rule: a real reason wins, an absent one falls back to
+    /// the unchanged synthesis, and the provenance is recorded either way.
+    #[test]
+    fn a_real_stop_reason_wins_and_absence_falls_back_to_the_synthesis() {
+        let resolved = AttemptFinishReason::resolve(
+            Some(StopReason::ContentFilter),
+            false,
+            usage_under_ceiling(),
+            Some(128),
+        );
+        assert_eq!(resolved.reason, "content_filter");
+        assert_eq!(resolved.source, FINISH_REASON_UPSTREAM);
+
+        let resolved = AttemptFinishReason::resolve(None, false, usage_at_ceiling(), Some(128));
+        assert_eq!(
+            resolved.reason, "length",
+            "with no real reason the token arithmetic runs exactly as before"
+        );
+        assert_eq!(resolved.source, FINISH_REASON_SYNTHETIC);
+    }
+
+    /// The source is the token migration 0004's CHECK reserved for it. Any
+    /// other spelling would fail the constraint and abort the settle
+    /// transaction, so this is pinned rather than left to a doc comment.
+    #[test]
+    fn the_source_tokens_are_the_two_the_ledger_constraint_permits() {
+        assert_eq!(FINISH_REASON_UPSTREAM, "upstream");
+        assert_eq!(FINISH_REASON_SYNTHETIC, "synthetic");
+        for source in [FINISH_REASON_UPSTREAM, FINISH_REASON_SYNTHETIC] {
+            assert_eq!(finish_reason_source_from_keyword(source), Some(source));
+        }
+        assert_eq!(
+            finish_reason_source_from_keyword("provider"),
+            None,
+            "'provider' is NOT a permitted value; it would violate \
+             usage_events_finish_reason_source_is_known"
+        );
+        assert_eq!(finish_reason_source_from_keyword(""), None);
+    }
+
+    /// Every row of `AttemptFinishReason`'s divergence table, pinned.
+    ///
+    /// Each case is a (real, synthetic) disagreement. The assertion is on the
+    /// resolved reason and on the `shape_ok` label it produces — the two
+    /// things the change actually moves. Serving and billing are unaffected
+    /// in every row, which the sibling test below states as its own fact.
+    #[test]
+    fn every_divergence_row_resolves_to_the_real_reason_and_relabels_shape() {
+        // (row, real, has_tool_calls, usage, max_tokens, synth, shape with
+        //  synth, shape with real)
+        let table = [
+            (
+                1,
+                StopReason::Stop,
+                false,
+                usage_at_ceiling(),
+                "length",
+                false,
+                true,
+            ),
+            (
+                2,
+                StopReason::Stop,
+                true,
+                usage_under_ceiling(),
+                "tool_calls",
+                true,
+                true,
+            ),
+            (
+                3,
+                StopReason::Length,
+                false,
+                usage_under_ceiling(),
+                "stop",
+                true,
+                false,
+            ),
+            (
+                4,
+                StopReason::Length,
+                true,
+                usage_under_ceiling(),
+                "tool_calls",
+                true,
+                false,
+            ),
+            (
+                5,
+                StopReason::ToolCalls,
+                false,
+                usage_under_ceiling(),
+                "stop",
+                true,
+                true,
+            ),
+            (
+                6,
+                StopReason::ToolCalls,
+                false,
+                usage_at_ceiling(),
+                "length",
+                false,
+                true,
+            ),
+            (
+                7,
+                StopReason::ContentFilter,
+                false,
+                usage_under_ceiling(),
+                "stop",
+                true,
+                true,
+            ),
+            (
+                8,
+                StopReason::ContentFilter,
+                false,
+                usage_at_ceiling(),
+                "length",
+                false,
+                true,
+            ),
+        ];
+        for (row, real, has_tool_calls, usage, synth, shape_with_synth, shape_with_real) in table {
+            let max_tokens = Some(128);
+            assert_eq!(
+                finish_reason(has_tool_calls, usage, max_tokens),
+                synth,
+                "row {row}: the synthesis must be the value this row claims it is"
+            );
+            assert_ne!(
+                real.as_str(),
+                synth,
+                "row {row} is only a divergence row if the two actually differ"
+            );
+
+            let resolved =
+                AttemptFinishReason::resolve(Some(real), has_tool_calls, usage, max_tokens);
+            assert_eq!(
+                resolved.reason,
+                real.as_str(),
+                "row {row}: the real value wins"
+            );
+            assert_eq!(resolved.source, FINISH_REASON_UPSTREAM, "row {row}");
+
+            assert_eq!(
+                shape_ok(emitted_text(), true, synth),
+                shape_with_synth,
+                "row {row}: shape label under the synthesis"
+            );
+            assert_eq!(
+                shape_ok(emitted_text(), true, resolved.reason),
+                shape_with_real,
+                "row {row}: shape label under the real reason"
+            );
+        }
+    }
+
+    /// Rows 7 and 8: a `content_filter` completion labels as a GOOD shape,
+    /// because `shape_ok` only rejects `length`. Pinned deliberately — it is a
+    /// pre-existing property of the predicate now reachable for the first
+    /// time, not a judgment this change made, and it is the one row of the
+    /// table a reviewer is most likely to think is a bug.
+    #[test]
+    fn content_filter_labels_as_a_good_shape_because_only_length_is_rejected() {
+        assert!(
+            shape_ok(emitted_text(), true, "content_filter"),
+            "shape_ok's predicate is `!= length`; withheld output still passes it"
+        );
+    }
+
     /// A thinking model can answer entirely in `reasoning_content`. That is a
     /// non-empty response and must label as one — reading only `text` and
     /// `tool_calls` labelled it a failure and would have taught the success
@@ -1593,6 +1903,7 @@ mod tests {
             tool_calls: Vec::new(),
             usage: None,
             reasoning_content: Some("thinking about it".to_owned()),
+            stop_reason: None,
         };
         assert!(
             EmittedOutput::from_response(&response).is_nonempty(),
@@ -1626,6 +1937,7 @@ mod tests {
                 output_tokens: Some(500),
             }),
             reasoning_content: None,
+            stop_reason: None,
         };
         assert!(
             !EmittedOutput::from_response(&empty).is_nonempty(),

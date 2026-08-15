@@ -161,6 +161,8 @@ fn usage_record(cost_usd: Decimal) -> UsageRecord {
                 cached_input_per_mtok: Some(0.2),
             },
             finish_reason: None,
+            finish_reason_source: None,
+            usage_gap: None,
             shape_ok: None,
             priority: Some(Priority::Balanced),
         },
