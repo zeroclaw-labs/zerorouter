@@ -1154,3 +1154,152 @@ async fn an_event_dated_past_this_month_still_counts_against_it() {
         "a future-dated event must keep counting against the ceiling, as it did before"
     );
 }
+
+/// Direct writes to the rollup are refused; the accrual trigger's are not.
+///
+/// Without this guard `UPDATE usage_key_month_spend SET spend_usd = ...`
+/// succeeded silently, and since nothing ever recomputes the total from the
+/// ledger the divergence was permanent and invisible — admission would go on
+/// enforcing the wrong ceiling for that key forever. That is strictly worse
+/// than the slow scan this table replaced: slow is visible, a quietly wrong
+/// spend cap is not.
+#[tokio::test]
+async fn the_rollup_refuses_every_hand_written_change() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let user_id = create_user(&pool, "rollup-guard").await;
+    let key = create_key(&pool, user_id, Decimal::from(1_000), 1_000_000).await;
+
+    // Accrual through the trigger (depth 1) works and creates the bucket.
+    seed_event_at(&pool, &key, "NOW()", Decimal::new(250, 2)).await;
+    let bucket = query_scalar::<_, Decimal>(
+        "SELECT spend_usd FROM usage_key_month_spend WHERE api_key_id = $1",
+    )
+    .bind(key.id)
+    .fetch_one(&pool)
+    .await
+    .expect("the accrual trigger must have created the bucket");
+    assert_eq!(bucket, Decimal::new(250, 2));
+
+    // Every direct write (depth 0) is refused.
+    for statement in [
+        "UPDATE usage_key_month_spend SET spend_usd = 999 WHERE api_key_id = $1",
+        "DELETE FROM usage_key_month_spend WHERE api_key_id = $1",
+    ] {
+        let refused = query(statement).bind(key.id).execute(&pool).await;
+        assert!(
+            refused.is_err(),
+            "a direct write must be refused: {statement}"
+        );
+    }
+    let hand_inserted = query(
+        r#"
+        INSERT INTO usage_key_month_spend (api_key_id, month, spend_usd)
+        VALUES ($1, usage_event_utc_month(NOW() - INTERVAL '1 year'), 500)
+        "#,
+    )
+    .bind(key.id)
+    .execute(&pool)
+    .await;
+    assert!(
+        hand_inserted.is_err(),
+        "a hand-inserted bucket must be refused"
+    );
+    let truncated = query("TRUNCATE usage_key_month_spend").execute(&pool).await;
+    assert!(truncated.is_err(), "TRUNCATE must be refused");
+
+    // The ledger and the rollup still agree, and accrual still works after the
+    // refusals — the guard rejects the writer, not the table.
+    seed_event_at(&pool, &key, "NOW()", Decimal::ONE).await;
+    let after = query_scalar::<_, Decimal>(
+        "SELECT spend_usd FROM usage_key_month_spend WHERE api_key_id = $1",
+    )
+    .bind(key.id)
+    .fetch_one(&pool)
+    .await
+    .expect("bucket must still be readable");
+    assert_eq!(
+        after,
+        Decimal::new(350, 2),
+        "accrual must still work after a refused hand-write"
+    );
+    assert_eq!(rollup_disagreements(&pool).await, 0);
+}
+
+/// The accrual trigger's row lock is bounded by the statement's `lock_timeout`.
+///
+/// This is the property the free-lane write depends on and it is not obvious:
+/// the lock is taken inside a plpgsql trigger, one nesting level down from the
+/// statement that set the timeout, and a trigger that opened its own
+/// subtransaction could plausibly have escaped it. If it did, the spawned
+/// free-lane task would wait forever on a wedged same-key settle while holding
+/// a pool connection, and enough of those drain the pool into a stall that
+/// reaches the metered lane too.
+///
+/// One second rather than the five the real path sets, so the test is fast; the
+/// mechanism under test is identical.
+#[tokio::test]
+async fn the_accrual_row_lock_is_bounded_by_lock_timeout() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let user_id = create_user(&pool, "accrual-lock").await;
+    let key = create_key(&pool, user_id, Decimal::from(1_000), 1_000_000).await;
+    seed_event_at(&pool, &key, "NOW()", Decimal::ONE).await;
+
+    // Hold the key's rollup bucket, standing in for a wedged settle. A plain
+    // SELECT ... FOR UPDATE takes the row lock without tripping the guard,
+    // which only refuses INSERT/UPDATE/DELETE.
+    let mut holder = pool.begin().await.expect("holder transaction must begin");
+    query_scalar::<_, Decimal>(
+        "SELECT spend_usd FROM usage_key_month_spend WHERE api_key_id = $1 FOR UPDATE",
+    )
+    .bind(key.id)
+    .fetch_one(&mut *holder)
+    .await
+    .expect("holder must lock the bucket");
+
+    // A second writer inserting a usage event for the same key must give up
+    // rather than block forever.
+    let started = std::time::Instant::now();
+    let blocked = async {
+        let mut writer = pool.begin().await?;
+        query("SET LOCAL lock_timeout = '1s'")
+            .execute(&mut *writer)
+            .await?;
+        query(
+            r#"
+            INSERT INTO usage_events (
+                request_id, api_key_id, tier, upstream_provider, upstream_model,
+                input_tokens, cached_input_tokens, output_tokens, cost_usd,
+                latency_ms, status
+            )
+            VALUES ($1, $2, 'zero/test', 'test', 'test/model', 0, 0, 0, 0, 1, 200)
+            "#,
+        )
+        .bind(Uuid::new_v4())
+        .bind(key.id)
+        .execute(&mut *writer)
+        .await?;
+        writer.commit().await
+    }
+    .await;
+    let waited = started.elapsed();
+
+    let error = blocked.expect_err("the blocked insert must fail rather than wait forever");
+    assert_eq!(
+        error
+            .as_database_error()
+            .and_then(|db| db.code())
+            .as_deref(),
+        Some("55P03"),
+        "the failure must be a lock timeout (55P03), not something else: {error}"
+    );
+    assert!(
+        waited < Duration::from_secs(5),
+        "the wait must be bounded by lock_timeout, took {waited:?}"
+    );
+
+    holder.rollback().await.expect("holder must release");
+}
