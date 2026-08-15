@@ -94,7 +94,22 @@
 -- this migration to commit. The backfill in between therefore sees a settled
 -- table: no row can land after the backfill's snapshot yet before the trigger
 -- exists, which is the one interleaving that would silently lose spend.
+--
+-- RUNBOOK: that lock is the cost of the guarantee, and it is held for the whole
+-- backfill scan, not just the CREATE. Settles BLOCK for as long as the
+-- aggregate over `usage_events` takes — 0.25 s on the 523k-row benchmark
+-- database, so unremarkable today. On a table of tens of millions of rows it is
+-- a stall measured in tens of seconds, and that is a maintenance window rather
+-- than a routine deploy. Take that seriously before running this against a
+-- grown production ledger.
 
+-- Truncating the very smallest representable timestamptz to a month start can
+-- underflow and raise a range error rather than returning a value. No writer
+-- can reach it: `usage_events.ts` is filled by the column DEFAULT NOW() at
+-- every insert site, and the backfill below reads values that got there the
+-- same way. Stated so a future caller that starts passing a caller-supplied
+-- `ts` knows this function has a domain edge rather than discovering it as a
+-- failed settle.
 CREATE FUNCTION usage_event_utc_month(ts TIMESTAMPTZ)
 RETURNS TIMESTAMPTZ
 LANGUAGE sql
@@ -145,3 +160,63 @@ INSERT INTO usage_key_month_spend (api_key_id, month, spend_usd)
 SELECT api_key_id, usage_event_utc_month(ts), SUM(cost_usd)
 FROM usage_events
 GROUP BY api_key_id, usage_event_utc_month(ts);
+
+-- Only the accrual trigger may write this table.
+--
+-- Without this, `UPDATE usage_key_month_spend SET spend_usd = ...` succeeds
+-- silently, and because nothing ever recomputes the total from the ledger the
+-- divergence is permanent and invisible — admission goes on enforcing the
+-- wrong number for that key forever. That is a worse failure than the scan
+-- this migration removed: slow is visible, a quietly wrong spend ceiling is
+-- not. `usage_events` has been protected this way since 0001 and the table
+-- derived from it gets the same treatment.
+--
+-- `pg_trigger_depth() = 0` is what distinguishes the two writers. The WHEN
+-- clause is evaluated before the trigger function is entered, so a statement
+-- issued by a client sees depth 0 and is refused, while the accrual trigger's
+-- own INSERT ... ON CONFLICT is issued from inside a trigger function and sees
+-- depth 1, so this never fires for it. The rejection is therefore about who is
+-- writing, not about what they wrote.
+--
+-- Created AFTER the backfill on purpose: the backfill is a top-level statement
+-- and would see depth 0 and refuse itself. This ordering does not weaken the
+-- fencing argument in the header — that argument is about the lock CREATE
+-- TRIGGER takes on `usage_events`, and this trigger is on a different table.
+--
+-- What this cannot defend against: a restore that bypasses triggers wholesale
+-- (`SET session_replication_role = replica`, `pg_restore --disable-triggers`)
+-- silences the accrual trigger and this guard together, so events land with no
+-- contribution to the rollup and the totals are left short. After any such
+-- restore the rollup must be REBUILT from `usage_events`, not patched — and
+-- because this guard refuses hand-written repairs under the normal role, a
+-- partial reset fails loudly instead of half-succeeding.
+CREATE FUNCTION reject_usage_key_month_spend_mutation()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    RAISE EXCEPTION 'usage_key_month_spend is maintained by trigger; it cannot be written directly';
+    RETURN NULL;
+END;
+$$;
+
+CREATE TRIGGER usage_key_month_spend_reject_direct_mutation
+    BEFORE INSERT OR UPDATE OR DELETE ON usage_key_month_spend
+    FOR EACH ROW
+    WHEN (pg_trigger_depth() = 0)
+    EXECUTE FUNCTION reject_usage_key_month_spend_mutation();
+
+-- TRUNCATE is statement-level and the accrual path never issues one, so this
+-- arm needs no depth exemption.
+CREATE TRIGGER usage_key_month_spend_reject_truncate
+    BEFORE TRUNCATE ON usage_key_month_spend
+    FOR EACH STATEMENT
+    EXECUTE FUNCTION reject_usage_key_month_spend_mutation();
+
+-- A table this migration both created and filled has no statistics until
+-- autoanalyze happens to reach it, and the planner reads that as "empty". The
+-- admission read still works and is still flat, but measured 1.44 ms instead of
+-- 0.26 ms until statistics existed — a regression window on exactly the deploy
+-- that is supposed to remove one. Cheap to close here, since this transaction
+-- already holds the table and just wrote every row in it.
+ANALYZE usage_key_month_spend;

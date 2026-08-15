@@ -1888,8 +1888,31 @@ impl UsageSession {
         let latency_ms = record.latency_ms;
         let status = record.status;
         tokio::spawn(async move {
-            let written = sqlx::query(
-                r#"
+            // One statement, but wrapped in a transaction so it can carry a
+            // `lock_timeout`, and set to the same 5s every other holder in this
+            // crate uses.
+            //
+            // Since migration 0019 this INSERT fires the accrual trigger, which
+            // takes a row lock on the key's `usage_key_month_spend` bucket. That
+            // is a lock this path never used to touch, and this lane holds no
+            // advisory lock to serialize behind — so a wedged same-key settle
+            // sitting on that bucket would otherwise park this task on the lock
+            // FOREVER. These tasks are spawned per free request and each holds a
+            // pool connection while it waits, so an unbounded wait is not one
+            // lost row: it is the pool draining into a stall that reaches the
+            // metered lane too. Bounding the wait converts that into the
+            // failure this path already accepts.
+            //
+            // Timing out is therefore the SAME outcome as any other write
+            // failure here — a WARN and a missing observability row, never a
+            // billing consequence, because nothing on this lane is billable.
+            let written = async {
+                let mut transaction = pool.begin().await?;
+                sqlx::query("SET LOCAL lock_timeout = '5s'")
+                    .execute(&mut *transaction)
+                    .await?;
+                sqlx::query(
+                    r#"
                 INSERT INTO usage_events (
                     request_id,
                     api_key_id,
@@ -1923,32 +1946,35 @@ impl UsageSession {
                     $20, $21, $22, $23, $24
                 )
                 "#,
-            )
-            .bind(request_id)
-            .bind(api_key_id)
-            .bind(tier)
-            .bind(upstream_provider)
-            .bind(upstream_model)
-            .bind(input_tokens)
-            .bind(cached_input_tokens.min(input_tokens))
-            .bind(output_tokens)
-            .bind(latency_ms)
-            .bind(status)
-            .bind(candidate_id)
-            .bind(cost_basis_usd)
-            .bind(sell_rates)
-            .bind(basis_rates)
-            .bind(finish_reason)
-            .bind(finish_reason_source)
-            .bind(telemetry.requested_max_tokens)
-            .bind(telemetry.stream)
-            .bind(telemetry.prompt_bytes)
-            .bind(telemetry.message_count)
-            .bind(telemetry.tool_count)
-            .bind(attempt_count)
-            .bind(telemetry.shape_ok)
-            .bind(telemetry.priority.map(Priority::as_str))
-            .execute(&pool)
+                )
+                .bind(request_id)
+                .bind(api_key_id)
+                .bind(tier)
+                .bind(upstream_provider)
+                .bind(upstream_model)
+                .bind(input_tokens)
+                .bind(cached_input_tokens.min(input_tokens))
+                .bind(output_tokens)
+                .bind(latency_ms)
+                .bind(status)
+                .bind(candidate_id)
+                .bind(cost_basis_usd)
+                .bind(sell_rates)
+                .bind(basis_rates)
+                .bind(finish_reason)
+                .bind(finish_reason_source)
+                .bind(telemetry.requested_max_tokens)
+                .bind(telemetry.stream)
+                .bind(telemetry.prompt_bytes)
+                .bind(telemetry.message_count)
+                .bind(telemetry.tool_count)
+                .bind(attempt_count)
+                .bind(telemetry.shape_ok)
+                .bind(telemetry.priority.map(Priority::as_str))
+                .execute(&mut *transaction)
+                .await?;
+                transaction.commit().await
+            }
             .await;
             if let Err(error) = written {
                 tracing::warn!(
