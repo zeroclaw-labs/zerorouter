@@ -823,10 +823,34 @@ fn reject_priority_suffix_collision(id: &str) -> Result<(), TierConfigError> {
 ///
 /// - `basis == sell` is **legal**. That is the intended flagship shape, so
 ///   only a strictly greater basis is a violation.
-/// - A dimension either side leaves unset is skipped, not read as zero. The
-///   bedrock rows omit `cached_input_per_mtok` because Bedrock does not report
-///   cached tokens at all; an absent basis is "unknown here", and treating it
-///   as free (or as a violation) would both be wrong.
+/// - A dimension either side leaves unset is skipped, not read as zero. An
+///   absent rate is "unknown here", and treating it as free (or as a
+///   violation) would both be wrong.
+///
+/// # Why the cached dimension is compared on EFFECTIVE rates
+///
+/// The second edge above used to be applied to the cached dimension as
+/// DECLARED, and that was a hole, because an absent cached rate is not
+/// unknown to the biller: [`crate::openai::usage_cost`] prices it at the
+/// INPUT rate. Skipping the comparison whenever either side omitted it
+/// therefore skipped a comparison that settlement would go on to make real,
+/// and two negative-margin shapes loaded happily:
+///
+/// - **Candidate declares a cached rate, the tier does not.** Basis 5.00
+///   against a tier whose cached traffic sells at its 3.00 input rate: the
+///   customer pays 3.00 for cached tokens that cost 5.00, on every request
+///   that reports any.
+/// - **The tier declares one, the candidate does not.** A tier selling cached
+///   input at a 0.60 discount, served by a candidate with a 3.00 input rate
+///   and no cached rate of its own — so the discount is real for the customer
+///   and imaginary for ZeroRouter.
+///
+/// Both are exactly the silent margin leak this function exists to catch, and
+/// both are invisible to a declared-value comparison. Reading each side
+/// through [`ModelRates::effective_cached_input_per_mtok`] — the same fallback
+/// `usage_cost` applies — closes it. "Unknown" still skips: the fallback
+/// resolves to `None` only when the input rate is absent too, which
+/// `validate_rates` has already refused before this runs.
 fn validate_candidate_margin(
     tier: &str,
     sell_rates: ModelRates,
@@ -845,8 +869,8 @@ fn validate_candidate_margin(
         ),
         (
             "cached_input_per_mtok",
-            candidate.rates.cached_input_per_mtok,
-            sell_rates.cached_input_per_mtok,
+            candidate.rates.effective_cached_input_per_mtok(),
+            sell_rates.effective_cached_input_per_mtok(),
         ),
     ] {
         let (Some(basis), Some(sell)) = (basis, sell) else {
@@ -890,8 +914,27 @@ fn validate_candidate_margin(
 /// It is whole-file rather than tier-scoped for the same reason an unsupported
 /// provider is: the file is wrong about the world, not merely mispriced, and
 /// withholding one tier is precisely how it would go unnoticed.
+///
+/// # Why the REQUIRED dimensions alone are enough to refuse
+///
+/// This used to ask [`TierCandidate::rates_are_zero`] — "is this candidate
+/// free?" — and that let a shape through that it should never have:
+/// `{input: 0.00, output: 0.00, cached_input: 5.00}` on a cloud provider. It
+/// is not free (the declared cached rate is real money), so the free-lane
+/// question answers no and the rule stayed silent; but it still asserts that
+/// the input and output tokens EVERY request generates cost ZeroRouter
+/// nothing on an upstream that bills for them. That is the fat-fingered-rate
+/// signature this function exists to catch, and letting it load records ~0
+/// COGS against real spend and reports a healthy margin until the invoice
+/// arrives.
+///
+/// So the question asked here is the weaker, more suspicious one —
+/// [`ModelRates::required_rates_are_zero`] — while [`TierCandidate::is_free`]
+/// keeps asking the stronger one. The two are deliberately different: what
+/// makes a claim REFUSABLE is not the same as what makes a route FREE, and
+/// conflating them is how the hole got in.
 fn validate_zero_price(tier: &str, candidate: &TierCandidate) -> Result<(), TierConfigError> {
-    if candidate.rates_are_zero() && !provider_settles_free(&candidate.provider) {
+    if candidate.rates.required_rates_are_zero() && !provider_settles_free(&candidate.provider) {
         return Err(TierConfigError::ZeroPriceWithoutFreeSettlement {
             tier: tier.to_owned(),
             candidate: candidate.id.clone(),
@@ -1150,17 +1193,46 @@ model = "upstream-model"
     }
 
     #[test]
-    fn an_absent_cached_basis_is_not_a_margin_violation() {
-        // The bedrock shape: no `cached_input_per_mtok` on the candidate, and
-        // an input basis well above the tier's *cached* sell rate. An unset
-        // dimension is unknown, not free and not a violation — reading it as
-        // the input rate would fail a table that is fine.
-        let catalog = catalog_with(
+    fn an_absent_cached_basis_is_compared_at_the_rate_it_will_be_billed_at() {
+        // DELIBERATELY REVERSED. This test used to assert the opposite, on the
+        // reasoning that "an unset dimension is unknown, not free and not a
+        // violation — reading it as the input rate would fail a table that is
+        // fine". The table is not fine, and the premise was the bug: `usage_cost`
+        // reads an absent cached rate AS the input rate, so this shape sells
+        // cached tokens at 0.06 and buys them at 0.30. A fivefold loss on every
+        // request that reports a cache hit is exactly the silent margin leak
+        // `validate_candidate_margin` exists to refuse, and the old rule stayed
+        // quiet about it because it compared what was WRITTEN rather than what
+        // would be BILLED.
+        let leaking = catalog_with(
             "input_per_mtok = 0.30\noutput_per_mtok = 1.20\ncached_input_per_mtok = 0.06",
             "input_per_mtok = 0.30\noutput_per_mtok = 1.20",
         );
-        validate_tier_catalog(&catalog)
-            .expect("a candidate that declares no cached rate must still validate");
+        let error = validate_tier_catalog(&leaking)
+            .expect_err("a cached discount the candidate cannot honour must be refused");
+        assert!(
+            matches!(
+                error,
+                TierConfigError::NegativeMargin {
+                    dimension: "cached_input_per_mtok",
+                    ..
+                }
+            ),
+            "unexpected error {error:?}"
+        );
+
+        // What the old test was RIGHT to protect, and what survives: a rate
+        // table that predates cached pricing, where NEITHER side declares the
+        // dimension. Both fall back to their own input rate, an at-cost
+        // flagship stays exactly at cost, and nothing is refused. "Unknown" is
+        // still not a violation — it is only no longer a way to dodge the
+        // comparison while the biller goes ahead and makes it.
+        let honest = catalog_with(
+            "input_per_mtok = 0.30\noutput_per_mtok = 1.20",
+            "input_per_mtok = 0.30\noutput_per_mtok = 1.20",
+        );
+        validate_tier_catalog(&honest)
+            .expect("an absent cached dimension on both sides is at cost, not over it");
     }
 
     #[test]
