@@ -949,3 +949,208 @@ async fn velocity_counts_uncached_tokens_only() {
         "a fully-uncached row still meets the whole cap"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The monthly-spend rollup (migration 0019)
+// ---------------------------------------------------------------------------
+//
+// Admission stopped summing `usage_events` for the month-to-date spend ceiling
+// and now reads `usage_key_month_spend`, a per-(key, UTC month) running total
+// accrued by trigger. That is an access-path change and nothing else, so what
+// these pin is that the ceiling still binds on exactly the same values: the
+// derived total must equal the ledger it came from, the cap must still refuse
+// at the same boundary, and an event must land in the same month the old
+// `ts >= date_trunc('month', NOW())` predicate would have put it in.
+
+/// Insert a settled usage row directly, dated `ts`, bypassing admission.
+///
+/// Backdating is the point: the accrual trigger buckets on the row's own `ts`,
+/// so this is how a month boundary gets exercised without waiting for one.
+async fn seed_event_at(pool: &PgPool, key: &AuthenticatedKey, ts_sql: &str, cost_usd: Decimal) {
+    query(&format!(
+        r#"
+        INSERT INTO usage_events (
+            request_id, api_key_id, ts, tier, upstream_provider, upstream_model,
+            input_tokens, cached_input_tokens, output_tokens, cost_usd,
+            latency_ms, status
+        )
+        VALUES ($1, $2, {ts_sql}, 'zero/test', 'test', 'test/model', 0, 0, 0, $3, 1, 200)
+        "#
+    ))
+    .bind(Uuid::new_v4())
+    .bind(key.id)
+    .bind(cost_usd)
+    .execute(pool)
+    .await
+    .expect("seeded usage event must insert");
+}
+
+/// Every rollup bucket in the database equals a fresh sum of the ledger rows it
+/// derives from, and no bucket is present on one side only.
+async fn rollup_disagreements(pool: &PgPool) -> i64 {
+    query_scalar::<_, i64>(
+        r#"
+        SELECT COUNT(*)
+        FROM (
+            SELECT api_key_id, usage_event_utc_month(ts) AS month, SUM(cost_usd) AS spend
+            FROM usage_events
+            GROUP BY 1, 2
+        ) AS truth
+        FULL OUTER JOIN usage_key_month_spend AS rollup
+          ON rollup.api_key_id = truth.api_key_id AND rollup.month = truth.month
+        WHERE truth.api_key_id IS NULL
+           OR rollup.api_key_id IS NULL
+           OR truth.spend <> rollup.spend_usd
+        "#,
+    )
+    .fetch_one(pool)
+    .await
+    .expect("rollup consistency must query")
+}
+
+#[tokio::test]
+async fn the_month_rollup_never_disagrees_with_the_ledger() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let user_id = create_user(&pool, "rollup-truth").await;
+    let first = create_key(&pool, user_id, Decimal::from(1_000), 1_000_000).await;
+    let second = create_key(&pool, user_id, Decimal::from(1_000), 1_000_000).await;
+
+    // Real settlements through the real path, across two keys.
+    for _ in 0..5 {
+        spend(&pool, &first, Decimal::new(133, 2)).await;
+        spend(&pool, &second, Decimal::new(7, 3)).await;
+    }
+    // Plus rows in three different months, so the bucketing is exercised and
+    // not just a single-bucket sum.
+    seed_event_at(&pool, &first, "NOW()", Decimal::new(25, 2)).await;
+    seed_event_at(
+        &pool,
+        &first,
+        "NOW() - INTERVAL '2 months'",
+        Decimal::from(9),
+    )
+    .await;
+    seed_event_at(
+        &pool,
+        &second,
+        "NOW() + INTERVAL '2 months'",
+        Decimal::from(4),
+    )
+    .await;
+
+    assert_eq!(
+        rollup_disagreements(&pool).await,
+        0,
+        "every rollup bucket must equal the ledger rows it derives from"
+    );
+}
+
+#[tokio::test]
+async fn the_spend_ceiling_binds_on_the_same_boundary_it_always_did() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let user_id = create_user(&pool, "spend-boundary").await;
+    let key = create_key(&pool, user_id, Decimal::from(20), 1_000_000).await;
+
+    // Spend to one cent short of the ceiling.
+    spend(&pool, &key, Decimal::new(1999, 2)).await;
+
+    // A request that lands exactly ON the ceiling is admitted: the cap refuses
+    // strictly-greater, never equal. Rolled back rather than settled so the
+    // next assertion starts from the same $19.99.
+    let UsageAdmission::Allowed(session) = admit(&pool, &key, 10, Decimal::new(1, 2)).await else {
+        panic!("a projection landing exactly on the ceiling must be admitted");
+    };
+    drop(session);
+    // The reservation the admitted session took is still encumbering, so clear
+    // it before probing the boundary again.
+    query("DELETE FROM usage_reservations WHERE api_key_id = $1")
+        .bind(key.id)
+        .execute(&pool)
+        .await
+        .expect("reservation cleanup must run");
+
+    // One cent past it is refused.
+    assert!(
+        matches!(
+            admit(&pool, &key, 10, Decimal::new(2, 2)).await,
+            UsageAdmission::SpendExceeded
+        ),
+        "a projection one cent past the ceiling must be refused"
+    );
+}
+
+#[tokio::test]
+async fn a_prior_month_event_does_not_count_against_this_month() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let user_id = create_user(&pool, "prior-month").await;
+    let key = create_key(&pool, user_id, Decimal::from(20), 1_000_000).await;
+
+    // Far more than the ceiling, but all of it last month.
+    seed_event_at(
+        &pool,
+        &key,
+        "date_trunc('month', NOW() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC' - INTERVAL '1 second'",
+        Decimal::from(500),
+    )
+    .await;
+
+    assert!(
+        matches!(
+            admit(&pool, &key, 10, Decimal::ONE).await,
+            UsageAdmission::Allowed(_)
+        ),
+        "last month's spend must not bind this month's ceiling"
+    );
+
+    // The same amount one second later is inside this month, and does bind.
+    seed_event_at(
+        &pool,
+        &key,
+        "date_trunc('month', NOW() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'",
+        Decimal::from(500),
+    )
+    .await;
+    assert!(
+        matches!(
+            admit(&pool, &key, 10, Decimal::ONE).await,
+            UsageAdmission::SpendExceeded
+        ),
+        "an event on the first instant of the month is inside it"
+    );
+}
+
+#[tokio::test]
+async fn an_event_dated_past_this_month_still_counts_against_it() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let user_id = create_user(&pool, "future-month").await;
+    let key = create_key(&pool, user_id, Decimal::from(20), 1_000_000).await;
+
+    // The predicate this replaced was `ts >= <start of this month>`, which has
+    // no upper bound: a row landing in a later month — two routers with clocks
+    // skewed across a month boundary — counted against the ceiling. Reading
+    // only the CURRENT bucket would have quietly stopped counting it and
+    // loosened the cap, so the rollup read is `month >= <this month>`.
+    seed_event_at(
+        &pool,
+        &key,
+        "date_trunc('month', NOW() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC' + INTERVAL '1 month'",
+        Decimal::from(500),
+    )
+    .await;
+
+    assert!(
+        matches!(
+            admit(&pool, &key, 10, Decimal::ONE).await,
+            UsageAdmission::SpendExceeded
+        ),
+        "a future-dated event must keep counting against the ceiling, as it did before"
+    );
+}
