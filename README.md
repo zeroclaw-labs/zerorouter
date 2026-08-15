@@ -112,6 +112,7 @@ Two config files, no code:
      "key": "local-llama",
      "adapter": "chat_completions",
      "credential": "none",
+     "settlement": "free",
      "display_name": "llama.cpp (local)",
      "base_url": "http://127.0.0.1:8080/v1/chat/completions"
    }]}
@@ -119,26 +120,44 @@ Two config files, no code:
 
    `"credential": "none"` is how an upstream that takes no API key says so —
    it is then never skipped for a missing credential, and no `Authorization`
-   header is sent. It is legal *only* on `chat_completions`, the adapter with
-   no implied endpoint; a keyless entry must still name its `base_url`.
+   header is sent. `"settlement": "free"` says its traffic bills nobody. Both
+   are legal *only* on `chat_completions`, the adapter with no implied
+   endpoint, and an entry using it must always name its `base_url`. The two are
+   independent: a local server behind a bearer token is credentialed **and**
+   free, and that is a normal deployment.
 
-2. **Declare the candidates.** In your `tiers.toml`, a candidate on that
-   provider priced at `0` is a **$0 rung**, and cost-led requests
-   (`:cost`, or a key defaulting to cost) order $0 rungs first — no estimator
-   warm-up needed, because free is cheapest at any length. Declare what the
-   model can actually take: a request whose prompt overflows the declared
-   `context_window`, or that needs tools a candidate declared it lacks, sinks
-   behind the rungs that can serve it and the existing failover walk bursts to
-   cloud. An *undeclared* capability means unknown and never excludes anything.
-   Selection is mechanical only — the router never predicts answer quality.
+2. **Declare the candidates.** In your `tiers.toml`, a candidate priced at `0`
+   on a provider that declares `settlement: free` is a **$0 rung**, and
+   cost-led requests (`:cost`, or a key defaulting to cost) order $0 rungs
+   first — no estimator warm-up needed, because free is cheapest at any length.
+   Declare what the model can actually take: in cost mode, a request whose
+   prompt overflows the declared `context_window`, or that needs tools a
+   candidate declared it lacks, sinks behind the rungs that can serve it and
+   the existing failover walk bursts to cloud. An *undeclared* capability means
+   unknown and never excludes anything. Selection is mechanical only — the
+   router never predicts answer quality.
 
-   A `$0` basis is refused on any provider that is not on the
-   `chat_completions` adapter: on a paid upstream it would record zero cost
-   against real spend. And a candidate is billed at its **tier's** sell rate,
-   so a $0 rung inside a mixed tier is free for the operator, not for the
-   customer; to sell a local model for nothing, pin it in a tier whose sell
-   rate is `0`. $0 routes are still metered end to end today (reserve → settle
-   at zero); skipping that is a later stage.
+   **Entering the free lane takes both declarations, and neither is inferred.**
+   A $0 price on a provider that has not declared free settlement refuses the
+   whole catalog, and `settlement: free` on a cloud adapter refuses the whole
+   inventory. Note what this does *not* claim: nothing can verify that a
+   free-declaring upstream really is free — `chat_completions` also serves a
+   hosted ZeroRouter taking metered traffic, and an operator who declares a
+   billed upstream free has lied to their own config in a way no validation can
+   detect. What the double declaration guarantees is that the free lane is
+   never entered by accident: not by a typo in a rate, not by picking a wire,
+   not by forgetting a credential.
+
+   A candidate is billed at its **tier's** sell rate, so a $0 rung inside a
+   mixed tier is free for the operator, not for the customer; to sell a local
+   model for nothing, pin it in a tier whose sell rate is `0`. $0 routes are
+   still metered end to end today (reserve → settle at zero); skipping that is
+   a later stage.
+
+`zerorouter admin catalog-drift` reads the same `ZEROROUTER_PROVIDERS_PATH`
+(or `--providers`), so an edge catalog reconciles: local $0 rungs are reported
+as `local $0 rung` and never fail the command, because no public model catalog
+lists a model running on your hardware.
 
 ## Environment variables
 
