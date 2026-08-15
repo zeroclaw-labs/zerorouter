@@ -1033,6 +1033,10 @@ async fn chat_completions(
     // generation limit sent upstream is untouched by sizing, and the cost
     // ordering prices a walk rather than a reservation.
     let mut provider_route = services.provider_route(&resolved, max_output_tokens)?;
+    // The one definition of $0 that ships: both halves of the declaration
+    // (`config::TierCandidate::is_free`), read from server-side configuration
+    // at selection time.
+    let is_free = TierCandidate::is_free;
     order_candidates(
         priority.resolved,
         provider_route.candidates_mut(),
@@ -1041,6 +1045,7 @@ async fn chat_completions(
             signature: &signature,
             signature_cell,
             input_bytes: reservation_usage.prompt_tokens,
+            is_free: &is_free,
         },
         &services.health,
         // Mechanical eligibility reads the same byte bound the cost ordering
@@ -1137,17 +1142,27 @@ fn model_unresolvable(catalog: &TierCatalog, requested_model: &str) -> ApiError 
 /// floor is unchanged. An all-demoted route partitions to itself, so this
 /// can never manufacture an empty route.
 ///
-/// **Mechanical eligibility applies last and outermost** (edge mode, stage 2:
-/// `docs/design/edge-mode-local-rung.md`). A rung whose DECLARED capabilities
-/// cannot take this request — the prompt overflows its context window, the
-/// request needs tools it does not have — sinks behind every rung that can,
-/// whatever the mode preferred and whatever health thinks. It is outermost
-/// because the two verdicts differ in kind: a demoted rung is one that has
-/// been failing and might still work, while an ineligible rung is one the
-/// operator has told us cannot take this request at all. Preferring a
-/// might-work rung over a stated-cannot one is the right order, and it is what
-/// makes "the local rung overflows, so this request bursts to cloud" fall out
-/// of the existing failover machinery rather than needing a new refusal path.
+/// **Mechanical eligibility applies last and outermost, in cost mode only**
+/// (edge mode, stage 2: `docs/design/edge-mode-local-rung.md`). A rung whose
+/// DECLARED capabilities cannot take this request — the prompt overflows its
+/// context window, the request needs tools it does not have — sinks behind
+/// every rung that can, whatever cost mode preferred and whatever health
+/// thinks. It is outermost because the two verdicts differ in kind: a demoted
+/// rung is one that has been failing and might still work, while an ineligible
+/// rung is one the operator has told us cannot take this request at all.
+/// Preferring a might-work rung over a stated-cannot one is the right order,
+/// and it is what makes "the local rung overflows, so this request bursts to
+/// cloud" fall out of the existing failover machinery rather than needing a new
+/// refusal path.
+///
+/// It is scoped to cost mode because that is where the $0 rung it exists for is
+/// specified, and because balanced is the frozen control group: a multi-
+/// candidate PAID tier in balanced mode must keep ordering exactly as it did
+/// before this stage, and a rule that reordered it on declared metadata would
+/// silently change the control group's behaviour — for tiers that have nothing
+/// to do with edge mode. The cost is real and accepted: in balanced mode an
+/// oversized prompt still meets the rung that cannot hold it, and the walk
+/// handles it exactly as it did before stage 2.
 ///
 /// Sinking, never removing — the same discipline as health, and for the same
 /// reason. An all-ineligible route partitions to itself, so a single-candidate
@@ -1173,11 +1188,13 @@ fn order_candidates(
         .partition(|candidate| !health.should_skip(candidate.definition()));
     candidates.extend(healthy);
     candidates.extend(demoted);
-    let (able, unable): (Vec<_>, Vec<_>) = candidates
-        .drain(..)
-        .partition(|candidate| candidate.definition().metadata.can_serve(needs));
-    candidates.extend(able);
-    candidates.extend(unable);
+    if priority == Priority::Cost {
+        let (able, unable): (Vec<_>, Vec<_>) = candidates
+            .drain(..)
+            .partition(|candidate| candidate.definition().metadata.can_serve(needs));
+        candidates.extend(able);
+        candidates.extend(unable);
+    }
 }
 
 /// The request-scoped inputs cost-mode ordering reads (design doc: Engine
@@ -1192,6 +1209,16 @@ struct CostContext<'a> {
     /// The byte-bound input measure — the same number admission reserves
     /// against, reused as the input side of expected cost.
     input_bytes: u64,
+    /// How a candidate is recognized as a $0 rung.
+    ///
+    /// Injected rather than called directly because
+    /// [`TierCandidate::is_free`] reads the process-wide provider inventory —
+    /// installing one is a once-per-process act, so the ordering MECHANISM
+    /// could otherwise only be tested in a binary that had installed a
+    /// particular inventory. Production passes `TierCandidate::is_free` and
+    /// nothing else; there is no second definition of free, and the real one
+    /// is exercised end to end in `tests/local_candidates.rs`.
+    is_free: &'a dyn Fn(&TierCandidate) -> bool,
 }
 
 /// Cost mode's base ordering: ascending expected cost basis, stable, so
@@ -1231,7 +1258,7 @@ struct CostContext<'a> {
 fn order_by_expected_cost(candidates: &mut Vec<ProviderCandidate>, estimates: &CostContext<'_>) {
     let (free, mut priced): (Vec<_>, Vec<_>) = candidates
         .drain(..)
-        .partition(|candidate| candidate.definition().is_free());
+        .partition(|candidate| (estimates.is_free)(candidate.definition()));
     order_priced_by_expected_cost(&mut priced, estimates);
     candidates.extend(free);
     candidates.extend(priced);
@@ -3398,6 +3425,15 @@ mod tests {
                 ProviderCandidate::against_local_upstream(definition, "http://127.0.0.1:1/unused")
             })
             .collect();
+        // Stands in for `TierCandidate::is_free`, which needs an installed
+        // operator inventory to be true of anything — a once-per-process act
+        // this binary must not perform (other tests pin the shipped inventory
+        // exactly). The predicate itself is tested in `config`; that the real
+        // one drives real ordering is tested end to end in
+        // `tests/local_candidates.rs`. What these tests own is the MECHANISM:
+        // where the partition sits relative to the estimator, health, and
+        // eligibility.
+        let is_free = |candidate: &TierCandidate| candidate.rates_are_zero();
         order_candidates(
             priority,
             &mut candidates,
@@ -3408,6 +3444,7 @@ mod tests {
                 // exactly when a local rung most needs to be chosen.
                 signature_cell: CellRead::Cold,
                 input_bytes: needs.prompt_bound,
+                is_free: &is_free,
             },
             health,
             needs,
@@ -3640,6 +3677,51 @@ mod tests {
                 &health,
             ),
             ["openai/cloud", "local/qwen"]
+        );
+    }
+
+    #[test]
+    fn balanced_never_reorders_a_paid_tier_on_declared_metadata() {
+        // The frozen control group, protected from a rule that has nothing to
+        // do with it. Eligibility exists for the $0 rung, which is specified in
+        // cost mode; applying it in balanced would silently reorder ordinary
+        // multi-candidate PAID tiers — tiers with no local rung and no
+        // involvement in edge mode — the first time a request outgrew the
+        // narrower rung's declared window. Balanced means the file decides.
+        let narrow = TierCandidate {
+            metadata: ModelMetadata {
+                context_window: Some(8_000),
+                ..cloud_rung("openai/narrow").metadata
+            },
+            ..cloud_rung("openai/narrow")
+        };
+        let needs = RequestNeeds {
+            prompt_bound: 40_000,
+            ..modest_needs()
+        };
+        for priority in [Priority::Balanced, Priority::Success] {
+            assert_eq!(
+                ordered(
+                    priority,
+                    vec![narrow.clone(), cloud_rung("openai/wide")],
+                    &needs,
+                    &ProviderHealth::default(),
+                ),
+                ["openai/narrow", "openai/wide"],
+                "{priority:?} must keep the table order it had before stage 2"
+            );
+        }
+
+        // Cost mode is where the rule lives, and there it does sink the rung
+        // that cannot hold the prompt.
+        assert_eq!(
+            ordered(
+                Priority::Cost,
+                vec![narrow, cloud_rung("openai/wide")],
+                &needs,
+                &ProviderHealth::default(),
+            ),
+            ["openai/wide", "openai/narrow"]
         );
     }
 

@@ -103,15 +103,17 @@ pub enum Verdict {
     /// prints, so the exemption is visible in the table rather than silently
     /// skipping the candidate.
     ///
-    /// The exemption needs BOTH halves and is deliberately the narrowest thing
-    /// that works. Operator-declared alone is not enough: an operator's
-    /// *priced* upstream is a real cost basis and deserves a real answer, even
-    /// if that answer is `NOT IN SOURCE`. $0 alone is very much not enough —
-    /// a fat-fingered zero on a shipped cloud provider is precisely the
-    /// silent-margin failure this module was written to catch, and exempting it
-    /// would disable the alarm at the moment it matters most. (Such a candidate
-    /// cannot load at all since stage 2 — `validate_zero_price` refuses it —
-    /// but this file does not depend on that being true.)
+    /// The exemption needs BOTH halves — the provider's `"settlement": "free"`
+    /// declaration and the candidate's $0 price, the same pair
+    /// [`crate::config::TierCandidate::is_free`] requires — and is deliberately
+    /// the narrowest thing that works. A free-declaring provider's *priced*
+    /// candidate is a real cost basis and deserves a real answer, even if that
+    /// answer is `NOT IN SOURCE`. And $0 alone is very much not enough: a
+    /// fat-fingered zero on a metered provider is precisely the silent-margin
+    /// failure this module was written to catch, and exempting it would disable
+    /// the alarm at the moment it matters most. (Such a candidate cannot load
+    /// at all since stage 2 — `validate_zero_price` refuses it — but this file
+    /// does not depend on that being true.)
     Unreconcilable,
 }
 
@@ -354,12 +356,12 @@ fn metadata_drift(recorded: &ModelMetadata, upstream: &ModelMetadata) -> Vec<Met
 #[must_use]
 pub fn reconcile(catalog: &TierCatalog, source: &str) -> Vec<CandidateDrift> {
     reconcile_with(catalog, source, &|candidate| {
-        crate::providers::is_operator_declared_provider(&candidate.provider)
+        crate::providers::provider_settles_free(&candidate.provider)
     })
 }
 
-/// [`reconcile`], with the "is this the operator's own upstream?" question
-/// supplied rather than read from the process-wide inventory.
+/// [`reconcile`], with the "does this candidate's provider settle free?"
+/// question supplied rather than read from the process-wide inventory.
 ///
 /// The seam exists so the exemption can be tested for what it is — a rule
 /// about candidates — without a test having to install a global inventory to
@@ -367,7 +369,7 @@ pub fn reconcile(catalog: &TierCatalog, source: &str) -> Vec<CandidateDrift> {
 fn reconcile_with(
     catalog: &TierCatalog,
     source: &str,
-    operator_declared: &dyn Fn(&crate::config::TierCandidate) -> bool,
+    settles_free: &dyn Fn(&crate::config::TierCandidate) -> bool,
 ) -> Vec<CandidateDrift> {
     let providers: BTreeMap<String, SourceProvider> =
         serde_json::from_str(source).unwrap_or_default();
@@ -406,10 +408,10 @@ fn reconcile_with(
                 })
                 .unwrap_or_default();
 
-            // Checked before the source is consulted at all: a $0 rung on the
-            // operator's own upstream is not a model the source failed to
+            // Checked before the source is consulted at all: a $0 rung on an
+            // upstream that bills nobody is not a model the source failed to
             // mention, it is a model the source is not about.
-            let verdict = if candidate.is_free() && operator_declared(candidate) {
+            let verdict = if candidate.rates_are_zero() && settles_free(candidate) {
                 Verdict::Unreconcilable
             } else {
                 match entry {

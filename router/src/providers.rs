@@ -40,9 +40,24 @@ struct ProviderInventory {
 }
 
 #[derive(Clone, Debug, Deserialize)]
+// A misspelled field must not silently default. `"credentail": "none"` would
+// otherwise leave `credential` at `required` and the typo invisible — and the
+// two fields this struct gained in stage 2 are both safety declarations whose
+// absence is meaningful, which is exactly the shape where a silent default is
+// worst.
+#[serde(deny_unknown_fields)]
 struct ProviderMetadata {
     key: String,
     adapter: ProviderAdapter,
+    /// Whether requests to this upstream cost anyone money.
+    ///
+    /// Defaults to [`SettlementDeclaration::Metered`], so the shipped file and
+    /// every entry written before this field existed keep meaning what they
+    /// meant. Declaring `free` is the ONLY way a candidate on this provider may
+    /// be priced at $0 — see [`provider_settles_free`] for why the adapter
+    /// cannot answer that question.
+    #[serde(default)]
+    settlement: SettlementDeclaration,
     /// Whether this upstream takes a credential at all. Defaults to
     /// [`CredentialRequirement::Required`], so the shipped file — and every
     /// entry written before this field existed — keeps meaning exactly what it
@@ -65,12 +80,42 @@ struct ProviderMetadata {
     display_name: Option<String>,
     #[serde(default)]
     base_url: Option<String>,
-    /// Which file this entry came from. Never deserialized — it is a fact
-    /// about where the bytes were read, not a field an entry may claim, and an
-    /// entry that could declare itself shipped would defeat every rule below
-    /// that treats the two differently.
-    #[serde(skip)]
-    source: InventorySource,
+}
+
+/// Whether an upstream's traffic costs anyone money.
+///
+/// The free lane is entered by this declaration and by nothing else — not by
+/// the adapter, and not by the absence of a credential. Both of those were
+/// considered and both are wrong:
+///
+/// - **The adapter cannot answer it.** `chat_completions` is dual-use by the
+///   design's own scope (`docs/design/edge-mode-local-rung.md`): it serves the
+///   operator's local models AND a hosted ZeroRouter `/v1` taking metered burst
+///   traffic. "On the local wire" and "bills nobody" are different claims, and
+///   only one of them is about money.
+/// - **Credential presence cannot answer it either.** A local vLLM behind a
+///   bearer token is an ordinary deployment; it is free because its operator
+///   runs it, not because it happens to be unauthenticated. A free provider may
+///   be keyless or credentialed.
+///
+/// So it is stated twice, deliberately: once here, by the provider, and once in
+/// `tiers.toml`, by the candidate's $0 price. [`crate::config::TierCandidate::is_free`]
+/// — the key stage 3's metering skip is specified to read — requires both.
+///
+/// What this does NOT do, and must not be described as doing: make it
+/// impossible to run a paid model through the free lane. An operator who
+/// declares `settlement: free` on an upstream that bills them has lied to their
+/// own configuration, and no validation here can detect that — the router has
+/// no way to know what an arbitrary endpoint charges. What the double
+/// declaration buys is that it cannot happen by ACCIDENT: not by a typo in a
+/// rate, not by picking the wrong adapter, not by forgetting a credential. The
+/// free lane is always something someone wrote down on purpose.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum SettlementDeclaration {
+    #[default]
+    Metered,
+    Free,
 }
 
 /// Whether an upstream authenticates.
@@ -94,20 +139,6 @@ enum CredentialRequirement {
     #[default]
     Required,
     None,
-}
-
-/// Which inventory an entry was read from.
-///
-/// Load-bearing in two places, both of which must never treat an
-/// operator-supplied entry as though ZeroRouter had vouched for it: the
-/// shadowing rule in [`ProviderInventory::assembled`], and the drift
-/// reconciliation's exemption for upstreams no public catalog covers
-/// ([`is_operator_declared_provider`]).
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-enum InventorySource {
-    #[default]
-    Shipped,
-    Operator,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
@@ -191,17 +222,13 @@ impl ProviderInventory {
         })
     }
 
-    /// Parse an operator-supplied inventory document, stamping every entry
-    /// with its origin.
+    /// Parse an operator-supplied inventory document.
     fn parse_operator(source: &str) -> Result<Vec<ProviderMetadata>, ProviderBuildError> {
-        let mut inventory = serde_json::from_str::<Self>(source).map_err(|source| {
+        let inventory = serde_json::from_str::<Self>(source).map_err(|source| {
             ProviderBuildError::InvalidInventory {
                 detail: format!("operator provider inventory is not valid: {source}"),
             }
         })?;
-        for provider in &mut inventory.providers {
-            provider.source = InventorySource::Operator;
-        }
         Ok(inventory.providers)
     }
 
@@ -213,21 +240,48 @@ impl ProviderInventory {
     /// a config file that could silently repoint `openai` at another host is a
     /// credential-exfiltration primitive, not an extension point. Renaming the
     /// operator's entry costs one line and leaves both providers addressable.
+    ///
+    /// The same rule covers the credential the entry reads. Blocking the key
+    /// while leaving `credential_env` free would stop an operator entry from
+    /// *being* `anthropic` but not from *reading* `ANTHROPIC_API_KEY` and
+    /// posting it to an address of their choosing — the identical outcome by a
+    /// different door. Both halves of "where ZeroRouter's own credential goes"
+    /// are therefore reserved.
     fn assembled(operator: &[ProviderMetadata]) -> Result<Self, ProviderBuildError> {
         let mut inventory = Self::shipped()?;
         if !operator.is_empty() {
-            let shipped: BTreeSet<String> = inventory
+            let shipped_keys: BTreeSet<String> = inventory
                 .providers
                 .iter()
                 .map(|provider| provider.key.clone())
                 .collect();
+            let shipped_credentials: BTreeSet<String> = inventory
+                .providers
+                .iter()
+                .filter_map(|provider| provider.credential_env.clone())
+                .collect();
             for entry in operator {
-                if shipped.contains(&entry.key) {
+                if shipped_keys.contains(&entry.key) {
                     return Err(ProviderBuildError::InvalidInventory {
                         detail: format!(
                             "operator provider {} shadows a shipped provider of the same key; \
                              the shipped entry names where ZeroRouter's own credential is sent, \
                              so it may be added to but never redefined — rename the operator entry",
+                            entry.key
+                        ),
+                    });
+                }
+                if let Some(credential_env) = entry
+                    .credential_env
+                    .as_deref()
+                    .filter(|name| shipped_credentials.contains(*name))
+                {
+                    return Err(ProviderBuildError::InvalidInventory {
+                        detail: format!(
+                            "operator provider {} reads {credential_env}, which is a shipped \
+                             provider's credential; an operator entry may not borrow a credential \
+                             ZeroRouter holds for an upstream of its own — give this provider its \
+                             own environment variable",
                             entry.key
                         ),
                     });
@@ -259,6 +313,7 @@ impl ProviderInventory {
                 });
             }
             provider.validate_credential()?;
+            provider.validate_settlement()?;
             if !keys.insert(provider.key.as_str()) {
                 return Err(ProviderBuildError::InvalidInventory {
                     detail: format!("duplicate provider key {}", provider.key),
@@ -331,6 +386,31 @@ impl ProviderMetadata {
     /// A `required` entry is checked exactly as it was before this field
     /// existed — both names present and non-blank — so the shipped inventory is
     /// unaffected.
+    /// Enforce the settlement declaration.
+    ///
+    /// One rule: `free` is legal only on the chat-completions adapter. That
+    /// adapter is not *sufficient* for free settlement — the whole point of
+    /// [`SettlementDeclaration`] is that it cannot be — but it is necessary.
+    /// The other two adapters exist to talk to api.anthropic.com and
+    /// api.openai.com, whose traffic ZeroRouter is invoiced for, so an entry
+    /// claiming that traffic settles free is stating something known to be
+    /// untrue and is refused before it can reach a rate table.
+    fn validate_settlement(&self) -> Result<(), ProviderBuildError> {
+        if self.settlement == SettlementDeclaration::Free
+            && self.adapter != ProviderAdapter::ChatCompletions
+        {
+            return Err(ProviderBuildError::InvalidInventory {
+                detail: format!(
+                    "provider {} declares \"settlement\": \"free\" on an adapter that dials a \
+                     cloud endpoint ZeroRouter is invoiced for; only the chat_completions adapter \
+                     — which must name its own base_url — may settle free",
+                    self.key
+                ),
+            });
+        }
+        Ok(())
+    }
+
     fn validate_credential(&self) -> Result<(), ProviderBuildError> {
         let declared = |value: &Option<String>| {
             value
@@ -386,40 +466,27 @@ pub fn is_supported_provider(provider: &str) -> bool {
     ProviderInventory::load().is_ok_and(|inventory| inventory.provider(provider).is_some())
 }
 
-/// Whether a provider may carry $0 candidates (edge mode, stage 2).
+/// Whether this provider declares that its traffic bills nobody (edge mode,
+/// stage 2) — half of what makes a candidate free, the other half being a $0
+/// price in `tiers.toml`.
 ///
-/// True only for the chat-completions adapter — the local/edge upstream, which
-/// has no implied endpoint and must name its own `base_url`. The rule exists
-/// because a $0 basis on a paid cloud adapter is never a fact about the world:
-/// it is either a fat-fingered rate, which records zero COGS on real spend and
-/// reports a healthy margin while the invoice grows (the exact silent failure
-/// `config/tiers.toml` and `drift.rs` are both written against), or a
-/// deliberate attempt to file a paid model under the free rung. Refusing it at
-/// catalog load makes the free rung structurally unable to name a cloud model,
-/// which is the property stage 3's metering skip will need to be able to
-/// assume — and it is enforced here, once, against the inventory itself rather
-/// than by a list of vendor names kept somewhere else.
+/// Read in three places, all of which must agree on one answer: catalog
+/// validation (a $0 candidate on a metered provider refuses the file),
+/// [`crate::config::TierCandidate::is_free`] (the selection-time key, and
+/// stage 3's metering-skip key), and the drift reconciliation (a free upstream
+/// is one no public catalog covers). Answering from the inventory rather than
+/// from a list of vendor names kept elsewhere is what keeps those three from
+/// drifting apart.
+///
+/// See [`SettlementDeclaration`] for why neither the adapter nor the presence
+/// of a credential can stand in for this declaration, and for the honest limit
+/// of what it guarantees.
 #[must_use]
-pub fn provider_allows_zero_price(provider: &str) -> bool {
+pub fn provider_settles_free(provider: &str) -> bool {
     ProviderInventory::load().is_ok_and(|inventory| {
         inventory
             .provider(provider)
-            .is_some_and(|metadata| metadata.adapter == ProviderAdapter::ChatCompletions)
-    })
-}
-
-/// Whether this provider was declared by the operator rather than shipped.
-///
-/// Read by the drift reconciliation, which reconciles the tier file against a
-/// public model catalog: an upstream running on the operator's own hardware is
-/// absent from every such catalog by construction, and that absence is not
-/// evidence of anything.
-#[must_use]
-pub fn is_operator_declared_provider(provider: &str) -> bool {
-    ProviderInventory::load().is_ok_and(|inventory| {
-        inventory
-            .provider(provider)
-            .is_some_and(|metadata| metadata.source == InventorySource::Operator)
+            .is_some_and(|metadata| metadata.settlement == SettlementDeclaration::Free)
     })
 }
 
@@ -935,11 +1002,13 @@ mod tests {
         format!(r#"{{"providers": [{body}]}}"#)
     }
 
-    /// The canonical local entry: keyless, chat-completions, own endpoint.
+    /// The canonical local entry: keyless, free-settling, chat-completions,
+    /// own endpoint.
     const LOCAL_ENTRY: &str = r#"{
         "key": "local-llama",
         "adapter": "chat_completions",
         "credential": "none",
+        "settlement": "free",
         "display_name": "llama.cpp (local)",
         "base_url": "http://127.0.0.1:8080/v1/chat/completions"
     }"#;
@@ -969,11 +1038,15 @@ mod tests {
             .expect("the operator entry is addressable by key");
         assert_eq!(local.adapter, ProviderAdapter::ChatCompletions);
         assert_eq!(local.credential, CredentialRequirement::None);
-        assert_eq!(local.source, InventorySource::Operator);
+        assert_eq!(local.settlement, SettlementDeclaration::Free);
         for shipped in ["anthropic", "openai"] {
             let metadata = inventory.provider(shipped).expect("shipped entry survives");
             assert_eq!(metadata.credential, CredentialRequirement::Required);
-            assert_eq!(metadata.source, InventorySource::Shipped);
+            assert_eq!(
+                metadata.settlement,
+                SettlementDeclaration::Metered,
+                "a shipped provider bills, and says so by saying nothing"
+            );
         }
     }
 
@@ -995,6 +1068,103 @@ mod tests {
         let detail = error.to_string();
         assert!(detail.contains("openai"), "{detail}");
         assert!(detail.contains("shadows"), "{detail}");
+    }
+
+    #[test]
+    fn free_settlement_is_refused_on_every_adapter_that_dials_a_billed_endpoint() {
+        // Necessary but not sufficient. The chat-completions adapter is the
+        // only one that CAN settle free, because it is the only one without an
+        // endpoint ZeroRouter is invoiced for — but being on it proves nothing
+        // (see the dual-use note on `SettlementDeclaration`), which is why the
+        // declaration exists at all.
+        for adapter in ["anthropic", "openai_responses"] {
+            let error = assemble(&format!(
+                r#"{{"key": "wishful", "adapter": "{adapter}", "settlement": "free",
+                    "credential_env": "W", "secret_name": "w"}}"#
+            ))
+            .expect_err("free settlement must be refused on a billed adapter");
+            let detail = error.to_string();
+            assert!(detail.contains("wishful"), "{adapter}: {detail}");
+            assert!(detail.contains("settlement"), "{adapter}: {detail}");
+        }
+    }
+
+    #[test]
+    fn a_free_settling_provider_may_be_keyless_or_credentialed() {
+        // The correction the review forced. Credential presence was never the
+        // right key: a local vLLM behind a bearer token is an ordinary
+        // deployment, and it is free because its operator runs it — not because
+        // it happens to be unauthenticated. Both shapes assemble.
+        let keyless = assemble(LOCAL_ENTRY).expect("a keyless free provider assembles");
+        assert_eq!(
+            keyless
+                .provider("local-llama")
+                .expect("entry exists")
+                .settlement,
+            SettlementDeclaration::Free
+        );
+
+        let credentialed = assemble(
+            r#"{
+                "key": "secure-local",
+                "adapter": "chat_completions",
+                "credential_env": "SECURE_LOCAL_API_KEY",
+                "secret_name": "secure-local-api-key",
+                "settlement": "free",
+                "base_url": "http://127.0.0.1:8000/v1/chat/completions"
+            }"#,
+        )
+        .expect("a credentialed free provider assembles too");
+        let entry = credentialed.provider("secure-local").expect("entry exists");
+        assert_eq!(entry.settlement, SettlementDeclaration::Free);
+        assert_eq!(entry.credential, CredentialRequirement::Required);
+    }
+
+    #[test]
+    fn an_operator_entry_may_not_borrow_a_shipped_providers_credential() {
+        // The other door into the same room the shadowing rule guards. Blocking
+        // the KEY `anthropic` while leaving `ANTHROPIC_API_KEY` readable would
+        // stop an operator entry from being Anthropic and not from reading
+        // Anthropic's key and posting it to an address of its choosing.
+        let error = assemble(
+            r#"{
+                "key": "definitely-local",
+                "adapter": "chat_completions",
+                "credential_env": "ANTHROPIC_API_KEY",
+                "secret_name": "anthropic-api-key",
+                "base_url": "http://198.51.100.7:8080/v1/chat/completions"
+            }"#,
+        )
+        .expect_err("borrowing a shipped credential must be refused");
+        let detail = error.to_string();
+        assert!(detail.contains("definitely-local"), "{detail}");
+        assert!(detail.contains("ANTHROPIC_API_KEY"), "{detail}");
+    }
+
+    #[test]
+    fn a_misspelled_field_refuses_the_inventory_instead_of_defaulting() {
+        // Every field this struct gained in stage 2 is a safety declaration
+        // whose ABSENCE is meaningful, which is the shape where a silent
+        // default is worst: `"credentail": "none"` would leave the entry
+        // `required` and the typo invisible until a route quietly lost a rung.
+        for typo in [
+            r#""credentail": "none""#,
+            r#""settlment": "free""#,
+            r#""base_urls": "http://127.0.0.1:8080/v1/chat/completions""#,
+        ] {
+            let refused = ProviderInventory::parse_operator(&operator_json(&format!(
+                r#"{{"key": "local-llama", "adapter": "chat_completions", {typo}}}"#
+            )));
+            assert!(
+                refused.is_err(),
+                "a misspelled field must refuse the document: {typo}"
+            );
+        }
+
+        // And the fields that DO exist still parse — including the shipped
+        // inventory, which names none of the stage-2 ones.
+        ProviderInventory::shipped().expect("the shipped inventory still parses");
+        assemble(LOCAL_ENTRY).expect("a fully-specified entry still parses");
     }
 
     #[test]

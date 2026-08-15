@@ -81,6 +81,11 @@ pub struct CatalogDriftArgs {
     /// Tier file to check. Defaults to the same path the server serves.
     #[arg(long)]
     pub tiers: Option<std::path::PathBuf>,
+    /// Operator provider inventory, if the tier file names upstreams the
+    /// shipped inventory does not (edge mode). Defaults to
+    /// `ZEROROUTER_PROVIDERS_PATH`, the same variable the server reads.
+    #[arg(long)]
+    pub providers: Option<std::path::PathBuf>,
     /// Report and exit zero even when something drifted.
     #[arg(long)]
     pub allow_drift: bool,
@@ -967,6 +972,29 @@ async fn catalog_drift(args: CatalogDriftArgs) -> Result<()> {
             .unwrap_or_else(|_| crate::config::DEFAULT_TIER_CONFIG_PATH.to_owned())
             .into()
     });
+    // An edge deployment's tier file names upstreams that exist only in the
+    // operator's inventory, so this must be loaded before the catalog is — or
+    // the load fails with "unsupported provider" and the one deployment shape
+    // that most needs a drift report is the one that cannot run it. Same
+    // variable the server reads, so `catalog-drift` and `serve` are looking at
+    // the same world; also what makes the local-rung exemption reachable at all
+    // (`drift::Verdict::Unreconcilable` keys on the provider's declaration).
+    let providers_path = args.providers.or_else(|| {
+        std::env::var_os(crate::providers::PROVIDER_INVENTORY_PATH_ENV)
+            .map(std::path::PathBuf::from)
+    });
+    if let Some(path) = providers_path {
+        let count = crate::providers::load_operator_inventory(&path).with_context(|| {
+            format!(
+                "loading the operator provider inventory from {}",
+                path.display()
+            )
+        })?;
+        println!(
+            "operator providers: {count} from {path}",
+            path = path.display()
+        );
+    }
     let catalog = crate::config::load_tier_catalog(&tiers_path)
         .await
         .with_context(|| format!("loading the tier catalog from {}", tiers_path.display()))?;

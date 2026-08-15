@@ -4,8 +4,26 @@
       "key": "local-llama",
       "adapter": "chat_completions",
       "credential": "none",
+      "settlement": "free",
       "display_name": "llama.cpp (local)",
       "base_url": "http://127.0.0.1:8080/v1/chat/completions"
+    },
+    {
+      "key": "secure-local",
+      "adapter": "chat_completions",
+      "credential_env": "SECURE_LOCAL_API_KEY",
+      "secret_name": "secure-local-api-key",
+      "settlement": "free",
+      "display_name": "vLLM behind a token (local)",
+      "base_url": "http://127.0.0.1:8000/v1/chat/completions"
+    },
+    {
+      "key": "hosted-zr",
+      "adapter": "chat_completions",
+      "credential_env": "HOSTED_ZR_API_KEY",
+      "secret_name": "hosted-zr-api-key",
+      "display_name": "hosted ZeroRouter (metered burst)",
+      "base_url": "https://api.zerorouter.example/v1/chat/completions"
     }
   ]
 }
