@@ -13,7 +13,7 @@ use thiserror::Error;
 
 use crate::{
     config::TierCandidate,
-    wire::{AnthropicWire, OpenAiResponsesWire},
+    wire::{AnthropicWire, ChatCompletionsWire, OpenAiResponsesWire},
 };
 
 const PROVIDER_INVENTORY_JSON: &str = include_str!("../config/providers.json");
@@ -46,6 +46,14 @@ enum ProviderAdapter {
     /// provider discards usage.
     #[serde(rename = "openai_responses")]
     OpenAiResponses,
+    /// Any upstream speaking OpenAI **chat completions** — the dialect
+    /// llama.cpp, vLLM, Ollama, and LM Studio all implement, and the one a
+    /// hosted ZeroRouter `/v1` serves. Unlike the other two adapters this one
+    /// has no implied endpoint, so a provider entry selecting it is expected
+    /// to carry a `base_url` (edge mode, stage 1:
+    /// `docs/design/edge-mode-local-rung.md`).
+    #[serde(rename = "chat_completions")]
+    ChatCompletions,
 }
 
 impl ProviderInventory {
@@ -86,10 +94,13 @@ impl ProviderInventory {
                     detail: format!("duplicate provider key {}", provider.key),
                 });
             }
-            // Neither shipped adapter takes a base_url override: both wires
-            // own their endpoints, and the only override is the documented
-            // test seam. The per-adapter validation this replaced covered
-            // aggregator and Bedrock shapes that no longer exist.
+            // Neither adapter in the SHIPPED inventory takes a base_url
+            // override: both of those wires own their endpoints, and the only
+            // override is the documented test seam. The chat-completions
+            // adapter is the exception by design — it has no implied endpoint
+            // — but an entry selecting it still may not declare an EMPTY one.
+            // The per-adapter validation this replaced covered aggregator and
+            // Bedrock shapes that no longer exist.
             if provider
                 .base_url
                 .as_deref()
@@ -408,6 +419,14 @@ fn create_provider(
             // upstream budget, not an adapter default.
             900,
         )),
+        ProviderAdapter::ChatCompletions => Arc::new(ChatCompletionsWire::new(
+            alias,
+            credential,
+            effective_base_url,
+            Some(max_output_tokens),
+            // Same budget note as the arms above.
+            900,
+        )),
     };
     Ok(provider)
 }
@@ -448,6 +467,93 @@ mod tests {
             );
         }
         assert!(!is_supported_provider("unknown"));
+    }
+
+    #[test]
+    fn the_shipped_inventory_gains_no_route_from_the_new_adapter() {
+        // Stage 1 of edge mode adds the chat-completions ADAPTER, not a
+        // provider entry that uses it — the local-candidate configuration
+        // surface is stage 2. This pins that separation: adding the wire must
+        // not have quietly widened what a deployment dispatches to.
+        let inventory = ProviderInventory::load().expect("inventory should load");
+        let adapters: Vec<(&str, ProviderAdapter)> = inventory
+            .providers
+            .iter()
+            .map(|provider| (provider.key.as_str(), provider.adapter))
+            .collect();
+        assert_eq!(
+            adapters,
+            [
+                ("anthropic", ProviderAdapter::Anthropic),
+                ("openai", ProviderAdapter::OpenAiResponses),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_provider_entry_can_select_the_chat_completions_adapter() {
+        // The config contract: the tag a provider entry writes to reach the
+        // new wire, and the base_url that entry needs — this adapter is the
+        // one with no implied endpoint.
+        let inventory: ProviderInventory = serde_json::from_str(
+            r#"{"providers": [{
+                "key": "local-llama",
+                "adapter": "chat_completions",
+                "credential_env": "LOCAL_LLAMA_API_KEY",
+                "secret_name": "local-llama-api-key",
+                "display_name": "llama.cpp (local)",
+                "base_url": "http://127.0.0.1:8080/v1/chat/completions"
+            }]}"#,
+        )
+        .expect("a chat_completions entry parses");
+        inventory.validate().expect("and validates");
+        let metadata = inventory
+            .provider("local-llama")
+            .expect("the entry is addressable by key");
+        assert_eq!(metadata.adapter, ProviderAdapter::ChatCompletions);
+
+        // And it builds a client, through the same constructor a production
+        // route uses.
+        let provider = create_provider(metadata, "secret", crate::provider::BASELINE_MAX_TOKENS)
+            .expect("the chat-completions arm builds");
+        assert_eq!(provider.alias(), "local-llama");
+        assert!(provider.supports_streaming());
+    }
+
+    #[test]
+    fn an_empty_base_url_is_still_refused_for_the_new_adapter() {
+        // base_url is meaningful configuration for this adapter rather than a
+        // test seam, which makes the existing empty-value rule load-bearing:
+        // an entry that declares one must declare a real one.
+        let inventory: ProviderInventory = serde_json::from_str(
+            r#"{"providers": [{
+                "key": "local-llama",
+                "adapter": "chat_completions",
+                "credential_env": "LOCAL_LLAMA_API_KEY",
+                "secret_name": "local-llama-api-key",
+                "base_url": "   "
+            }]}"#,
+        )
+        .expect("the entry parses");
+        assert!(matches!(
+            inventory.validate(),
+            Err(ProviderBuildError::InvalidInventory { .. })
+        ));
+    }
+
+    #[test]
+    fn an_unknown_adapter_tag_is_a_loud_inventory_error() {
+        // The adapter tag is a closed set; a typo must fail the whole
+        // inventory rather than silently selecting a default wire.
+        assert!(
+            serde_json::from_str::<ProviderInventory>(
+                r#"{"providers": [{
+                    "key": "x", "adapter": "chat_completion",
+                    "credential_env": "E", "secret_name": "s"
+                }]}"#,
+            )
+            .is_err()
+        );
     }
 
     #[test]
