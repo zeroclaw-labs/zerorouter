@@ -1,0 +1,80 @@
+schema_version = 1
+
+# Benchmark tier catalog — TWO pins over the SAME mock upstream, differing only
+# in settlement. This is what makes the two-lane comparison apples-to-apples:
+# both lanes use the chat_completions adapter, dial the identical mock
+# endpoint, and parse the identical response body; the only difference between
+# them is the metering work.
+#
+#   local-mock/mock-model   — the FREE lane. Sell rate $0 on every dimension
+#                             (basis == sell == 0), single candidate on the
+#                             `settlement: free` keyless provider. Both halves
+#                             of the double declaration are present, so
+#                             `api::free_lane_admissible` admits it and the
+#                             route skips reserve/lock/settle (edge mode,
+#                             stage 3).
+#
+#   metered-mock/mock-model — the METERED lane. Nonzero sell rates (basis ==
+#                             sell, the shipped catalog's flagship shape) on a
+#                             credentialed provider with default (metered)
+#                             settlement. Every request takes the per-user
+#                             advisory lock and does the full prepaid
+#                             reserve -> dispatch -> settle against Postgres.
+#
+# Rates for the metered pin copy the shipped `openai/gpt-5.6-luna` pin so the
+# per-request debit is a realistic magnitude (12 in + 9 out tokens at these
+# rates = $0.0000132/request).
+
+# ---------------------------------------------------------------------------
+# FREE lane — $0-sell pin on the settlement:free provider.
+# ---------------------------------------------------------------------------
+
+[tiers."local-mock/mock-model"]
+
+[tiers."local-mock/mock-model".rates]
+input_per_mtok = 0.00
+cached_input_per_mtok = 0.00
+output_per_mtok = 0.00
+
+[[tiers."local-mock/mock-model".candidates]]
+id = "local-mock/mock-model"
+provider = "local-mock"
+model = "mock-model"
+
+[tiers."local-mock/mock-model".candidates.metadata]
+context_window = 128000
+max_output_tokens = 4096
+input_modalities = ["text"]
+tool_call = false
+
+[tiers."local-mock/mock-model".candidates.rates]
+input_per_mtok = 0.00
+cached_input_per_mtok = 0.00
+output_per_mtok = 0.00
+
+# ---------------------------------------------------------------------------
+# METERED lane — priced pin on the credentialed, default-settlement provider.
+# ---------------------------------------------------------------------------
+
+[tiers."metered-mock/mock-model"]
+
+[tiers."metered-mock/mock-model".rates]
+input_per_mtok = 0.20
+cached_input_per_mtok = 0.02
+output_per_mtok = 1.20
+
+[[tiers."metered-mock/mock-model".candidates]]
+id = "metered-mock/mock-model"
+provider = "metered-mock"
+model = "mock-model"
+
+[tiers."metered-mock/mock-model".candidates.metadata]
+context_window = 128000
+max_output_tokens = 4096
+input_modalities = ["text"]
+tool_call = false
+
+[tiers."metered-mock/mock-model".candidates.rates]
+input_per_mtok = 0.20
+cached_input_per_mtok = 0.02
+output_per_mtok = 1.20

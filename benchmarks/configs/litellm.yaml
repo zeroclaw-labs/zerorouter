@@ -1,0 +1,17 @@
+model_list:
+  - model_name: mock-model
+    litellm_params:
+      model: openai/mock-model
+      api_base: http://127.0.0.1:9010/v1
+      api_key: dummy-bench-key
+
+litellm_settings:
+  drop_params: true
+  set_verbose: false
+  telemetry: false
+
+general_settings:
+  # No master key -> proxy accepts requests without auth, which keeps the
+  # benchmark focused on proxy overhead rather than key lookups.
+  disable_spend_logs: true
+  disable_error_logs: true
