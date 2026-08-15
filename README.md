@@ -4,9 +4,9 @@ ZeroRouter is a Rust LLM gateway with prepaid billing:
 
 - an **OpenAI-compatible inference surface** (`POST /v1/chat/completions` with
   SSE streaming, public `GET /v1/models`, `GET /healthz`);
-- **tiered routing** — clients ask for `zero/low-cost`, `zero/balanced`, or
-  `zero/high-end` and the router walks an ordered candidate list of upstream
-  providers, never leaving the tier the client selected;
+- a **pinned model catalog** — OpenRouter-standard `{vendor}/{model}` ids
+  (`anthropic/claude-sonnet-5`, `openai/gpt-5.6-luna`) served at the vendor's
+  list rate, with the `zero/*` namespace reserved for future routed tiers;
 - **prepaid credits** — Stripe Checkout purchases, an append-only USD ledger
   enforced by database triggers, and advisory-locked reserve→settle metering
   so a balance can never be overdrawn by concurrent requests;
@@ -39,7 +39,7 @@ docker run --rm -d --name zerorouter-pg -p 5432:5432 \
 
 cd router
 export DATABASE_URL=postgres://postgres:dev@localhost:5432/zerorouter
-export ANTHROPIC_API_KEY=...   # any subset of the provider keys below
+export ANTHROPIC_API_KEY=...   # and/or OPENAI_API_KEY — see the table below
 
 cargo run -- serve
 ```
@@ -65,7 +65,7 @@ Call it, non-streaming:
 curl http://127.0.0.1:8080/v1/chat/completions \
   -H 'Authorization: Bearer zcr_<shown-once>' \
   -H 'Content-Type: application/json' \
-  -d '{"model":"zero/balanced","stream":false,"messages":[{"role":"user","content":"Hello"}]}'
+  -d '{"model":"anthropic/claude-haiku-4-5","stream":false,"messages":[{"role":"user","content":"Hello"}]}'
 ```
 
 and streaming (standard OpenAI SSE chunks):
@@ -74,27 +74,30 @@ and streaming (standard OpenAI SSE chunks):
 curl --no-buffer http://127.0.0.1:8080/v1/chat/completions \
   -H 'Authorization: Bearer zcr_<shown-once>' \
   -H 'Content-Type: application/json' \
-  -d '{"model":"zero/high-end","stream":true,"messages":[{"role":"user","content":"Hello"}]}'
+  -d '{"model":"anthropic/claude-sonnet-5","stream":true,"messages":[{"role":"user","content":"Hello"}]}'
 ```
 
-### Tiers
+### Models
 
-`model` is either a tier alias or a concrete candidate ID:
+The catalog is pins only: `model` is an OpenRouter-standard `{vendor}/{model}`
+id (for example `anthropic/claude-sonnet-5`, `openai/gpt-5.6-terra`) that
+names exactly that model, priced at the vendor's list rate. The public id is
+the vendor's own id and `/v1/models` reports `owned_by` as the vendor, so an
+OpenRouter client migrates by changing only the base URL and key. Unknown
+models are hard errors.
 
-| tier | what you get |
-|---|---|
-| `zero/low-cost` | cheap high-volume models (MiniMax M3, DeepSeek V4 Flash) |
-| `zero/balanced` | mid-range quality (DeepSeek V4 Pro, Claude Haiku 4.5) |
-| `zero/high-end` | frontier models (Claude Sonnet 5, Claude Opus 4.8) |
+The `zero/*` namespace is reserved for future routed tiers that pick among
+candidates; the three `zero/*` intent bands that once lived here are removed
+(the header of `router/config/tiers.toml` records why, and what brings them
+back).
 
-A tier alias resolves to an ordered candidate list; failover walks that list
-and nothing else. A concrete ID such as `anthropic/claude-sonnet-5` pins one
-candidate. Unknown models are hard errors. `router/config/tiers.toml` is the
-sole source of truth for the catalog, fallback order, upstream model IDs, and
-sell rates; `GET /v1/models` is materialized from it.
+`router/config/tiers.toml` is the sole source of truth for the catalog,
+upstream model IDs, sell rates, and per-model metadata (context windows,
+capabilities); `GET /v1/models` is materialized from it.
 
-A candidate is only usable when its provider credential is present in the
-environment; a tier still needs at least one credential-backed candidate.
+A candidate is only usable when its provider's credential is present in the
+environment (unless the provider declares `credential: "none"` — edge mode,
+below); a tier still needs at least one usable candidate.
 
 ### Hosted service
 
@@ -189,14 +192,11 @@ fail-closed inventory in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 |---|---|---|---|
 | `ZEROROUTER_BIND` | no | `0.0.0.0:8080` | listen address |
 | `ZEROROUTER_TIERS_PATH` | no | `config/tiers.toml` | tier catalog (container ships `/etc/zerorouter/tiers.toml`) |
-| `ZEROROUTER_PROVIDERS_PATH` | no | — | operator-declared upstreams, **added to** the shipped inventory (see below). Unreadable, invalid, or shadowing a shipped key aborts startup |
+| `ZEROROUTER_PROVIDERS_PATH` | no | — | operator-declared upstreams, **added to** the shipped inventory — how edge mode declares keyless / `settlement: free` local upstreams (see below). Unreadable, invalid, or shadowing a shipped key aborts startup |
 | `DATABASE_URL` | yes* | — | explicit connection string, for local development |
 | `DB_HOST` / `DB_PORT` / `DB_NAME` / `DB_USERNAME` / `DB_PASSWORD` / `DB_SSL_ROOT_CERT` | yes* | — | production path; always connects with `verify-full` TLS |
 | `ANTHROPIC_API_KEY` | no | — | enables `anthropic/*` candidates |
-| `BEDROCK_API_KEY` | no | — | Bedrock service bearer key (not AWS access keys); enables `bedrock/*` candidates |
-| `DEEPINFRA_API_KEY` | no | — | enables `deepinfra/*` candidates |
-| `FIREWORKS_API_KEY` | no | — | enables `fireworks/*` candidates |
-| `TOGETHER_API_KEY` | no | — | enables `together/*` candidates |
+| `OPENAI_API_KEY` | no | — | enables `openai/*` candidates |
 | `ZEROROUTER_REQUIRE_CREDITS` | no | `true` | `true`/`1` or `false`/`0`; anything else aborts, and unset or blank means `true`. When true, admission requires prepaid balance ≥ the reserved cost. `false` opts into cap-only (see below) |
 
 \* exactly one database path must be fully configured: either `DATABASE_URL`,
