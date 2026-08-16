@@ -1008,8 +1008,8 @@ async fn catalog_drift(args: CatalogDriftArgs) -> Result<()> {
 
     let findings = reconcile(&catalog, &source);
     println!(
-        "{:<22} {:<32} {:<18} {:>26} {:>26} {:>12} {:>10}",
-        "TIER", "CANDIDATE", "VERDICT", "RECORDED BASIS", "UPSTREAM COST", "CONTEXT", "MARKUP"
+        "{:<22} {:<32} {:<18} {:>26} {:>26} {:>13} {:>10}",
+        "TIER", "CANDIDATE", "VERDICT", "RECORDED BASIS", "UPSTREAM COST", "UPSTREAM CTX", "MARKUP"
     );
     let rate = |r: crate::provider::ModelRates| {
         let show = |v: Option<f64>| v.map_or_else(|| "-".to_owned(), |v| format!("{v}"));
@@ -1022,10 +1022,10 @@ async fn catalog_drift(args: CatalogDriftArgs) -> Result<()> {
     };
     for found in &findings {
         println!(
-            "{:<22} {:<32} {:<18} {:>26} {:>26} {:>12} {:>10}",
+            "{:<22} {:<32} {:<18} {:>26} {:>26} {:>13} {:>10}",
             found.tier,
             found.candidate_id,
-            found.verdict.label(),
+            found.row_label(),
             rate(found.recorded_basis),
             rate(found.upstream_cost),
             found
