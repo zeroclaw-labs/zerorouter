@@ -1,22 +1,12 @@
-// Draft — pending legal review. Not legal advice.
-//
-// This file contains DRAFT Terms of Service. It is a working draft for
-// internal review and must be reviewed and approved by qualified legal counsel
-// before it is relied upon or published. Bracketed [placeholders] mark details
-// (legal entity, jurisdiction, contact emails, dates, refund terms) that are
-// intentionally unresolved and must be filled in by counsel.
+// ZeroRouter Terms of Service — published. Substantive changes need Jordan's
+// sign-off; keep the deposit-fee, pass-through-pricing, and chargeback-freeze
+// descriptions in sync with the billing implementation.
 
 export function Terms() {
   return (
     <article className="legal">
-      <div className="legal-draft" role="note">
-        <strong>Draft — pending legal review. Not legal advice.</strong> This document is a working
-        draft for internal review and must be reviewed and approved by qualified legal counsel before
-        it is relied upon. Bracketed items are placeholders to be resolved before publication.
-      </div>
-
       <h1>Terms of Service</h1>
-      <p className="legal-meta">Effective date: August 14, 2026 · Last updated: August 14, 2026</p>
+      <p className="legal-meta">Effective date: August 14, 2026 · Last updated: August 16, 2026</p>
 
       <h2>1. Agreement &amp; who we are</h2>
       <p>
@@ -161,7 +151,7 @@ export function Terms() {
         These Terms are governed by the laws of the Commonwealth of Massachusetts, United States, without regard to its
         conflict-of-laws rules. The courts located in the Commonwealth of Massachusetts, United States will have exclusive
         jurisdiction over any dispute arising out of or relating to these Terms or the Service, except
-        where prohibited by applicable law. [Dispute-resolution / arbitration terms TBD.]
+        where prohibited by applicable law.
       </p>
 
       <h2>13. Changes to these Terms</h2>
