@@ -1,24 +1,13 @@
-// Draft — pending legal review. Not legal advice.
-//
-// This file contains a DRAFT Privacy Policy. It is a working draft for internal
-// review and must be reviewed and approved by qualified legal counsel before it
-// is relied upon or published. The content-free-by-design statements below
+// ZeroRouter Privacy Policy — published. The content-free-by-design statements
 // describe ZeroRouter's own systems and MUST NOT be edited to overclaim: the
 // upstream nuance (requests are forwarded to the selected third-party provider,
-// which processes content under its own terms) must remain. Bracketed
-// [placeholders] mark details to be resolved by counsel.
+// which processes content under its own terms) must remain.
 
 export function Privacy() {
   return (
     <article className="legal">
-      <div className="legal-draft" role="note">
-        <strong>Draft — pending legal review. Not legal advice.</strong> This document is a working
-        draft for internal review and must be reviewed and approved by qualified legal counsel before
-        it is relied upon. Bracketed items are placeholders to be resolved before publication.
-      </div>
-
       <h1>Privacy Policy</h1>
-      <p className="legal-meta">Effective date: August 14, 2026 · Last updated: August 14, 2026</p>
+      <p className="legal-meta">Effective date: August 14, 2026 · Last updated: August 16, 2026</p>
 
       <h2>1. Overview &amp; scope</h2>
       <p>
@@ -141,7 +130,7 @@ export function Privacy() {
       <p>
         We operate on cloud infrastructure and work with providers that may process data in countries
         other than yours. Where data is transferred across borders, we intend to rely on appropriate
-        safeguards as required by applicable law. [International-transfer mechanisms TBD.]
+        safeguards as required by applicable law.
       </p>
 
       <h2>11. Children</h2>
