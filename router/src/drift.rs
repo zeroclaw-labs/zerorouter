@@ -214,6 +214,26 @@ pub struct CandidateDrift {
 }
 
 impl CandidateDrift {
+    /// The single word for this candidate's whole row — everything wrong with
+    /// it, not just its rates.
+    ///
+    /// [`Verdict`] answers only "does the recorded basis match", so a
+    /// candidate priced correctly but describing a 1M-token model as 32k
+    /// labels itself `ok`. That row is precisely the one an operator scanning
+    /// for problems skips, and the detail section below then contradicts it.
+    ///
+    /// Rates win the cell when both drifted: a wrong basis is the more
+    /// expensive fact, and no metadata detail is lost — every field still
+    /// prints below.
+    #[must_use]
+    pub fn row_label(&self) -> &'static str {
+        if !self.verdict.is_actionable() && self.has_actionable_metadata_drift() {
+            MetadataDriftKind::Disagrees.label()
+        } else {
+            self.verdict.label()
+        }
+    }
+
     /// Markup the customer pays over the upstream's published output rate, as
     /// a multiplier. `None` when either side is unknown. A pass-through tier
     /// claims this is 1.0.
@@ -556,6 +576,68 @@ mod tests {
         let found = reconcile(&catalog, SOURCE);
         assert_eq!(found[0].verdict, Verdict::Match);
         assert_eq!(found[0].upstream_metadata, sonnet_metadata());
+    }
+
+    /// The row label is the only part of the report an operator reads for
+    /// every candidate; the detail section below is what they read for the
+    /// ones it flags. So a row must never claim `ok` while carrying drift
+    /// that the section then lists — the table would be sending them past
+    /// the very candidate they are scanning for.
+    #[test]
+    fn a_row_whose_rates_are_fine_but_metadata_drifted_does_not_claim_ok() {
+        let catalog = catalog_declaring(
+            "claude-sonnet-5",
+            rates(2.0, 0.2, 10.0),
+            rates(2.0, 0.2, 10.0),
+            ModelMetadata {
+                context_window: Some(32_000),
+                ..sonnet_metadata()
+            },
+        );
+        let found = reconcile(&catalog, SOURCE);
+
+        assert_eq!(
+            found[0].verdict,
+            Verdict::Match,
+            "the basis genuinely does match; that is what makes this the trap"
+        );
+        assert!(found[0].has_actionable_metadata_drift());
+        assert_eq!(found[0].row_label(), "METADATA DRIFT");
+    }
+
+    /// Rates win the cell when both drifted — the more expensive fact leads,
+    /// and the metadata still prints in full below.
+    #[test]
+    fn a_drifted_basis_still_leads_the_row_over_drifted_metadata() {
+        let catalog = catalog_declaring(
+            "claude-sonnet-5",
+            rates(9.0, 0.2, 10.0),
+            rates(9.0, 0.2, 10.0),
+            ModelMetadata {
+                context_window: Some(32_000),
+                ..sonnet_metadata()
+            },
+        );
+        let found = reconcile(&catalog, SOURCE);
+
+        assert_eq!(found[0].verdict, Verdict::BasisDrift);
+        assert!(found[0].has_actionable_metadata_drift());
+        assert_eq!(found[0].row_label(), "BASIS DRIFT");
+    }
+
+    /// A clean candidate still reads `ok`: the label was not widened into
+    /// something that flags everything.
+    #[test]
+    fn a_candidate_that_agrees_on_both_axes_still_reads_ok() {
+        let catalog = catalog_declaring(
+            "claude-sonnet-5",
+            rates(2.0, 0.2, 10.0),
+            rates(2.0, 0.2, 10.0),
+            sonnet_metadata(),
+        );
+        let found = reconcile(&catalog, SOURCE);
+
+        assert_eq!(found[0].row_label(), "ok");
     }
 
     #[test]
