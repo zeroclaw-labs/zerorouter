@@ -65,7 +65,35 @@ pub fn router() -> Router<WebCtx> {
 /// mounts this router only when the directory is present.
 pub fn spa_router(dist_path: &std::path::Path) -> Router<()> {
     let service = ServeDir::new(dist_path).fallback(ServeFile::new(dist_path.join("index.html")));
-    Router::new().fallback_service(service)
+    Router::new()
+        .fallback_service(service)
+        .layer(axum::middleware::from_fn(stamp_spa_cache_control))
+}
+
+/// Cache discipline for the SPA. Vite content-hashes everything under
+/// `/assets/`, so those files are immutable — cache them for a year. The HTML
+/// shell, and every SPA route that falls back to it, must revalidate on each
+/// load (`no-cache` still permits conditional 304s via `Last-Modified`) — or a
+/// deploy strands returning browsers on the previous bundle. Found live: the
+/// legal-page publish was invisible to a browser that had heuristically cached
+/// the shell, because no `Cache-Control` was sent at all and the browser
+/// invented its own TTL from `Last-Modified`.
+async fn stamp_spa_cache_control(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let immutable = request.uri().path().starts_with("/assets/");
+    let mut response = next.run(request).await;
+    let value = if immutable {
+        "public, max-age=31536000, immutable"
+    } else {
+        "no-cache"
+    };
+    response.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static(value),
+    );
+    response
 }
 
 #[derive(Debug)]

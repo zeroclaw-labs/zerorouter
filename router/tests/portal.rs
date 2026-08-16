@@ -401,3 +401,46 @@ async fn portal_api_is_scoped_to_the_session_user() {
             .expect("active key count must query");
     assert_eq!(active, 20);
 }
+
+#[tokio::test]
+async fn the_spa_serves_immutable_assets_and_a_revalidating_shell() {
+    // A deploy must never strand a returning browser on the previous bundle:
+    // the shell (and every SPA route that falls back to it) says `no-cache`,
+    // while Vite's content-hashed /assets/ files are immutable for a year.
+    // Found live on 2026-08-16, when the legal-page publish stayed invisible
+    // to a browser that had heuristically cached the header-less shell.
+    let dist = std::env::temp_dir().join(format!("zr-spa-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(dist.join("assets")).expect("create dist");
+    std::fs::write(dist.join("index.html"), "<title>shell</title>").expect("write shell");
+    std::fs::write(dist.join("assets").join("app-abc123.js"), "js").expect("write asset");
+
+    let app = portal::spa_router(&dist);
+    let cache = |path: &str| {
+        let app = app.clone();
+        let path = path.to_owned();
+        async move {
+            let response = app
+                .oneshot(Request::get(&path).body(Body::empty()).expect("request"))
+                .await
+                .expect("response");
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+            response
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .expect("cache-control present")
+                .to_str()
+                .expect("ascii")
+                .to_owned()
+        }
+    };
+
+    assert_eq!(
+        cache("/assets/app-abc123.js").await,
+        "public, max-age=31536000, immutable"
+    );
+    assert_eq!(cache("/").await, "no-cache");
+    // An unknown path falls back to the shell and must revalidate too.
+    assert_eq!(cache("/terms").await, "no-cache");
+
+    std::fs::remove_dir_all(&dist).ok();
+}

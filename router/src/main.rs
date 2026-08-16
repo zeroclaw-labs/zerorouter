@@ -2,7 +2,6 @@ use std::{env, net::SocketAddr, path::PathBuf};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use tower_http::services::{ServeDir, ServeFile};
 use zerorouter::{
     DEFAULT_TIER_CONFIG_PATH, PROVIDER_INVENTORY_PATH_ENV, RouterState, TIER_CONFIG_PATH_ENV,
     admin::{self, AdminArgs},
@@ -112,10 +111,7 @@ async fn serve() -> Result<()> {
                 .with_state(ctx),
         );
         if portal_dist.is_dir() {
-            router = router.fallback_service(
-                ServeDir::new(&portal_dist)
-                    .fallback(ServeFile::new(portal_dist.join("index.html"))),
-            );
+            router = router.fallback_service(portal::spa_router(&portal_dist));
         } else {
             tracing::warn!(path = %portal_dist.display(), "portal dist directory not found; SPA disabled");
         }
