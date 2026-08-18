@@ -435,6 +435,223 @@ impl ModelRates {
     }
 }
 
+/// One CONDITIONAL rate table: what applies once a request's prompt reaches
+/// [`Self::min_prompt_tokens`].
+///
+/// `min_prompt_tokens` is a minimum, exactly as the name says: the comparison
+/// is `>=`, so a request measuring precisely the threshold is priced HERE and
+/// not at the table below. See [`RateSchedule::at_prompt_tokens`] for what is
+/// being measured and why.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ConditionalRate {
+    pub min_prompt_tokens: u64,
+    pub rates: ModelRates,
+}
+
+/// A price for one model that may REPRICE THE WHOLE REQUEST past a prompt-size
+/// threshold — the shape several vendors' long-context pricing actually has.
+///
+/// # The repricing is a step, never a margin
+///
+/// An upstream quotes one price up to some number of prompt tokens and a
+/// different, higher price for everything past it. Past the boundary EVERY
+/// dimension reprices for the WHOLE request: a 300,000-token prompt is billed
+/// at the high input rate on all 300,000 tokens, and its entire completion at
+/// the high output rate. Nothing is split at the boundary and nothing is
+/// blended — the vendor charges as though the low rate had never applied. That
+/// is why a [`ConditionalRate`] carries a complete [`ModelRates`] that
+/// REPLACES the base table, rather than a delta that would have to be
+/// integrated over a token range.
+///
+/// # A flat schedule is the old type, exactly
+///
+/// A schedule with no conditional tables answers [`Self::base`] to every
+/// question — [`Self::at_prompt_tokens`] and [`Self::worst_case`] both return
+/// the base table itself, by an early return rather than by arithmetic that
+/// happens to agree. So a `tiers.toml` written before conditional rates
+/// existed prices bit-for-bit as it did, on every path, and that guarantee is
+/// a property of this type rather than something each caller has to preserve.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RateSchedule {
+    base: ModelRates,
+    conditional: Vec<ConditionalRate>,
+}
+
+impl From<ModelRates> for RateSchedule {
+    /// One rate table is a schedule that charges it at every size.
+    fn from(base: ModelRates) -> Self {
+        Self::flat(base)
+    }
+}
+
+impl RateSchedule {
+    /// A schedule that charges one price at every size — every rate table that
+    /// existed before conditional rates did.
+    #[must_use]
+    pub fn flat(base: ModelRates) -> Self {
+        Self {
+            base,
+            conditional: Vec::new(),
+        }
+    }
+
+    /// A schedule with conditional tables. Nothing here orders or deduplicates
+    /// them: `validate_rate_schedule` (`crate::config`) refuses a file whose
+    /// thresholds are not strictly ascending, so the file reads in the order it
+    /// prices in. [`Self::at_prompt_tokens`] is written to be correct anyway,
+    /// so a schedule built in a test that skipped validation still prices
+    /// right.
+    #[must_use]
+    pub fn new(base: ModelRates, conditional: Vec<ConditionalRate>) -> Self {
+        Self { base, conditional }
+    }
+
+    /// The table that applies below every threshold.
+    ///
+    /// This is what the catalog ADVERTISES and what a report renders; it is
+    /// never on its own what a request is billed at. Use
+    /// [`Self::at_prompt_tokens`] to charge and [`Self::worst_case`] to
+    /// reserve.
+    #[must_use]
+    pub fn base(&self) -> ModelRates {
+        self.base
+    }
+
+    #[must_use]
+    pub fn conditional(&self) -> &[ConditionalRate] {
+        &self.conditional
+    }
+
+    /// Whether this schedule charges one price at every size.
+    #[must_use]
+    pub fn is_flat(&self) -> bool {
+        self.conditional.is_empty()
+    }
+
+    /// Every rate table this schedule can ever apply, base first.
+    fn tables(&self) -> impl Iterator<Item = ModelRates> + '_ {
+        std::iter::once(self.base)
+            .chain(self.conditional.iter().map(|conditional| conditional.rates))
+    }
+
+    /// The rates a request measuring `prompt_tokens` is billed at: the highest
+    /// threshold at or below it, or the base table when it is under all of
+    /// them.
+    ///
+    /// # What `prompt_tokens` must be
+    ///
+    /// The MEASURED prompt count the upstream reported —
+    /// `OpenAiUsage::prompt_tokens` — and not the byte-length prompt bound
+    /// admission sizes reservations against. The two differ by roughly the
+    /// bytes-per-token ratio, so selecting a tier from the bound would move the
+    /// boundary by a factor of about four. Reservation sizing does not call
+    /// this at all; it calls [`Self::worst_case`], which needs no measurement.
+    ///
+    /// # Cached prompt tokens COUNT toward the threshold
+    ///
+    /// Deliberate, and not a judgment call this code had to make: the wire
+    /// contract is that cached input is a SUBSET of input (`TokenUsage`, and
+    /// the test that pins it in this module), and [`crate::openai::usage_cost`]
+    /// reads exactly that — it splits `prompt_tokens` into a cached part and an
+    /// uncached remainder rather than adding them. So `prompt_tokens` is
+    /// already the whole prompt, cached portion included, which is the figure
+    /// vendors quote their thresholds against. A request of 250,000 cached plus
+    /// 30,000 fresh tokens is a 280,000-token prompt to OpenAI and is a
+    /// 280,000-token prompt here.
+    #[must_use]
+    pub fn at_prompt_tokens(&self, prompt_tokens: u64) -> ModelRates {
+        if self.conditional.is_empty() {
+            return self.base;
+        }
+        self.conditional
+            .iter()
+            .filter(|conditional| prompt_tokens >= conditional.min_prompt_tokens)
+            .max_by_key(|conditional| conditional.min_prompt_tokens)
+            .map_or(self.base, |conditional| conditional.rates)
+    }
+
+    /// The dearest rates this schedule could ever charge, dimension by
+    /// dimension — what a RESERVATION must be sized at.
+    ///
+    /// Admission runs before the upstream has said anything, so the request's
+    /// real prompt-token count does not exist yet and no tier can be selected
+    /// honestly. Reserving at the base rate would under-reserve every request
+    /// that turns out to cross the boundary, and an under-reserved request is a
+    /// customer spending past their balance — the one failure this path may
+    /// never have. So the reservation is sized at the worst case and settlement
+    /// releases the difference, exactly as it already releases the difference
+    /// between the byte-length prompt bound and the measured prompt.
+    ///
+    /// The maximum is taken PER DIMENSION rather than by picking the highest
+    /// threshold's table wholesale. Nothing forbids a schedule whose top tier
+    /// raises input while lowering output, and a per-dimension maximum can
+    /// never be cheaper than the table that ends up applying, whatever shape
+    /// the schedule has. The cached dimension is maximised over EFFECTIVE
+    /// rates ([`ModelRates::effective_cached_input_per_mtok`]) because that is
+    /// what `usage_cost` will bill, so a table that omits the dimension
+    /// contributes its input rate rather than skipping the comparison.
+    #[must_use]
+    pub fn worst_case(&self) -> ModelRates {
+        if self.conditional.is_empty() {
+            return self.base;
+        }
+        let dearest = |pick: fn(&ModelRates) -> Option<f64>| {
+            self.tables().filter_map(|rates| pick(&rates)).fold(
+                None,
+                |dearest: Option<f64>, rate| {
+                    Some(dearest.map_or(rate, |dearest| dearest.max(rate)))
+                },
+            )
+        };
+        ModelRates {
+            input_per_mtok: dearest(|rates| rates.input_per_mtok),
+            output_per_mtok: dearest(|rates| rates.output_per_mtok),
+            cached_input_per_mtok: dearest(ModelRates::effective_cached_input_per_mtok),
+        }
+    }
+
+    /// Whether EVERY rate this schedule could ever charge is zero.
+    ///
+    /// The schedule-level [`ModelRates::are_zero`], and it has to quantify over
+    /// the conditional tables rather than ask the base one: a schedule reading
+    /// `base 0/0/0` with a table charging $5.00 past 272,000 tokens is not
+    /// free, and treating it as free would hand the free lane a rung that bills
+    /// real money the moment a prompt got long. Asking [`Self::worst_case`] is
+    /// the same question stated once — every dimension of the dearest table is
+    /// zero exactly when every dimension of every table is.
+    #[must_use]
+    pub fn are_zero(&self) -> bool {
+        self.worst_case().are_zero()
+    }
+
+    /// Whether ANY table in this schedule claims the two required dimensions
+    /// cost nothing.
+    ///
+    /// `any`, not "the base table", and not [`Self::are_zero`]. This is the
+    /// suspicious question `validate_zero_price` asks — see
+    /// [`ModelRates::required_rates_are_zero`] for why it is deliberately
+    /// weaker than freeness — and a conditional table asserting that input and
+    /// output tokens cost nothing carries exactly the same fat-fingered-rate
+    /// signature as a base table asserting it. On a flat schedule this is the
+    /// base table's answer and nothing else, so the rule is unchanged for every
+    /// catalog written before conditional rates existed.
+    #[must_use]
+    pub fn any_required_rates_are_zero(&self) -> bool {
+        self.tables().any(|rates| rates.required_rates_are_zero())
+    }
+
+    /// The thresholds this schedule declares, in declaration order.
+    ///
+    /// Read by the basis/sell boundary comparison: a candidate and its tier
+    /// must agree about WHERE the price changes, or there is a band of prompt
+    /// sizes in which one side has repriced and the other has not.
+    pub fn thresholds(&self) -> impl Iterator<Item = u64> + '_ {
+        self.conditional
+            .iter()
+            .map(|conditional| conditional.min_prompt_tokens)
+    }
+}
+
 /// Output ceiling assumed when a request names none.
 pub const BASELINE_MAX_TOKENS: u32 = 4096;
 
@@ -477,6 +694,227 @@ pub trait ModelProvider: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // Conditional rates: which table applies, and what a reservation must
+    // assume when nothing has been measured yet.
+    // -----------------------------------------------------------------------
+
+    fn rates(input: f64, cached: Option<f64>, output: f64) -> ModelRates {
+        ModelRates {
+            input_per_mtok: Some(input),
+            cached_input_per_mtok: cached,
+            output_per_mtok: Some(output),
+        }
+    }
+
+    /// `openai/gpt-5.6-luna` as the vendor publishes it: 0.2/0.02/1.2 up to
+    /// 272,000 prompt tokens, 0.4/0.04/1.8 from there.
+    fn luna() -> RateSchedule {
+        RateSchedule::new(
+            rates(0.2, Some(0.02), 1.2),
+            vec![ConditionalRate {
+                min_prompt_tokens: 272_000,
+                rates: rates(0.4, Some(0.04), 1.8),
+            }],
+        )
+    }
+
+    #[test]
+    fn a_flat_schedule_answers_its_base_table_to_every_question() {
+        // The backwards-compatibility guarantee, stated as a test rather than
+        // left to inspection: a catalog written before conditional rates
+        // existed must price EXACTLY as it did, so both selectors have to
+        // return the base table itself — the same `Option` shape included, not
+        // merely a table that happens to bill the same.
+        let base = rates(2.0, None, 12.0);
+        let schedule = RateSchedule::flat(base);
+        for prompt_tokens in [0, 1, 271_999, 272_000, 1_000_000, u64::MAX] {
+            assert_eq!(schedule.at_prompt_tokens(prompt_tokens), base);
+        }
+        assert_eq!(schedule.worst_case(), base);
+        assert!(schedule.is_flat());
+        // An absent cached rate must stay absent. Synthesising the input rate
+        // into it would price identically but would change what the public
+        // catalog advertises, which reads this same table.
+        assert_eq!(schedule.worst_case().cached_input_per_mtok, None);
+    }
+
+    #[test]
+    fn the_threshold_is_a_minimum_and_includes_its_own_boundary() {
+        // `min_prompt_tokens` is a MINIMUM, so the comparison is `>=` and a
+        // request measuring precisely the boundary is priced in the band
+        // above. One token below is the last request at the base rate.
+        let schedule = luna();
+        assert_eq!(
+            schedule.at_prompt_tokens(271_999),
+            rates(0.2, Some(0.02), 1.2),
+            "one token below the boundary is still a base-rate request"
+        );
+        assert_eq!(
+            schedule.at_prompt_tokens(272_000),
+            rates(0.4, Some(0.04), 1.8),
+            "the threshold is a minimum: exactly the boundary reprices"
+        );
+        assert_eq!(
+            schedule.at_prompt_tokens(272_001),
+            rates(0.4, Some(0.04), 1.8)
+        );
+    }
+
+    #[test]
+    fn every_dimension_reprices_for_the_whole_request_and_nothing_is_blended() {
+        // The step, restated as arithmetic. A schedule holds complete tables,
+        // so the band above the boundary carries its own output rate as well
+        // as its own input rate, and there is no combination of the two tables
+        // that any prompt size produces.
+        let schedule = luna();
+        let high = schedule.at_prompt_tokens(300_000);
+        assert_eq!(high.input_per_mtok, Some(0.4));
+        assert_eq!(high.output_per_mtok, Some(1.8));
+        assert_eq!(high.cached_input_per_mtok, Some(0.04));
+        for prompt_tokens in [0, 100, 271_999, 272_000, 300_000, u64::MAX] {
+            let applied = schedule.at_prompt_tokens(prompt_tokens);
+            assert!(
+                applied == rates(0.2, Some(0.02), 1.2) || applied == rates(0.4, Some(0.04), 1.8),
+                "a prompt of {prompt_tokens} produced a blended table {applied:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_highest_threshold_at_or_below_the_prompt_wins() {
+        // Multiple bands are supported in principle even though no shipped
+        // upstream publishes more than one, and the rule is "the HIGHEST
+        // threshold the prompt has reached" rather than "the first one that
+        // matches".
+        //
+        // Both declaration orders are exercised, and that is not thoroughness
+        // for its own sake. With the bands written high-first, "first match"
+        // and "highest match" agree on every input, so a schedule declared
+        // that way cannot tell a correct implementation from one that returns
+        // whichever band it happens to see first. Only the ascending order —
+        // which is the order the file is required to be written in — separates
+        // them. Asserting both also pins that selection is independent of the
+        // ordering, which is what lets validation own legibility rather than
+        // correctness.
+        let low = ConditionalRate {
+            min_prompt_tokens: 100_000,
+            rates: rates(2.0, Some(0.2), 10.0),
+        };
+        let high = ConditionalRate {
+            min_prompt_tokens: 500_000,
+            rates: rates(4.0, Some(0.4), 20.0),
+        };
+        for bands in [vec![low, high], vec![high, low]] {
+            let order: Vec<u64> = bands.iter().map(|b| b.min_prompt_tokens).collect();
+            let schedule = RateSchedule::new(rates(1.0, Some(0.1), 5.0), bands);
+            for (prompt_tokens, expected) in [
+                (0, rates(1.0, Some(0.1), 5.0)),
+                (99_999, rates(1.0, Some(0.1), 5.0)),
+                (100_000, rates(2.0, Some(0.2), 10.0)),
+                (499_999, rates(2.0, Some(0.2), 10.0)),
+                (500_000, rates(4.0, Some(0.4), 20.0)),
+                (u64::MAX, rates(4.0, Some(0.4), 20.0)),
+            ] {
+                assert_eq!(
+                    schedule.at_prompt_tokens(prompt_tokens),
+                    expected,
+                    "wrong band at {prompt_tokens} prompt tokens, declared {order:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_worst_case_is_the_dearest_rate_on_every_dimension_independently() {
+        // What a reservation is sized at. Taking the highest threshold's table
+        // wholesale would under-reserve a schedule whose top band raises one
+        // dimension and lowers another — nothing forbids that shape — so the
+        // maximum is per dimension and can never come out below the table that
+        // ends up applying.
+        let schedule = RateSchedule::new(
+            rates(1.0, Some(0.5), 20.0),
+            vec![ConditionalRate {
+                min_prompt_tokens: 200_000,
+                rates: rates(4.0, Some(0.1), 8.0),
+            }],
+        );
+        assert_eq!(schedule.worst_case(), rates(4.0, Some(0.5), 20.0));
+        for prompt_tokens in [0, 199_999, 200_000, u64::MAX] {
+            let applied = schedule.at_prompt_tokens(prompt_tokens);
+            let worst = schedule.worst_case();
+            assert!(
+                applied.input_per_mtok <= worst.input_per_mtok
+                    && applied.output_per_mtok <= worst.output_per_mtok
+                    && applied.effective_cached_input_per_mtok()
+                        <= worst.effective_cached_input_per_mtok(),
+                "the band at {prompt_tokens} is dearer than the worst case on some dimension"
+            );
+        }
+    }
+
+    #[test]
+    fn a_band_that_omits_its_cached_rate_is_worst_cased_at_that_bands_input_rate() {
+        // An absent cached rate is not "no cached charge": `usage_cost` bills
+        // it at the same table's input rate. A worst case that skipped the
+        // dimension would reserve 0.02 for cached tokens that will bill at
+        // 0.40, which is an under-reservation on precisely the long, heavily
+        // cached requests this whole feature is about.
+        let schedule = RateSchedule::new(
+            rates(0.2, Some(0.02), 1.2),
+            vec![ConditionalRate {
+                min_prompt_tokens: 272_000,
+                rates: rates(0.4, None, 1.8),
+            }],
+        );
+        assert_eq!(schedule.worst_case().cached_input_per_mtok, Some(0.4));
+    }
+
+    #[test]
+    fn a_conditional_band_that_charges_stops_the_schedule_being_free() {
+        // The free lane must not be reachable through a schedule that gives
+        // its base rate away and bills past a threshold: the skipped path
+        // writes no reservation and no ledger row, so a long request would be
+        // delivered with nothing to charge it against.
+        let free_base_paid_band = RateSchedule::new(
+            rates(0.0, Some(0.0), 0.0),
+            vec![ConditionalRate {
+                min_prompt_tokens: 272_000,
+                rates: rates(5.0, Some(0.5), 30.0),
+            }],
+        );
+        assert!(!free_base_paid_band.are_zero());
+        // ... while a schedule that is zero everywhere still is free.
+        let free_throughout = RateSchedule::new(
+            rates(0.0, None, 0.0),
+            vec![ConditionalRate {
+                min_prompt_tokens: 272_000,
+                rates: rates(0.0, None, 0.0),
+            }],
+        );
+        assert!(free_throughout.are_zero());
+    }
+
+    #[test]
+    fn a_conditional_band_claiming_free_required_rates_is_visible_to_the_zero_price_rule() {
+        // `validate_zero_price` asks the suspicious question — "does any table
+        // here claim the traffic every request generates is free" — and a
+        // conditional table makes that claim just as loudly as a base one.
+        let paid_base_free_band = RateSchedule::new(
+            rates(5.0, Some(0.5), 30.0),
+            vec![ConditionalRate {
+                min_prompt_tokens: 272_000,
+                rates: rates(0.0, None, 0.0),
+            }],
+        );
+        assert!(paid_base_free_band.any_required_rates_are_zero());
+        assert!(
+            !paid_base_free_band.are_zero(),
+            "it is not free — which is exactly why the weaker question is the one that refuses it"
+        );
+        assert!(!luna().any_required_rates_are_zero());
+    }
 
     #[test]
     fn the_usage_contract_is_cached_as_a_subset_of_input() {

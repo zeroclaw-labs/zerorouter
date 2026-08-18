@@ -1270,6 +1270,98 @@ pub fn usage_cost(rates: ModelRates, usage: OpenAiUsage) -> Option<Decimal> {
 mod tests {
     use super::*;
 
+    /// `openai/gpt-5.6-luna`'s published schedule.
+    fn luna() -> crate::provider::RateSchedule {
+        let rates = |input: f64, cached: f64, output: f64| ModelRates {
+            input_per_mtok: Some(input),
+            cached_input_per_mtok: Some(cached),
+            output_per_mtok: Some(output),
+        };
+        crate::provider::RateSchedule::new(
+            rates(0.2, 0.02, 1.2),
+            vec![crate::provider::ConditionalRate {
+                min_prompt_tokens: 272_000,
+                rates: rates(0.4, 0.04, 1.8),
+            }],
+        )
+    }
+
+    #[test]
+    fn cached_prompt_tokens_count_toward_the_conditional_threshold() {
+        // The question the vendor answers by counting TOTAL prompt tokens, and
+        // this codebase answers the same way — not by choice made here, but
+        // because `prompt_tokens` already IS the whole prompt. `usage_cost`
+        // below splits it into a cached part and an uncached remainder rather
+        // than adding them, so a request of 250,000 cached plus 30,000 fresh
+        // tokens is a 280,000-token prompt on both sides of the ledger.
+        let usage = OpenAiUsage {
+            prompt_tokens: 280_000,
+            completion_tokens: 1_000,
+            total_tokens: 281_000,
+            prompt_tokens_details: Some(PromptTokenDetails {
+                cached_tokens: 250_000,
+            }),
+        };
+        assert_eq!(usage.cached_input_tokens(), 250_000);
+        assert!(
+            usage.cached_input_tokens() < 272_000,
+            "the fixture is only interesting because the cached portion alone is under the \
+             boundary: a rule that counted fresh tokens only would pick the base band here"
+        );
+
+        let applied = luna().at_prompt_tokens(usage.prompt_tokens);
+        assert_eq!(applied.input_per_mtok, Some(0.4));
+
+        // Priced end to end: 30,000 fresh at 0.40 + 250,000 cached at 0.04 +
+        // 1,000 output at 1.80, all per million.
+        let expected = (Decimal::from(30_000) * Decimal::from_f64(0.40).unwrap()
+            + Decimal::from(250_000) * Decimal::from_f64(0.04).unwrap()
+            + Decimal::from(1_000) * Decimal::from_f64(1.80).unwrap())
+            / Decimal::from(1_000_000);
+        assert_eq!(usage_cost(applied, usage), Some(expected));
+    }
+
+    #[test]
+    fn a_request_under_the_threshold_is_priced_at_the_base_band() {
+        let usage = OpenAiUsage {
+            prompt_tokens: 271_999,
+            completion_tokens: 1_000,
+            total_tokens: 272_999,
+            prompt_tokens_details: None,
+        };
+        let applied = luna().at_prompt_tokens(usage.prompt_tokens);
+        assert_eq!(applied.input_per_mtok, Some(0.2));
+        let expected = (Decimal::from(271_999) * Decimal::from_f64(0.20).unwrap()
+            + Decimal::from(1_000) * Decimal::from_f64(1.20).unwrap())
+            / Decimal::from(1_000_000);
+        assert_eq!(usage_cost(applied, usage), Some(expected));
+    }
+
+    #[test]
+    fn one_more_prompt_token_across_the_boundary_reprices_the_entire_request() {
+        // The step, in money. The two requests differ by a single prompt
+        // token and the charge nearly doubles, because the output side
+        // reprices too — which is the whole reason a marginal calculation
+        // would be wrong here.
+        let at = |prompt_tokens: u64| {
+            let usage = OpenAiUsage {
+                prompt_tokens,
+                completion_tokens: 10_000,
+                total_tokens: prompt_tokens + 10_000,
+                prompt_tokens_details: None,
+            };
+            usage_cost(luna().at_prompt_tokens(usage.prompt_tokens), usage)
+                .expect("luna's rates price")
+        };
+        let below = at(271_999);
+        let above = at(272_000);
+        assert!(
+            above > below * Decimal::from(19) / Decimal::from(10),
+            "crossing the boundary must reprice the whole request, not the marginal token: \
+             {below} -> {above}"
+        );
+    }
+
     #[test]
     fn all_zero_token_usage_is_rejected_as_unusable() {
         // A provider reporting 0 input + 0 output must not meter as a free

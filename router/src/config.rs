@@ -4,7 +4,7 @@ use std::{
     sync::{Mutex, OnceLock, PoisonError},
 };
 
-use crate::provider::ModelRates;
+use crate::provider::{ConditionalRate, ModelRates, RateSchedule};
 use serde::{Deserialize, Deserializer};
 use thiserror::Error;
 
@@ -58,8 +58,8 @@ pub struct UnavailableTier {
 pub struct TierDefinition {
     #[serde(default)]
     pub candidates: Vec<TierCandidate>,
-    #[serde(deserialize_with = "deserialize_model_rates")]
-    pub rates: ModelRates,
+    #[serde(deserialize_with = "deserialize_rate_schedule")]
+    pub rates: RateSchedule,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -67,8 +67,8 @@ pub struct TierCandidate {
     pub id: String,
     pub provider: String,
     pub model: String,
-    #[serde(deserialize_with = "deserialize_model_rates")]
-    pub rates: ModelRates,
+    #[serde(deserialize_with = "deserialize_rate_schedule")]
+    pub rates: RateSchedule,
     /// What this model can take and produce. Declared here, beside the rates,
     /// because it is the same kind of claim: static, human-owned, and true
     /// only because someone checked. A candidate that declares none is
@@ -93,6 +93,11 @@ impl TierCandidate {
     /// On its own this says nothing about whether anyone is billed — a rate
     /// table can be wrong, and a zero in it is as likely to be a typo as a
     /// claim. [`Self::is_free`] is the question with an answer.
+    ///
+    /// A schedule carrying conditional tables answers this only if EVERY one
+    /// of them is zero too ([`RateSchedule::are_zero`]) — a free rung has no
+    /// repricing to declare, and a conditional table that charges past a
+    /// threshold is a priced rung whatever its base row says.
     #[must_use]
     pub fn rates_are_zero(&self) -> bool {
         self.rates.are_zero()
@@ -304,7 +309,11 @@ impl ModelMetadata {
 pub struct ResolvedRoute {
     pub requested_model: String,
     pub candidates: Vec<TierCandidate>,
-    pub sell_rates: ModelRates,
+    /// What the customer is billed at. A SCHEDULE rather than one rate table,
+    /// because the tier may reprice past a prompt-size threshold: admission
+    /// sizes its reservation at [`RateSchedule::worst_case`] and settlement
+    /// charges [`RateSchedule::at_prompt_tokens`] against the measured prompt.
+    pub sell_rates: RateSchedule,
 }
 
 impl ResolvedRoute {
@@ -336,6 +345,12 @@ impl ResolvedRoute {
     /// is exactly the set of routes on which the metered path provably prices
     /// `cost_usd = 0` and debits nothing — so the skip is a latency change
     /// and never a billing one.
+    ///
+    /// Quantified over the whole schedule ([`RateSchedule::are_zero`]): a tier
+    /// that gives its base rate away and reprices past a threshold sells
+    /// something, and the skip must not engage on it — the skipped path writes
+    /// no reservation and no ledger row, so a request past the boundary would
+    /// be delivered with nothing to charge it against.
     #[must_use]
     pub fn sells_free(&self) -> bool {
         self.sell_rates.are_zero()
@@ -347,18 +362,61 @@ struct RawModelRates {
     input_per_mtok: Option<f64>,
     output_per_mtok: Option<f64>,
     cached_input_per_mtok: Option<f64>,
+    /// Conditional rate tables, each replacing the three rates above for the
+    /// whole request once the prompt reaches its `min_prompt_tokens`. Absent
+    /// means the table charges one price at every size, which is what every
+    /// rate table in this file meant before the key existed.
+    #[serde(default)]
+    conditional: Vec<RawConditionalRate>,
 }
 
-fn deserialize_model_rates<'de, D>(deserializer: D) -> Result<ModelRates, D::Error>
+/// One `[[...rates.conditional]]` block.
+///
+/// `deny_unknown_fields` where [`RawModelRates`] does not have it, and the
+/// asymmetry is the point. A misspelled key inside a conditional block —
+/// `input_per_mtoks`, say — would otherwise deserialize to `None` and the
+/// block would price that dimension at zero for every request past the
+/// boundary. The required-dimension check in `validate_rate_schedule` catches
+/// exactly that case, but a misspelling of the OPTIONAL cached dimension would
+/// slip past it, and a rejected file is a better answer than a silently
+/// cheaper one. Nothing that loads today carries one of these blocks, so this
+/// cannot refuse a file that used to load.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawConditionalRate {
+    min_prompt_tokens: u64,
+    input_per_mtok: Option<f64>,
+    output_per_mtok: Option<f64>,
+    cached_input_per_mtok: Option<f64>,
+}
+
+fn deserialize_rate_schedule<'de, D>(deserializer: D) -> Result<RateSchedule, D::Error>
 where
     D: Deserializer<'de>,
 {
     let raw = RawModelRates::deserialize(deserializer)?;
-    Ok(ModelRates {
+    let base = ModelRates {
         input_per_mtok: raw.input_per_mtok,
         output_per_mtok: raw.output_per_mtok,
         cached_input_per_mtok: raw.cached_input_per_mtok,
-    })
+    };
+    if raw.conditional.is_empty() {
+        return Ok(RateSchedule::flat(base));
+    }
+    Ok(RateSchedule::new(
+        base,
+        raw.conditional
+            .into_iter()
+            .map(|conditional| ConditionalRate {
+                min_prompt_tokens: conditional.min_prompt_tokens,
+                rates: ModelRates {
+                    input_per_mtok: conditional.input_per_mtok,
+                    output_per_mtok: conditional.output_per_mtok,
+                    cached_input_per_mtok: conditional.cached_input_per_mtok,
+                },
+            })
+            .collect(),
+    ))
 }
 
 #[derive(Debug, Error)]
@@ -437,7 +495,7 @@ pub enum TierConfigError {
     },
     #[error(
         "candidate {candidate} in tier {tier} costs more than the tier sells: \
-         {dimension} cost basis {basis} exceeds tier sell rate {sell}"
+         {dimension} cost basis {basis} exceeds tier sell rate {sell}{at}"
     )]
     NegativeMargin {
         tier: String,
@@ -445,7 +503,32 @@ pub enum TierConfigError {
         dimension: &'static str,
         basis: f64,
         sell: f64,
+        /// Which rate table the violation is in, rendered for the message:
+        /// empty for the base table, `" above N prompt tokens"` for a
+        /// conditional one. A tier can be profitable at its base rate and lose
+        /// money on every long request, so a margin refusal that did not say
+        /// which band it meant would send an operator to the wrong line.
+        at: String,
     },
+    #[error(
+        "candidate {candidate} in tier {tier} declares conditional rate thresholds {basis:?} \
+         while the tier sells at thresholds {sell:?}: the two must reprice at the same prompt \
+         sizes, or there is a band of requests in which one side has repriced and the other has \
+         not, and no rate table describes what that band should be billed at"
+    )]
+    ConditionalThresholdMismatch {
+        tier: String,
+        candidate: String,
+        basis: Vec<u64>,
+        sell: Vec<u64>,
+    },
+    #[error(
+        "tier {tier} declares conditional rate thresholds {thresholds:?}: they must be strictly \
+         ascending and above zero — a threshold of 0 redefines the base rate rather than \
+         conditioning on anything, and a repeated or out-of-order one makes the file's reading \
+         order disagree with its pricing order"
+    )]
+    InvalidConditionalThresholds { tier: String, thresholds: Vec<u64> },
 }
 
 impl TierCatalog {
@@ -464,7 +547,7 @@ impl TierCatalog {
             return Some(ResolvedRoute {
                 requested_model: requested_model.to_owned(),
                 candidates: tier.candidates.clone(),
-                sell_rates: tier.rates,
+                sell_rates: tier.rates.clone(),
             });
         }
 
@@ -477,8 +560,10 @@ impl TierCatalog {
                     requested_model: requested_model.to_owned(),
                     // A pinned concrete candidate meters at its owning tier's
                     // sell rate, never the per-candidate cost basis, so pinning
-                    // a model cannot undercut the tier price.
-                    sell_rates: tier.rates,
+                    // a model cannot undercut the tier price. The whole
+                    // SCHEDULE is inherited, thresholds included, so a pin
+                    // cannot dodge the tier's repricing either.
+                    sell_rates: tier.rates.clone(),
                     candidates: vec![candidate],
                 })
         })
@@ -566,7 +651,7 @@ impl TierCatalog {
                     tier_id.clone(),
                     ModelListing {
                         owned_by: "zerorouter".to_owned(),
-                        sell_rates: definition.rates,
+                        sell_rates: definition.rates.base(),
                         metadata: ModelMetadata::narrowed(&definition.candidates),
                     },
                 );
@@ -576,7 +661,7 @@ impl TierCatalog {
                     .entry(candidate.id.clone())
                     .or_insert_with(|| ModelListing {
                         owned_by: candidate.provider.clone(),
-                        sell_rates: definition.rates,
+                        sell_rates: definition.rates.base(),
                         metadata: candidate.metadata.clone(),
                     });
             }
@@ -591,6 +676,20 @@ impl TierCatalog {
 #[derive(Clone, Debug)]
 pub struct ModelListing {
     pub owned_by: String,
+    /// The tier's BASE rate — what a request under every declared threshold is
+    /// billed at.
+    ///
+    /// **A tier with conditional rates advertises less than it charges**, and
+    /// that is a known gap rather than an oversight. The wire type this feeds
+    /// ([`crate::openai::ModelPricing`]) is ZeroClaw's consumed contract: three
+    /// `Option<String>` per-token rates and no place to state a threshold, so
+    /// publishing the repricing means changing a documented external contract
+    /// and deciding what every existing client does with a field it has never
+    /// seen. That is a product decision, not an implementation detail, so this
+    /// stays byte-identical to what it published before conditional rates
+    /// existed and the gap is written down here instead of being closed
+    /// quietly. Settlement is unaffected — it prices from
+    /// [`RateSchedule::at_prompt_tokens`], never from this.
     pub sell_rates: ModelRates,
     pub metadata: ModelMetadata,
 }
@@ -670,15 +769,18 @@ fn report_withheld_tiers(withheld: &BTreeMap<String, String>) {
 ///
 /// - **Structural** faults — an unsupported schema version, a malformed tier
 ///   id, a tier with no candidates, a missing or negative or non-finite rate,
-///   a malformed candidate, an unsupported provider, a duplicate concrete id —
-///   mean the file itself cannot be trusted, so they still refuse the whole
-///   catalog. Serving *part* of a file that is wrong about its own structure
-///   would be guessing at the operator's intent.
+///   a malformed candidate, an unsupported provider, a duplicate concrete id,
+///   a conditional rate threshold that is zero or out of order, or a candidate
+///   whose thresholds disagree with its tier's — mean the file itself cannot
+///   be trusted, so they still refuse the whole catalog. Serving *part* of a
+///   file that is wrong about its own structure would be guessing at the
+///   operator's intent.
 /// - **Economic** faults — a candidate priced above its owning tier's sell
-///   rate — condemn exactly one tier and nothing else. They are returned here
-///   (tier id → the rendered [`TierConfigError::NegativeMargin`]) instead of
-///   erroring, so the caller can withhold that tier and keep serving the rest.
-///   The rule is unchanged; only its blast radius is.
+///   rate, in ANY of the bands a conditional schedule declares — condemn
+///   exactly one tier and nothing else. They are returned here (tier id → the
+///   rendered [`TierConfigError::NegativeMargin`]) instead of erroring, so the
+///   caller can withhold that tier and keep serving the rest. The rule is
+///   unchanged; only its blast radius is.
 ///
 /// Duplicate concrete ids are checked across *every* tier, healthy or not, and
 /// stay fatal. They are inherently cross-tier: a repeated id makes `resolve`'s
@@ -724,7 +826,7 @@ fn validate_tier_catalog(
                 tier: tier_id.clone(),
             });
         }
-        validate_rates(tier_id, definition.rates)?;
+        validate_rate_schedule(tier_id, &definition.rates)?;
 
         for candidate in &definition.candidates {
             if candidate.id.trim().is_empty()
@@ -746,10 +848,15 @@ fn validate_tier_catalog(
             if !concrete_ids.insert(candidate.id.clone()) {
                 return Err(TierConfigError::DuplicateModelId(candidate.id.clone()));
             }
-            validate_rates(tier_id, candidate.rates)?;
+            validate_rate_schedule(tier_id, &candidate.rates)?;
             validate_metadata(tier_id, candidate)?;
             validate_zero_price(tier_id, candidate)?;
-            if let Err(error) = validate_candidate_margin(tier_id, definition.rates, candidate) {
+            // Structural, and checked BEFORE the margin rule because the
+            // margin rule pairs the two sides' bands positionally and that
+            // pairing only means anything once the thresholds are known to
+            // match.
+            validate_conditional_alignment(tier_id, &definition.rates, candidate)?;
+            if let Err(error) = validate_candidate_margin(tier_id, &definition.rates, candidate) {
                 // The first violating candidate becomes the tier's reason, but
                 // the walk continues: a later candidate in the same tier can
                 // still carry a structural fault, and that must condemn the
@@ -851,40 +958,114 @@ fn reject_priority_suffix_collision(id: &str) -> Result<(), TierConfigError> {
 /// `usage_cost` applies — closes it. "Unknown" still skips: the fallback
 /// resolves to `None` only when the input rate is absent too, which
 /// `validate_rates` has already refused before this runs.
+/// # Why every band is checked, not just the base one
+///
+/// A conditional rate table reprices the whole request past a threshold, so a
+/// candidate and its tier each hold several rate tables rather than one. The
+/// margin rule is a claim about what a request costs against what it sells
+/// for, and a request lands in exactly one band — so the rule has to hold in
+/// EVERY band or it holds only for short requests. A candidate whose 272k
+/// basis is 0.40 under a tier still selling 0.20 up there loses money on every
+/// long request while its base row looks perfect, which is the same silent
+/// margin leak in a place the old check could not see.
+///
+/// The bands line up positionally because
+/// [`validate_conditional_alignment`] has already refused any candidate whose
+/// thresholds differ from its tier's, so band *i* on one side is band *i* on
+/// the other by construction and there is no pairing to guess at.
 fn validate_candidate_margin(
     tier: &str,
-    sell_rates: ModelRates,
+    sell_rates: &RateSchedule,
     candidate: &TierCandidate,
 ) -> Result<(), TierConfigError> {
-    for (dimension, basis, sell) in [
-        (
-            "input_per_mtok",
-            candidate.rates.input_per_mtok,
-            sell_rates.input_per_mtok,
-        ),
-        (
-            "output_per_mtok",
-            candidate.rates.output_per_mtok,
-            sell_rates.output_per_mtok,
-        ),
-        (
-            "cached_input_per_mtok",
-            candidate.rates.effective_cached_input_per_mtok(),
-            sell_rates.effective_cached_input_per_mtok(),
-        ),
-    ] {
-        let (Some(basis), Some(sell)) = (basis, sell) else {
-            continue;
-        };
-        if basis > sell {
-            return Err(TierConfigError::NegativeMargin {
-                tier: tier.to_owned(),
-                candidate: candidate.id.clone(),
-                dimension,
-                basis,
-                sell,
-            });
+    let bands = std::iter::once((String::new(), candidate.rates.base(), sell_rates.base())).chain(
+        candidate
+            .rates
+            .conditional()
+            .iter()
+            .zip(sell_rates.conditional())
+            .map(|(basis, sell)| {
+                (
+                    format!(" above {} prompt tokens", basis.min_prompt_tokens),
+                    basis.rates,
+                    sell.rates,
+                )
+            }),
+    );
+
+    for (at, basis_rates, sell_rates) in bands {
+        for (dimension, basis, sell) in [
+            (
+                "input_per_mtok",
+                basis_rates.input_per_mtok,
+                sell_rates.input_per_mtok,
+            ),
+            (
+                "output_per_mtok",
+                basis_rates.output_per_mtok,
+                sell_rates.output_per_mtok,
+            ),
+            (
+                "cached_input_per_mtok",
+                basis_rates.effective_cached_input_per_mtok(),
+                sell_rates.effective_cached_input_per_mtok(),
+            ),
+        ] {
+            let (Some(basis), Some(sell)) = (basis, sell) else {
+                continue;
+            };
+            if basis > sell {
+                return Err(TierConfigError::NegativeMargin {
+                    tier: tier.to_owned(),
+                    candidate: candidate.id.clone(),
+                    dimension,
+                    basis,
+                    sell,
+                    at,
+                });
+            }
         }
+    }
+    Ok(())
+}
+
+/// Refuse a candidate whose cost basis reprices at different prompt sizes than
+/// the tier it is sold through, on the *structural* side of the split
+/// described on [`validate_tier_catalog`].
+///
+/// # Why a mismatch is unbillable rather than merely unprofitable
+///
+/// Say a candidate's basis reprices at 272,000 tokens and its tier's sell rate
+/// reprices at 200,000. Between those two numbers the customer is paying the
+/// high rate while ZeroRouter is still paying the low one — a 2x markup on a
+/// tier whose whole promise is pass-through, and one that
+/// [`validate_candidate_margin`] cannot see because it only ever refuses a
+/// basis ABOVE a sell rate. Reverse the two numbers and the same band loses
+/// money instead. Either way the file states two different answers to "where
+/// does this model's price change", and there is no third number anyone could
+/// write that would reconcile them: the boundary is a fact about the vendor,
+/// so a disagreement means at least one side is simply wrong about the world.
+///
+/// Structural, so it refuses the whole file, for the reason
+/// [`TierConfigError::UnbillableRate`] does: withholding the tier would leave
+/// a running product minus one model, and an operator who mistyped a threshold
+/// would see one pin quietly vanish while the rest kept serving — which is
+/// precisely how a pricing error goes unnoticed. The fix is one line either
+/// way, and until it lands nothing mispriced is served.
+fn validate_conditional_alignment(
+    tier: &str,
+    sell_rates: &RateSchedule,
+    candidate: &TierCandidate,
+) -> Result<(), TierConfigError> {
+    let basis: Vec<u64> = candidate.rates.thresholds().collect();
+    let sell: Vec<u64> = sell_rates.thresholds().collect();
+    if basis != sell {
+        return Err(TierConfigError::ConditionalThresholdMismatch {
+            tier: tier.to_owned(),
+            candidate: candidate.id.clone(),
+            basis,
+            sell,
+        });
     }
     Ok(())
 }
@@ -933,8 +1114,21 @@ fn validate_candidate_margin(
 /// keeps asking the stronger one. The two are deliberately different: what
 /// makes a claim REFUSABLE is not the same as what makes a route FREE, and
 /// conflating them is how the hole got in.
+///
+/// # Why ANY table in the schedule is enough to refuse
+///
+/// The question is asked of every rate table a schedule holds
+/// ([`RateSchedule::any_required_rates_are_zero`]), not of the base one. A
+/// conditional table reading `{input: 0.00, output: 0.00}` past 272,000 tokens
+/// makes the identical claim about the identical traffic — every request in
+/// that band generates input and output tokens — and on a metered upstream it
+/// records no COGS against real spend for exactly the requests that cost the
+/// most. On a flat schedule this is the base table's answer and nothing else,
+/// so the rule is unchanged for every catalog written before conditional rates
+/// existed.
 fn validate_zero_price(tier: &str, candidate: &TierCandidate) -> Result<(), TierConfigError> {
-    if candidate.rates.required_rates_are_zero() && !provider_settles_free(&candidate.provider) {
+    if candidate.rates.any_required_rates_are_zero() && !provider_settles_free(&candidate.provider)
+    {
         return Err(TierConfigError::ZeroPriceWithoutFreeSettlement {
             tier: tier.to_owned(),
             candidate: candidate.id.clone(),
@@ -1023,6 +1217,44 @@ fn validate_rates(tier: &str, rates: ModelRates) -> Result<(), TierConfigError> 
     )
 }
 
+/// [`validate_rates`] over every table a schedule holds, plus the thresholds
+/// that separate them.
+///
+/// Each conditional table is held to the SAME rules as the base one, including
+/// that input and output are required. An omitted dimension is not inherited
+/// from the table below: a conditional table REPLACES the base one wholesale
+/// (see [`RateSchedule`]), so `usage_cost` would price the missing dimension
+/// at zero and the customer would be charged nothing for it on precisely the
+/// largest requests. Requiring it means the file has to state the whole price
+/// at every size, which is what the vendor quotes anyway. The cached dimension
+/// stays optional and keeps falling back to that same table's input rate —
+/// the one convention `usage_cost` already applies.
+///
+/// The thresholds must be strictly ascending and above zero. Zero is refused
+/// because a table conditioned on nothing is a second base table and the file
+/// would state two answers to the same question; repeats and out-of-order
+/// entries are refused so the file's reading order is its pricing order.
+/// [`RateSchedule::at_prompt_tokens`] does not depend on either property, so
+/// this is about the file staying legible to the human who has to check it
+/// against a vendor's page.
+fn validate_rate_schedule(tier: &str, schedule: &RateSchedule) -> Result<(), TierConfigError> {
+    validate_rates(tier, schedule.base())?;
+    let thresholds: Vec<u64> = schedule.thresholds().collect();
+    let ascending = thresholds
+        .first()
+        .is_none_or(|first| *first > 0 && thresholds.windows(2).all(|pair| pair[0] < pair[1]));
+    if !ascending {
+        return Err(TierConfigError::InvalidConditionalThresholds {
+            tier: tier.to_owned(),
+            thresholds,
+        });
+    }
+    for conditional in schedule.conditional() {
+        validate_rates(tier, conditional.rates)?;
+    }
+    Ok(())
+}
+
 fn validate_rate(
     tier: &str,
     dimension: &'static str,
@@ -1051,6 +1283,285 @@ fn validate_rate(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // Conditional rates in the file: what parses, and what the loader refuses.
+    // -----------------------------------------------------------------------
+
+    /// A catalog holding the pin under test — selling at `sell`, costing
+    /// `basis`, each written as the body of a `rates` table so a test can put
+    /// whatever conditional blocks it likes on either side — beside one
+    /// permanently healthy pin.
+    ///
+    /// The healthy neighbour is not decoration. A catalog with nothing servable
+    /// left errors outright rather than withholding (`validate_tier_catalog`),
+    /// so without it every economic fault here would surface as a whole-file
+    /// refusal and the tests could not tell the two blast radii apart — which
+    /// is the distinction half of them exist to pin.
+    fn conditional_catalog(sell: &str, basis: &str) -> Result<TierCatalog, TierConfigError> {
+        let source = format!(
+            r#"
+schema_version = 1
+[tiers."openai/pin"]
+[tiers."openai/pin".rates]
+{sell}
+[[tiers."openai/pin".candidates]]
+id = "openai/pin"
+provider = "openai"
+model = "pin"
+[tiers."openai/pin".candidates.rates]
+{basis}
+
+[tiers."openai/healthy"]
+[tiers."openai/healthy".rates]
+input_per_mtok = 1.0
+output_per_mtok = 2.0
+[[tiers."openai/healthy".candidates]]
+id = "openai/healthy"
+provider = "openai"
+model = "healthy"
+[tiers."openai/healthy".candidates.rates]
+input_per_mtok = 1.0
+output_per_mtok = 2.0
+"#
+        );
+        let catalog: TierCatalog =
+            toml::from_str(&source).map_err(|source| TierConfigError::Parse {
+                path: PathBuf::from("<test>"),
+                source,
+            })?;
+        validate_tier_catalog(&catalog).map(|withheld| {
+            let mut catalog = catalog;
+            catalog.withhold(withheld);
+            catalog
+        })
+    }
+
+    /// The rate table `openai/gpt-5.6-luna` ships with, sell and basis alike.
+    const LUNA_RATES: &str = r#"
+input_per_mtok = 0.20
+cached_input_per_mtok = 0.02
+output_per_mtok = 1.20
+[[tiers."openai/pin".rates.conditional]]
+min_prompt_tokens = 272000
+input_per_mtok = 0.40
+cached_input_per_mtok = 0.04
+output_per_mtok = 1.80
+"#;
+
+    /// The same, spelled for the candidate's own `rates` table.
+    const LUNA_BASIS: &str = r#"
+input_per_mtok = 0.20
+cached_input_per_mtok = 0.02
+output_per_mtok = 1.20
+[[tiers."openai/pin".candidates.rates.conditional]]
+min_prompt_tokens = 272000
+input_per_mtok = 0.40
+cached_input_per_mtok = 0.04
+output_per_mtok = 1.80
+"#;
+
+    #[test]
+    fn a_conditional_table_parses_into_the_band_it_describes() {
+        let catalog =
+            conditional_catalog(LUNA_RATES, LUNA_BASIS).expect("a matched pin should load");
+        let route = catalog.resolve("openai/pin").expect("the pin resolves");
+        assert_eq!(
+            route.sell_rates.at_prompt_tokens(271_999).input_per_mtok,
+            Some(0.20)
+        );
+        assert_eq!(
+            route.sell_rates.at_prompt_tokens(272_000).input_per_mtok,
+            Some(0.40)
+        );
+        assert_eq!(route.sell_rates.worst_case().output_per_mtok, Some(1.80));
+        assert_eq!(
+            route.candidates[0].rates.at_prompt_tokens(272_000),
+            route.sell_rates.at_prompt_tokens(272_000),
+            "a pass-through pin costs what it sells for in the high band too"
+        );
+    }
+
+    #[test]
+    fn a_rates_table_with_no_conditional_block_stays_a_flat_schedule() {
+        // The backwards-compatibility claim at the file level: the shape every
+        // rate table in this catalog has today must keep meaning exactly what
+        // it meant, which is "one price at every size".
+        let catalog = conditional_catalog(
+            "input_per_mtok = 1.0\noutput_per_mtok = 2.0",
+            "input_per_mtok = 1.0\noutput_per_mtok = 2.0",
+        )
+        .expect("a flat pin should load");
+        let route = catalog.resolve("openai/pin").expect("the pin resolves");
+        assert!(route.sell_rates.is_flat());
+        assert!(route.candidates[0].rates.is_flat());
+        assert_eq!(route.sell_rates.conditional(), &[]);
+    }
+
+    #[test]
+    fn a_candidate_dearer_than_its_tier_in_a_conditional_band_alone_is_withheld() {
+        // The margin rule, applied where the old one could not see. Both sides
+        // agree perfectly at the base rate — this file looks correct to a
+        // check that only reads the base table — and the candidate costs more
+        // than it sells for on every request past 272,000 tokens.
+        let leaky_basis = LUNA_BASIS.replace("input_per_mtok = 0.40", "input_per_mtok = 0.50");
+        let catalog = conditional_catalog(LUNA_RATES, &leaky_basis)
+            .expect("one mispriced tier is withheld, not fatal");
+        assert!(
+            catalog.resolve("openai/pin").is_none(),
+            "a tier that loses money above the boundary must not serve"
+        );
+        let reason = &catalog
+            .unavailable_for("openai/pin")
+            .expect("the withheld tier explains itself")
+            .reason;
+        assert!(
+            reason.contains("input_per_mtok")
+                && reason.contains("0.5")
+                && reason.contains("above 272000 prompt tokens"),
+            "the refusal must name the band an operator has to go and fix: {reason}"
+        );
+    }
+
+    #[test]
+    fn a_margin_violation_in_the_base_band_still_reads_as_it_always_did() {
+        // The pre-existing message shape is load-bearing — `tests/http.rs`
+        // matches on it — so a base-band violation must not acquire a band
+        // suffix it never had.
+        let catalog = conditional_catalog(
+            "input_per_mtok = 1.0\noutput_per_mtok = 2.0",
+            "input_per_mtok = 3.0\noutput_per_mtok = 2.0",
+        )
+        .expect("one mispriced tier is withheld, not fatal");
+        let reason = &catalog
+            .unavailable_for("openai/pin")
+            .expect("the withheld tier explains itself")
+            .reason;
+        assert!(
+            reason.ends_with("cost basis 3 exceeds tier sell rate 1"),
+            "a base-band refusal reads exactly as before: {reason}"
+        );
+    }
+
+    #[test]
+    fn a_basis_and_sell_that_reprice_at_different_sizes_refuse_the_file() {
+        // Between 200,000 and 272,000 tokens the customer would pay the high
+        // rate while ZeroRouter still paid the low one — a markup on a
+        // pass-through pin that the margin rule can never see, because it only
+        // refuses a basis ABOVE a sell rate. There is no number that
+        // reconciles the two, so the file is refused rather than withheld.
+        let sell_at_200k =
+            LUNA_RATES.replace("min_prompt_tokens = 272000", "min_prompt_tokens = 200000");
+        let error = conditional_catalog(&sell_at_200k, LUNA_BASIS)
+            .expect_err("mismatched thresholds must refuse the file");
+        assert!(
+            matches!(error, TierConfigError::ConditionalThresholdMismatch { .. }),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn a_tiered_basis_under_a_flat_tier_refuses_the_file() {
+        // The other shape of the same fault, and the one an operator reaches
+        // by updating the candidate and forgetting the tier. It is refused for
+        // the same reason rather than left to the margin rule, which would
+        // report it as an ordinary below-cost tier and send the operator to
+        // the wrong line.
+        let error = conditional_catalog(
+            "input_per_mtok = 0.20\ncached_input_per_mtok = 0.02\noutput_per_mtok = 1.20",
+            LUNA_BASIS,
+        )
+        .expect_err("a threshold on one side only must refuse the file");
+        assert!(
+            matches!(error, TierConfigError::ConditionalThresholdMismatch { .. }),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn a_conditional_threshold_of_zero_or_out_of_order_refuses_the_file() {
+        // Zero conditions on nothing — it is a second base table, and the file
+        // would state two answers to one question. Repeated and descending
+        // thresholds make the file's reading order disagree with its pricing
+        // order, which is how a human checking it against a vendor's page gets
+        // the wrong answer.
+        for broken in [
+            "min_prompt_tokens = 0",
+            "min_prompt_tokens = 272000\ninput_per_mtok = 0.40\noutput_per_mtok = 1.80\n\
+             [[tiers.\"openai/pin\".rates.conditional]]\nmin_prompt_tokens = 100000",
+            "min_prompt_tokens = 272000\ninput_per_mtok = 0.40\noutput_per_mtok = 1.80\n\
+             [[tiers.\"openai/pin\".rates.conditional]]\nmin_prompt_tokens = 272000",
+        ] {
+            let sell = format!(
+                "input_per_mtok = 0.20\noutput_per_mtok = 1.20\n\
+                 [[tiers.\"openai/pin\".rates.conditional]]\n{broken}\n\
+                 input_per_mtok = 0.40\noutput_per_mtok = 1.80\n"
+            );
+            let error = conditional_catalog(&sell, "input_per_mtok = 0.20\noutput_per_mtok = 1.20")
+                .expect_err("a malformed threshold list must refuse the file");
+            assert!(
+                matches!(error, TierConfigError::InvalidConditionalThresholds { .. }),
+                "{broken} produced {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_conditional_band_missing_a_required_rate_refuses_the_file() {
+        // A band REPLACES the base table rather than patching it, so an
+        // omitted input or output rate would price that dimension at zero for
+        // every request past the boundary — the silent-free-dimension failure,
+        // reached from a new direction.
+        for missing in ["input_per_mtok = 0.40", "output_per_mtok = 1.80"] {
+            let sell = format!(
+                "input_per_mtok = 0.20\noutput_per_mtok = 1.20\n\
+                 [[tiers.\"openai/pin\".rates.conditional]]\nmin_prompt_tokens = 272000\n{missing}\n"
+            );
+            let error = conditional_catalog(&sell, "input_per_mtok = 0.20\noutput_per_mtok = 1.20")
+                .expect_err("an incomplete band must refuse the file");
+            assert!(
+                matches!(error, TierConfigError::InvalidRate { .. }),
+                "a band declaring only `{missing}` produced {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_conditional_band_priced_at_zero_on_a_metered_provider_refuses_the_file() {
+        // `validate_zero_price`'s claim, made by a band instead of a base
+        // table: it asserts that the input and output tokens every long
+        // request generates cost ZeroRouter nothing on an upstream that bills
+        // for them. Same fat-fingered-rate signature, same refusal.
+        let basis = "input_per_mtok = 0.20\noutput_per_mtok = 1.20\n\
+             [[tiers.\"openai/pin\".candidates.rates.conditional]]\nmin_prompt_tokens = 272000\n\
+             input_per_mtok = 0.0\noutput_per_mtok = 0.0\n";
+        let sell = "input_per_mtok = 0.20\noutput_per_mtok = 1.20\n\
+             [[tiers.\"openai/pin\".rates.conditional]]\nmin_prompt_tokens = 272000\n\
+             input_per_mtok = 0.40\noutput_per_mtok = 1.80\n";
+        let error = conditional_catalog(sell, basis)
+            .expect_err("a $0 band on a metered upstream must refuse the file");
+        assert!(
+            matches!(
+                error,
+                TierConfigError::ZeroPriceWithoutFreeSettlement { .. }
+            ),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn a_misspelled_key_inside_a_conditional_band_refuses_the_file() {
+        // The hazard that makes this block stricter than the table around it:
+        // a misspelled OPTIONAL dimension would otherwise deserialize to
+        // `None` and quietly price cached tokens at the band's input rate
+        // instead of the discounted one the operator meant to write.
+        let sell = "input_per_mtok = 0.20\noutput_per_mtok = 1.20\n\
+             [[tiers.\"openai/pin\".rates.conditional]]\nmin_prompt_tokens = 272000\n\
+             input_per_mtok = 0.40\noutput_per_mtok = 1.80\ncached_input_per_mtoks = 0.04\n";
+        let error = conditional_catalog(sell, "input_per_mtok = 0.20\noutput_per_mtok = 1.20")
+            .expect_err("an unknown key in a band must refuse the file");
+        assert!(matches!(error, TierConfigError::Parse { .. }), "{error:?}");
+    }
 
     #[test]
     fn concrete_model_resolves_to_one_candidate() {
@@ -1801,11 +2312,11 @@ output_per_mtok = 8.00
             id: "local/model".to_owned(),
             provider: "local-llama".to_owned(),
             model: "qwen3-8b".to_owned(),
-            rates: ModelRates {
+            rates: RateSchedule::flat(ModelRates {
                 input_per_mtok: input,
                 cached_input_per_mtok: cached,
                 output_per_mtok: output,
-            },
+            }),
             metadata: ModelMetadata::default(),
         }
     }

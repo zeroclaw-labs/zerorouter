@@ -227,11 +227,11 @@ mod tests {
             id: format!("{provider}/{model}"),
             provider: provider.to_owned(),
             model: model.to_owned(),
-            rates: ModelRates {
+            rates: crate::provider::RateSchedule::flat(ModelRates {
                 input_per_mtok: Some(1.0),
                 output_per_mtok: Some(2.0),
                 cached_input_per_mtok: None,
-            },
+            }),
             // Health scoring is about whether a candidate answers, not about
             // what it can accept.
             metadata: ModelMetadata::default(),

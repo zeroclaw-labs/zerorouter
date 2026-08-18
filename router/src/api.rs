@@ -10,7 +10,8 @@ use std::{
 
 use crate::provider::BASELINE_MAX_TOKENS;
 use crate::provider::{
-    ChatRequest, ChatResponse, ModelRates, StreamEvent, StreamFinal, StreamOptions, UsageGap,
+    ChatRequest, ChatResponse, ModelRates, RateSchedule, StreamEvent, StreamFinal, StreamOptions,
+    UsageGap,
 };
 use axum::{
     Json, Router,
@@ -175,9 +176,17 @@ fn build_attempt(
     // this NULL — the ledger's word for "not captured", which also flips the
     // row's `attempts_cost_basis_complete` FALSE so the COGS sum is read as the
     // lower bound it is. Never zero, which would claim the attempt was free.
+    //
+    // The band comes from the same usage being priced. On an attempt that
+    // reported real usage that is the measured prompt and the answer is exact.
+    // On an output-floor attempt the prompt dimension is NULL — `priceable`
+    // reconstructs it as 0 — so the base band applies and a long request's
+    // floor is quoted at the low rate. That understates a figure already
+    // labelled a floor, which is this ledger's standing preference over a
+    // guess in an unknown direction (see [`attempt_tokens`]).
     let cost_basis_usd = tokens
         .priceable()
-        .and_then(|usage| usage_cost(candidate.rates, usage));
+        .and_then(|usage| usage_cost(candidate.rates.at_prompt_tokens(usage.prompt_tokens), usage));
     AttemptRecord {
         attempt_no: i16::try_from(attempt_no).unwrap_or(i16::MAX),
         started_at,
@@ -1374,8 +1383,18 @@ fn order_priced_by_expected_cost(
                 CellRead::Warm(percentiles) => percentiles.p50,
                 CellRead::Cold => shared_fallback?,
             };
+            // Base rates, deliberately. `input_bytes` is the byte-length
+            // prompt bound, not a token count, so it cannot say which side of
+            // a token threshold this request will land on — selecting a
+            // conditional band from it would move the boundary by roughly the
+            // bytes-per-token ratio. This figure orders rungs against each
+            // other and is never charged to anyone, so an ordering that
+            // ignores repricing is a worse ordering rather than a wrong
+            // price. Every shipped tier has one candidate today, which makes
+            // this a no-op in practice; it becomes worth revisiting the day a
+            // tier holds two rungs that reprice differently.
             Some(expected_cost_basis(
-                definition.rates,
+                definition.rates.base(),
                 estimates.input_bytes,
                 expected_output,
             ))
@@ -1879,7 +1898,7 @@ async fn settle_walk_terminal(
         upstream_model,
         candidate,
         OpenAiUsage::default(),
-        resolved.sell_rates,
+        &resolved.sell_rates,
         features,
         None,
         None,
@@ -1984,7 +2003,7 @@ async fn serve_completion(
             &candidate.model,
             Some(candidate),
             OpenAiUsage::default(),
-            resolved.sell_rates,
+            &resolved.sell_rates,
             features,
             None,
             None,
@@ -2042,7 +2061,7 @@ async fn serve_completion(
         &candidate.model,
         Some(candidate),
         usage,
-        resolved.sell_rates,
+        &resolved.sell_rates,
         features,
         Some(finish),
         Some(shape_label),
@@ -2190,7 +2209,7 @@ async fn stream_to_channel(
                     upstream_model,
                     last_candidate,
                     OpenAiUsage::default(),
-                    resolved.sell_rates,
+                    &resolved.sell_rates,
                     features,
                     None,
                     None,
@@ -2669,7 +2688,7 @@ async fn stream_to_channel(
                 &candidate.definition().model,
                 Some(candidate.definition()),
                 settled_usage,
-                resolved.sell_rates,
+                &resolved.sell_rates,
                 features,
                 None,
                 None,
@@ -2720,7 +2739,7 @@ async fn stream_to_channel(
             &candidate.model,
             Some(candidate),
             OpenAiUsage::default(),
-            resolved.sell_rates,
+            &resolved.sell_rates,
             features,
             None,
             None,
@@ -2825,7 +2844,7 @@ async fn settle_stream_interruption(
             upstream_model,
             candidate,
             settled_usage,
-            resolved.sell_rates,
+            &resolved.sell_rates,
             features,
             None,
             None,
@@ -2920,7 +2939,7 @@ async fn complete_synthetic_stream(
             &candidate.definition().model,
             Some(candidate.definition()),
             OpenAiUsage::default(),
-            resolved.sell_rates,
+            &resolved.sell_rates,
             features,
             None,
             None,
@@ -2969,7 +2988,7 @@ async fn complete_synthetic_stream(
         &candidate.definition().model,
         Some(candidate.definition()),
         usage,
-        resolved.sell_rates,
+        &resolved.sell_rates,
         features,
         Some(finish),
         Some(shape_label),
@@ -3101,7 +3120,7 @@ async fn finish_successful_stream(
             &candidate.definition().model,
             Some(candidate.definition()),
             delivery.settled_usage(None),
-            resolved.sell_rates,
+            &resolved.sell_rates,
             features,
             None,
             None,
@@ -3180,7 +3199,7 @@ async fn finish_successful_stream(
         &candidate.definition().model,
         Some(candidate.definition()),
         billable,
-        resolved.sell_rates,
+        &resolved.sell_rates,
         features,
         Some(finish),
         Some(shape_label),
@@ -3289,6 +3308,25 @@ async fn send_data(sender: &mpsc::Sender<Event>, data: String) -> bool {
 /// reservation, and a request that cannot be metered must not be dispatched.
 /// The catalog validated these rates at load, so this is a backstop rather
 /// than a live path.
+///
+/// # Why the WORST-CASE rate, on a tier that reprices
+///
+/// A reservation is taken before the upstream has said anything, so the
+/// request's real prompt-token count — the thing a conditional rate is
+/// conditioned on — does not exist yet. The prompt figure available here is a
+/// BYTE bound, which over-counts tokens by roughly the bytes-per-token ratio,
+/// so it cannot decide which side of a token threshold the request will land
+/// on either.
+///
+/// [`RateSchedule::worst_case`] sidesteps the question: it needs no
+/// measurement, and it can never price below the table that ends up applying.
+/// The alternative — reserving at the base rate — would under-reserve every
+/// request that crosses the boundary, and an under-reserved request is a
+/// customer spending past their balance. Over-reserving costs the customer
+/// nothing: settlement charges the true band and releases the difference by
+/// the same mechanism that already releases the gap between this byte bound
+/// and the measured prompt. On a flat tier `worst_case()` IS the tier's rate
+/// table, so nothing about a catalog without conditional rates changes.
 fn sized_reservation(
     request: &ChatCompletionRequest,
     resolved: &ResolvedRoute,
@@ -3298,7 +3336,8 @@ fn sized_reservation(
     Ok(ReservationSize {
         total_tokens: i64::try_from(usage.total_tokens).map_err(|_| ApiError::InvalidRequest)?,
         output_tokens: i64::from(output_bound),
-        cost_usd: usage_cost(resolved.sell_rates, usage).ok_or(ApiError::MeteringUnavailable)?,
+        cost_usd: usage_cost(resolved.sell_rates.worst_case(), usage)
+            .ok_or(ApiError::MeteringUnavailable)?,
     })
 }
 
@@ -3331,7 +3370,7 @@ async fn persist_usage(
     upstream_model: &str,
     candidate: Option<&TierCandidate>,
     usage: OpenAiUsage,
-    sell_rates: ModelRates,
+    sell_rates: &RateSchedule,
     features: RequestFeatures,
     finish: Option<AttemptFinishReason>,
     shape_label: Option<bool>,
@@ -3341,6 +3380,16 @@ async fn persist_usage(
     status: i16,
 ) -> Result<(), ApiError> {
     let latency_ms = i32::try_from(started.elapsed().as_millis()).unwrap_or(i32::MAX);
+    // The band this request actually landed in, chosen from the MEASURED
+    // prompt the upstream reported — the same figure the vendor bills us
+    // against, so the customer's basis and ZeroRouter's stay the same shape.
+    // `usage` here is `StreamDelivery::settled_usage`: metered actuals, never
+    // an estimate, so a request that reported nothing settles at the base
+    // band and bills nothing, exactly as before. On a flat tier this is the
+    // tier's one rate table and every figure below is unchanged.
+    let sell_rates = sell_rates.at_prompt_tokens(usage.prompt_tokens);
+    let basis_rates =
+        candidate.map(|candidate| candidate.rates.at_prompt_tokens(usage.prompt_tokens));
     // What the customer owes, computed before anything is written. Rates that
     // cannot be priced are a metering failure and settle nothing: the request
     // ends in `MeteringUnavailable` and the reservation is released by the TTL
@@ -3354,7 +3403,11 @@ async fn persist_usage(
         message_count: features.message_count,
         tool_count: features.tool_count,
         candidate_id: candidate.map(|candidate| candidate.id.clone()),
-        basis_rates: candidate.map(|candidate| candidate.rates),
+        // The rate tables this request was PRICED at, not the schedules they
+        // came from. The ledger's job is to record what was charged, and a
+        // reader asking "what did this row bill at" must get the band that
+        // applied rather than a base rate the request may never have touched.
+        basis_rates,
         sell_rates,
         finish_reason: finish.map(|finish| finish.reason.to_owned()),
         // Provenance rides with the value it describes, so a row can never
@@ -3517,11 +3570,11 @@ mod tests {
             id: id.to_owned(),
             provider: "openai".to_owned(),
             model: format!("upstream/{id}"),
-            rates: ModelRates {
+            rates: RateSchedule::flat(ModelRates {
                 input_per_mtok: Some(1.0),
                 output_per_mtok: Some(2.0),
                 cached_input_per_mtok: Some(0.2),
-            },
+            }),
             metadata: ModelMetadata {
                 context_window: Some(1_000_000),
                 max_output_tokens: Some(128_000),
@@ -3538,11 +3591,11 @@ mod tests {
             id: id.to_owned(),
             provider: "local-llama".to_owned(),
             model: format!("local/{id}"),
-            rates: ModelRates {
+            rates: RateSchedule::flat(ModelRates {
                 input_per_mtok: Some(0.0),
                 output_per_mtok: Some(0.0),
                 cached_input_per_mtok: None,
-            },
+            }),
             metadata,
         }
     }
@@ -3627,7 +3680,11 @@ mod tests {
 
     /// A route of `definitions` under a tier selling at `sell_rates`, answered
     /// by the predicate the request path asks.
-    fn skips_metering(definitions: Vec<TierCandidate>, sell_rates: ModelRates) -> bool {
+    fn skips_metering(
+        definitions: Vec<TierCandidate>,
+        sell_rates: impl Into<RateSchedule>,
+    ) -> bool {
+        let sell_rates = sell_rates.into();
         let candidates: Vec<ProviderCandidate> = definitions
             .iter()
             .cloned()
@@ -4069,11 +4126,11 @@ mod tests {
             id: id.to_owned(),
             provider: "test-upstream".to_owned(),
             model: format!("upstream/{id}"),
-            rates: ModelRates {
+            rates: RateSchedule::flat(ModelRates {
                 input_per_mtok: Some(1.0),
                 output_per_mtok: Some(2.0),
                 cached_input_per_mtok: None,
-            },
+            }),
             // The walk does not read metadata; it only routes and bills.
             metadata: ModelMetadata::default(),
         }
@@ -4184,14 +4241,317 @@ mod tests {
     }
 
     fn walk_route(candidates: Vec<TierCandidate>) -> ResolvedRoute {
-        ResolvedRoute {
-            requested_model: "zero/test".to_owned(),
+        walk_route_selling(
             candidates,
-            sell_rates: ModelRates {
+            RateSchedule::flat(ModelRates {
                 input_per_mtok: Some(3.0),
                 output_per_mtok: Some(6.0),
                 cached_input_per_mtok: None,
+            }),
+        )
+    }
+
+    // -----------------------------------------------------------------------
+    // Conditional rates on the money path: what admission reserves, and what
+    // settlement charges. The band selection itself is pinned in
+    // `provider::tests`; these pin that the two sites ask the RIGHT question —
+    // admission the worst case, settlement the measured prompt.
+    // -----------------------------------------------------------------------
+
+    fn banded(input: f64, cached: f64, output: f64) -> ModelRates {
+        ModelRates {
+            input_per_mtok: Some(input),
+            cached_input_per_mtok: Some(cached),
+            output_per_mtok: Some(output),
+        }
+    }
+
+    /// `openai/gpt-5.6-luna`'s shipped schedule, sell side.
+    fn luna_schedule() -> RateSchedule {
+        RateSchedule::new(
+            banded(0.2, 0.02, 1.2),
+            vec![crate::provider::ConditionalRate {
+                min_prompt_tokens: 272_000,
+                rates: banded(0.4, 0.04, 1.8),
+            }],
+        )
+    }
+
+    /// A pass-through pin: its cost basis IS the schedule it is sold on.
+    ///
+    /// Taking the schedule as an argument rather than hardcoding one keeps the
+    /// fixture inside what the loader will actually accept — a candidate whose
+    /// thresholds differ from its tier's is refused outright
+    /// (`validate_conditional_alignment`), so a test built that way would be
+    /// pinning behaviour on a file that can never load.
+    fn pass_through_candidate(schedule: RateSchedule) -> TierCandidate {
+        TierCandidate {
+            id: "openai/luna".to_owned(),
+            provider: "test-upstream".to_owned(),
+            model: "upstream/luna".to_owned(),
+            rates: schedule,
+            metadata: ModelMetadata::default(),
+        }
+    }
+
+    fn measured(prompt_tokens: u64, completion_tokens: u64) -> OpenAiUsage {
+        OpenAiUsage {
+            prompt_tokens,
+            completion_tokens,
+            total_tokens: prompt_tokens + completion_tokens,
+            prompt_tokens_details: None,
+        }
+    }
+
+    /// A request whose prompt is genuinely long — half a megabyte of text,
+    /// which admission bounds at ~500,000 "tokens" because that bound is
+    /// measured in BYTES.
+    ///
+    /// The size is what makes the settle tests below mean anything. The real
+    /// prompt behind such a request is a few hundred thousand tokens, so a
+    /// 300,000-token usage report is a plausible outcome for it and the
+    /// reservation's byte bound still over-counts, exactly as it does in
+    /// production. Sized to stay under the fixture key's 1,000,000 token/min
+    /// velocity cap.
+    fn long_walk_request() -> ChatCompletionRequest {
+        serde_json::from_value(json!({
+            "model": "zero/test",
+            "messages": [{ "role": "user", "content": "x".repeat(500_000) }],
+            "stream": true,
+            "max_tokens": 64,
+        }))
+        .expect("long walk request should deserialize")
+    }
+
+    #[test]
+    fn a_reservation_is_sized_at_the_dearest_band_never_the_base_one() {
+        // INVARIANT: never under-reserve. Admission has no measured prompt —
+        // only a byte bound — so it cannot know which band the request will
+        // land in, and reserving at the base rate would leave every request
+        // that crosses the boundary spending past what was held for it.
+        let request = walk_request();
+        let resolved = walk_route_selling(
+            vec![pass_through_candidate(luna_schedule())],
+            luna_schedule(),
+        );
+        let sized = sized_reservation(&request, &resolved, 64).expect("luna's rates price");
+
+        let usage = request.reservation_usage(64);
+        let at_base = usage_cost(banded(0.2, 0.02, 1.2), usage).expect("base band prices");
+        let at_high = usage_cost(banded(0.4, 0.04, 1.8), usage).expect("high band prices");
+        assert_eq!(
+            sized.cost_usd, at_high,
+            "the reservation must hold the dearest rate the schedule can charge"
+        );
+        assert!(
+            sized.cost_usd > at_base,
+            "a reservation at the base band would under-reserve every long request"
+        );
+    }
+
+    #[test]
+    fn a_flat_tier_reserves_exactly_what_it_always_did() {
+        // The other half of the same invariant: a catalog with no conditional
+        // rates must reserve bit-for-bit as before, so `worst_case` may not
+        // inflate anything on the tiers that ship today.
+        let request = walk_request();
+        let flat = ModelRates {
+            input_per_mtok: Some(3.0),
+            output_per_mtok: Some(6.0),
+            cached_input_per_mtok: None,
+        };
+        let resolved = walk_route_selling(vec![walk_candidate("flat")], RateSchedule::flat(flat));
+        let sized = sized_reservation(&request, &resolved, 64).expect("flat rates price");
+        assert_eq!(
+            sized.cost_usd,
+            usage_cost(flat, request.reservation_usage(64)).expect("flat rates price"),
+        );
+    }
+
+    #[test]
+    fn a_tier_that_reprices_past_a_threshold_never_takes_the_free_lane() {
+        // The free lane writes no reservation and no ledger row, so a route
+        // admitted into it has nothing to charge a long request against. A
+        // schedule whose base rate is $0 and whose high band bills real money
+        // must therefore stay on the metered path.
+        let free_base_paid_band = RateSchedule::new(
+            ModelRates {
+                input_per_mtok: Some(0.0),
+                output_per_mtok: Some(0.0),
+                cached_input_per_mtok: Some(0.0),
             },
+            vec![crate::provider::ConditionalRate {
+                min_prompt_tokens: 272_000,
+                rates: banded(5.0, 0.5, 30.0),
+            }],
+        );
+        assert!(!skips_metering(
+            vec![local_rung("local/qwen", local_metadata())],
+            free_base_paid_band,
+        ));
+        // A schedule that is $0 in every band is still free — the rule
+        // narrows the skip, it does not abolish it.
+        assert!(skips_metering(
+            vec![local_rung("local/qwen", local_metadata())],
+            RateSchedule::new(
+                free_sell_rates(),
+                vec![crate::provider::ConditionalRate {
+                    min_prompt_tokens: 272_000,
+                    rates: free_sell_rates(),
+                }],
+            ),
+        ));
+    }
+
+    /// Settle one request at `usage` against a tier selling on `schedule`, and
+    /// return what the customer was charged plus the sell rates the ledger row
+    /// recorded.
+    async fn settle_at(
+        pool: &PgPool,
+        key: &AuthenticatedKey,
+        schedule: RateSchedule,
+        usage: OpenAiUsage,
+    ) -> (Decimal, Decimal, serde_json::Value) {
+        let candidate = pass_through_candidate(schedule.clone());
+        let resolved = walk_route_selling(vec![candidate.clone()], schedule);
+        let request = long_walk_request();
+        let reservation_usage = request.reservation_usage(64);
+        let (session, request_id) = admit_walk(pool, key, &resolved, reservation_usage).await;
+        let reserved = query_as::<_, (Decimal,)>(
+            "SELECT reserved_cost_usd FROM usage_reservations WHERE id = $1",
+        )
+        .bind(request_id)
+        .fetch_one(pool)
+        .await
+        .expect("the reservation must exist before the settle")
+        .0;
+
+        persist_usage(
+            session,
+            "zero/test",
+            &candidate.provider,
+            &candidate.model,
+            Some(&candidate),
+            usage,
+            &resolved.sell_rates,
+            RequestFeatures::from_request(
+                &request,
+                reservation_usage,
+                PriorityResolution::new(None),
+                ZeroRouterEstimate::cold(64),
+            ),
+            None,
+            None,
+            None,
+            Vec::new(),
+            Instant::now(),
+            200,
+        )
+        .await
+        .expect("settlement must succeed");
+
+        let (cost_usd, sell_rates, basis_rates) =
+            query_as::<_, (Decimal, serde_json::Value, Option<serde_json::Value>)>(
+                "SELECT cost_usd, sell_rates, basis_rates FROM usage_events WHERE request_id = $1",
+            )
+            .bind(request_id)
+            .fetch_one(pool)
+            .await
+            .expect("the settled row must exist");
+        // COGS is recorded in the same band the customer was charged in. A row
+        // whose sell rate repriced while its basis did not would report a
+        // margin that never existed.
+        assert_eq!(
+            basis_rates.as_ref(),
+            Some(&sell_rates),
+            "this pass-through pin costs what it sells for, in whichever band applied"
+        );
+        let held = query_as::<_, (i64,)>("SELECT COUNT(*) FROM usage_reservations WHERE id = $1")
+            .bind(request_id)
+            .fetch_one(pool)
+            .await
+            .expect("the reservation count must query")
+            .0;
+        assert_eq!(held, 0, "settlement releases the reservation");
+        (cost_usd, reserved, sell_rates)
+    }
+
+    #[tokio::test]
+    async fn a_request_past_the_boundary_settles_at_the_high_band_end_to_end() {
+        // INVARIANT: settlement prices from the MEASURED prompt, mirroring how
+        // the vendor bills us. 300,000 prompt tokens is past luna's 272,000
+        // boundary, so all 300,000 bill at 0.40 and the whole completion at
+        // 1.80 — no split, no blend.
+        let Some((pool, key)) = walk_fixture().await else {
+            return;
+        };
+        let usage = measured(300_000, 10_000);
+        let (charged, reserved, recorded) = settle_at(&pool, &key, luna_schedule(), usage).await;
+
+        assert_eq!(
+            charged,
+            usage_cost(banded(0.4, 0.04, 1.8), usage).expect("the high band prices"),
+            "a request past the boundary bills entirely at the high band"
+        );
+        assert!(
+            charged > usage_cost(banded(0.2, 0.02, 1.2), usage).expect("the base band prices"),
+            "billing it at the base band would be charging a basis ZeroRouter does not pay"
+        );
+        // The ledger records the band that applied, not the base rate the
+        // request never touched.
+        assert_eq!(recorded["input_per_mtok"], serde_json::json!(0.4));
+        assert_eq!(recorded["output_per_mtok"], serde_json::json!(1.8));
+        // And the reservation, sized at that same worst case, covered it: the
+        // over-estimate is the byte bound, never the rate.
+        assert!(
+            reserved >= charged,
+            "reserved {reserved} did not cover the {charged} charge"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_request_below_the_boundary_settles_at_the_base_band() {
+        // The other side of the step, and the release that makes worst-case
+        // reservation safe: the customer is charged the base rate they were
+        // quoted, and the difference against the dearer reservation goes back.
+        let Some((pool, key)) = walk_fixture().await else {
+            return;
+        };
+        let usage = measured(100_000, 10_000);
+        let (charged, reserved, recorded) = settle_at(&pool, &key, luna_schedule(), usage).await;
+
+        assert_eq!(
+            charged,
+            usage_cost(banded(0.2, 0.02, 1.2), usage).expect("the base band prices"),
+            "a request under the boundary bills at the base band"
+        );
+        assert_eq!(recorded["input_per_mtok"], serde_json::json!(0.2));
+        assert!(
+            reserved > charged,
+            "the worst-case reservation must be released down to the true charge"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_flat_tier_settles_exactly_as_it_always_did() {
+        let Some((pool, key)) = walk_fixture().await else {
+            return;
+        };
+        let flat = banded(0.2, 0.02, 1.2);
+        let usage = measured(300_000, 10_000);
+        let (charged, _, recorded) = settle_at(&pool, &key, RateSchedule::flat(flat), usage).await;
+        assert_eq!(charged, usage_cost(flat, usage).expect("flat rates price"));
+        assert_eq!(recorded["input_per_mtok"], serde_json::json!(0.2));
+    }
+
+    fn walk_route_selling(
+        candidates: Vec<TierCandidate>,
+        sell_rates: RateSchedule,
+    ) -> ResolvedRoute {
+        ResolvedRoute {
+            requested_model: "zero/test".to_owned(),
+            candidates,
+            sell_rates,
         }
     }
 
@@ -4210,7 +4570,10 @@ mod tests {
                 total_tokens: i64::try_from(reservation_usage.total_tokens)
                     .expect("reservation should fit"),
                 output_tokens: 64,
-                cost_usd: usage_cost(resolved.sell_rates, reservation_usage)
+                // `worst_case`, mirroring `sized_reservation`: admission has
+                // no measured prompt to select a band with, so it reserves at
+                // the dearest rate the schedule can charge.
+                cost_usd: usage_cost(resolved.sell_rates.worst_case(), reservation_usage)
                     .expect("sell rates must price"),
             }),
             task_signature("walk-user", &[], 1, 128, true, 64),
@@ -4481,7 +4844,11 @@ mod tests {
         .expect("attempts must query");
         let billed = OpenAiUsage::try_from_provider(Some(&upstream_usage))
             .expect("the scripted usage report is usable");
-        let served_basis = usage_cost(candidate.rates, billed).expect("candidate rates must price");
+        let served_basis = usage_cost(
+            candidate.rates.at_prompt_tokens(billed.prompt_tokens),
+            billed,
+        )
+        .expect("candidate rates must price");
         assert_eq!(
             attempts,
             vec![("aborted".to_owned(), true, Some(served_basis))],
@@ -4586,7 +4953,7 @@ mod tests {
         assert_eq!(output_tokens, 0);
         assert_eq!(
             cost_basis_usd,
-            usage_cost(candidate.rates, OpenAiUsage::default()),
+            usage_cost(candidate.rates.base(), OpenAiUsage::default()),
             "COGS is still priced on the same usage the customer is billed"
         );
         assert_eq!(status, 503);

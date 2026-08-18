@@ -190,8 +190,8 @@ async fn models_are_materialized_from_tiers_toml() {
     // One row per model PIN, keyed by its OpenRouter-standard {vendor}/{model}
     // id. The pre-rename catalog published a `zero/*` alias row AND a concrete
     // candidate row per model (14 rows); each pin now equals its candidate, so
-    // it contributes exactly one row — nine models, nine rows.
-    assert_eq!(data.len(), 9);
+    // it contributes exactly one row — ten models, ten rows.
+    assert_eq!(data.len(), 10);
     assert!(data.iter().all(|model| model["object"] == "model"));
 
     let ids = data
@@ -209,13 +209,14 @@ async fn models_are_materialized_from_tiers_toml() {
             "anthropic/claude-haiku-4-5",
             "anthropic/claude-opus-5",
             "anthropic/claude-sonnet-5",
+            "google/gemini-3.1-pro-preview",
             "google/gemini-3.5-flash-lite",
             "google/gemini-3.7-flash",
             "openai/gpt-5.6-luna",
             "openai/gpt-5.6-sol",
             "openai/gpt-5.6-terra",
         ]),
-        "exactly the nine vendor-named pins — no zero/* alias, no gpt-5.3-codex"
+        "exactly the ten vendor-named pins — no zero/* alias, no gpt-5.3-codex"
     );
 
     // `owned_by` is the vendor, matching OpenRouter — never the string
@@ -412,15 +413,16 @@ async fn bundled_tier_catalog_has_expected_virtual_models() {
             "anthropic/claude-haiku-4-5",
             "anthropic/claude-opus-5",
             "anthropic/claude-sonnet-5",
+            "google/gemini-3.1-pro-preview",
             "google/gemini-3.5-flash-lite",
             "google/gemini-3.7-flash",
             "openai/gpt-5.6-luna",
             "openai/gpt-5.6-sol",
             "openai/gpt-5.6-terra",
         ],
-        "the nine vendor-named model pins (Gemini flash + flash-lite added \
-         2026-08-18; Gemini Pro deliberately absent — Google prices it in \
-         context tiers this catalog cannot express)"
+        "the ten vendor-named model pins (Gemini flash + flash-lite added \
+         2026-08-18; Gemini Pro joined them once conditional rates could \
+         express the 200,000-token boundary Google prices it at)"
     );
 
     // One upstream each, and only from the providers ZeroRouter integrates
@@ -505,31 +507,54 @@ async fn no_shipped_candidate_costs_more_than_its_tier_sells() {
 
     for (tier_id, tier) in &catalog.tiers {
         for candidate in &tier.candidates {
-            for (dimension, basis, sell) in [
-                (
-                    "input_per_mtok",
-                    candidate.rates.input_per_mtok,
-                    tier.rates.input_per_mtok,
-                ),
-                (
-                    "output_per_mtok",
-                    candidate.rates.output_per_mtok,
-                    tier.rates.output_per_mtok,
-                ),
-                (
-                    "cached_input_per_mtok",
-                    candidate.rates.cached_input_per_mtok,
-                    tier.rates.cached_input_per_mtok,
-                ),
-            ] {
-                let (Some(basis), Some(sell)) = (basis, sell) else {
-                    continue;
-                };
-                assert!(
-                    basis <= sell,
-                    "{} in {tier_id} has a {dimension} basis of {basis} above the tier sell rate {sell}",
-                    candidate.id
-                );
+            // Every band, not just the base one. A tier that reprices past a
+            // prompt threshold holds several rate tables and a request lands
+            // in exactly one of them, so a rule checked only at the base is a
+            // rule that holds only for short requests. The bands pair up
+            // positionally because the loader refuses a candidate whose
+            // thresholds differ from its tier's.
+            assert_eq!(
+                candidate.rates.thresholds().collect::<Vec<_>>(),
+                tier.rates.thresholds().collect::<Vec<_>>(),
+                "{} in {tier_id} reprices at different prompt sizes than its tier",
+                candidate.id
+            );
+            let bands = std::iter::once((0_u64, candidate.rates.base(), tier.rates.base())).chain(
+                candidate
+                    .rates
+                    .conditional()
+                    .iter()
+                    .zip(tier.rates.conditional())
+                    .map(|(basis, sell)| (basis.min_prompt_tokens, basis.rates, sell.rates)),
+            );
+            for (threshold, basis_rates, sell_rates) in bands {
+                for (dimension, basis, sell) in [
+                    (
+                        "input_per_mtok",
+                        basis_rates.input_per_mtok,
+                        sell_rates.input_per_mtok,
+                    ),
+                    (
+                        "output_per_mtok",
+                        basis_rates.output_per_mtok,
+                        sell_rates.output_per_mtok,
+                    ),
+                    (
+                        "cached_input_per_mtok",
+                        basis_rates.cached_input_per_mtok,
+                        sell_rates.cached_input_per_mtok,
+                    ),
+                ] {
+                    let (Some(basis), Some(sell)) = (basis, sell) else {
+                        continue;
+                    };
+                    assert!(
+                        basis <= sell,
+                        "{} in {tier_id} has a {dimension} basis of {basis} above the tier sell \
+                         rate {sell} in the band above {threshold} prompt tokens",
+                        candidate.id
+                    );
+                }
             }
         }
     }
@@ -710,6 +735,7 @@ async fn a_basis_hike_above_sell_withholds_that_tier_and_nothing_else() {
             "anthropic/claude-fable-5",
             "anthropic/claude-haiku-4-5",
             "anthropic/claude-opus-5",
+            "google/gemini-3.1-pro-preview",
             "google/gemini-3.5-flash-lite",
             "google/gemini-3.7-flash",
             "openai/gpt-5.6-luna",
@@ -749,14 +775,15 @@ async fn a_basis_hike_above_sell_withholds_that_tier_and_nothing_else() {
     // which is exactly what the calendar does to this table on 2026-08-31.
     let sell = catalog.unavailable["anthropic/claude-sonnet-5"]
         .definition
-        .rates;
+        .rates
+        .base();
     assert_eq!(sell.input_per_mtok, Some(2.00));
     assert_eq!(sell.output_per_mtok, Some(10.00));
 
-    // And the public catalog stops advertising what it cannot serve: the eight
+    // And the public catalog stops advertising what it cannot serve: the nine
     // surviving pins, one row each.
     let listed = listed_model_ids(RouterState::new(path)).await;
-    assert_eq!(listed.len(), 8);
+    assert_eq!(listed.len(), 9);
     assert!(listed.iter().any(|id| id == "openai/gpt-5.6-luna"));
     assert!(listed.iter().any(|id| id == "anthropic/claude-haiku-4-5"));
 
@@ -781,7 +808,79 @@ async fn the_shipped_catalog_withholds_no_tier_today() {
         "the shipped catalog withholds {:?}",
         catalog.unavailable.keys().collect::<Vec<_>>()
     );
-    assert_eq!(catalog.tiers.len(), 9);
+    assert_eq!(catalog.tiers.len(), 10);
+}
+
+/// Every conditional rate the shipped catalog declares, transcribed from
+/// models.dev on 2026-08-18 and asserted here so an edit to `tiers.toml` is
+/// caught by `cargo test` rather than only by the networked drift check.
+///
+/// `(tier, threshold, input, cached, output)`. The two thresholds are
+/// different on purpose — OpenAI reprices the 5.6 family at 272,000 and Google
+/// reprices Gemini Pro at 200,000 — and a future edit that "tidies" them into
+/// one number is exactly what this table is here to stop.
+const SHIPPED_CONDITIONAL_RATES: [(&str, u64, f64, f64, f64); 4] = [
+    ("openai/gpt-5.6-luna", 272_000, 0.40, 0.04, 1.80),
+    ("openai/gpt-5.6-terra", 272_000, 4.00, 0.40, 18.00),
+    ("openai/gpt-5.6-sol", 272_000, 10.00, 1.00, 45.00),
+    ("google/gemini-3.1-pro-preview", 200_000, 4.00, 0.40, 18.00),
+];
+
+#[tokio::test]
+async fn every_shipped_conditional_rate_is_the_one_the_vendor_publishes() {
+    let catalog = load_tier_catalog(&tier_config_path())
+        .await
+        .expect("bundled tier catalog must load");
+
+    for (tier_id, threshold, input, cached, output) in SHIPPED_CONDITIONAL_RATES {
+        let tier = catalog
+            .tiers
+            .get(tier_id)
+            .unwrap_or_else(|| panic!("{tier_id} must be in the shipped catalog"));
+        let bands = tier.rates.conditional();
+        assert_eq!(bands.len(), 1, "{tier_id} declares {} bands", bands.len());
+        assert_eq!(bands[0].min_prompt_tokens, threshold, "{tier_id} boundary");
+        assert_eq!(
+            bands[0].rates.input_per_mtok,
+            Some(input),
+            "{tier_id} input"
+        );
+        assert_eq!(
+            bands[0].rates.cached_input_per_mtok,
+            Some(cached),
+            "{tier_id} cached"
+        );
+        assert_eq!(
+            bands[0].rates.output_per_mtok,
+            Some(output),
+            "{tier_id} output"
+        );
+
+        // The band is what a long request is actually billed at, and the base
+        // is what a short one is: the two must be genuinely different, or the
+        // table is decoration.
+        let route = catalog.resolve(tier_id).expect("a shipped pin resolves");
+        assert_eq!(route.sell_rates.at_prompt_tokens(threshold), bands[0].rates);
+        assert_eq!(
+            route.sell_rates.at_prompt_tokens(threshold - 1),
+            tier.rates.base()
+        );
+        assert_ne!(bands[0].rates, tier.rates.base(), "{tier_id}");
+    }
+
+    // And no OTHER shipped tier quietly grew a band. A conditional table is a
+    // price change; it does not arrive by accident.
+    let declared: std::collections::BTreeSet<&str> = SHIPPED_CONDITIONAL_RATES
+        .iter()
+        .map(|(tier, ..)| *tier)
+        .collect();
+    for (tier_id, tier) in &catalog.tiers {
+        assert_eq!(
+            !tier.rates.conditional().is_empty(),
+            declared.contains(tier_id.as_str()),
+            "{tier_id}'s conditional rates disagree with the table in this test"
+        );
+    }
 }
 
 /// The routed tiers vs the pass-through tiers, told apart explicitly so
@@ -791,7 +890,7 @@ async fn the_shipped_catalog_withholds_no_tier_today() {
 // rungs across >=2 providers). Every tier is pass-through until a second
 // provider serves a model class again.
 const ROUTED_TIERS: [&str; 0] = [];
-const PASS_THROUGH_TIERS: [&str; 9] = [
+const PASS_THROUGH_TIERS: [&str; 10] = [
     // Model pins, keyed by their OpenRouter-standard {vendor}/{model} ids.
     "openai/gpt-5.6-luna",
     "anthropic/claude-haiku-4-5",
@@ -802,6 +901,7 @@ const PASS_THROUGH_TIERS: [&str; 9] = [
     "anthropic/claude-fable-5",
     "google/gemini-3.7-flash",
     "google/gemini-3.5-flash-lite",
+    "google/gemini-3.1-pro-preview",
 ];
 
 #[tokio::test]
@@ -839,19 +939,14 @@ async fn every_shipped_tier_keeps_its_structural_promise() {
                 "{tier_id} is pass-through: one model, one rung"
             );
             let candidate = &tier.candidates[0];
+            // The WHOLE schedule, thresholds included. A pin that sold at list
+            // below 272,000 tokens and at a markup above it would still be a
+            // markup, and comparing only the base tables is exactly how that
+            // would go unnoticed.
             assert_eq!(
-                (
-                    candidate.rates.input_per_mtok,
-                    candidate.rates.cached_input_per_mtok,
-                    candidate.rates.output_per_mtok
-                ),
-                (
-                    tier.rates.input_per_mtok,
-                    tier.rates.cached_input_per_mtok,
-                    tier.rates.output_per_mtok
-                ),
-                "{tier_id} must sell at list on EVERY dimension (cached \
-                 input included): margin is volume discounts, never markup"
+                candidate.rates, tier.rates,
+                "{tier_id} must sell at list on EVERY dimension (cached input included) and in \
+                 EVERY band: margin is volume discounts, never markup"
             );
         } else {
             panic!("{tier_id} is neither routed nor pass-through — decide");

@@ -28,7 +28,7 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 
 use crate::config::{ModelMetadata, TierCatalog};
-use crate::provider::ModelRates;
+use crate::provider::{ModelRates, RateSchedule};
 
 /// The public catalog ZeroRouter reconciles against.
 pub const DEFAULT_SOURCE_URL: &str = "https://models.dev/api.json";
@@ -149,23 +149,30 @@ pub enum Verdict {
     /// at all since stage 2 — `validate_zero_price` refuses it — but this file
     /// does not depend on that being true.)
     Unreconcilable,
-    /// The recorded basis matches the upstream's FLAT rate, but the upstream
-    /// also reprices the whole request above a measured threshold, and
-    /// `tiers.toml` holds exactly one rate per dimension. Every request past
+    /// The upstream reprices the whole request above a measured threshold and
+    /// the CATALOG declares no conditional rates at all, so every request past
     /// the boundary is billed at a basis ZeroRouter does not actually pay.
     ///
-    /// Its own verdict rather than [`Self::BasisDrift`] because nothing in the
-    /// file is wrong: the recorded number is the vendor's real base rate, and
-    /// there is no number the operator could write that would make a
-    /// single-rate row correct. The catalog cannot express the shape yet.
+    /// Its own verdict rather than [`Self::BasisDrift`] because no single
+    /// number in the file is wrong: the recorded rate is the vendor's real
+    /// base rate, and the fault is a missing table rather than a mistyped one.
+    /// Once the catalog DOES declare conditional rates the two are comparable
+    /// like anything else — matching thresholds and rates give
+    /// [`Self::Match`], any disagreement about either gives
+    /// [`Self::BasisDrift`] — so this variant means exactly "the file has
+    /// nothing to say about a boundary the vendor charges at".
     ///
-    /// Reported, not actionable — the same call, and the same reasoning, as
-    /// [`Self::Unreconcilable`]: `openai/gpt-5.6-luna` has shipped tiered since
-    /// before this variant existed, so failing on it would redden every PR
-    /// until tiered rates land, and a check that is always red is a check
-    /// nobody reads. What makes it actionable is the catalog gaining
-    /// conditional rates; a row that then disagrees is ordinary
-    /// [`Self::BasisDrift`].
+    /// **Actionable, since conditional rates landed.** It was not, and the
+    /// reason it was not is written into its own history: `openai/gpt-5.6-luna`
+    /// shipped tiered before the catalog could express the shape, so failing on
+    /// it would have reddened every PR with a fault nobody could fix, and a
+    /// check that is always red is a check nobody reads. That reason is gone.
+    /// There is now a four-line table an operator can add, and until they add
+    /// it the request path is quoting a basis the invoice will not match — the
+    /// precise silent-margin failure this module exists to break. It fails the
+    /// command for the same reason [`Self::BasisDrift`] does, and it fires the
+    /// day an upstream introduces a boundary it did not have before, which is
+    /// when someone needs to hear about it.
     TieredUpstream,
 }
 
@@ -185,10 +192,14 @@ impl Verdict {
     /// Whether this verdict should fail the command. `Unpriced` does not: the
     /// source simply has nothing to say, and failing on it would train
     /// operators to ignore the alarm. Neither does `Unreconcilable`, for the
-    /// reason spelled out on that variant.
+    /// reason spelled out on that variant. `TieredUpstream` now does — see its
+    /// variant for why the call changed.
     #[must_use]
     pub const fn is_actionable(&self) -> bool {
-        matches!(self, Self::BasisDrift | Self::Missing)
+        matches!(
+            self,
+            Self::BasisDrift | Self::Missing | Self::TieredUpstream
+        )
     }
 }
 
@@ -275,7 +286,13 @@ pub struct CandidateDrift {
     /// dispatched model string (a dated Anthropic snapshot, say).
     pub matched_as: Option<String>,
     pub verdict: Verdict,
+    /// The BASE cost basis — what the file records for a request under every
+    /// threshold. Paired with `recorded_conditional`, which carries the rest.
     pub recorded_basis: ModelRates,
+    /// The conditional bands the file records, as `(min_prompt_tokens, rates)`
+    /// in declaration order. Empty for a model priced flat, which is every
+    /// model this file described before conditional rates existed.
+    pub recorded_conditional: Vec<(u64, ModelRates)>,
     pub upstream_cost: ModelRates,
     /// The tier's sell rate — what the customer pays.
     pub sell: ModelRates,
@@ -352,6 +369,40 @@ impl CandidateDrift {
 fn undated(model: &str) -> Option<&str> {
     let (head, tail) = model.rsplit_once('-')?;
     (tail.len() == 8 && tail.bytes().all(|b| b.is_ascii_digit())).then_some(head)
+}
+
+/// Whether the catalog's conditional rates say the same thing as the source's.
+///
+/// Both halves count. **Thresholds** must match one for one and in order: a
+/// catalog repricing at 200,000 against an upstream repricing at 272,000 is
+/// wrong for every request in between, and it is wrong in a way no rate
+/// comparison would ever notice because both sides' numbers are individually
+/// correct. **Rates** are then compared band by band with the same
+/// [`rates_agree`] the base tables use, so an upstream silent about a
+/// dimension is silence rather than disagreement, exactly as it is at the
+/// base.
+///
+/// Reads `cost.tiers[]` and never the flat `context_over_200k` convenience key
+/// — see [`SourceCost::tiers`] for why that key's name is a lie.
+fn conditional_agrees(recorded: &RateSchedule, upstream: &[SourceCostTier]) -> bool {
+    if recorded.conditional().len() != upstream.len() {
+        return false;
+    }
+    recorded
+        .conditional()
+        .iter()
+        .zip(upstream)
+        .all(|(recorded, upstream)| {
+            recorded.min_prompt_tokens == upstream.tier.size
+                && rates_agree(
+                    recorded.rates,
+                    ModelRates {
+                        input_per_mtok: upstream.input,
+                        output_per_mtok: upstream.output,
+                        cached_input_per_mtok: upstream.cache_read,
+                    },
+                )
+        })
 }
 
 fn rates_agree(recorded: ModelRates, upstream: ModelRates) -> bool {
@@ -509,6 +560,11 @@ fn reconcile_with(
                 })
                 .unwrap_or_default();
 
+            let upstream_conditional = entry
+                .and_then(|entry| entry.cost.as_ref())
+                .map(|cost| cost.tiers.as_slice())
+                .unwrap_or_default();
+
             // Checked before the source is consulted at all: a $0 rung on an
             // upstream that bills nobody is not a model the source failed to
             // mention, it is a model the source is not about.
@@ -520,9 +576,20 @@ fn reconcile_with(
                     Some(entry) if entry.cost.is_none() => Verdict::Unpriced,
                     // Checked before `Match`: a row whose flat rate agrees is
                     // still mispriced past the threshold, and saying "ok" to it
-                    // is exactly the silence this module exists to break.
-                    Some(entry) if upstream_tier_note(entry).is_some() => Verdict::TieredUpstream,
-                    Some(_) if rates_agree(candidate.rates, upstream_cost) => Verdict::Match,
+                    // is exactly the silence this module exists to break. Only
+                    // when the CATALOG has nothing to say about the boundary,
+                    // though — once it declares its own conditional rates the
+                    // two are comparable and this is an ordinary rate
+                    // comparison again.
+                    Some(_) if !upstream_conditional.is_empty() && candidate.rates.is_flat() => {
+                        Verdict::TieredUpstream
+                    }
+                    Some(_)
+                        if rates_agree(candidate.rates.base(), upstream_cost)
+                            && conditional_agrees(&candidate.rates, upstream_conditional) =>
+                    {
+                        Verdict::Match
+                    }
                     Some(_) => Verdict::BasisDrift,
                 }
             };
@@ -545,9 +612,15 @@ fn reconcile_with(
                 model: candidate.model.clone(),
                 matched_as,
                 verdict,
-                recorded_basis: candidate.rates,
+                recorded_basis: candidate.rates.base(),
+                recorded_conditional: candidate
+                    .rates
+                    .conditional()
+                    .iter()
+                    .map(|conditional| (conditional.min_prompt_tokens, conditional.rates))
+                    .collect(),
                 upstream_cost,
-                sell: definition.rates,
+                sell: definition.rates.base(),
                 metadata_drift: metadata_drift(&candidate.metadata, &upstream_metadata),
                 upstream_tier: entry.and_then(upstream_tier_note),
                 recorded_metadata: candidate.metadata.clone(),
@@ -581,6 +654,7 @@ pub async fn fetch_source(url: &str) -> Result<String> {
 mod tests {
     use super::*;
     use crate::config::{TierCandidate, TierDefinition};
+    use crate::provider::ConditionalRate;
 
     fn rates(input: f64, cached: f64, output: f64) -> ModelRates {
         ModelRates {
@@ -590,28 +664,40 @@ mod tests {
         }
     }
 
-    fn catalog_with(model: &str, basis: ModelRates, sell: ModelRates) -> TierCatalog {
+    fn catalog_with(
+        model: &str,
+        basis: impl Into<RateSchedule>,
+        sell: impl Into<RateSchedule>,
+    ) -> TierCatalog {
         catalog_declaring(model, basis, sell, ModelMetadata::default())
+    }
+
+    /// One conditional band, for a catalog that reprices past `threshold`.
+    fn conditional(threshold: u64, rates: ModelRates) -> ConditionalRate {
+        ConditionalRate {
+            min_prompt_tokens: threshold,
+            rates,
+        }
     }
 
     /// `catalog_with`, plus what the file claims the model can take and
     /// produce — the half of the comparison that used to have no input.
     fn catalog_declaring(
         model: &str,
-        basis: ModelRates,
-        sell: ModelRates,
+        basis: impl Into<RateSchedule>,
+        sell: impl Into<RateSchedule>,
         metadata: ModelMetadata,
     ) -> TierCatalog {
         let mut tiers = BTreeMap::new();
         tiers.insert(
             "zero/test".to_owned(),
             TierDefinition {
-                rates: sell,
+                rates: sell.into(),
                 candidates: vec![TierCandidate {
                     id: format!("anthropic/{model}"),
                     provider: "anthropic".to_owned(),
                     model: model.to_owned(),
-                    rates: basis,
+                    rates: basis.into(),
                     metadata,
                 }],
             },
@@ -704,6 +790,85 @@ mod tests {
             note.contains("0.4") && note.contains("1.8"),
             "the tier's own rates belong in the report: {note}"
         );
+    }
+
+    #[test]
+    fn a_flat_catalog_against_a_tiered_upstream_is_now_actionable() {
+        // The verdict was reported-but-tolerated only because the catalog
+        // could not express the shape. It can now, so a file that still says
+        // nothing about a boundary the vendor charges at has a four-line fix
+        // and must fail the command until someone applies it.
+        let catalog = catalog_with("gpt-5.6-luna", rates(0.2, 0.02, 1.2), rates(0.2, 0.02, 1.2));
+        let found = reconcile(&catalog, TIERED_SOURCE);
+        assert_eq!(found[0].verdict, Verdict::TieredUpstream);
+        assert!(
+            found[0].verdict.is_actionable(),
+            "an unexpressed boundary bills at a basis ZeroRouter does not pay"
+        );
+        assert!(found[0].recorded_conditional.is_empty());
+    }
+
+    #[test]
+    fn a_catalog_that_matches_the_upstreams_conditional_rates_reconciles() {
+        // Once both sides declare the shape, this is an ordinary rate
+        // comparison again: same boundary, same rates, `ok`.
+        let schedule = RateSchedule::new(
+            rates(0.2, 0.02, 1.2),
+            vec![conditional(272_000, rates(0.4, 0.04, 1.8))],
+        );
+        let catalog = catalog_with("gpt-5.6-luna", schedule.clone(), schedule);
+        let found = reconcile(&catalog, TIERED_SOURCE);
+        assert_eq!(found[0].verdict, Verdict::Match);
+        assert!(!found[0].verdict.is_actionable());
+        assert_eq!(
+            found[0].recorded_conditional,
+            vec![(272_000, rates(0.4, 0.04, 1.8))],
+            "the report carries the band so an operator can read what is being trusted"
+        );
+    }
+
+    #[test]
+    fn a_catalog_whose_boundary_differs_from_the_upstreams_is_basis_drift() {
+        // The failure a rate-only comparison cannot see: every individual
+        // number matches, and the file is still wrong for every request
+        // between 200,000 and 272,000 tokens.
+        let schedule = RateSchedule::new(
+            rates(0.2, 0.02, 1.2),
+            vec![conditional(200_000, rates(0.4, 0.04, 1.8))],
+        );
+        let catalog = catalog_with("gpt-5.6-luna", schedule.clone(), schedule);
+        let found = reconcile(&catalog, TIERED_SOURCE);
+        assert_eq!(found[0].verdict, Verdict::BasisDrift);
+        assert!(found[0].verdict.is_actionable());
+    }
+
+    #[test]
+    fn a_catalog_whose_conditional_rates_differ_is_basis_drift() {
+        let schedule = RateSchedule::new(
+            rates(0.2, 0.02, 1.2),
+            vec![conditional(272_000, rates(0.4, 0.04, 2.4))],
+        );
+        let catalog = catalog_with("gpt-5.6-luna", schedule.clone(), schedule);
+        assert_eq!(
+            reconcile(&catalog, TIERED_SOURCE)[0].verdict,
+            Verdict::BasisDrift
+        );
+    }
+
+    #[test]
+    fn a_catalog_that_invents_a_boundary_the_upstream_does_not_have_is_basis_drift() {
+        // The reverse direction, and it matters as much: a vendor that DROPS
+        // its long-context surcharge leaves ZeroRouter charging customers for
+        // a repricing it no longer pays, which the sell-side of this report is
+        // there to catch.
+        let schedule = RateSchedule::new(
+            rates(2.0, 0.2, 10.0),
+            vec![conditional(272_000, rates(4.0, 0.4, 18.0))],
+        );
+        let catalog = catalog_with("claude-sonnet-5", schedule.clone(), schedule);
+        let found = reconcile(&catalog, SOURCE);
+        assert_eq!(found[0].verdict, Verdict::BasisDrift);
+        assert_eq!(found[0].upstream_tier, None);
     }
 
     /// A flat upstream must stay flat: the tier machinery may not invent a
@@ -994,12 +1159,12 @@ mod tests {
         tiers.insert(
             "zero/edge".to_owned(),
             TierDefinition {
-                rates: rates(2.0, 0.2, 10.0),
+                rates: RateSchedule::flat(rates(2.0, 0.2, 10.0)),
                 candidates: vec![TierCandidate {
                     id: format!("{provider}/qwen3-8b"),
                     provider: provider.to_owned(),
                     model: "qwen3-8b".to_owned(),
-                    rates: basis,
+                    rates: RateSchedule::flat(basis),
                     metadata: ModelMetadata::default(),
                 }],
             },

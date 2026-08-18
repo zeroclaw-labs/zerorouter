@@ -1038,26 +1038,35 @@ async fn catalog_drift(args: CatalogDriftArgs) -> Result<()> {
         );
     }
 
-    // An upstream that reprices past a threshold cannot be expressed by a row
-    // holding one rate per dimension, so the table's flat comparison says
-    // nothing about requests past it. Spelled out with the boundary and the
-    // rates, because "somewhere above some size you are underpricing" is not
-    // something anyone can act on.
+    // Every model whose upstream reprices past a threshold, with what the file
+    // records beside what the source publishes. The rows that matter are the
+    // ones where the file records nothing — those bill past the boundary at a
+    // basis ZeroRouter does not pay — but the reconciled ones print too, so an
+    // operator can see the boundary they are trusting rather than infer it
+    // from the absence of a warning.
     let tiered: Vec<_> = findings
         .iter()
-        .filter(|f| f.upstream_tier.is_some())
+        .filter(|f| f.upstream_tier.is_some() || !f.recorded_conditional.is_empty())
         .collect();
     if !tiered.is_empty() {
-        println!(
-            "\nUpstream reprices past a threshold — the catalog holds one rate per dimension,"
-        );
-        println!("so every request past the boundary bills at a basis ZeroRouter does not pay:");
+        println!("\nUpstream reprices past a threshold. A row the catalog does not match there");
+        println!("bills every request past the boundary at a basis ZeroRouter does not pay:");
         for found in &tiered {
+            let recorded = if found.recorded_conditional.is_empty() {
+                "NOT DECLARED".to_owned()
+            } else {
+                found
+                    .recorded_conditional
+                    .iter()
+                    .map(|(threshold, rates)| format!("≥{threshold} tok: {}", rate(*rates)))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
             println!(
-                "  {} base {} then {}",
-                found.tier,
-                rate(found.upstream_cost),
-                found.upstream_tier.as_deref().unwrap_or_default()
+                "  {tier} base {base} | catalog {recorded} | upstream {upstream}",
+                tier = found.tier,
+                base = rate(found.upstream_cost),
+                upstream = found.upstream_tier.as_deref().unwrap_or("none"),
             );
         }
     }
