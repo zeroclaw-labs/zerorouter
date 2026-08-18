@@ -34,8 +34,56 @@ schema_version = 1
 #
 # Pricing invariant, enforced at load time by `validate_tier_catalog`
 # (`src/config.rs`): no candidate's cost basis may exceed its owning tier's
-# sell rate on any dimension. `basis == sell` is the intended shape here and
-# stays legal; only a strictly greater basis is rejected.
+# sell rate on any dimension, IN EVERY BAND a conditional rate table declares.
+# `basis == sell` is the intended shape here and stays legal; only a strictly
+# greater basis is rejected.
+#
+# CONDITIONAL RATES (2026-08-18): a `rates` table may carry
+# `[[....rates.conditional]]` blocks, each naming a `min_prompt_tokens`
+# threshold and a COMPLETE replacement rate table. Several vendors reprice
+# long-context requests, and the repricing is a STEP, not a margin: at or above
+# the threshold EVERY dimension reprices for the WHOLE request, so a
+# 300,000-token prompt on `openai/gpt-5.6-luna` bills all 300,000 input tokens
+# at 0.40 AND its entire completion at 1.80. Nothing is split at the boundary
+# and nothing is blended. Before this existed the catalog held one rate per
+# dimension and every request past a boundary was billed at a basis ZeroRouter
+# does not pay; `admin catalog-drift` reported it as TIERED UPSTREAM and could
+# not do anything about it.
+#
+# Six things to know before editing one:
+#
+# - `min_prompt_tokens` is a MINIMUM: the comparison is `>=`, so a request
+#   measuring exactly the threshold is priced in the band above it. The vendors
+#   disagree in writing about that one token — OpenRouter's key name says
+#   inclusive, Google's prose says "over" — and drift cannot settle it, because
+#   basis and sell use the same comparison and the source publishes only a
+#   size. `>=` is the markup-not-loss side. See `ConditionalRate` in
+#   `src/provider.rs` for the full argument and how to flip it.
+# - It counts PROMPT tokens — input, cached portion INCLUDED, because cached
+#   input is a subset of input on this wire and `usage_cost` splits rather than
+#   sums it. That is also how the vendors count. Output tokens never enter the
+#   comparison, though they do reprice.
+# - A band REPLACES the base table; it does not patch it. Input and output are
+#   required in every band, and an omitted cached rate falls back to THAT
+#   band's input rate, exactly as at the base.
+# - The candidate's thresholds and its tier's must be IDENTICAL. A mismatch
+#   leaves a band of prompt sizes where one side has repriced and the other has
+#   not, which is unbillable, so the loader refuses the whole file.
+# - Thresholds must be strictly ascending and above zero, so the file reads in
+#   the order it prices in.
+# - Admission cannot know a request's prompt-token count, so it RESERVES at the
+#   dearest rate any band could charge and settlement releases the difference.
+#   Under-reserving would let a customer spend past their balance; over-
+#   reserving costs them nothing.
+#
+# `/v1/models` PUBLISHES THE BANDS, as OpenRouter's `pricing.overrides[]`
+# keyed on the same `min_prompt_tokens` field name. A price a customer cannot
+# see is a price they cannot check, and quoting only the base rate understated
+# four of the ten listed models by 2x on exactly the requests where the gap is
+# largest. The field is additive — a flat tier's row is byte-identical to what
+# it published before — so editing a band here changes what customers are
+# QUOTED as well as what they are charged. The two come from one schedule, so
+# they cannot disagree.
 #
 # Concrete candidate ids are unique file-wide and each belongs to exactly one
 # tier. A pin's tier id equals its single candidate's id, so the tier and the
@@ -87,6 +135,17 @@ input_per_mtok = 0.20
 cached_input_per_mtok = 0.02
 output_per_mtok = 1.20
 
+# OpenAI reprices the whole 5.6 family at 272,000 prompt tokens (models.dev
+# `cost.tiers[]`, verified 2026-08-18). Note that the source ALSO carries a
+# flat `context_over_200k` key holding these same rates under a name that is
+# simply wrong for this model — the boundary is 272,000, not 200,000. The
+# structured field is the one to trust; `drift.rs` never reads the other.
+[[tiers."openai/gpt-5.6-luna".rates.conditional]]
+min_prompt_tokens = 272000
+input_per_mtok = 0.40
+cached_input_per_mtok = 0.04
+output_per_mtok = 1.80
+
 [[tiers."openai/gpt-5.6-luna".candidates]]
 id = "openai/gpt-5.6-luna"
 provider = "openai"
@@ -102,6 +161,12 @@ tool_call = true
 input_per_mtok = 0.20
 cached_input_per_mtok = 0.02
 output_per_mtok = 1.20
+
+[[tiers."openai/gpt-5.6-luna".candidates.rates.conditional]]
+min_prompt_tokens = 272000
+input_per_mtok = 0.40
+cached_input_per_mtok = 0.04
+output_per_mtok = 1.80
 
 [tiers."anthropic/claude-haiku-4-5"]
 
@@ -139,6 +204,12 @@ input_per_mtok = 2.00
 cached_input_per_mtok = 0.20
 output_per_mtok = 12.00
 
+[[tiers."openai/gpt-5.6-terra".rates.conditional]]
+min_prompt_tokens = 272000
+input_per_mtok = 4.00
+cached_input_per_mtok = 0.40
+output_per_mtok = 18.00
+
 [[tiers."openai/gpt-5.6-terra".candidates]]
 id = "openai/gpt-5.6-terra"
 provider = "openai"
@@ -154,6 +225,12 @@ tool_call = true
 input_per_mtok = 2.00
 cached_input_per_mtok = 0.20
 output_per_mtok = 12.00
+
+[[tiers."openai/gpt-5.6-terra".candidates.rates.conditional]]
+min_prompt_tokens = 272000
+input_per_mtok = 4.00
+cached_input_per_mtok = 0.40
+output_per_mtok = 18.00
 
 # Renamed from `zero/high-end` on 2026-08-07. That name promised the top of the
 # catalog and delivered the fourth rung of seven — three tiers cost more, so it
@@ -228,6 +305,15 @@ input_per_mtok = 5.00
 cached_input_per_mtok = 0.50
 output_per_mtok = 30.00
 
+# Note the output rate does NOT simply double the way input and cached do:
+# 30.00 becomes 45.00, not 60.00. Every number here is transcribed, not
+# derived — the family shares a boundary, not a multiplier.
+[[tiers."openai/gpt-5.6-sol".rates.conditional]]
+min_prompt_tokens = 272000
+input_per_mtok = 10.00
+cached_input_per_mtok = 1.00
+output_per_mtok = 45.00
+
 [[tiers."openai/gpt-5.6-sol".candidates]]
 id = "openai/gpt-5.6-sol"
 provider = "openai"
@@ -243,6 +329,12 @@ tool_call = true
 input_per_mtok = 5.00
 cached_input_per_mtok = 0.50
 output_per_mtok = 30.00
+
+[[tiers."openai/gpt-5.6-sol".candidates.rates.conditional]]
+min_prompt_tokens = 272000
+input_per_mtok = 10.00
+cached_input_per_mtok = 1.00
+output_per_mtok = 45.00
 
 [tiers."anthropic/claude-fable-5"]
 
@@ -272,19 +364,20 @@ output_per_mtok = 50.00
 # own; the provider entry carries the full endpoint path, which that adapter
 # requires.
 #
-# Only FLAT-PRICED Gemini models are pinned here. Google prices Gemini Pro in
-# CONTEXT TIERS — `gemini-3.1-pro-preview` is $2.00/$12.00 up to 200k input
-# tokens and $4.00/$18.00 above it — and this catalog has exactly one rate per
-# dimension, so a pin for it would bill a long-context request at half what
-# Google charges. `context_window` cannot fence that off: it is descriptive
-# metadata published as `/v1/models.context_length`, and it truncates nothing.
-# Gemini Pro therefore waits for real tiered-rate support (see the finding
-# recorded 2026-08-18 — `openai/gpt-5.6-luna` already carries this exposure).
+# Gemini Pro was HELD BACK from this section when it was written, and the
+# reason it was held back is worth keeping: Google prices it in context tiers,
+# the catalog had exactly one rate per dimension, and a pin for it would have
+# billed every long-context request at half what Google charges.
+# `context_window` could not fence that off — it is descriptive metadata
+# published as `/v1/models.context_length`, and it truncates nothing. That
+# blocker is gone as of the conditional rates documented in this file's header,
+# so `google/gemini-3.1-pro-preview` is pinned below with its real 200,000-token
+# boundary. Its threshold differs from the OpenAI family's 272,000: these are
+# per-vendor facts, never a shared constant.
 #
 # Rates and metadata below are transcribed from models.dev, the same source
 # `admin catalog-drift` reconciles against, so CI checks them the way it checks
-# every other pin. Both models are flat-priced there: no `tiers` key, no
-# `context_over_200k` key.
+# every other pin. The two Flash models are flat-priced there: no `tiers` key.
 
 [tiers."google/gemini-3.7-flash"]
 
@@ -331,3 +424,42 @@ tool_call = true
 input_per_mtok = 0.30
 cached_input_per_mtok = 0.03
 output_per_mtok = 2.50
+
+# Gemini 3.1 Pro Preview (added 2026-08-18, with conditional rates). Google
+# reprices the whole request at 200,000 prompt tokens — a DIFFERENT boundary
+# from OpenAI's 272,000, which is why the threshold lives on each rate table
+# rather than in a constant somewhere.
+[tiers."google/gemini-3.1-pro-preview"]
+
+[tiers."google/gemini-3.1-pro-preview".rates]
+input_per_mtok = 2.00
+cached_input_per_mtok = 0.20
+output_per_mtok = 12.00
+
+[[tiers."google/gemini-3.1-pro-preview".rates.conditional]]
+min_prompt_tokens = 200000
+input_per_mtok = 4.00
+cached_input_per_mtok = 0.40
+output_per_mtok = 18.00
+
+[[tiers."google/gemini-3.1-pro-preview".candidates]]
+id = "google/gemini-3.1-pro-preview"
+provider = "google"
+model = "gemini-3.1-pro-preview"
+
+[tiers."google/gemini-3.1-pro-preview".candidates.metadata]
+context_window = 1048576
+max_output_tokens = 65536
+input_modalities = ["text", "image", "video", "audio", "pdf"]
+tool_call = true
+
+[tiers."google/gemini-3.1-pro-preview".candidates.rates]
+input_per_mtok = 2.00
+cached_input_per_mtok = 0.20
+output_per_mtok = 12.00
+
+[[tiers."google/gemini-3.1-pro-preview".candidates.rates.conditional]]
+min_prompt_tokens = 200000
+input_per_mtok = 4.00
+cached_input_per_mtok = 0.40
+output_per_mtok = 18.00

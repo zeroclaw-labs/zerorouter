@@ -1038,27 +1038,52 @@ async fn catalog_drift(args: CatalogDriftArgs) -> Result<()> {
         );
     }
 
-    // An upstream that reprices past a threshold cannot be expressed by a row
-    // holding one rate per dimension, so the table's flat comparison says
-    // nothing about requests past it. Spelled out with the boundary and the
-    // rates, because "somewhere above some size you are underpricing" is not
-    // something anyone can act on.
+    // Every model whose upstream reprices past a threshold, with what the file
+    // records beside what the source publishes. The rows that matter are the
+    // ones where the file records nothing — those bill past the boundary at a
+    // basis ZeroRouter does not pay — but the reconciled ones print too, so an
+    // operator can see the boundary they are trusting rather than infer it
+    // from the absence of a warning.
     let tiered: Vec<_> = findings
         .iter()
-        .filter(|f| f.upstream_tier.is_some())
+        .filter(|f| {
+            f.upstream_tier.is_some()
+                || !f.recorded_conditional.is_empty()
+                || !f.sell_conditional.is_empty()
+        })
         .collect();
     if !tiered.is_empty() {
-        println!(
-            "\nUpstream reprices past a threshold — the catalog holds one rate per dimension,"
-        );
-        println!("so every request past the boundary bills at a basis ZeroRouter does not pay:");
+        let bands = |bands: &[(u64, crate::provider::ModelRates)]| {
+            if bands.is_empty() {
+                "NOT DECLARED".to_owned()
+            } else {
+                bands
+                    .iter()
+                    .map(|(threshold, rates)| format!("≥{threshold} tok: {}", rate(*rates)))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            }
+        };
+        println!("\nUpstream reprices past a threshold. A row the catalog does not match there");
+        println!("bills every request past the boundary at a basis ZeroRouter does not pay:");
         for found in &tiered {
             println!(
-                "  {} base {} then {}",
-                found.tier,
-                rate(found.upstream_cost),
-                found.upstream_tier.as_deref().unwrap_or_default()
+                "  {tier} base {base} | upstream {upstream}",
+                tier = found.tier,
+                base = rate(found.upstream_cost),
+                upstream = found.upstream_tier.as_deref().unwrap_or("none"),
             );
+            // Basis and SELL both, because they answer different questions and
+            // only one of them is about the customer. A row can carry the
+            // right cost basis above the boundary and still charge the wrong
+            // price there, and "what does a long request cost the person
+            // paying for it" is not something an operator should have to
+            // reconstruct from the tier file by hand.
+            println!(
+                "      basis {basis}",
+                basis = bands(&found.recorded_conditional)
+            );
+            println!("      sell  {sell}", sell = bands(&found.sell_conditional));
         }
     }
 

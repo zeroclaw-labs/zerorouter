@@ -1800,3 +1800,93 @@ async fn request_id_of(pool: &PgPool, api_key_id: Uuid) -> Uuid {
     .await
     .expect("request id must query")
 }
+
+/// The documented edge ladder (`docs/edge-quickstart.md`, `zero/burst`) with
+/// its hosted rung's real conditional rate: a $0 local rung on a free-settling
+/// provider, beside a metered hosted rung that reprices at 272,000 prompt
+/// tokens, under a tier that reprices with it.
+///
+/// **This must load.** The local rung declares no threshold, because a rung
+/// that is free at every size has nothing to reprice — there is no number its
+/// operator could write. An earlier revision required a candidate's thresholds
+/// to equal its tier's and refused the whole catalog on a mismatch, which made
+/// this ladder unloadable: on an edge box that is a total outage caused by a
+/// configuration whose economics are impeccable, since $0 is under the sell
+/// rate in every band. The margin rule now probes both schedules at every
+/// prompt size either one reprices at, which needs no agreement at all.
+#[tokio::test]
+async fn the_edge_ladder_still_loads_once_its_hosted_rung_reprices() {
+    operator_inventory();
+
+    let path = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("burst_conditional.toml");
+    tokio::fs::write(
+        &path,
+        r#"
+schema_version = 1
+[tiers."zero/burst"]
+[tiers."zero/burst".rates]
+input_per_mtok = 0.20
+cached_input_per_mtok = 0.02
+output_per_mtok = 1.20
+[[tiers."zero/burst".rates.conditional]]
+min_prompt_tokens = 272000
+input_per_mtok = 0.40
+cached_input_per_mtok = 0.04
+output_per_mtok = 1.80
+
+[[tiers."zero/burst".candidates]]
+id = "burst-local"
+provider = "local-llama"
+model = "qwen3-8b"
+[tiers."zero/burst".candidates.rates]
+input_per_mtok = 0.00
+cached_input_per_mtok = 0.00
+output_per_mtok = 0.00
+
+[[tiers."zero/burst".candidates]]
+id = "burst-hosted"
+provider = "hosted-zr"
+model = "openai/gpt-5.6-luna"
+[tiers."zero/burst".candidates.rates]
+input_per_mtok = 0.20
+cached_input_per_mtok = 0.02
+output_per_mtok = 1.20
+[[tiers."zero/burst".candidates.rates.conditional]]
+min_prompt_tokens = 272000
+input_per_mtok = 0.40
+cached_input_per_mtok = 0.04
+output_per_mtok = 1.80
+"#,
+    )
+    .await
+    .expect("the fixture should write");
+
+    let catalog = load_tier_catalog(&path)
+        .await
+        .expect("a $0 rung beside a repricing rung is a legal ladder");
+    let route = catalog
+        .resolve("zero/burst")
+        .expect("the ladder must serve, not be withheld");
+    assert_eq!(route.candidates.len(), 2);
+
+    // The free rung is still free — at every size, which is why it needs no
+    // threshold of its own.
+    let local = &route.candidates[0];
+    assert!(local.is_free(), "the local rung is the $0 rung");
+    assert!(local.rates.is_flat());
+
+    // And the tier still reprices, so a long request bills the high band even
+    // though one of its rungs never heard of the boundary.
+    assert_eq!(
+        route.sell_rates.at_prompt_tokens(271_999).input_per_mtok,
+        Some(0.20)
+    );
+    assert_eq!(
+        route.sell_rates.at_prompt_tokens(272_000).input_per_mtok,
+        Some(0.40)
+    );
+    // A mixed ladder meters: the tier sells for money, so the free lane is not
+    // available to it and the reservation is sized at the dearest band.
+    assert!(!route.sells_free());
+    assert_eq!(route.sell_rates.worst_case().input_per_mtok, Some(0.40));
+}

@@ -839,11 +839,11 @@ mod tests {
             id: id.to_owned(),
             provider: provider.to_owned(),
             model: format!("upstream/{id}"),
-            rates: ModelRates {
+            rates: crate::provider::RateSchedule::flat(ModelRates {
                 input_per_mtok: Some(1.0),
                 output_per_mtok: Some(2.0),
                 cached_input_per_mtok: None,
-            },
+            }),
             // Provider dispatch reads `provider` and `model` and nothing else.
             metadata: ModelMetadata::default(),
         }
