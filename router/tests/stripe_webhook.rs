@@ -13,11 +13,20 @@
 //! ledger are untouched, not merely that a non-2xx came back. Gated on
 //! `DATABASE_URL` like `tests/billing.rs`: unset means the test returns early.
 
-use std::{path::PathBuf, str::FromStr, time::Duration};
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+    str::FromStr,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use axum::{
+    Router,
     body::Body,
-    http::{Request, StatusCode},
+    extract::{Form, State},
+    http::{Request, StatusCode, header},
+    routing::post,
 };
 use chrono::Utc;
 use hmac::{Hmac, Mac};
@@ -32,6 +41,7 @@ use uuid::Uuid;
 use zerorouter::{
     billing::{balance, checkout_intent, record_checkout_intent},
     db::migrate,
+    session::{CSRF_HEADER, SESSION_COOKIE, create_session},
     stripe::{self, STRIPE_SIGNATURE_HEADER, WebhookVerifyError, verify_webhook_signature},
     web::{StripeSettings, WebConfig, WebCtx},
 };
@@ -194,6 +204,12 @@ fn unique_session_id() -> String {
 }
 
 fn webhook_app(pool: &PgPool) -> axum::Router {
+    // The webhook arms never call Stripe, so the unreachable default base is
+    // the honest configuration for them.
+    stripe_app(pool, "https://api.stripe.invalid")
+}
+
+fn stripe_app(pool: &PgPool, api_base: &str) -> axum::Router {
     let config = WebConfig {
         public_base_url: "http://127.0.0.1".to_owned(),
         secure_cookies: false,
@@ -203,7 +219,7 @@ fn webhook_app(pool: &PgPool) -> axum::Router {
             webhook_secret: SECRET.to_owned(),
             checkout_min_usd: Decimal::from(5),
             checkout_max_usd: Decimal::from(1000),
-            api_base: "https://api.stripe.com".to_owned(),
+            api_base: api_base.to_owned(),
         }),
         signup_credit_usd: Decimal::ZERO,
         portal_dist_path: PathBuf::from("portal/dist"),
@@ -242,6 +258,55 @@ fn paid_session_event(
         }
     })
     .to_string()
+}
+
+/// The same object, but priced the way Stripe Tax prices an EXCLUSIVE-tax
+/// session: `ex_tax_cents` is the gross ZeroRouter quoted, `tax_cents` is what
+/// Stripe added on top, and `amount_total` is the sum — the money that
+/// actually left the customer's card. The breakdown arrives in
+/// `total_details`, which is where Stripe reports it.
+fn taxed_session_event(
+    session_id: &str,
+    user_id: Uuid,
+    metadata_credit_usd: &str,
+    ex_tax_cents: i64,
+    tax_cents: i64,
+    currency: &str,
+) -> String {
+    taxed_session_event_raw(
+        session_id,
+        user_id,
+        metadata_credit_usd,
+        ex_tax_cents + tax_cents,
+        json!(tax_cents),
+        currency,
+    )
+}
+
+/// The same, with `amount_total` and the reported tax set independently, so a
+/// test can build a session whose parts do not add up.
+fn taxed_session_event_raw(
+    session_id: &str,
+    user_id: Uuid,
+    metadata_credit_usd: &str,
+    amount_total: i64,
+    reported_tax: Value,
+    currency: &str,
+) -> String {
+    let mut event: Value = serde_json::from_str(&paid_session_event(
+        session_id,
+        user_id,
+        metadata_credit_usd,
+        amount_total,
+        currency,
+    ))
+    .expect("base event must parse");
+    event["data"]["object"]["total_details"] = json!({
+        "amount_discount": 0,
+        "amount_shipping": 0,
+        "amount_tax": reported_tax,
+    });
+    event.to_string()
 }
 
 /// POST a correctly signed payload at the real handler.
@@ -471,6 +536,453 @@ async fn unpaid_session_is_acknowledged_without_crediting() {
     let (status, _) = post_webhook(&pool, &event.to_string()).await;
     assert_eq!(status, StatusCode::OK);
     assert_nothing_credited(&pool, user_id, "unpaid session").await;
+}
+
+// ---------------------------------------------------------------------------
+// Stripe Tax: sales tax rides on top of the price and is never credit
+// ---------------------------------------------------------------------------
+
+/// THE invariant. With exclusive tax the card is charged gross + tax, so
+/// "amount charged == gross" stops being true — but what the customer receives
+/// must not move by a cent. Two identical $25 purchases, one taxed and one
+/// not, must leave identical balances and identical ledger rows.
+#[tokio::test]
+async fn a_taxed_purchase_credits_exactly_what_an_untaxed_one_does() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    // $25 credit is quoted at $26.38 gross (fee ceil(0.055*25) = $1.38).
+    // Massachusetts at 6.25% of $26.38 is $1.65, so the card is charged
+    // $28.03 — none of which is the customer's to spend beyond the $25.
+    const GROSS_CENTS: i64 = 2_638;
+    const TAX_CENTS: i64 = 165;
+
+    let taxed = create_user(&pool, "taxed").await;
+    let taxed_session = unique_session_id();
+    record_checkout_intent(
+        &pool,
+        &taxed_session,
+        taxed,
+        GROSS_CENTS,
+        Decimal::from(25),
+        "usd",
+    )
+    .await
+    .expect("pending purchase record must insert");
+    let (status, body) = post_webhook(
+        &pool,
+        &taxed_session_event(
+            &taxed_session,
+            taxed,
+            "25.00",
+            GROSS_CENTS,
+            TAX_CENTS,
+            "usd",
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+
+    let untaxed = create_user(&pool, "untaxed").await;
+    let untaxed_session = unique_session_id();
+    record_checkout_intent(
+        &pool,
+        &untaxed_session,
+        untaxed,
+        GROSS_CENTS,
+        Decimal::from(25),
+        "usd",
+    )
+    .await
+    .expect("pending purchase record must insert");
+    let (status, body) = post_webhook(
+        &pool,
+        &paid_session_event(&untaxed_session, untaxed, "25.00", GROSS_CENTS, "usd"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+
+    let taxed_balance = balance(&pool, taxed).await.expect("balance must query");
+    let untaxed_balance = balance(&pool, untaxed).await.expect("balance must query");
+    assert_eq!(
+        taxed_balance, untaxed_balance,
+        "tax must not change what a purchase credits"
+    );
+    assert_eq!(
+        taxed_balance,
+        Decimal::from(25),
+        "the customer is credited the net credit, never the gross and never the taxed total"
+    );
+
+    // The ledger row records the credit, not the money collected: no part of
+    // the $1.65 of tax (nor the $1.38 fee) is spendable or booked as a credit.
+    let credited = query_scalar::<_, Decimal>(
+        "SELECT amount_usd FROM credit_ledger WHERE stripe_session_id = $1",
+    )
+    .bind(&taxed_session)
+    .fetch_one(&pool)
+    .await
+    .expect("ledger row must query");
+    assert_eq!(credited, Decimal::from(25));
+
+    // The intent row keeps meaning the EX-TAX gross, so fee revenue stays
+    // exactly gross - credit and tax never contaminates it.
+    let intent = checkout_intent(&pool, &taxed_session)
+        .await
+        .expect("intent must query")
+        .expect("intent must exist");
+    assert_eq!(intent.expected_amount_cents, GROSS_CENTS);
+    assert!(intent.settled_at.is_some());
+}
+
+/// A real untaxed Stripe session still reports `total_details`, with the tax
+/// broken out as zero. That shape must behave exactly like today's fixture.
+#[tokio::test]
+async fn a_session_reporting_zero_tax_is_credited_exactly_as_before() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let user_id = create_user(&pool, "zero-tax").await;
+    let session_id = unique_session_id();
+    record_checkout_intent(&pool, &session_id, user_id, 2_638, Decimal::from(25), "usd")
+        .await
+        .expect("pending purchase record must insert");
+    let (status, body) = post_webhook(
+        &pool,
+        &taxed_session_event(&session_id, user_id, "25.00", 2_638, 0, "usd"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(
+        balance(&pool, user_id).await.expect("balance must query"),
+        Decimal::from(25)
+    );
+}
+
+/// A session whose parts do not add up credits nothing.
+///
+/// The shape that matters is an INCLUSIVE-tax session: `amount_total` is the
+/// price we quoted, with the tax carved OUT of it rather than added on top, so
+/// ZeroRouter would be handing over its own revenue as tax while crediting the
+/// full amount. Deriving what was collected as `amount_total - amount_tax`
+/// makes that arrive as a short payment and it is refused. The same check
+/// catches a coupon or a shipping line — anything that makes the money
+/// collected differ from the price ZeroRouter sold.
+#[tokio::test]
+async fn tax_carved_out_of_the_price_instead_of_added_on_top_credits_nothing() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let user_id = create_user(&pool, "inclusive-tax").await;
+    let session_id = unique_session_id();
+    record_checkout_intent(&pool, &session_id, user_id, 2_638, Decimal::from(25), "usd")
+        .await
+        .expect("pending purchase record must insert");
+    // $26.38 collected, of which $1.65 is tax: only $24.73 of price arrived.
+    let event = taxed_session_event_raw(&session_id, user_id, "25.00", 2_638, json!(165), "usd");
+
+    let (status, body) = post_webhook(&pool, &event).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["code"], json!("amount_mismatch"));
+    assert_nothing_credited(&pool, user_id, "tax carved out of the price").await;
+}
+
+/// Tax is excluded from the corroboration, so it must never be usable to
+/// disguise a short payment — and an unreadable or impossible tax figure is
+/// refused outright rather than read as zero.
+#[tokio::test]
+async fn an_unusable_or_padded_tax_figure_credits_nothing() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    for (label, amount_total, reported_tax) in [
+        // The full price arrived, but the event claims most of it was tax.
+        ("tax padding a short payment", 2_638, json!(1_000)),
+        // Tax cannot be negative; a negative one would inflate what we read
+        // as collected.
+        ("negative tax", 2_473, json!(-165)),
+        // Not an integer number of cents: unreadable, so unusable.
+        ("tax as a string", 2_803, json!("165")),
+        ("fractional tax", 2_803, json!(165.5)),
+    ] {
+        let user_id = create_user(&pool, "bad-tax").await;
+        let session_id = unique_session_id();
+        record_checkout_intent(&pool, &session_id, user_id, 2_638, Decimal::from(25), "usd")
+            .await
+            .expect("pending purchase record must insert");
+        let event = taxed_session_event_raw(
+            &session_id,
+            user_id,
+            "25.00",
+            amount_total,
+            reported_tax,
+            "usd",
+        );
+
+        let (status, _) = post_webhook(&pool, &event).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{label} must be refused");
+        assert_nothing_credited(&pool, user_id, label).await;
+    }
+}
+
+/// Tax does not switch off the rest of the corroboration: a taxed session
+/// that collected the wrong price, or names the wrong recipient, still
+/// credits nothing.
+#[tokio::test]
+async fn the_amount_and_recipient_guards_still_fire_on_a_taxed_session() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    // Wrong price: $25 of credit claimed, but only $20.00 of price collected
+    // (plus tax on it), so Layer 1 refuses.
+    let short = create_user(&pool, "taxed-short").await;
+    let short_session = unique_session_id();
+    record_checkout_intent(
+        &pool,
+        &short_session,
+        short,
+        2_638,
+        Decimal::from(25),
+        "usd",
+    )
+    .await
+    .expect("pending purchase record must insert");
+    let (status, body) = post_webhook(
+        &pool,
+        &taxed_session_event(&short_session, short, "25.00", 2_000, 125, "usd"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["code"], json!("amount_mismatch"));
+    assert_nothing_credited(&pool, short, "taxed short payment").await;
+
+    // Right price and right tax, forged recipient: Layer 2 refuses.
+    let payer = create_user(&pool, "taxed-payer").await;
+    let attacker = create_user(&pool, "taxed-attacker").await;
+    let session_id = unique_session_id();
+    record_checkout_intent(&pool, &session_id, payer, 2_638, Decimal::from(25), "usd")
+        .await
+        .expect("pending purchase record must insert");
+    let (status, body) = post_webhook(
+        &pool,
+        &taxed_session_event(&session_id, attacker, "25.00", 2_638, 165, "usd"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["code"], json!("amount_mismatch"));
+    assert_nothing_credited(&pool, attacker, "taxed forged recipient").await;
+    assert_nothing_credited(&pool, payer, "taxed forged recipient (payer)").await;
+}
+
+// ---------------------------------------------------------------------------
+// Checkout session creation: the exact form ZeroRouter sends to Stripe
+// ---------------------------------------------------------------------------
+
+/// The `POST /v1/checkout/sessions` form the router sent, as captured by the
+/// mock Stripe below.
+type CapturedForm = Arc<Mutex<Option<HashMap<String, String>>>>;
+
+/// A Stripe stand-in that records the Checkout Session form verbatim and
+/// answers with a session shaped like the real one. Asserting on what is
+/// captured here is the only way to pin the wire contract: everything about
+/// tax is decided by the parameters in this form, and a silently dropped
+/// parameter is indistinguishable from a working integration until a customer
+/// is charged the wrong amount.
+async fn mock_checkout_stripe(session_id: String) -> (String, CapturedForm) {
+    let captured: CapturedForm = Arc::new(Mutex::new(None));
+    let app = Router::new()
+        .route(
+            "/v1/checkout/sessions",
+            post(
+                |State((captured, session_id)): State<(CapturedForm, String)>,
+                 Form(form): Form<HashMap<String, String>>| async move {
+                    *captured.lock().expect("captured form must lock") = Some(form);
+                    axum::Json(json!({
+                        "id": session_id,
+                        "url": format!("https://checkout.stripe.invalid/c/pay/{session_id}"),
+                    }))
+                },
+            ),
+        )
+        .with_state((captured.clone(), session_id));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("mock stripe should bind");
+    let address = listener.local_addr().expect("mock stripe address");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    (format!("http://{address}"), captured)
+}
+
+/// Drive the real `POST /api/billing/checkout` handler as an authenticated
+/// portal user, against whatever `api_base` is passed.
+async fn post_checkout(
+    pool: &PgPool,
+    api_base: &str,
+    user_id: Uuid,
+    amount_usd: &str,
+) -> (StatusCode, Value) {
+    let (token, _) = create_session(pool, user_id, Duration::from_secs(3_600))
+        .await
+        .expect("portal session must create");
+    let request = Request::builder()
+        .method("POST")
+        .uri("/api/billing/checkout")
+        .header(header::COOKIE, format!("{SESSION_COOKIE}={token}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(CSRF_HEADER, "1")
+        .body(Body::from(json!({ "amount_usd": amount_usd }).to_string()))
+        .expect("checkout request should build");
+    let response = stripe_app(pool, api_base)
+        .oneshot(request)
+        .await
+        .expect("checkout request should complete");
+    let status = response.status();
+    let bytes = response
+        .into_body()
+        .collect()
+        .await
+        .expect("checkout response body should be readable")
+        .to_bytes();
+    let json = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    (status, json)
+}
+
+/// Every parameter of the Checkout Session, pinned exactly.
+///
+/// This is a characterization test in the `tests/request_path.rs` sense: it
+/// exists so that a change to what ZeroRouter asks Stripe to charge cannot
+/// happen by accident. If it fails, the wire contract moved — decide whether
+/// that was intended before touching the expectation.
+#[tokio::test]
+async fn checkout_session_form_is_the_pinned_stripe_wire_contract() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let user_id = create_user(&pool, "checkout-form").await;
+    let email = query_scalar::<_, String>("SELECT email FROM users WHERE id = $1")
+        .bind(user_id)
+        .fetch_one(&pool)
+        .await
+        .expect("user email must query");
+    let session_id = unique_session_id();
+    let (api_base, captured) = mock_checkout_stripe(session_id.clone()).await;
+
+    let (status, body) = post_checkout(&pool, &api_base, user_id, "25.00").await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+
+    let form = captured
+        .lock()
+        .expect("captured form must lock")
+        .clone()
+        .expect("stripe must have been called");
+    let expected: HashMap<String, String> = [
+        ("mode", "payment"),
+        ("line_items[0][price_data][currency]", "usd"),
+        // The unit amount is the EX-TAX gross: $25.00 credit + ceil(0.055 * 25)
+        // = $1.38 fee = $26.38. Tax is added on top of this by Stripe.
+        ("line_items[0][price_data][unit_amount]", "2638"),
+        (
+            "line_items[0][price_data][product_data][name]",
+            "ZeroRouter credits",
+        ),
+        (
+            "line_items[0][price_data][product_data][tax_code]",
+            "txcd_10105001",
+        ),
+        ("line_items[0][price_data][tax_behavior]", "exclusive"),
+        ("line_items[0][quantity]", "1"),
+        ("automatic_tax[enabled]", "true"),
+        ("metadata[user_id]", &user_id.to_string()),
+        ("metadata[credit_usd]", "25.00"),
+        ("metadata[fee_usd]", "1.38"),
+        ("metadata[gross_usd]", "26.38"),
+        ("customer_email", &email),
+        ("success_url", "http://127.0.0.1/credits?checkout=success"),
+        ("cancel_url", "http://127.0.0.1/credits?checkout=cancelled"),
+    ]
+    .into_iter()
+    .map(|(key, value)| (key.to_owned(), value.to_owned()))
+    .collect();
+    assert_eq!(form, expected, "the Checkout Session form moved");
+
+    // `customer_update` is only valid alongside a `customer`, and this session
+    // attaches none. Sending it would make Stripe reject every checkout, so its
+    // absence is a guard, not an omission.
+    assert!(
+        !form.contains_key("customer"),
+        "checkout attaches no Stripe Customer"
+    );
+    assert!(
+        form.keys().all(|key| !key.starts_with("customer_update")),
+        "customer_update without a customer is rejected by Stripe"
+    );
+
+    // The intent row still records the EX-TAX gross in cents and the net
+    // credit in dollars — the two numbers the webhook reconciles against.
+    let intent = checkout_intent(&pool, &session_id)
+        .await
+        .expect("intent must query")
+        .expect("intent must exist");
+    assert_eq!(intent.expected_amount_cents, 2_638);
+    assert_eq!(intent.expected_credit_usd, Decimal::from(25));
+    assert_eq!(intent.user_id, user_id);
+}
+
+/// The three parameters that make Stripe compute tax at all, asserted on their
+/// own so that losing any one of them fails for an obvious reason.
+///
+/// Each does a distinct job: without `automatic_tax[enabled]` Stripe never
+/// calculates, without a `tax_code` it falls back to the account preset for a
+/// product it knows nothing about, and without `tax_behavior=exclusive` the tax
+/// could be carved out of ZeroRouter's own margin instead of added on top.
+/// None of them fails loudly in production if dropped — the session is created
+/// happily and simply collects the wrong amount — which is why they are pinned
+/// here.
+#[tokio::test]
+async fn the_checkout_session_asks_stripe_to_calculate_tax() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let user_id = create_user(&pool, "automatic-tax").await;
+    let session_id = unique_session_id();
+    let (api_base, captured) = mock_checkout_stripe(session_id).await;
+
+    let (status, body) = post_checkout(&pool, &api_base, user_id, "25.00").await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let form = captured
+        .lock()
+        .expect("captured form must lock")
+        .clone()
+        .expect("stripe must have been called");
+
+    assert_eq!(
+        form.get("automatic_tax[enabled]").map(String::as_str),
+        Some("true"),
+        "Stripe must be asked to determine the tax"
+    );
+    assert_eq!(
+        form.get("line_items[0][price_data][product_data][tax_code]")
+            .map(String::as_str),
+        Some("txcd_10105001"),
+        "the product must be classified as cloud-delivered AI-as-a-service"
+    );
+    assert_eq!(
+        form.get("line_items[0][price_data][tax_behavior]")
+            .map(String::as_str),
+        Some("exclusive"),
+        "tax rides on top of the price, never out of it"
+    );
+    // No rate and no jurisdiction may be encoded anywhere in the request:
+    // taxability is Stripe's determination from the buyer's address and the
+    // registrations in the dashboard, and a hardcoded rate would silently
+    // outlive the next rate change.
+    assert!(
+        form.keys()
+            .all(|key| !key.contains("tax_rate") && !key.contains("tax_rates")),
+        "no manual tax rate may be sent; it cannot coexist with automatic tax"
+    );
 }
 
 // ---------------------------------------------------------------------------

@@ -146,6 +146,59 @@ needs from the environment:
 The sweep itself (charge candidates, reconcile stale intents, three-strikes
 disable) starts with serve mode and needs no configuration.
 
+## Stripe Tax must be configured BEFORE this deploys
+
+Checkout Sessions are created with `automatic_tax[enabled]=true`. The code
+sends no rate and no jurisdiction — taxability is entirely Stripe's
+determination from the buyer's address and the registrations in the
+dashboard — so the dashboard is not optional configuration, it is the
+feature. There is no environment variable and no code path that checks any
+of it.
+
+Two distinct things go wrong when it is missing, and only one of them is
+loud:
+
+1. **Stripe Tax not activated on the account.** Stripe rejects the session
+   creation (`stripe_tax_inactive`), so `POST /api/billing/checkout`
+   returns 502 `checkout_failed` and **nobody can buy credits at all**.
+   This is immediate and total on deploy — activate first.
+2. **Activated, but no registration covering the buyer.** Stripe accepts
+   the session and calculates zero tax. Checkout works, credits land, and
+   nothing in the logs says tax is not being collected. This is the quiet
+   failure, and Stripe cannot retroactively correct a sale that collected
+   the wrong tax — so registrations must exist before the first live
+   purchase, not after the first complaint.
+
+Operator steps, in order, in **each** environment (a sandbox's tax
+registrations do not carry to live mode; Tax Settings must be verified per
+environment):
+
+1. Dashboard → **Tax → Settings**: activate Stripe Tax and set the head
+   office address (Cambridge, MA). `automatic_tax` calculates nothing while
+   the settings status is `pending`.
+2. Dashboard → **Tax → Registrations**: add the Massachusetts registration
+   and confirm it shows as *Collecting*. With a head office in
+   Massachusetts the business is not a remote seller, so this registration
+   is required on physical presence, not on a sales threshold.
+3. Confirm the product tax code and tax behavior the code sends are the
+   intended ones — see `CHECKOUT_TAX_CODE` in `router/src/stripe.rs`, which
+   carries the reasoning and the **unresolved question of whether tax is due
+   when credits are bought or when they are spent**. That is an open item
+   for the operator's accountant, not something the code settles.
+4. Run one real purchase and confirm the session carries a non-zero tax
+   line. A green test suite is not evidence: the tests prove the parameters
+   are sent, not that Stripe collected anything.
+
+Two consequences worth planning for:
+
+- **Stripe Tax costs roughly 0.5% per transaction** where a registration
+  applies, on top of card processing. The deposit fee has not been re-sized
+  for it; the arithmetic is in the `DEPOSIT_FEE_FLOOR_USD` comment.
+- **Autopay is not taxed and cannot be**, because a raw PaymentIntent has
+  no `automatic_tax` parameter. The same credits bought through autopay
+  collect no tax. Closing that gap needs the Tax Calculation API and is a
+  separate decision.
+
 ## Credit enforcement is on by default
 
 `ZEROROUTER_REQUIRE_CREDITS` **defaults to `true`**. It previously defaulted
