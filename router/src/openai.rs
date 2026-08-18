@@ -2,7 +2,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::config::RequestNeeds;
 use crate::provider::ToolSpec;
-use crate::provider::{ChatMessage, ChatResponse, ModelRates, StopReason, TokenUsage, ToolCall};
+use crate::provider::{
+    ChatMessage, ChatResponse, ModelRates, RateSchedule, StopReason, TokenUsage, ToolCall,
+};
 use chrono::Utc;
 use rust_decimal::{Decimal, prelude::FromPrimitive};
 use serde::{Deserialize, Serialize};
@@ -473,20 +475,73 @@ pub struct ModelPricing {
     pub completion: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub input_cache_read: Option<String>,
+    /// What this model costs past a prompt-size threshold, when it reprices.
+    ///
+    /// **A price a customer cannot see is a price they cannot check**, and
+    /// four of the ten models this catalog lists reprice at 2x. Publishing
+    /// only the base rate meant `/v1/models` quoted half the real price on
+    /// exactly the requests where the difference is largest — indefensible for
+    /// a gateway whose whole claim is honest pass-through.
+    ///
+    /// The shape is OpenRouter's `pricing.overrides[]`, keyed on the same
+    /// `min_prompt_tokens` field name this catalog uses, so a client that
+    /// already understands OpenRouter understands this without being told.
+    ///
+    /// Purely additive: `skip_serializing_if` means a model that charges one
+    /// price at every size serializes byte-for-byte as it did before this
+    /// field existed. Safe for the known consumer — ZeroClaw's `ModelPricing`
+    /// carries no `deny_unknown_fields` and its normalizer reads three named
+    /// fields — and unknown fields are ignored by serde's default, so an older
+    /// client sees exactly what it saw before.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub overrides: Vec<PricingOverride>,
+}
+
+/// One repricing band on the wire: the prompt size at which it starts, and the
+/// per-single-token rates that apply from there.
+///
+/// `min_prompt_tokens` is a minimum — a request measuring exactly this many
+/// prompt tokens is billed here, matching
+/// [`crate::provider::RateSchedule::at_prompt_tokens`], which is what actually
+/// charges. Rates are absolute replacements, not deltas: past the threshold the
+/// whole request bills here, input and output alike.
+#[derive(Debug, Serialize)]
+pub struct PricingOverride {
+    pub min_prompt_tokens: u64,
+    pub prompt: String,
+    pub completion: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_cache_read: Option<String>,
 }
 
 impl ModelPricing {
-    /// Convert per-1M-token sell rates (`config/tiers.toml`) into
+    /// Convert a per-1M-token sell SCHEDULE (`config/tiers.toml`) into
     /// OpenRouter's per-single-token decimal-string convention. Division by
     /// `1_000_000` happens in `Decimal`, never `f64`, and the result is
     /// trailing-zero-normalized before rendering, so the wire value a
     /// customer reads never carries a binary-float artifact.
+    ///
+    /// The base table fills the top-level fields and each conditional band
+    /// becomes one [`PricingOverride`], in the order the catalog declares them
+    /// (validated ascending). A flat schedule produces an empty `overrides`,
+    /// which does not serialize at all.
     #[must_use]
-    pub fn from_sell_rates(rates: ModelRates) -> Self {
+    pub fn from_sell_rates(schedule: &RateSchedule) -> Self {
+        let base = schedule.base();
         Self {
-            prompt: per_token_price(rates.input_per_mtok.unwrap_or(0.0)),
-            completion: per_token_price(rates.output_per_mtok.unwrap_or(0.0)),
-            input_cache_read: rates.cached_input_per_mtok.map(per_token_price),
+            prompt: per_token_price(base.input_per_mtok.unwrap_or(0.0)),
+            completion: per_token_price(base.output_per_mtok.unwrap_or(0.0)),
+            input_cache_read: base.cached_input_per_mtok.map(per_token_price),
+            overrides: schedule
+                .conditional()
+                .iter()
+                .map(|conditional| PricingOverride {
+                    min_prompt_tokens: conditional.min_prompt_tokens,
+                    prompt: per_token_price(conditional.rates.input_per_mtok.unwrap_or(0.0)),
+                    completion: per_token_price(conditional.rates.output_per_mtok.unwrap_or(0.0)),
+                    input_cache_read: conditional.rates.cached_input_per_mtok.map(per_token_price),
+                })
+                .collect(),
         }
     }
 }
@@ -510,7 +565,7 @@ impl ModelList {
                     object: "model",
                     created: 0,
                     owned_by: row.owned_by,
-                    pricing: ModelPricing::from_sell_rates(row.sell_rates),
+                    pricing: ModelPricing::from_sell_rates(&row.sell_rates),
                     context_length: row.metadata.context_window,
                     max_output_tokens: row.metadata.max_output_tokens,
                     input_modalities: row.metadata.input_modalities,

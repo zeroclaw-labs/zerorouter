@@ -442,6 +442,34 @@ impl ModelRates {
 /// is `>=`, so a request measuring precisely the threshold is priced HERE and
 /// not at the table below. See [`RateSchedule::at_prompt_tokens`] for what is
 /// being measured and why.
+///
+/// # The boundary direction is contested, and this is the safe side of it
+///
+/// The vendors do not agree with each other in writing. OpenRouter publishes
+/// these bands under a `min_prompt_tokens` key, and a minimum is inclusive.
+/// Google's own pricing page describes Gemini's band as applying to prompts
+/// "over" 200,000 tokens, which reads exclusive. The source catalog ZeroRouter
+/// reconciles against carries only a `size`, so it cannot settle the question
+/// either way.
+///
+/// `>=` is chosen because it matches the field name an operator reads in
+/// `tiers.toml` and the `≥` the drift report already renders. The exposure is
+/// exactly one token count: a request measuring *precisely* the threshold is
+/// charged the high rate, and if the vendor turns out to be exclusive there,
+/// ZeroRouter collects the high rate while paying the low one. That is a
+/// markup rather than a loss — the safe direction for the balance, the wrong
+/// direction for a pass-through promise — and it is bounded by how often a
+/// prompt lands on an exact round number.
+///
+/// **Drift cannot catch this**, and that is why it is written down rather than
+/// left to CI: basis and sell both run through this same function, so they
+/// agree with each other no matter which way the comparison points, and the
+/// source publishes no inclusivity to compare against. Confirming it takes a
+/// real invoice for a boundary-exact request. Flipping it afterwards is one
+/// operator in this function.
+///
+/// Pinned by `provider::tests::the_threshold_is_a_minimum_and_includes_its_own_boundary`,
+/// which fails if the direction changes silently.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ConditionalRate {
     pub min_prompt_tokens: u64,

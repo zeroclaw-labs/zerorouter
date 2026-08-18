@@ -53,7 +53,12 @@ schema_version = 1
 # Six things to know before editing one:
 #
 # - `min_prompt_tokens` is a MINIMUM: the comparison is `>=`, so a request
-#   measuring exactly the threshold is priced in the band above it.
+#   measuring exactly the threshold is priced in the band above it. The vendors
+#   disagree in writing about that one token — OpenRouter's key name says
+#   inclusive, Google's prose says "over" — and drift cannot settle it, because
+#   basis and sell use the same comparison and the source publishes only a
+#   size. `>=` is the markup-not-loss side. See `ConditionalRate` in
+#   `src/provider.rs` for the full argument and how to flip it.
 # - It counts PROMPT tokens — input, cached portion INCLUDED, because cached
 #   input is a subset of input on this wire and `usage_cost` splits rather than
 #   sums it. That is also how the vendors count. Output tokens never enter the
@@ -71,11 +76,14 @@ schema_version = 1
 #   Under-reserving would let a customer spend past their balance; over-
 #   reserving costs them nothing.
 #
-# KNOWN GAP, deliberate: `/v1/models` publishes only the BASE rate. The wire
-# type it feeds is ZeroClaw's consumed contract and has no place to state a
-# threshold, so a tier with conditional rates advertises less than it charges.
-# Closing that means changing a documented external contract — a product
-# decision, not a config edit. Settlement is unaffected; it prices the band.
+# `/v1/models` PUBLISHES THE BANDS, as OpenRouter's `pricing.overrides[]`
+# keyed on the same `min_prompt_tokens` field name. A price a customer cannot
+# see is a price they cannot check, and quoting only the base rate understated
+# four of the ten listed models by 2x on exactly the requests where the gap is
+# largest. The field is additive — a flat tier's row is byte-identical to what
+# it published before — so editing a band here changes what customers are
+# QUOTED as well as what they are charged. The two come from one schedule, so
+# they cannot disagree.
 #
 # Concrete candidate ids are unique file-wide and each belongs to exactly one
 # tier. A pin's tier id equals its single candidate's id, so the tier and the

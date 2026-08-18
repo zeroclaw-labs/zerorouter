@@ -177,16 +177,35 @@ fn build_attempt(
     // row's `attempts_cost_basis_complete` FALSE so the COGS sum is read as the
     // lower bound it is. Never zero, which would claim the attempt was free.
     //
-    // The band comes from the same usage being priced. On an attempt that
-    // reported real usage that is the measured prompt and the answer is exact.
-    // On an output-floor attempt the prompt dimension is NULL — `priceable`
-    // reconstructs it as 0 — so the base band applies and a long request's
-    // floor is quoted at the low rate. That understates a figure already
-    // labelled a floor, which is this ledger's standing preference over a
-    // guess in an unknown direction (see [`attempt_tokens`]).
-    let cost_basis_usd = tokens
-        .priceable()
-        .and_then(|usage| usage_cost(candidate.rates.at_prompt_tokens(usage.prompt_tokens), usage));
+    // The band comes from the same usage being priced, so a MEASURED attempt
+    // is exact: its reported prompt selects the band the vendor billed us at.
+    //
+    // An output-floor attempt has no prompt — `priceable` reconstructs it as 0
+    // — and on a candidate that reprices, that silently selects the BASE band.
+    // The resulting figure prices a possibly-300,000-token request at the
+    // short-request rate, and it does so on precisely the long-context traffic
+    // conditional rates were added for. So this leaves it NULL instead: the
+    // ledger's word for "not captured", which is what an unpriceable band
+    // honestly is. `attempts_cost_basis_complete` was already FALSE for such a
+    // row (it requires every token dimension), so the sum a reader sees is
+    // still explicitly a lower bound — it just stops including a number chosen
+    // from a band nothing supports.
+    //
+    // Borrowing the reservation's byte bound to pick the band is rejected for
+    // the reason [`attempt_tokens`] rejects it for the tokens themselves: the
+    // bound over-counts by roughly the bytes-per-token ratio, so it would pick
+    // the HIGH band on requests that never reached it, trading a known gap for
+    // an error of unknown size and direction.
+    //
+    // A FLAT candidate is unaffected — there is only one band, so an unknown
+    // prompt cannot select the wrong one, and its floor is recorded exactly as
+    // before.
+    let cost_basis_usd = tokens.priceable().and_then(|usage| {
+        let band_is_knowable = candidate.rates.is_flat() || tokens.input.is_some();
+        band_is_knowable
+            .then(|| usage_cost(candidate.rates.at_prompt_tokens(usage.prompt_tokens), usage))
+            .flatten()
+    });
     AttemptRecord {
         attempt_no: i16::try_from(attempt_no).unwrap_or(i16::MAX),
         started_at,
@@ -4321,6 +4340,81 @@ mod tests {
             "max_tokens": 64,
         }))
         .expect("long walk request should deserialize")
+    }
+
+    #[test]
+    fn an_output_floor_on_a_repricing_candidate_records_no_cogs_rather_than_a_low_one() {
+        // An abandoned stream leaves the prompt dimension unknown — the only
+        // figure the router has is a per-chunk output floor — and `priceable`
+        // reconstructs the missing prompt as 0. On a FLAT candidate that is a
+        // sound floor: right rate, understated tokens.
+        //
+        // On a candidate that reprices it is not. Band selection reads the
+        // prompt, so a reconstructed 0 always picks the BASE band, and a
+        // request whose real prompt was 300,000 tokens gets its output priced
+        // at 1.20 when ZeroRouter is paying 1.80. That is a number derived from
+        // a band there is no evidence applies, on exactly the long-context
+        // traffic conditional rates exist for — so the honest entry is NULL,
+        // the ledger's word for "not captured", which is already what the
+        // completeness flag says about this row.
+        let floor = AttemptTokens::output_floor(10_000);
+        let repricing = build_attempt(
+            1,
+            &pass_through_candidate(luna_schedule()),
+            "aborted",
+            false,
+            Instant::now(),
+            floor,
+            true,
+            None,
+            None,
+        );
+        assert_eq!(
+            repricing.cost_basis_usd, None,
+            "an unknown prompt cannot choose a band, so this attempt has no priceable COGS"
+        );
+
+        // The flat case is untouched: a floor at the only rate there is.
+        let flat_rates = banded(0.2, 0.02, 1.2);
+        let flat = build_attempt(
+            1,
+            &pass_through_candidate(RateSchedule::flat(flat_rates)),
+            "aborted",
+            false,
+            Instant::now(),
+            floor,
+            true,
+            None,
+            None,
+        );
+        assert_eq!(
+            flat.cost_basis_usd,
+            usage_cost(
+                flat_rates,
+                floor.priceable().expect("an output floor prices")
+            ),
+            "a flat candidate still records its floor exactly as before"
+        );
+
+        // And a MEASURED attempt on a repricing candidate still prices — the
+        // prompt is known, so the band is known.
+        let measured_tokens = AttemptTokens::measured(measured(300_000, 10_000));
+        let measured_attempt = build_attempt(
+            1,
+            &pass_through_candidate(luna_schedule()),
+            "served",
+            true,
+            Instant::now(),
+            measured_tokens,
+            false,
+            None,
+            None,
+        );
+        assert_eq!(
+            measured_attempt.cost_basis_usd,
+            usage_cost(banded(0.4, 0.04, 1.8), measured(300_000, 10_000)),
+            "a measured prompt selects the high band and prices there"
+        );
     }
 
     #[test]

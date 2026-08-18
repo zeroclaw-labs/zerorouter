@@ -99,6 +99,25 @@ struct SourceCostTierBound {
     size: u64,
 }
 
+/// The only bound kind ZeroRouter can price against, because
+/// [`crate::provider::ConditionalRate`] conditions on prompt size and nothing
+/// else. The source spells it `context`.
+const PROMPT_SIZE_TIER_KIND: &str = "context";
+
+impl SourceCostTier {
+    /// Whether this tier's bound is measured on the prompt.
+    ///
+    /// The `type` field exists because the source does not promise every tier
+    /// measures the same thing, so a comparison that reads only `size` is
+    /// comparing two numbers that may not denote the same quantity. An
+    /// output-length bound of 272,000 is not a prompt bound of 272,000, and
+    /// treating it as one reconciles a catalog band against a rule it does not
+    /// implement — a green row over a real mispricing.
+    fn measures_prompt_size(&self) -> bool {
+        self.tier.kind == PROMPT_SIZE_TIER_KIND
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct SourceLimit {
     context: Option<u64>,
@@ -174,6 +193,25 @@ pub enum Verdict {
     /// day an upstream introduces a boundary it did not have before, which is
     /// when someone needs to hear about it.
     TieredUpstream,
+    /// The upstream reprices on a dimension ZeroRouter does not model.
+    ///
+    /// A [`crate::provider::ConditionalRate`] conditions on PROMPT SIZE and
+    /// nothing else. The source's tier bound carries a `type` alongside its
+    /// `size`, and every tier seen so far says `context` — but the field
+    /// exists precisely because that is not guaranteed, and a bound measured
+    /// on output length, or on anything else the source grows a name for, is a
+    /// different rule wearing the same shape. Compared on `size` alone it
+    /// would reconcile against a prompt-token band number-for-number while
+    /// pricing something else entirely, and report `ok`.
+    ///
+    /// Its own verdict rather than [`Self::TieredUpstream`] because the advice
+    /// differs: there is no band an operator could add that would make this
+    /// right. And emphatically not [`Self::Unreconcilable`], which is the
+    /// non-actionable local-$0-rung exemption — filing this there would turn
+    /// "we cannot price what this vendor charges" into a silent pass, which is
+    /// the exact failure mode this module exists to prevent. It fails the
+    /// command; what it asks for is a human decision, not a config edit.
+    UnsupportedTierKind,
 }
 
 impl Verdict {
@@ -186,6 +224,7 @@ impl Verdict {
             Self::Missing => "NOT IN SOURCE",
             Self::Unreconcilable => "local $0 rung",
             Self::TieredUpstream => "TIERED UPSTREAM",
+            Self::UnsupportedTierKind => "UNMODELLED TIER",
         }
     }
 
@@ -198,7 +237,7 @@ impl Verdict {
     pub const fn is_actionable(&self) -> bool {
         matches!(
             self,
-            Self::BasisDrift | Self::Missing | Self::TieredUpstream
+            Self::BasisDrift | Self::Missing | Self::TieredUpstream | Self::UnsupportedTierKind
         )
     }
 }
@@ -294,8 +333,18 @@ pub struct CandidateDrift {
     /// model this file described before conditional rates existed.
     pub recorded_conditional: Vec<(u64, ModelRates)>,
     pub upstream_cost: ModelRates,
-    /// The tier's sell rate — what the customer pays.
+    /// The tier's BASE sell rate — what the customer pays below every
+    /// threshold.
     pub sell: ModelRates,
+    /// The bands the tier SELLS at, as `(min_prompt_tokens, rates)`.
+    ///
+    /// Reported beside `recorded_conditional` because the two answer different
+    /// questions and only this one is about the customer. A tier can record a
+    /// perfectly correct cost basis above the boundary and still charge the
+    /// wrong price there — nothing in this file forces basis and sell to
+    /// declare the same bands, deliberately, since a tier's rungs need not
+    /// reprice where the tier does.
+    pub sell_conditional: Vec<(u64, ModelRates)>,
     /// What `tiers.toml` claims this model can take and produce.
     pub recorded_metadata: ModelMetadata,
     /// What the source catalog publishes about the same model. Named to
@@ -393,7 +442,14 @@ fn conditional_agrees(recorded: &RateSchedule, upstream: &[SourceCostTier]) -> b
         .iter()
         .zip(upstream)
         .all(|(recorded, upstream)| {
-            recorded.min_prompt_tokens == upstream.tier.size
+            // The kind is checked again here, not only at the call site. This
+            // predicate answers "do these two say the same thing", and two
+            // bounds measuring different quantities do not say the same thing
+            // however well their numbers line up — so the guarantee belongs to
+            // the comparison rather than to the order its callers happen to
+            // run their checks in.
+            upstream.measures_prompt_size()
+                && recorded.min_prompt_tokens == upstream.tier.size
                 && rates_agree(
                     recorded.rates,
                     ModelRates {
@@ -574,6 +630,17 @@ fn reconcile_with(
                 match entry {
                     None => Verdict::Missing,
                     Some(entry) if entry.cost.is_none() => Verdict::Unpriced,
+                    // Before anything else about the bands: if the upstream is
+                    // measuring something ZeroRouter cannot condition on, no
+                    // comparison below means what it appears to mean, and the
+                    // advice "add a conditional band" would be wrong.
+                    Some(_)
+                        if upstream_conditional
+                            .iter()
+                            .any(|tier| !tier.measures_prompt_size()) =>
+                    {
+                        Verdict::UnsupportedTierKind
+                    }
                     // Checked before `Match`: a row whose flat rate agrees is
                     // still mispriced past the threshold, and saying "ok" to it
                     // is exactly the silence this module exists to break. Only
@@ -621,6 +688,12 @@ fn reconcile_with(
                     .collect(),
                 upstream_cost,
                 sell: definition.rates.base(),
+                sell_conditional: definition
+                    .rates
+                    .conditional()
+                    .iter()
+                    .map(|conditional| (conditional.min_prompt_tokens, conditional.rates))
+                    .collect(),
                 metadata_drift: metadata_drift(&candidate.metadata, &upstream_metadata),
                 upstream_tier: entry.and_then(upstream_tier_note),
                 recorded_metadata: candidate.metadata.clone(),
@@ -808,6 +881,64 @@ mod tests {
         assert!(found[0].recorded_conditional.is_empty());
     }
 
+    /// The same model, repriced on a dimension that is NOT prompt size. The
+    /// rates and the boundary number are identical to `TIERED_SOURCE`; only
+    /// `tier.type` differs, so anything that ignores that field reconciles
+    /// this as a perfect match.
+    const OUTPUT_TIERED_SOURCE: &str = r#"{
+      "anthropic": { "models": {
+        "gpt-5.6-luna": {
+          "cost": {
+            "input": 0.2, "output": 1.2, "cache_read": 0.02,
+            "tiers": [
+              { "input": 0.4, "output": 1.8, "cache_read": 0.04,
+                "tier": { "type": "output", "size": 272000 } }
+            ]
+          },
+          "limit": { "context": 1050000, "output": 128000 }
+        }
+      } } }"#;
+
+    #[test]
+    fn a_tier_measured_on_something_other_than_prompt_size_is_never_ok() {
+        // `min_prompt_tokens` conditions on the PROMPT. An upstream repricing
+        // on output length — or on time of day, or on anything else the source
+        // grows a `type` for — is a different rule that happens to be written
+        // in the same shape, and a catalog band would reconcile against it
+        // number-for-number while pricing the wrong thing entirely.
+        //
+        // The `size` and every rate here match what the catalog declares, so
+        // this row says `ok` unless `tier.type` is actually compared. It must
+        // not: the honest answer is that ZeroRouter cannot model this, and
+        // that has to fail the command rather than pass silently.
+        let schedule = RateSchedule::new(
+            rates(0.2, 0.02, 1.2),
+            vec![conditional(272_000, rates(0.4, 0.04, 1.8))],
+        );
+        let catalog = catalog_with("gpt-5.6-luna", schedule.clone(), schedule);
+        let found = reconcile(&catalog, OUTPUT_TIERED_SOURCE);
+        assert_ne!(
+            found[0].verdict,
+            Verdict::Match,
+            "an output-length tier must never reconcile against a prompt-token band"
+        );
+        assert_eq!(found[0].verdict, Verdict::UnsupportedTierKind);
+        assert!(
+            found[0].verdict.is_actionable(),
+            "a repricing rule ZeroRouter cannot model is not something to pass over quietly"
+        );
+    }
+
+    #[test]
+    fn a_flat_catalog_against_an_unmodellable_tier_says_so_rather_than_asking_for_a_band() {
+        // And the same on a catalog that declares nothing: the advice
+        // "add a conditional band" would be wrong, because no band ZeroRouter
+        // can express would price an output-length rule.
+        let catalog = catalog_with("gpt-5.6-luna", rates(0.2, 0.02, 1.2), rates(0.2, 0.02, 1.2));
+        let found = reconcile(&catalog, OUTPUT_TIERED_SOURCE);
+        assert_eq!(found[0].verdict, Verdict::UnsupportedTierKind);
+    }
+
     #[test]
     fn a_catalog_that_matches_the_upstreams_conditional_rates_reconciles() {
         // Once both sides declare the shape, this is an ordinary rate
@@ -824,6 +955,40 @@ mod tests {
             found[0].recorded_conditional,
             vec![(272_000, rates(0.4, 0.04, 1.8))],
             "the report carries the band so an operator can read what is being trusted"
+        );
+    }
+
+    #[test]
+    fn the_report_carries_the_sell_bands_not_only_the_basis_bands() {
+        // What the customer pays above the boundary is a different fact from
+        // what ZeroRouter pays, and the file is free to state them
+        // differently. A report that showed only the basis would let a tier
+        // charge 9.00 above 272,000 tokens while every row read `ok`, because
+        // the basis it reconciles against is impeccable.
+        let basis = RateSchedule::new(
+            rates(0.2, 0.02, 1.2),
+            vec![conditional(272_000, rates(0.4, 0.04, 1.8))],
+        );
+        let sell = RateSchedule::new(
+            rates(0.2, 0.02, 1.2),
+            vec![conditional(272_000, rates(9.0, 0.9, 9.0))],
+        );
+        let catalog = catalog_with("gpt-5.6-luna", basis, sell);
+        let found = reconcile(&catalog, TIERED_SOURCE);
+
+        assert_eq!(
+            found[0].verdict,
+            Verdict::Match,
+            "the BASIS matches the upstream exactly — that is the point"
+        );
+        assert_eq!(
+            found[0].recorded_conditional,
+            vec![(272_000, rates(0.4, 0.04, 1.8))]
+        );
+        assert_eq!(
+            found[0].sell_conditional,
+            vec![(272_000, rates(9.0, 0.9, 9.0))],
+            "the sell band must reach the report, or a markup above the boundary is invisible"
         );
     }
 

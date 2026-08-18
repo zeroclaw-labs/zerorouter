@@ -256,6 +256,15 @@ async fn model_pricing_matches_zeroclaws_model_pricing_wire_contract() {
     //
     // The snapshot is whole-row on purpose, so it also pins that no field
     // appears that nobody asked for — including the metadata block below.
+    //
+    // A model that REPRICES publishes its bands as `pricing.overrides[]`,
+    // OpenRouter's shape, keyed on the same `min_prompt_tokens` this catalog
+    // uses. Quoting only the base rate would understate luna's real price by
+    // 2x on every request past 272,000 prompt tokens, which is precisely where
+    // a customer most needs the number to be right. The field is additive:
+    // ZeroClaw's `ModelPricing` declares no `deny_unknown_fields` and its
+    // normalizer reads `prompt`, `completion`, `input_cache_read` by name, so
+    // an existing client sees exactly what it saw before.
     let data = listed_models(RouterState::new(tier_config_path())).await;
 
     let tier = data
@@ -273,6 +282,12 @@ async fn model_pricing_matches_zeroclaws_model_pricing_wire_contract() {
                 "prompt": "0.0000002",
                 "completion": "0.0000012",
                 "input_cache_read": "0.00000002",
+                "overrides": [{
+                    "min_prompt_tokens": 272_000,
+                    "prompt": "0.0000004",
+                    "completion": "0.0000018",
+                    "input_cache_read": "0.00000004",
+                }],
             },
             "context_length": 1_050_000,
             "max_output_tokens": 128_000,
@@ -281,11 +296,32 @@ async fn model_pricing_matches_zeroclaws_model_pricing_wire_contract() {
         })
     );
 
+    // The published override is the rate settlement will actually charge, not
+    // a number rendered beside it: same schedule, same band, same source.
+    let catalog = load_tier_catalog(&tier_config_path())
+        .await
+        .expect("bundled tier catalog must load");
+    let sell = catalog
+        .resolve("openai/gpt-5.6-luna")
+        .expect("the pin resolves")
+        .sell_rates;
+    assert_eq!(sell.at_prompt_tokens(272_000).input_per_mtok, Some(0.40));
+    assert_eq!(
+        tier["pricing"]["overrides"][0]["prompt"], "0.0000004",
+        "the advertised override must be the band settlement bills at"
+    );
+
     // A pinned concrete candidate bills at its *owning tier's* sell rate,
     // never its own cost basis — this candidate's own rates in tiers.toml
     // omit `cached_input_per_mtok` entirely, yet the served pricing still
     // carries the tier's `input_cache_read`, proving the listing reads the
     // tier rate and not the candidate rate.
+    //
+    // Haiku charges one price at every size, and its row below carries NO
+    // `overrides` key at all — not an empty array. That is the whole
+    // backwards-compatibility claim for this field, asserted as a whole-row
+    // snapshot: a flat tier's JSON is byte-identical to what it published
+    // before conditional rates existed.
     let candidate = data
         .iter()
         .find(|model| model["id"] == "anthropic/claude-haiku-4-5")
