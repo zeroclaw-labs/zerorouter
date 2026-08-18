@@ -4347,10 +4347,24 @@ mod tests {
         // One slot, never drained: the role primer fills it and nothing behind
         // it can be accepted.
         let (sender, receiver) = mpsc::channel(1);
-        // The refused delta waits out the 5s `SSE_SEND_TIMEOUT`; pausing the
-        // clock spends that instantly. `walk_fixture`'s pool is warm and
-        // timer-free on acquire, so the settle below is unaffected.
-        tokio::time::pause();
+        // This spends the 5s `SSE_SEND_TIMEOUT` in real time, deliberately.
+        //
+        // It used to wrap the call in `tokio::time::pause()`/`resume()` to skip
+        // that wait, on the stated grounds that the pool is warm so "the settle
+        // below is unaffected". That premise was false and the test failed
+        // roughly three runs in four: the settle happens INSIDE
+        // `stream_to_channel`, so it ran under the paused clock too, and a
+        // paused clock auto-advances whenever the runtime parks — which is
+        // exactly what awaiting a real socket does. Time therefore jumped while
+        // Postgres was mid-answer, firing a timeout that belonged to a
+        // millisecond later, and the row this test then queries was never
+        // written: `settled row must query: RowNotFound`. Load on the database
+        // made it likelier, so it failed most often in a full suite run and
+        // passed alone, which reads like DB contention and is not.
+        //
+        // No pause is possible while the settle shares this call: the timer to
+        // skip and the I/O that must not be skipped are the same await. Five
+        // seconds is the honest price of testing a timeout end to end.
         stream_to_channel(
             sender,
             CancellationToken::new(),
@@ -4365,7 +4379,6 @@ mod tests {
             ZeroRouterEstimate::cold(64),
         )
         .await;
-        tokio::time::resume();
         drop(receiver);
 
         let (cost_usd, input_tokens, output_tokens, status) =
