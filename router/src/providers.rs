@@ -866,11 +866,19 @@ mod tests {
     }
 
     #[test]
-    fn the_shipped_inventory_gains_no_route_from_the_new_adapter() {
-        // Stage 1 of edge mode adds the chat-completions ADAPTER, not a
-        // provider entry that uses it — the local-candidate configuration
-        // surface is stage 2. This pins that separation: adding the wire must
-        // not have quietly widened what a deployment dispatches to.
+    fn the_shipped_inventory_dispatches_exactly_where_it_says_it_does() {
+        // Every upstream a default deployment can reach, and the wire it speaks
+        // — pinned so that adding an adapter, or a provider that uses one, is
+        // always a deliberate edit to this list rather than a side effect.
+        //
+        // Stage 1 of edge mode added the chat-completions adapter with no
+        // shipped route using it, and this assertion held that separation until
+        // Google arrived on 2026-08-18: Gemini is served over Google's
+        // OpenAI-compatible endpoint, so it is the first shipped provider on
+        // that wire. The adapter being dual-use (local rungs AND a metered
+        // cloud vendor) is the design's own scope, not a widening of it — see
+        // `SettlementDeclaration`, which is why "on the local wire" still
+        // cannot make anything free.
         let inventory = ProviderInventory::load().expect("inventory should load");
         let adapters: Vec<(&str, ProviderAdapter)> = inventory
             .providers
@@ -882,7 +890,22 @@ mod tests {
             [
                 ("anthropic", ProviderAdapter::Anthropic),
                 ("openai", ProviderAdapter::OpenAiResponses),
+                ("google", ProviderAdapter::ChatCompletions),
             ]
+        );
+
+        // Google bills like any other vendor: the free lane is entered only by
+        // an explicit `settlement: free`, never by the wire a provider speaks.
+        let google = inventory.provider("google").expect("google is shipped");
+        assert_eq!(google.settlement, SettlementDeclaration::Metered);
+        assert_eq!(google.credential, CredentialRequirement::Required);
+        assert!(
+            google
+                .base_url
+                .as_deref()
+                .is_some_and(|url| url.ends_with("/chat/completions")),
+            "the chat-completions wire posts to the URL verbatim, so the entry \
+             must carry the full endpoint path, not an OpenAI-style /v1 base"
         );
     }
 
@@ -1031,7 +1054,7 @@ mod tests {
             .iter()
             .map(|provider| provider.key.as_str())
             .collect();
-        assert_eq!(keys, ["anthropic", "openai", "local-llama"]);
+        assert_eq!(keys, ["anthropic", "openai", "google", "local-llama"]);
 
         let local = inventory
             .provider("local-llama")
