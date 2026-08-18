@@ -190,8 +190,8 @@ async fn models_are_materialized_from_tiers_toml() {
     // One row per model PIN, keyed by its OpenRouter-standard {vendor}/{model}
     // id. The pre-rename catalog published a `zero/*` alias row AND a concrete
     // candidate row per model (14 rows); each pin now equals its candidate, so
-    // it contributes exactly one row — seven models, seven rows.
-    assert_eq!(data.len(), 7);
+    // it contributes exactly one row — nine models, nine rows.
+    assert_eq!(data.len(), 9);
     assert!(data.iter().all(|model| model["object"] == "model"));
 
     let ids = data
@@ -209,24 +209,33 @@ async fn models_are_materialized_from_tiers_toml() {
             "anthropic/claude-haiku-4-5",
             "anthropic/claude-opus-5",
             "anthropic/claude-sonnet-5",
+            "google/gemini-3.5-flash-lite",
+            "google/gemini-3.7-flash",
             "openai/gpt-5.6-luna",
             "openai/gpt-5.6-sol",
             "openai/gpt-5.6-terra",
         ]),
-        "exactly the seven vendor-named pins — no zero/* alias, no gpt-5.3-codex"
+        "exactly the nine vendor-named pins — no zero/* alias, no gpt-5.3-codex"
     );
 
     // `owned_by` is the vendor, matching OpenRouter — never the string
     // "zerorouter" — and no id keeps the retired `zero/*` namespace. Combined
-    // with the count above (7 rows, 7 distinct ids), this also pins that no
+    // with the count above (9 rows, 9 distinct ids), this also pins that no
     // model is listed twice.
     for model in data {
         let id = model["id"].as_str().expect("id is a string");
         let owner = model["owned_by"].as_str().expect("owned_by is a string");
-        assert!(
-            owner == "openai" || owner == "anthropic",
-            "{id} is owned_by {owner:?}, not the serving vendor"
+        // Derived from the id rather than checked against a list of vendors:
+        // the rule IS that a pin's id is `{vendor}/{model}` and `owned_by` is
+        // that vendor, so an id and an owner that disagree is the defect worth
+        // catching. Enumerating vendors instead made adding one a test edit
+        // that proved nothing.
+        let vendor = id.split('/').next().expect("a pin id names its vendor");
+        assert_eq!(
+            owner, vendor,
+            "{id} is owned_by {owner:?}, not the vendor its id names"
         );
+        assert_ne!(owner, "zerorouter", "{id} must name the serving vendor");
         assert!(
             !id.starts_with("zero/"),
             "{id} still carries the retired zero/* namespace"
@@ -327,13 +336,26 @@ async fn every_shipped_model_publishes_what_it_can_take_and_produce() {
             "{id} ships without a plausible max output: {}",
             model["max_output_tokens"]
         );
-        // Every model in the MVP inventory is multimodal and tool-calling.
-        // A rung that is not is a real change and should have to edit this.
-        assert_eq!(
-            model["input_modalities"],
-            serde_json::json!(["text", "image", "pdf"]),
-            "{id} does not take the whole-catalog modality set"
-        );
+        // Every model in the inventory is multimodal and tool-calling. The
+        // floor is asserted rather than the exact set: until Google arrived on
+        // 2026-08-18 every rung took precisely text/image/pdf, and pinning that
+        // literal was the stricter guard. Gemini genuinely takes video and
+        // audio as well, and this table's job is to report what a model is (the
+        // same kind of claim a rate is), not to flatten vendors to a common
+        // denominator — `admin catalog-drift` reconciles each set against
+        // models.dev, which is the check that would catch an invented modality.
+        // A rung that cannot take text and images is still a real change and
+        // still has to come back and edit this.
+        let modalities = model["input_modalities"]
+            .as_array()
+            .expect("every model declares what it can take");
+        for required in ["text", "image"] {
+            assert!(
+                modalities.iter().any(|modality| modality == required),
+                "{id} does not take {required}: {:?}",
+                model["input_modalities"]
+            );
+        }
         assert_eq!(model["tool_call"], true, "{id} should support tool calling");
     }
 }
@@ -390,16 +412,20 @@ async fn bundled_tier_catalog_has_expected_virtual_models() {
             "anthropic/claude-haiku-4-5",
             "anthropic/claude-opus-5",
             "anthropic/claude-sonnet-5",
+            "google/gemini-3.5-flash-lite",
+            "google/gemini-3.7-flash",
             "openai/gpt-5.6-luna",
             "openai/gpt-5.6-sol",
             "openai/gpt-5.6-terra",
         ],
-        "the seven vendor-named model pins (gpt-5.3-codex dropped, gpt-5.6-terra added)"
+        "the nine vendor-named model pins (Gemini flash + flash-lite added \
+         2026-08-18; Gemini Pro deliberately absent — Google prices it in \
+         context tiers this catalog cannot express)"
     );
 
-    // One upstream each, and only from the two providers ZeroRouter
-    // integrates directly. A tier gaining a second rung is exactly the
-    // change that should have to come back and edit this.
+    // One upstream each, and only from the providers ZeroRouter integrates
+    // directly. A tier gaining a second rung is exactly the change that should
+    // have to come back and edit this.
     for (tier_id, tier) in &catalog.tiers {
         assert_eq!(
             tier.candidates.len(),
@@ -408,7 +434,7 @@ async fn bundled_tier_catalog_has_expected_virtual_models() {
         );
         let provider = tier.candidates[0].provider.as_str();
         assert!(
-            provider == "openai" || provider == "anthropic",
+            provider == "openai" || provider == "anthropic" || provider == "google",
             "{tier_id} routes to {provider}, which is not in the MVP inventory"
         );
     }
@@ -684,6 +710,8 @@ async fn a_basis_hike_above_sell_withholds_that_tier_and_nothing_else() {
             "anthropic/claude-fable-5",
             "anthropic/claude-haiku-4-5",
             "anthropic/claude-opus-5",
+            "google/gemini-3.5-flash-lite",
+            "google/gemini-3.7-flash",
             "openai/gpt-5.6-luna",
             "openai/gpt-5.6-sol",
             "openai/gpt-5.6-terra",
@@ -725,10 +753,10 @@ async fn a_basis_hike_above_sell_withholds_that_tier_and_nothing_else() {
     assert_eq!(sell.input_per_mtok, Some(2.00));
     assert_eq!(sell.output_per_mtok, Some(10.00));
 
-    // And the public catalog stops advertising what it cannot serve: the six
+    // And the public catalog stops advertising what it cannot serve: the eight
     // surviving pins, one row each.
     let listed = listed_model_ids(RouterState::new(path)).await;
-    assert_eq!(listed.len(), 6);
+    assert_eq!(listed.len(), 8);
     assert!(listed.iter().any(|id| id == "openai/gpt-5.6-luna"));
     assert!(listed.iter().any(|id| id == "anthropic/claude-haiku-4-5"));
 
@@ -753,7 +781,7 @@ async fn the_shipped_catalog_withholds_no_tier_today() {
         "the shipped catalog withholds {:?}",
         catalog.unavailable.keys().collect::<Vec<_>>()
     );
-    assert_eq!(catalog.tiers.len(), 7);
+    assert_eq!(catalog.tiers.len(), 9);
 }
 
 /// The routed tiers vs the pass-through tiers, told apart explicitly so
@@ -763,7 +791,7 @@ async fn the_shipped_catalog_withholds_no_tier_today() {
 // rungs across >=2 providers). Every tier is pass-through until a second
 // provider serves a model class again.
 const ROUTED_TIERS: [&str; 0] = [];
-const PASS_THROUGH_TIERS: [&str; 7] = [
+const PASS_THROUGH_TIERS: [&str; 9] = [
     // Model pins, keyed by their OpenRouter-standard {vendor}/{model} ids.
     "openai/gpt-5.6-luna",
     "anthropic/claude-haiku-4-5",
@@ -772,6 +800,8 @@ const PASS_THROUGH_TIERS: [&str; 7] = [
     "openai/gpt-5.6-sol",
     "anthropic/claude-opus-5",
     "anthropic/claude-fable-5",
+    "google/gemini-3.7-flash",
+    "google/gemini-3.5-flash-lite",
 ];
 
 #[tokio::test]

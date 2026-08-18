@@ -11,6 +11,13 @@
       "adapter": "openai_responses",
       "credential_env": "OPENAI_API_KEY",
       "secret_name": "openai-api-key"
+    },
+    {
+      "key": "google",
+      "adapter": "chat_completions",
+      "credential_env": "GEMINI_API_KEY",
+      "secret_name": "gemini-api-key",
+      "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
     }
   ]
 }
