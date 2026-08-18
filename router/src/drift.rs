@@ -63,6 +63,40 @@ struct SourceCost {
     input: Option<f64>,
     output: Option<f64>,
     cache_read: Option<f64>,
+    /// Conditional rates that REPLACE the flat ones above some measured
+    /// threshold. Read from the structured array and from nowhere else.
+    ///
+    /// The source publishes each tier twice: here, with an explicit
+    /// `tier.size`, and again as a flat convenience key named literally
+    /// `context_over_200k`. That name is hardcoded and is WRONG for models
+    /// whose boundary is elsewhere — `openai/gpt-5.6-luna` reprices at 272,000
+    /// tokens, not 200,000, while carrying a `context_over_200k` key holding
+    /// the correct rates under an incorrect name. Reading it produced a false
+    /// report that this source disagreed with OpenRouter and was unfit to
+    /// reconcile against; it agrees exactly, on both the rates and the
+    /// threshold, once the structured field is the one consulted. Never read
+    /// the convenience key.
+    #[serde(default)]
+    tiers: Vec<SourceCostTier>,
+}
+
+/// One conditional rate table: what the upstream charges once
+/// [`SourceCostTierBound::size`] is exceeded.
+#[derive(Debug, Deserialize)]
+struct SourceCostTier {
+    input: Option<f64>,
+    output: Option<f64>,
+    cache_read: Option<f64>,
+    tier: SourceCostTierBound,
+}
+
+#[derive(Debug, Deserialize)]
+struct SourceCostTierBound {
+    /// What is being measured — `context` for every tier seen so far. Kept so
+    /// an unrecognized kind can be reported rather than assumed.
+    #[serde(rename = "type")]
+    kind: String,
+    size: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -115,6 +149,24 @@ pub enum Verdict {
     /// at all since stage 2 — `validate_zero_price` refuses it — but this file
     /// does not depend on that being true.)
     Unreconcilable,
+    /// The recorded basis matches the upstream's FLAT rate, but the upstream
+    /// also reprices the whole request above a measured threshold, and
+    /// `tiers.toml` holds exactly one rate per dimension. Every request past
+    /// the boundary is billed at a basis ZeroRouter does not actually pay.
+    ///
+    /// Its own verdict rather than [`Self::BasisDrift`] because nothing in the
+    /// file is wrong: the recorded number is the vendor's real base rate, and
+    /// there is no number the operator could write that would make a
+    /// single-rate row correct. The catalog cannot express the shape yet.
+    ///
+    /// Reported, not actionable — the same call, and the same reasoning, as
+    /// [`Self::Unreconcilable`]: `openai/gpt-5.6-luna` has shipped tiered since
+    /// before this variant existed, so failing on it would redden every PR
+    /// until tiered rates land, and a check that is always red is a check
+    /// nobody reads. What makes it actionable is the catalog gaining
+    /// conditional rates; a row that then disagrees is ordinary
+    /// [`Self::BasisDrift`].
+    TieredUpstream,
 }
 
 impl Verdict {
@@ -126,6 +178,7 @@ impl Verdict {
             Self::Unpriced => "unpriced upstream",
             Self::Missing => "NOT IN SOURCE",
             Self::Unreconcilable => "local $0 rung",
+            Self::TieredUpstream => "TIERED UPSTREAM",
         }
     }
 
@@ -187,6 +240,30 @@ impl MetadataDriftKind {
     }
 }
 
+/// How the upstream reprices this model past a threshold, rendered for the
+/// report, or `None` when it charges one flat rate at every size.
+///
+/// Quantifying it in the row is the point: "TIERED UPSTREAM" alone says a
+/// margin is wrong somewhere, while `≥272000 tok: 0.4/0.04/1.8` says how much
+/// and from where, which is what someone deciding whether to prioritize
+/// conditional rates actually needs.
+fn upstream_tier_note(entry: &SourceModel) -> Option<String> {
+    let cost = entry.cost.as_ref()?;
+    let mut notes: Vec<String> = Vec::new();
+    for tier in &cost.tiers {
+        let show = |rate: Option<f64>| rate.map_or_else(|| "-".to_owned(), |r| format!("{r}"));
+        notes.push(format!(
+            "≥{} {}: {}/{}/{}",
+            tier.tier.size,
+            tier.tier.kind,
+            show(tier.input),
+            show(tier.cache_read),
+            show(tier.output)
+        ));
+    }
+    (!notes.is_empty()).then(|| notes.join(", "))
+}
+
 /// One reconciled candidate.
 #[derive(Debug, Clone)]
 pub struct CandidateDrift {
@@ -211,6 +288,10 @@ pub struct CandidateDrift {
     /// Metadata fields the two disagree about. Empty when they agree, when
     /// the source is silent, or when the model is not in the source at all.
     pub metadata_drift: Vec<MetadataDrift>,
+    /// The upstream's conditional rates past a threshold, already rendered —
+    /// see [`upstream_tier_note`]. `None` means one flat rate at every size,
+    /// which is what a single-rate catalog row can honestly express.
+    pub upstream_tier: Option<String>,
 }
 
 impl CandidateDrift {
@@ -437,6 +518,10 @@ fn reconcile_with(
                 match entry {
                     None => Verdict::Missing,
                     Some(entry) if entry.cost.is_none() => Verdict::Unpriced,
+                    // Checked before `Match`: a row whose flat rate agrees is
+                    // still mispriced past the threshold, and saying "ok" to it
+                    // is exactly the silence this module exists to break.
+                    Some(entry) if upstream_tier_note(entry).is_some() => Verdict::TieredUpstream,
                     Some(_) if rates_agree(candidate.rates, upstream_cost) => Verdict::Match,
                     Some(_) => Verdict::BasisDrift,
                 }
@@ -464,6 +549,7 @@ fn reconcile_with(
                 upstream_cost,
                 sell: definition.rates,
                 metadata_drift: metadata_drift(&candidate.metadata, &upstream_metadata),
+                upstream_tier: entry.and_then(upstream_tier_note),
                 recorded_metadata: candidate.metadata.clone(),
                 upstream_metadata,
             });
@@ -565,6 +651,75 @@ mod tests {
         },
         "claude-unpriced": { "limit": { "context": 1000 } }
       } } }"#;
+
+    /// The source publishes each tier twice and the two spellings disagree by
+    /// construction: `cost.tiers[].tier.size` carries the model's real
+    /// boundary, while the flat `context_over_200k` key states that boundary in
+    /// its NAME and is simply wrong whenever it is not 200k — `gpt-5.6-luna`
+    /// reprices at 272,000. Reading the convenience key once produced a false
+    /// report that the source disagreed with OpenRouter and was unfit to
+    /// reconcile against, so the fixture below encodes the trap: a model whose
+    /// real threshold is 272,000 while a `context_over_200k` key sits beside it
+    /// holding a different number. The reported boundary must be the structured
+    /// one.
+    const TIERED_SOURCE: &str = r#"{
+      "anthropic": { "models": {
+        "gpt-5.6-luna": {
+          "cost": {
+            "input": 0.2, "output": 1.2, "cache_read": 0.02,
+            "tiers": [
+              { "input": 0.4, "output": 1.8, "cache_read": 0.04,
+                "tier": { "type": "context", "size": 272000 } }
+            ],
+            "context_over_200k": { "input": 9.9, "output": 9.9, "cache_read": 9.9 }
+          },
+          "limit": { "context": 1050000, "output": 128000 }
+        }
+      } } }"#;
+
+    #[test]
+    fn a_tiered_upstream_is_reported_from_the_structured_field_not_the_named_key() {
+        let catalog = catalog_with("gpt-5.6-luna", rates(0.2, 0.02, 1.2), rates(0.2, 0.02, 1.2));
+        let found = reconcile(&catalog, TIERED_SOURCE);
+
+        // The flat rates agree exactly, so the pre-existing comparison would
+        // have said `ok` and moved on. It must not: the row is right below the
+        // boundary and wrong above it.
+        assert!(rates_agree(found[0].recorded_basis, found[0].upstream_cost));
+        assert_eq!(found[0].verdict, Verdict::TieredUpstream);
+
+        let note = found[0]
+            .upstream_tier
+            .as_deref()
+            .expect("a tiered upstream reports its boundary");
+        assert!(
+            note.contains("272000"),
+            "the boundary must come from cost.tiers[].tier.size: {note}"
+        );
+        assert!(
+            !note.contains("200000") && !note.contains("9.9"),
+            "context_over_200k must never be read — its name is the lie: {note}"
+        );
+        assert!(
+            note.contains("0.4") && note.contains("1.8"),
+            "the tier's own rates belong in the report: {note}"
+        );
+    }
+
+    /// A flat upstream must stay flat: the tier machinery may not invent a
+    /// boundary for the models that do not have one, or every row would carry a
+    /// warning and none would mean anything.
+    #[test]
+    fn an_untiered_upstream_reports_no_boundary() {
+        let catalog = catalog_with(
+            "claude-sonnet-5",
+            rates(2.0, 0.2, 10.0),
+            rates(2.0, 0.2, 10.0),
+        );
+        let found = reconcile(&catalog, SOURCE);
+        assert_eq!(found[0].upstream_tier, None);
+        assert_eq!(found[0].verdict, Verdict::Match);
+    }
 
     #[test]
     fn a_matching_basis_reconciles() {

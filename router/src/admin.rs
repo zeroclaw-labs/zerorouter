@@ -1038,6 +1038,30 @@ async fn catalog_drift(args: CatalogDriftArgs) -> Result<()> {
         );
     }
 
+    // An upstream that reprices past a threshold cannot be expressed by a row
+    // holding one rate per dimension, so the table's flat comparison says
+    // nothing about requests past it. Spelled out with the boundary and the
+    // rates, because "somewhere above some size you are underpricing" is not
+    // something anyone can act on.
+    let tiered: Vec<_> = findings
+        .iter()
+        .filter(|f| f.upstream_tier.is_some())
+        .collect();
+    if !tiered.is_empty() {
+        println!(
+            "\nUpstream reprices past a threshold — the catalog holds one rate per dimension,"
+        );
+        println!("so every request past the boundary bills at a basis ZeroRouter does not pay:");
+        for found in &tiered {
+            println!(
+                "  {} base {} then {}",
+                found.tier,
+                rate(found.upstream_cost),
+                found.upstream_tier.as_deref().unwrap_or_default()
+            );
+        }
+    }
+
     // A markup on a tier that advertises pass-through is not drift in the
     // file's own terms — basis == sell, so the validator is satisfied — but it
     // is the customer paying more than the model costs, which is exactly the
