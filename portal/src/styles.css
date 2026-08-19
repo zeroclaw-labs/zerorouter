@@ -651,10 +651,76 @@ input {
   box-shadow: 0 24px 64px rgba(0, 0, 0, 0.6);
 }
 
+/* Room for Stripe's embedded form, which does not reflow usefully below
+   ~460px. Height is capped so the dialog scrolls on a short viewport rather
+   than pushing the pay button off-screen. */
+.modal-wide {
+  max-width: 560px;
+  max-height: calc(100vh - 48px);
+  overflow-y: auto;
+}
+
+.modal-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 8px;
+}
+
 .modal-title {
   font-size: 16px;
   font-weight: 600;
-  margin-bottom: 8px;
+}
+
+.modal-head .modal-title {
+  margin-bottom: 0;
+}
+
+.modal-close {
+  background: none;
+  border: none;
+  color: var(--muted);
+  font-size: 22px;
+  line-height: 1;
+  padding: 0 4px;
+  cursor: pointer;
+  border-radius: 4px;
+}
+
+.modal-close:hover {
+  color: var(--text);
+}
+
+/* The Stripe iframe mounts here. It sizes itself, so this only needs to give
+   it a full-width, unclipped box and a little separation from our own amount
+   controls above it. */
+.checkout-embed {
+  margin-top: 14px;
+  min-height: 320px;
+}
+
+/* The billing-address explanation, in ZeroRouter's voice, sitting directly
+   above the Stripe form so it reads as part of the same step. */
+.checkout-note {
+  font-size: 12.5px;
+  color: var(--muted);
+  line-height: 1.5;
+  margin-top: 10px;
+}
+
+.checkout-summary {
+  border-top: 1px solid var(--border);
+  margin-top: 14px;
+  padding-top: 12px;
+}
+
+/* A button that reads as a link — used for "Change amount", which is a
+   navigation affordance inside a sentence, not a form action. */
+.linkish {
+  color: var(--accent);
+  font-size: inherit;
+  text-decoration: underline;
 }
 
 .modal-warn {

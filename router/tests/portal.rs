@@ -23,7 +23,7 @@ use zerorouter::{
     db::migrate,
     portal,
     session::{CSRF_HEADER, SESSION_COOKIE, create_session},
-    web::{WebConfig, WebCtx},
+    web::{StripeSettings, WebConfig, WebCtx},
 };
 
 fn test_web_config() -> WebConfig {
@@ -202,6 +202,10 @@ async fn portal_api_is_scoped_to_the_session_user() {
     );
     assert_eq!(decimal_value(&me["credit_balance_usd"]), Decimal::ZERO);
     assert!(me["created_at"].is_string());
+    // This deployment has no Stripe configured, so the key is explicitly null
+    // rather than absent — the portal branches on it to decide whether to
+    // offer checkout at all.
+    assert_eq!(me["stripe_publishable_key"], Value::Null);
 
     // /api/keys lists only the session user's keys, and never hashes.
     let (status, text, keys) = send(&pool, get("/api/keys", Some(&cookie_a))).await;
@@ -400,6 +404,71 @@ async fn portal_api_is_scoped_to_the_session_user() {
             .await
             .expect("active key count must query");
     assert_eq!(active, 20);
+}
+
+/// `/api/me` is how the SPA receives the Stripe publishable key.
+///
+/// Embedded Checkout cannot mount without it, and it must not be baked into the
+/// bundle: the test and live Stripe accounts have different keys, so a
+/// hardcoded one is wrong for whichever environment it was not built for. This
+/// pins the delivery mechanism, and — just as importantly — pins that the
+/// SECRET key never rides along with it.
+#[tokio::test]
+async fn me_carries_the_stripe_publishable_key_but_never_the_secret() {
+    let Ok(database_url) = std::env::var("DATABASE_URL") else {
+        return;
+    };
+    let options = PgConnectOptions::from_str(&database_url).expect("test database URL must parse");
+    let pool = PgPoolOptions::new()
+        .max_connections(5)
+        .connect_with(options)
+        .await
+        .expect("test database must connect");
+    migrate(&pool).await.expect("migration must succeed");
+
+    let user_id = seed_user(&pool, "pk").await;
+    let (token, _) = create_session(&pool, user_id, Duration::from_secs(3_600))
+        .await
+        .expect("session must create");
+    let cookie = format!("{SESSION_COOKIE}={token}");
+
+    let mut config = test_web_config();
+    config.stripe = Some(StripeSettings {
+        secret_key: "sk_test_MUST_NOT_LEAK".to_owned(),
+        publishable_key: "pk_test_visible".to_owned(),
+        webhook_secret: "whsec_MUST_NOT_LEAK".to_owned(),
+        checkout_min_usd: Decimal::from(5),
+        checkout_max_usd: Decimal::from(1000),
+        api_base: "https://api.stripe.invalid".to_owned(),
+    });
+    let app = portal::router().with_state(WebCtx::new(pool.clone(), config));
+
+    let response = app
+        .oneshot(get("/api/me", Some(&cookie)))
+        .await
+        .expect("portal request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = response
+        .into_body()
+        .collect()
+        .await
+        .expect("body should be readable")
+        .to_bytes();
+    let text = String::from_utf8(bytes.to_vec()).expect("body should be UTF-8");
+    let me: Value = serde_json::from_str(&text).expect("body should be JSON");
+
+    assert_eq!(me["stripe_publishable_key"], "pk_test_visible");
+    // The publishable key is the ONLY Stripe credential this response may
+    // carry. Serving either of the others would hand an authenticated customer
+    // the ability to create charges or forge webhooks.
+    assert!(
+        !text.contains("sk_test_MUST_NOT_LEAK"),
+        "the Stripe secret key must never reach the browser: {text}"
+    );
+    assert!(
+        !text.contains("whsec_MUST_NOT_LEAK"),
+        "the webhook secret must never reach the browser: {text}"
+    );
 }
 
 #[tokio::test]

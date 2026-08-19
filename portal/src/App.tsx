@@ -7,6 +7,7 @@ import { AuthContext, Banner, ToastContext, useAuth } from './ui'
 import type { Auth, ToastKind } from './ui'
 import { Activate } from './pages/Activate'
 import { Credits } from './pages/Credits'
+import { CreditsReturn } from './pages/CreditsReturn'
 import { Keys } from './pages/Keys'
 import { Models } from './pages/Models'
 import { Overview } from './pages/Overview'
@@ -146,6 +147,9 @@ function SignedInLayout({ user }: { user: Me }) {
           <Route path="/" element={<Overview />} />
           <Route path="/models" element={<Models />} />
           <Route path="/credits" element={<Credits />} />
+          {/* Stripe's return_url target. Must stay in sync with
+              CHECKOUT_RETURN_PATH in router/src/stripe.rs. */}
+          <Route path="/credits/return" element={<CreditsReturn />} />
           <Route path="/keys" element={<Keys />} />
           <Route path="/activate" element={<Activate />} />
           <Route path="/terms" element={<Terms />} />

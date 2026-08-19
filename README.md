@@ -260,6 +260,7 @@ aborts startup rather than running with a silently disabled security control
 | `OIDC_CLIENT_ID` | group: OIDC | — | |
 | `OIDC_CLIENT_SECRET` | group: OIDC | — | |
 | `STRIPE_SECRET_KEY` | group: Stripe | — | |
+| `STRIPE_PUBLISHABLE_KEY` | group: Stripe | — | `pk_...`; served to the portal over `/api/me` so the embedded checkout can mount. Not a secret, but environment-specific |
 | `STRIPE_WEBHOOK_SECRET` | group: Stripe | — | webhook signature verification secret |
 | `ZEROROUTER_SIGNUP_CREDIT_USD` | no | `0` | promo credit granted on first login; must be ≥ 0 |
 | `ZEROROUTER_CHECKOUT_MIN_USD` | no | `5` | minimum Stripe Checkout amount; must be > 0 |

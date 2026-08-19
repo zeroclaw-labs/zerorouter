@@ -19,6 +19,7 @@ pub const OIDC_ISSUER_URL_ENV: &str = "OIDC_ISSUER_URL";
 pub const OIDC_CLIENT_ID_ENV: &str = "OIDC_CLIENT_ID";
 pub const OIDC_CLIENT_SECRET_ENV: &str = "OIDC_CLIENT_SECRET";
 pub const STRIPE_SECRET_KEY_ENV: &str = "STRIPE_SECRET_KEY";
+pub const STRIPE_PUBLISHABLE_KEY_ENV: &str = "STRIPE_PUBLISHABLE_KEY";
 pub const STRIPE_API_BASE_ENV: &str = "STRIPE_API_BASE";
 pub const DEFAULT_STRIPE_API_BASE: &str = "https://api.stripe.com";
 pub const STRIPE_WEBHOOK_SECRET_ENV: &str = "STRIPE_WEBHOOK_SECRET";
@@ -45,6 +46,20 @@ pub struct OidcSettings {
 #[derive(Clone)]
 pub struct StripeSettings {
     pub secret_key: String,
+    /// The `pk_...` key Stripe.js is initialized with in the browser.
+    ///
+    /// Publishable by design — it is meant to be shipped to the client, and
+    /// [`crate::portal`] hands it to the SPA over `/api/me`. It is still
+    /// configuration rather than a constant: it differs per environment
+    /// (test/live) and per account, so hardcoding it would pin the portal to
+    /// one Stripe account.
+    ///
+    /// It is required, not optional, because Embedded Checkout cannot mount
+    /// without it. A deployment with a secret key but no publishable key would
+    /// start happily and then fail at the point a customer tries to pay, which
+    /// is exactly the "silently disabled" shape the feature-group check exists
+    /// to prevent.
+    pub publishable_key: String,
     pub webhook_secret: String,
     pub checkout_min_usd: Decimal,
     pub checkout_max_usd: Decimal,
@@ -57,6 +72,10 @@ impl std::fmt::Debug for StripeSettings {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("StripeSettings")
             .field("secret_key", &"<scrubbed>")
+            // Not scrubbed: a publishable key is served to every browser that
+            // loads the portal, so hiding it here would buy nothing and make
+            // a misconfiguration harder to diagnose.
+            .field("publishable_key", &self.publishable_key)
             .field("webhook_secret", &"<scrubbed>")
             .field("checkout_min_usd", &self.checkout_min_usd)
             .field("checkout_max_usd", &self.checkout_max_usd)
@@ -91,6 +110,7 @@ impl WebConfig {
                 OIDC_CLIENT_ID_ENV,
                 OIDC_CLIENT_SECRET_ENV,
                 STRIPE_SECRET_KEY_ENV,
+                STRIPE_PUBLISHABLE_KEY_ENV,
                 STRIPE_WEBHOOK_SECRET_ENV,
             ] {
                 if optional_env(name).is_some() {
@@ -134,20 +154,27 @@ impl WebConfig {
             [
                 (STRIPE_SECRET_KEY_ENV, optional_env(STRIPE_SECRET_KEY_ENV)),
                 (
+                    STRIPE_PUBLISHABLE_KEY_ENV,
+                    optional_env(STRIPE_PUBLISHABLE_KEY_ENV),
+                ),
+                (
                     STRIPE_WEBHOOK_SECRET_ENV,
                     optional_env(STRIPE_WEBHOOK_SECRET_ENV),
                 ),
             ],
         )?
-        .map(|[secret_key, webhook_secret]| StripeSettings {
-            secret_key,
-            webhook_secret,
-            checkout_min_usd,
-            checkout_max_usd,
-            api_base: optional_env(STRIPE_API_BASE_ENV)
-                .map(|base| base.trim_end_matches('/').to_owned())
-                .unwrap_or_else(|| DEFAULT_STRIPE_API_BASE.to_owned()),
-        });
+        .map(
+            |[secret_key, publishable_key, webhook_secret]| StripeSettings {
+                secret_key,
+                publishable_key,
+                webhook_secret,
+                checkout_min_usd,
+                checkout_max_usd,
+                api_base: optional_env(STRIPE_API_BASE_ENV)
+                    .map(|base| base.trim_end_matches('/').to_owned())
+                    .unwrap_or_else(|| DEFAULT_STRIPE_API_BASE.to_owned()),
+            },
+        );
 
         let signup_credit_usd = decimal_env(SIGNUP_CREDIT_ENV, Decimal::ZERO)?;
         if signup_credit_usd < Decimal::ZERO {

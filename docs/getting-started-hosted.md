@@ -15,8 +15,11 @@ An account is created on first sign-in; there is no separate registration.
 Access is prepaid: a request is admitted only when the credit balance covers
 it, so a fresh account cannot make calls yet.
 
-On the **Credits** page, pick an amount ($5.00 minimum) — checkout happens on
-Stripe. **Deposits carry a processing fee, charged on top of the credit:
+On the **Credits** page, click **Add credits** and pick an amount ($5.00
+minimum). Payment happens in a dialog on the page — the card form itself is
+served by Stripe, so ZeroRouter never sees your card details, but you are not
+sent to another site. **Deposits carry a processing fee, charged on top of the
+credit:
 5.5% of the amount, with a minimum of $0.80.** The page quotes that split —
 you pay $X, you receive $Y of credit — before you commit; the quote is priced
 by the server with the same arithmetic the charge uses. **Sales tax, where it

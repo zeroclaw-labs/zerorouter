@@ -82,6 +82,16 @@ name until this repository took it over). To cut it over:
      not secret and may be plain env; remember the OIDC group is
      all-or-nothing — a partial group aborts the task at startup, which the
      circuit breaker will surface as a rollback.)
+   - **`STRIPE_PUBLISHABLE_KEY` (`pk_...`) — required, and new.** The Stripe
+     group is all-or-nothing like the OIDC one, so a task definition that
+     carries the secret key and the webhook secret but not this one **aborts
+     at startup** and the circuit breaker rolls the deployment back. It is
+     not a secret (the portal serves it to every signed-in browser over
+     `/api/me`, and Stripe.js sends it from the client), so plain env is
+     fine — but it IS environment-specific: use the sandbox `pk_test_...` in
+     a sandbox and the live `pk_live_...` in production, matching whichever
+     `STRIPE_SECRET_KEY` is set. A mismatched pair fails when a customer
+     tries to pay, not at startup.
 4. **Deploy**: run the `Deploy Router` workflow manually, or merge to
    `main` (the workflow triggers on push to `main`). Verify the run's
    deployment summary and that
@@ -113,6 +123,42 @@ name until this repository took it over). To cut it over:
 >   beta only.
 >
 > Treat the HTTPS listener as a blocker for any external user traffic.
+
+## Checkout is pinned to a Stripe API version
+
+The two checkout calls — creating a Checkout Session and reading one back for
+the return page — send `Stripe-Version: 2026-03-25.dahlia` explicitly. **Do not
+remove that pin, and do not assume the account's dashboard version can satisfy
+it.**
+
+The embedded form is requested with `ui_mode=embedded_page`. That enum value
+does not exist before Dahlia: the release renamed `hosted`/`embedded`/`custom`
+to `hosted_page`/`embedded_page`/`elements`, and the changelog marks it a
+breaking change. An unpinned request runs at whatever version the *account*
+defaults to, so on an account created before Dahlia, Stripe rejects the session
+outright — `POST /api/billing/checkout` returns 502 `checkout_failed` and
+**nobody can buy credits**. It fails on the first real purchase, not at startup.
+
+Two things make this easy to miss:
+
+- **A green sandbox does not prove live works.** A sandbox defaults to the API
+  version current when the sandbox was created, so a recently made sandbox
+  silently passes while an older live account fails.
+- **The client is already on Dahlia.** The portal loads Stripe.js from the
+  `dahlia` bundle and calls `createEmbeddedCheckoutPage` (itself a Dahlia
+  rename). Stripe's guidance is to keep Stripe.js and the server-side API
+  version on the same release train, which the pin does.
+
+Scope is deliberate: **only the two checkout calls are pinned.** The autopay
+paths (PaymentIntents, Customers, the setup-mode session) keep the account
+default, because they send nothing version-sensitive and Dahlia carries
+breaking Payments changes that this integration has not audited. Upgrading the
+account's default API version is therefore safe for checkout — it is pinned —
+but is still an autopay decision, not a checkout one.
+
+Webhook payloads are unaffected either way: Stripe renders events at the
+account's (or the endpoint's) configured version, not at the version of the
+request that created the object.
 
 ## Autopay: what deployment must provide
 

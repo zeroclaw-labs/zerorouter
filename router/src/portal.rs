@@ -160,6 +160,22 @@ struct MeResponse {
     email: String,
     credit_balance_usd: Decimal,
     created_at: DateTime<Utc>,
+    /// The Stripe publishable key the SPA initializes Stripe.js with, or
+    /// `null` when this deployment has no Stripe billing configured.
+    ///
+    /// This endpoint is where the portal already learns who it is talking to,
+    /// so it is also where it learns the one piece of server configuration the
+    /// embedded checkout needs. A publishable key is *meant* to be public —
+    /// Stripe.js sends it from the browser on every call — so serving it to an
+    /// authenticated session discloses nothing. It is not hardcoded in the
+    /// bundle because it differs between the test and live accounts, and a
+    /// bundle carrying a live key would be wrong the moment it is built for a
+    /// sandbox.
+    ///
+    /// `null` is the honest signal for "billing is off": the Credits page shows
+    /// its existing "billing is not enabled" notice rather than mounting a
+    /// checkout that could never complete.
+    stripe_publishable_key: Option<String>,
 }
 
 async fn me(State(ctx): State<WebCtx>, user: PortalUser) -> Result<Json<MeResponse>, PortalError> {
@@ -174,6 +190,11 @@ async fn me(State(ctx): State<WebCtx>, user: PortalUser) -> Result<Json<MeRespon
         email: user.email,
         credit_balance_usd,
         created_at,
+        stripe_publishable_key: ctx
+            .config
+            .stripe
+            .as_ref()
+            .map(|stripe| stripe.publishable_key.clone()),
     }))
 }
 
