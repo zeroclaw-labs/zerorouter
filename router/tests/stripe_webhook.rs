@@ -310,6 +310,44 @@ fn taxed_session_event_raw(
     event.to_string()
 }
 
+/// The shape Stripe sends when a VAT-registered business buyer was REVERSE
+/// CHARGED: the buyer accounts for the VAT themselves, so Stripe collects none.
+///
+/// Every field here is what distinguishes it from a session that was simply
+/// never taxed, and the point of the fixture is that none of them are money:
+/// `automatic_tax.status` is `complete` (tax WAS calculated — it came to zero,
+/// as opposed to `failed`, where it could not be determined at all), and the
+/// buyer's VAT number rides along in `customer_details.tax_ids[]`. The amounts
+/// are indistinguishable from an untaxed sale, which is exactly why the ex-tax
+/// accounting needs no new case for it.
+fn reverse_charged_session_event(
+    session_id: &str,
+    user_id: Uuid,
+    metadata_credit_usd: &str,
+    ex_tax_cents: i64,
+    currency: &str,
+) -> String {
+    let mut event: Value = serde_json::from_str(&taxed_session_event(
+        session_id,
+        user_id,
+        metadata_credit_usd,
+        ex_tax_cents,
+        0,
+        currency,
+    ))
+    .expect("taxed event must parse");
+    event["data"]["object"]["automatic_tax"] = json!({
+        "enabled": true,
+        "status": "complete",
+    });
+    event["data"]["object"]["customer_details"] = json!({
+        "email": "vat-buyer@example.com",
+        "tax_exempt": "reverse",
+        "tax_ids": [{ "type": "eu_vat", "value": "DE123456789" }],
+    });
+    event.to_string()
+}
+
 /// POST a correctly signed payload at the real handler.
 async fn post_webhook(pool: &PgPool, payload: &str) -> (StatusCode, Value) {
     // Signed at the current time: the handler checks tolerance against the
@@ -660,6 +698,105 @@ async fn a_session_reporting_zero_tax_is_credited_exactly_as_before() {
     );
 }
 
+/// A reverse-charged business purchase credits exactly what a consumer's does.
+///
+/// This is the invariant tax ID collection has to preserve. A VAT-registered
+/// buyer who enters their VAT number is charged NO tax — the money that arrives
+/// is the bare ex-tax gross — while a consumer buying the same credit pays tax
+/// on top. What each receives must be identical to the cent, and identical to
+/// what both received before tax IDs were collected at all.
+///
+/// The extra fields Stripe adds for such a session (`automatic_tax.status`,
+/// `customer_details.tax_ids[]`, `tax_exempt: reverse`) must be inert here: the
+/// webhook reads none of them, and a fixture carrying them is the only way to
+/// notice if that ever stops being true.
+#[tokio::test]
+async fn a_reverse_charged_purchase_credits_exactly_what_a_taxed_one_does() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    // $25 credit quoted at $26.38 gross. The consumer additionally pays $1.65
+    // of VAT; the reverse-charged business pays none. Both receive $25.
+    const GROSS_CENTS: i64 = 2_638;
+    const CONSUMER_TAX_CENTS: i64 = 165;
+
+    let business = create_user(&pool, "reverse-charged").await;
+    let business_session = unique_session_id();
+    record_checkout_intent(
+        &pool,
+        &business_session,
+        business,
+        GROSS_CENTS,
+        Decimal::from(25),
+        "usd",
+    )
+    .await
+    .expect("pending purchase record must insert");
+    let (status, body) = post_webhook(
+        &pool,
+        &reverse_charged_session_event(&business_session, business, "25.00", GROSS_CENTS, "usd"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+
+    let consumer = create_user(&pool, "vat-consumer").await;
+    let consumer_session = unique_session_id();
+    record_checkout_intent(
+        &pool,
+        &consumer_session,
+        consumer,
+        GROSS_CENTS,
+        Decimal::from(25),
+        "usd",
+    )
+    .await
+    .expect("pending purchase record must insert");
+    let (status, body) = post_webhook(
+        &pool,
+        &taxed_session_event(
+            &consumer_session,
+            consumer,
+            "25.00",
+            GROSS_CENTS,
+            CONSUMER_TAX_CENTS,
+            "usd",
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+
+    let business_balance = balance(&pool, business).await.expect("balance must query");
+    let consumer_balance = balance(&pool, consumer).await.expect("balance must query");
+    assert_eq!(
+        business_balance, consumer_balance,
+        "reverse charge must not change what a purchase credits"
+    );
+    assert_eq!(
+        business_balance,
+        Decimal::from(25),
+        "the reverse-charged buyer is credited the net credit, not the gross"
+    );
+
+    // The ledger records the credit, and the intent row still means the EX-TAX
+    // gross — so fee revenue stays exactly gross - credit on a zero-tax sale
+    // just as it does on a taxed one.
+    let credited = query_scalar::<_, Decimal>(
+        "SELECT amount_usd FROM credit_ledger WHERE stripe_session_id = $1",
+    )
+    .bind(&business_session)
+    .fetch_one(&pool)
+    .await
+    .expect("ledger row must query");
+    assert_eq!(credited, Decimal::from(25));
+
+    let intent = checkout_intent(&pool, &business_session)
+        .await
+        .expect("intent must query")
+        .expect("intent must exist");
+    assert_eq!(intent.expected_amount_cents, GROSS_CENTS);
+    assert!(intent.settled_at.is_some());
+}
+
 /// A session whose parts do not add up credits nothing.
 ///
 /// The shape that matters is an INCLUSIVE-tax session: `amount_total` is the
@@ -953,6 +1090,11 @@ async fn checkout_session_form_is_the_pinned_stripe_wire_contract() {
         // behavior: those are Tax Settings' job, so the operator can revise the
         // classification without a deploy.
         ("automatic_tax[enabled]", "true"),
+        // Offer the buyer a VAT/tax-ID field so a VAT-registered business is
+        // reverse-charged rather than taxed as a consumer. No `required` key:
+        // its default `never` is the optional mode, and the alternative would
+        // block every EU consumer from buying.
+        ("tax_id_collection[enabled]", "true"),
         ("metadata[user_id]", &user_id.to_string()),
         ("metadata[credit_usd]", "25.00"),
         ("metadata[fee_usd]", "1.38"),
@@ -1071,6 +1213,65 @@ async fn the_checkout_session_asks_stripe_to_calculate_tax() {
         form.keys()
             .all(|key| !key.contains("tax_rate") && !key.contains("tax_rates")),
         "no manual tax rate may be sent; it cannot coexist with automatic tax"
+    );
+}
+
+/// The parameter that offers a VAT/tax ID field, and the one that must NOT be
+/// sent alongside it.
+///
+/// Both directions fail silently in production, which is why they are pinned
+/// here rather than left to the wire-contract test's equality alone:
+///
+/// - Drop `tax_id_collection[enabled]` and every session is created happily,
+///   the form simply never offers the field, and every VAT-registered business
+///   buyer is charged consumer VAT on a sale that should have been reverse
+///   charged. Nothing in the logs says so.
+/// - Add `tax_id_collection[required]=if_supported` and the mirror image
+///   happens: a tax ID becomes MANDATORY for every buyer in a supported billing
+///   country, so EU consumers — who have no business tax ID — cannot complete a
+///   purchase at all. The default `never` is the optional mode this product
+///   needs, so the key's ABSENCE is the guard.
+#[tokio::test]
+async fn the_checkout_session_offers_an_optional_tax_id_field() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let user_id = create_user(&pool, "tax-id-collection").await;
+    let session_id = unique_session_id();
+    let (api_base, captured, _version) = mock_checkout_stripe(session_id).await;
+
+    let (status, body) = post_checkout(&pool, &api_base, user_id, "25.00").await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let form = captured
+        .lock()
+        .expect("captured form must lock")
+        .clone()
+        .expect("stripe must have been called");
+
+    assert_eq!(
+        form.get("tax_id_collection[enabled]").map(String::as_str),
+        Some("true"),
+        "Checkout must offer a tax ID field so business buyers can be reverse charged"
+    );
+    // Optional for the buyer, always. `required` unset means `never`, Stripe's
+    // optional mode; anything else blocks consumers from paying.
+    assert_eq!(
+        form.get("tax_id_collection[required]"),
+        None,
+        "tax ID collection must stay optional; `if_supported` would block consumers"
+    );
+    // Tax ID collection needs neither of these. The tax ID arrives on the
+    // completed session at `customer_details.tax_ids[]` with no Customer
+    // attached, and `customer_creation=always` would mint a second, duplicate
+    // customer per purchase on top of the one `ensure_stripe_customer` keeps.
+    assert_eq!(
+        form.get("customer_creation"),
+        None,
+        "tax ID collection must not start creating a duplicate Customer per purchase"
+    );
+    assert!(
+        !form.contains_key("customer"),
+        "checkout still attaches no Stripe Customer"
     );
 }
 

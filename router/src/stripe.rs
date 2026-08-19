@@ -145,6 +145,60 @@
 //! Whichever is selected, it does not fix transactions already taken: Stripe
 //! cannot retroactively correct a sale that collected the wrong tax.
 //!
+//! ## Tax IDs and reverse charge
+//!
+//! Sessions also carry `tax_id_collection[enabled]=true`, which makes the
+//! embedded form show a VAT/tax-ID field when the buyer's address is somewhere
+//! Stripe supports one. It is **optional for the buyer**: `required` is left at
+//! its default `never`, because the alternative (`if_supported`) makes a tax ID
+//! mandatory for everyone in a supported billing country, and an EU consumer has
+//! no business tax ID to give. For a self-serve product that is a checkout
+//! outage, not a policy.
+//!
+//! The point of collecting it is **reverse charge**: on a cross-border B2B sale
+//! of services into the EU or UK, a VAT-registered buyer accounts for the VAT
+//! themselves, the seller collects zero, and the invoice must cite the buyer's
+//! VAT number. Stripe applies this automatically when a valid tax ID is present
+//! and the jurisdictions line up. Collecting it is also what lets a US business
+//! buyer self-identify, though nothing in US sales tax acts on that today.
+//!
+//! **What it does NOT do — read this before expecting a number to change.**
+//! Reverse charge only produces a visible change where the operator is
+//! REGISTERED to collect VAT in the first place (an EU OSS or UK registration).
+//! Stripe calculates zero tax for an unregistered jurisdiction regardless — see
+//! failure mode 3 below — so with only the Massachusetts registration in place,
+//! an EU buyer's session collects zero tax whether or not they enter a VAT
+//! number. The field is collected and recorded; the tax was already zero. It
+//! likewise changes nothing on a US sale: reverse charge is a VAT mechanism and
+//! US sales tax has no equivalent, so a US business entering an EIN is taxed
+//! exactly as before. "Tax ID entered" and "tax went to zero" are independent
+//! facts, and only the registration list connects them.
+//!
+//! ## What the reverse-charged event looks like, and why nothing here changes
+//!
+//! A reverse-charged purchase arrives at the webhook as `amount_total` equal to
+//! the ex-tax gross, `total_details.amount_tax = 0`, `automatic_tax.status =
+//! complete`, and the buyer's id in `customer_details.tax_ids[]`. That is
+//! numerically identical to an untaxed session, which is the whole reason the
+//! ex-tax accounting needs no new case: [`collected_ex_tax_cents`] subtracts a
+//! zero and the corroborations compare the same figures they always did, so the
+//! buyer is credited exactly `credit_usd`. `customer_details` is not read by
+//! this module at all.
+//!
+//! **The tax ID is deliberately not stored.** A reverse-charge invoice must cite
+//! the buyer's VAT number, so the operator does need it — but Stripe already
+//! keeps it, on the Checkout Session (`customer_details.tax_ids[]`) and in the
+//! Tax reports that a VAT return is filed from, which is where the rest of the
+//! filing figures come from anyway. Copying it into `stripe_checkout_intents`
+//! would mean a migration, a second copy of a customer identifier to keep
+//! correct, and a new answer to give a deletion request — to duplicate a record
+//! the filing workflow does not read. Retrieve it with
+//! `stripe checkout sessions retrieve <id>` (or Dashboard → Payments → the
+//! session), or in bulk from Tax → Registrations → reports, which break out
+//! reverse-charged transactions with the buyer's tax ID per row. Revisit this
+//! only if the operator's accountant needs the ID inside ZeroRouter's own books
+//! rather than at filing time.
+//!
 //! ## Where the tax lands
 //!
 //! Nowhere in ZeroRouter's ledger, and that is the point:
@@ -1149,6 +1203,12 @@ async fn create_checkout_session(
     // `unit_amount`, and the webhook compares against `amount_total` minus that
     // tax rather than against `amount_total`.
     //
+    // `tax_id_collection[enabled]` makes the embedded form offer a VAT/tax-ID
+    // field so a VAT-registered business buyer can be reverse-charged instead
+    // of taxed as a consumer. See the module docs for what reverse charge does
+    // and does not do; the short version is that it changes the TAX, never the
+    // credit, so the webhook's ex-tax accounting is untouched by it.
+    //
     // Deliberately NOT sent — each of these is a decision, not an oversight:
     //
     // - `product_data[tax_code]` and `price_data[tax_behavior]`. Omitting them
@@ -1156,17 +1216,31 @@ async fn create_checkout_session(
     //   revise it without a deploy; see the module docs for what to select
     //   there and why the classification is not ours to hardcode. Stripe falls
     //   back to the Tax Settings presets for exactly this reason.
-    // - `customer_update[address]=auto`. It is only valid alongside a
-    //   `customer`, and this session attaches none — it identifies the buyer by
-    //   `customer_email` only. (The autopay path does keep a Stripe Customer
-    //   per user, but checkout has never used it and attaching one here would
-    //   change which address Checkout taxes against.)
-    // - `customer_creation=always`. Stripe notes that Google Pay is only
-    //   offered under Stripe Tax when a shipping address is collected or a
-    //   saved customer exists — but this deployment offers Apple Pay, not
-    //   Google Pay, and `ensure_stripe_customer` already mints one Customer per
-    //   user for autopay. Setting it here would create a SECOND, Checkout-owned
-    //   customer on every purchase, duplicating records for one human.
+    // - `tax_id_collection[required]`. Its default is `never`, which is the
+    //   OPTIONAL mode and the one a self-serve product needs: the alternative,
+    //   `if_supported`, makes a tax ID MANDATORY for every buyer in a supported
+    //   billing country, so an EU consumer — who has no business tax ID to
+    //   give — could not complete a purchase at all. That would be a checkout
+    //   outage for exactly the buyers Stripe Tax was turned on for. Optional
+    //   collection costs nothing: a consumer ignores the field and is taxed
+    //   normally, a business fills it in and is reverse-charged.
+    // - `customer_update[address]=auto` / `customer_update[name]=auto`. Both are
+    //   only valid alongside a `customer`, and this session attaches none — it
+    //   identifies the buyer by `customer_email` only. They exist to write the
+    //   collected tax ID and legal business name BACK onto an existing Customer
+    //   record; with no Customer attached there is nothing to write back to, and
+    //   sending either makes Stripe reject the request. (The autopay path does
+    //   keep a Stripe Customer per user, but checkout has never used it and
+    //   attaching one here would change which address Checkout taxes against.)
+    // - `customer_creation=always`. Tax ID collection does NOT require it.
+    //   Stripe's own wording: if you configure `customer_creation` "Checkout
+    //   saves any tax ID information collected during a session to that new
+    //   Account or Customer. If not, the tax ID information is still available
+    //   at `customer_details.tax_ids`." The tax ID reaches the completed session
+    //   either way, which is the only place this integration would read it from.
+    //   Setting it would create a SECOND, Checkout-owned customer on every
+    //   purchase — `ensure_stripe_customer` already mints one per user for
+    //   autopay — duplicating records for one human to buy nothing.
     // - `billing_address_collection=required`. Still deliberately absent, and
     //   the default `auto` is what makes the embedded form ask for an address
     //   at all: Stripe's own description of `auto` is that with `automatic_tax`
@@ -1182,7 +1256,7 @@ async fn create_checkout_session(
     // `{CHECKOUT_SESSION_ID}` template variable is substituted by Checkout on
     // the way back, which is how the return route knows which session to ask
     // about.
-    let form: [(&str, &str); 13] = [
+    let form: [(&str, &str); 14] = [
         ("mode", "payment"),
         ("ui_mode", CHECKOUT_UI_MODE),
         ("line_items[0][price_data][currency]", CHECKOUT_CURRENCY),
@@ -1193,6 +1267,7 @@ async fn create_checkout_session(
         ),
         ("line_items[0][quantity]", "1"),
         ("automatic_tax[enabled]", "true"),
+        ("tax_id_collection[enabled]", "true"),
         ("metadata[user_id]", &user_id),
         ("metadata[credit_usd]", &credit_usd),
         ("metadata[fee_usd]", &fee_usd),

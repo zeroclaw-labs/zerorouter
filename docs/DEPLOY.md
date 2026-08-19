@@ -194,8 +194,9 @@ disable) starts with serve mode and needs no configuration.
 
 ## Stripe Tax must be configured BEFORE this deploys
 
-Checkout Sessions are created with `automatic_tax[enabled]=true` and nothing
-else. The code sends no rate, no jurisdiction, **no product tax code, and no
+Checkout Sessions are created with `automatic_tax[enabled]=true` and
+`tax_id_collection[enabled]=true`, and nothing else. The code sends no rate, no
+jurisdiction, **no product tax code, and no
 tax behavior** — all of it comes from Tax Settings, deliberately, so the
 operator can revise a contested tax classification without a deploy. The
 dashboard is therefore not optional configuration around this feature, it
@@ -254,6 +255,42 @@ environment):
 5. Run one real purchase and confirm the session carries a non-zero tax
    line and that the credit still lands. A green test suite is not
    evidence.
+
+### Tax IDs and reverse charge — what entering a VAT number does and does not do
+
+The checkout form offers business buyers an **optional** VAT/tax-ID field
+(`tax_id_collection[enabled]=true`; `required` is deliberately left at its
+default `never`, because making it mandatory would stop EU consumers buying at
+all). The purpose is **reverse charge**: on a cross-border B2B sale of services
+into the EU or UK, a VAT-registered buyer accounts for the VAT themselves, the
+seller collects zero, and the invoice must cite the buyer's VAT number.
+
+**Reverse charge only shows up where you are registered.** Stripe applies it
+against your *registrations*, and it already calculates zero tax for any
+jurisdiction you are not registered in (failure mode 3 above). So with only the
+Massachusetts registration in place:
+
+- An **EU or UK buyer** collects **zero tax either way** — with or without a VAT
+  number. The field is collected and recorded; the tax was already zero. Adding
+  an EU OSS or UK VAT registration is what makes the distinction real, and at
+  that point entering a VAT number is what stops a business being charged
+  consumer VAT.
+- A **US buyer** is taxed exactly as before. Reverse charge is a VAT mechanism
+  and US sales tax has no equivalent, so a US business entering an EIN changes
+  nothing about that sale today. It is collected so the buyer can self-identify
+  for business-use treatment later.
+
+Do not read "the buyer entered a tax ID" as "the tax changed". Those are
+independent facts and only the registration list connects them.
+
+**The tax ID is not stored in ZeroRouter.** Reverse-charge invoices must cite
+it, but Stripe already holds it and no migration was added to duplicate it. To
+retrieve one: `stripe checkout sessions retrieve <session_id>` and read
+`customer_details.tax_ids[]`, or Dashboard → Payments → the session. For a VAT
+return, Tax → Registrations → reports break out reverse-charged transactions
+with the buyer's tax ID per row, alongside the rest of the filing figures. If
+the accountant ever needs the ID inside ZeroRouter's own books rather than at
+filing time, that is a migration and a deliberate decision.
 
 Two consequences worth planning for:
 
