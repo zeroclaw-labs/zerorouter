@@ -1918,14 +1918,23 @@ pub async fn overdue_autopay_intents(
 /// credited to a frozen / indebted account — so it is surfaced here for an
 /// operator to refund out of band, the same shape as `overdue_autopay_intents`
 /// surfaces claims automation must not touch. Returns (payment_intent_id,
-/// user_id, charge_amount_usd): the GROSS Stripe collected, which is the amount
-/// to refund.
+/// user_id, refundable): the amount to refund.
+///
+/// The refundable amount is `charge_amount_usd + tax_amount_usd`, NOT the
+/// ex-tax gross alone (migration 0021). Everywhere else in this module the
+/// ex-tax gross is the right figure, because it is what the ledger and the fee
+/// arithmetic are denominated in — but this one caller is answering a different
+/// question: *how much money left the customer's card?* With tax that is the
+/// taxed total, and refunding only the ex-tax gross would short the customer by
+/// exactly the tax. `COALESCE` because the column is NULL both for pre-0021
+/// rows and for a charge that took the untaxed fallback.
 pub async fn withheld_autopay_intents(
     pool: &PgPool,
 ) -> Result<Vec<(String, Uuid, Decimal)>, sqlx::Error> {
     sqlx::query_as::<_, (String, Uuid, Decimal)>(
         r#"
-        SELECT payment_intent_id, user_id, charge_amount_usd
+        SELECT payment_intent_id, user_id,
+               charge_amount_usd + COALESCE(tax_amount_usd, 0)
         FROM stripe_autopay_intents
         WHERE status = 'withheld'
         ORDER BY updated_at
@@ -1933,6 +1942,103 @@ pub async fn withheld_autopay_intents(
     )
     .fetch_all(pool)
     .await
+}
+
+/// The tax figures frozen on an autopay claim: the tax collected on top of the
+/// ex-tax gross, and the Stripe Tax Calculation that priced it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AutopayTax {
+    pub tax_usd: Decimal,
+    pub calculation_id: Option<String>,
+}
+
+/// Read the tax already frozen on a claim, if any.
+///
+/// `None` means no tax has been computed for this claim yet, so the caller must
+/// price one. `Some` — including `Some` with a zero amount — means a previous
+/// attempt already froze an answer and the caller MUST reuse it rather than
+/// asking Stripe again: a reconciliation replay re-POSTs under the original
+/// idempotency key, and Stripe rejects a replay whose parameters differ from
+/// the first request's (see migration 0021).
+pub async fn autopay_tax(
+    pool: &PgPool,
+    payment_intent_id: &str,
+) -> Result<Option<AutopayTax>, sqlx::Error> {
+    let row = sqlx::query_as::<_, (Option<Decimal>, Option<String>)>(
+        "SELECT tax_amount_usd, tax_calculation_id FROM stripe_autopay_intents WHERE payment_intent_id = $1",
+    )
+    .bind(payment_intent_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.and_then(|(tax_usd, calculation_id)| {
+        tax_usd.map(|tax_usd| AutopayTax {
+            tax_usd,
+            calculation_id,
+        })
+    }))
+}
+
+/// Freeze a computed tax onto a claim, first writer winning, and return the
+/// figures that are now authoritative.
+///
+/// This is deliberately ONE statement rather than a read followed by a write.
+/// Two sweeps — a live pass on one instance and a reconciliation replay on
+/// another — can price the same stranded claim concurrently, and they can get
+/// different answers (a rate change, or one of them falling back to untaxed
+/// because the Tax API was briefly unavailable). If both then charged their own
+/// figure under the same idempotency key, the second would be rejected by
+/// Stripe as a parameter mismatch and the claim terminal-failed even though the
+/// first may already have taken the money.
+///
+/// `COALESCE(tax_amount_usd, $2)` makes the first writer's answer stick and
+/// hands every later caller that same answer in the same round trip, so both
+/// racers POST an identical `amount`. The loser's calculation is simply
+/// abandoned, which costs nothing: a Tax Calculation is only a quote until a
+/// transaction is created from it.
+///
+/// The amount and the calculation id are frozen as an ATOMIC PAIR, which is why
+/// the id is not a second `COALESCE`. Consider a first writer that fell back to
+/// untaxed (tax 0, no calculation) and a second that priced 2.50 against a real
+/// calculation: two independent `COALESCE`s would keep the first writer's 0 and
+/// adopt the SECOND writer's calculation id, leaving the row claiming that a
+/// calculation for 2.50 of tax priced a charge that collected none. Recording a
+/// tax transaction from that calculation would report tax to a jurisdiction
+/// that was never collected from the customer. The `CASE` keys both columns off
+/// the same pre-update `tax_amount_usd IS NULL` test — every `SET` expression in
+/// one `UPDATE` sees the OLD row — so the pair moves together or not at all.
+///
+/// Scoped to `status = 'pending'` so a settled or failed row is never rewritten.
+/// Returns `None` if there is no such pending row.
+pub async fn freeze_autopay_tax(
+    pool: &PgPool,
+    payment_intent_id: &str,
+    tax_usd: Decimal,
+    calculation_id: Option<&str>,
+) -> Result<Option<AutopayTax>, sqlx::Error> {
+    let row = sqlx::query_as::<_, (Option<Decimal>, Option<String>)>(
+        r#"
+        UPDATE stripe_autopay_intents
+        SET tax_amount_usd = COALESCE(tax_amount_usd, $2),
+            tax_calculation_id = CASE
+                WHEN tax_amount_usd IS NULL THEN $3
+                ELSE tax_calculation_id
+            END,
+            updated_at = NOW()
+        WHERE payment_intent_id = $1 AND status = 'pending'
+        RETURNING tax_amount_usd, tax_calculation_id
+        "#,
+    )
+    .bind(payment_intent_id)
+    .bind(tax_usd)
+    .bind(calculation_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.and_then(|(tax_usd, calculation_id)| {
+        tax_usd.map(|tax_usd| AutopayTax {
+            tax_usd,
+            calculation_id,
+        })
+    }))
 }
 
 /// What settling an autopay charge did.

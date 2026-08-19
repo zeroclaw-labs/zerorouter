@@ -940,6 +940,13 @@ pub async fn migrate(pool: &PgPool) -> Result<()> {
                 )),
                 false,
             ),
+            Migration::new(
+                21,
+                Cow::Borrowed("autopay tax"),
+                MigrationType::Simple,
+                Cow::Borrowed(include_str!("../migrations/0021_autopay_tax.sql")),
+                false,
+            ),
         ]),
         ignore_missing: false,
         locking: true,

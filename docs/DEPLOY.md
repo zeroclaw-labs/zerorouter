@@ -296,11 +296,73 @@ Two consequences worth planning for:
 
 - **Stripe Tax costs roughly 0.5% per transaction** where a registration
   applies, on top of card processing. The deposit fee has not been re-sized
-  for it; the arithmetic is in the `DEPOSIT_FEE_FLOOR_USD` comment.
-- **Autopay is not taxed and cannot be**, because a raw PaymentIntent has
-  no `automatic_tax` parameter. The same credits bought through autopay
-  collect no tax. Closing that gap needs the Tax Calculation API and is a
-  separate decision.
+  for it; the arithmetic is in the `DEPOSIT_FEE_FLOOR_USD` comment. Autopay
+  now also pays for one tax *calculation* per top-up attempt (Stripe bills
+  per calculation call), which a reconciliation replay does not repeat.
+
+### Autopay is taxed too (migration 0021)
+
+Autopay top-ups used to collect no tax at all, so the same credits bought two
+ways collected two different amounts. They no longer do. A raw PaymentIntent
+still takes no `automatic_tax` parameter, so autopay prices tax with the **Tax
+Calculation API** and charges `gross + tax`, then records a tax transaction so
+the sale reaches the filing report. The reasoning — including why the Invoices
+route and Stripe's newer `hooks[inputs][tax][calculation]` PaymentIntent link
+were both rejected — is in the autopay section of `router/src/stripe.rs`.
+
+**Nothing here needs new configuration.** It uses the same Tax Settings the
+checkout path does: no tax code and no tax behavior is sent, so the preset
+governs both surfaces and they cannot drift into taxing the same product two
+different ways. The five operator steps above are the whole setup.
+
+**This ships inert, and that is expected.** With no tax registrations Stripe
+calculates zero tax for every buyer, so today every autopay charge is priced,
+comes back zero, and collects exactly what it collected before. The change
+becomes visible the day a registration goes live — which is the point: it
+means the first taxed autopay charge does not require a deploy.
+
+Three things worth knowing when it stops being inert:
+
+- **The buyer's location comes from the saved card's billing address**, and
+  nowhere else. `ensure_stripe_customer` stores no address on the Stripe
+  Customer, and the Tax API does not fall back to any other source. If Stripe
+  captured no billing address when the card was saved, or the address cannot
+  be rated (a US address needs a postal code), the top-up is charged
+  **untaxed** rather than failing. That is deliberate: a degraded top-up beats
+  a dead one. Every such charge logs at WARN with the field
+  **`autopay_tax_fallback`**, whose value is one of `no_billing_address`,
+  `incomplete_address`, `calculation_rejected`, `calculation_unavailable`.
+  **Alert on that field** — it is the only signal that autopay is collecting
+  no tax where it should. To fix `no_billing_address` at the source, turn on
+  billing-address collection for the card-setup session in Stripe's checkout
+  settings; existing saved cards need the customer to re-add the card.
+- **Tax reversals on a refund are NOT automatic.** Stripe reverses tax
+  automatically only for Checkout and for its own simplified PaymentIntent
+  link, neither of which this path uses. A refunded or disputed autopay charge
+  leaves its tax transaction standing, so the tax must be reversed by hand in
+  Dashboard → Tax → Transactions. The same is true of an autopay charge whose
+  credit was **withheld** (collected from a frozen or indebted account): no tax
+  transaction is recorded for it, and the operator refund must be the **taxed**
+  total — `withheld_autopay_intents` reports that figure, not the ex-tax gross.
+- **A tax transaction that fails to record does not fail the charge.** The
+  money is already correct by then, so the failure is logged at ERROR naming
+  the `payment_intent` and the `tax_calculation`, and the sale is missing from
+  the filing report until an operator creates the transaction from that
+  calculation. Search the logs for `tax transaction was not recorded` before
+  filing.
+
+The ledger is unchanged by all of this: the buyer is credited exactly the
+top-up, the recorded charge stays the ex-tax gross so fee revenue is still
+`charge - credit`, and tax lives in its own column — never credited, never
+counted as revenue.
+
+**Rollout ordering.** During a deploy the old and new binaries can both be
+processing webhooks. A pre-0021 intent (no tax metadata) is credited correctly
+by the new binary. A 0021 intent carrying real tax would be read as a short
+payment by an *old* binary and refused with `amount_mismatch` — Stripe retries
+for days, so it credits once the rollout completes. With no registrations the
+tax is zero and the two shapes are numerically identical, so this is a
+non-event today; it matters only if a registration is added mid-deploy.
 
 ## Credit enforcement is on by default
 
