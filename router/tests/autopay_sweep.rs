@@ -1016,3 +1016,541 @@ async fn autopay_still_armed_is_false_when_frozen_negative_or_maxed_out() {
         "a struck-out account is not armed"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Sales tax on autopay (migration 0021)
+//
+// Autopay prices tax through the Tax Calculation API and charges
+// `gross + tax`, while the balance still receives exactly the top-up. The two
+// properties worth the most here are the ones a reviewer cannot check by
+// reading: that a tax failure DEGRADES the charge instead of killing it, and
+// that a reconciliation replay re-sends the FROZEN tax rather than a fresh one
+// (Stripe rejects a replay whose parameters differ from the original request).
+// ---------------------------------------------------------------------------
+
+/// What the mock's tax endpoint should do.
+#[derive(Clone, Copy, PartialEq)]
+enum TaxMock {
+    /// Price the given tax, in cents, on top of the line item.
+    Charges(i64),
+    /// Reject the calculation the way an unusable address does
+    /// (`customer_tax_location_invalid`, HTTP 400).
+    LocationInvalid,
+    /// 5xx: Stripe Tax is having a bad day.
+    Unavailable,
+}
+
+#[derive(Clone)]
+struct TaxSpy {
+    /// `amount` values the PaymentIntent endpoint was asked to charge, in order.
+    charged: Arc<std::sync::Mutex<Vec<String>>>,
+    /// How many tax CALCULATIONS were requested. The replay test asserts this
+    /// stops growing, which is what proves the frozen figure is reused rather
+    /// than recomputed.
+    calculations: Arc<AtomicUsize>,
+    /// How many tax TRANSACTIONS were recorded.
+    transactions: Arc<AtomicUsize>,
+    /// The `reference` of each recorded transaction — must be the intent id.
+    references: Arc<std::sync::Mutex<Vec<String>>>,
+    behaviour: TaxMock,
+    /// Whether the saved card carries a billing address at all.
+    with_address: bool,
+}
+
+fn form_field(body: &str, key: &str) -> Option<String> {
+    body.split('&')
+        .filter_map(|pair| pair.split_once('='))
+        .find(|(candidate, _)| candidate.replace("%5B", "[").replace("%5D", "]") == key)
+        .map(|(_, value)| value.replace('+', " ").replace("%2E", "."))
+}
+
+fn tax_mock(behaviour: TaxMock, with_address: bool) -> (Router, TaxSpy) {
+    let spy = TaxSpy {
+        charged: Arc::new(std::sync::Mutex::new(Vec::new())),
+        calculations: Arc::new(AtomicUsize::new(0)),
+        transactions: Arc::new(AtomicUsize::new(0)),
+        references: Arc::new(std::sync::Mutex::new(Vec::new())),
+        behaviour,
+        with_address,
+    };
+    let app = Router::new()
+        .route(
+            "/v1/customers/{customer}/payment_methods",
+            get(
+                |State(state): State<TaxSpy>, Path(_c): Path<String>| async move {
+                    let card = if state.with_address {
+                        json!({
+                            "id": "pm_test_card",
+                            "billing_details": { "address": {
+                                "line1": "1 Broadway",
+                                "city": "Cambridge",
+                                "state": "MA",
+                                "postal_code": "02142",
+                                "country": "US",
+                            }},
+                        })
+                    } else {
+                        json!({ "id": "pm_test_card" })
+                    };
+                    axum::Json(json!({ "data": [card] }))
+                },
+            ),
+        )
+        .route(
+            "/v1/tax/calculations",
+            post(|State(state): State<TaxSpy>, body: String| async move {
+                state.calculations.fetch_add(1, Ordering::SeqCst);
+                match state.behaviour {
+                    TaxMock::LocationInvalid => (
+                        axum::http::StatusCode::BAD_REQUEST,
+                        axum::Json(json!({"error": {
+                            "code": "customer_tax_location_invalid",
+                            "param": "customer_details[address]",
+                            "type": "invalid_request_error",
+                        }})),
+                    ),
+                    TaxMock::Unavailable => (
+                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                        axum::Json(json!({"error": {"message": "tax is down"}})),
+                    ),
+                    TaxMock::Charges(tax_cents) => {
+                        let line = form_field(&body, "line_items[0][amount]")
+                            .and_then(|amount| amount.parse::<i64>().ok())
+                            .expect("the calculation must price the ex-tax gross");
+                        (
+                            axum::http::StatusCode::OK,
+                            axum::Json(json!({
+                                "id": format!("taxcalc_{}", Uuid::new_v4().simple()),
+                                "amount_total": line + tax_cents,
+                                "tax_amount_exclusive": tax_cents,
+                                "tax_amount_inclusive": 0,
+                            })),
+                        )
+                    }
+                }
+            }),
+        )
+        .route(
+            "/v1/tax/transactions/create_from_calculation",
+            post(|State(state): State<TaxSpy>, body: String| async move {
+                state.transactions.fetch_add(1, Ordering::SeqCst);
+                if let Some(reference) = form_field(&body, "reference") {
+                    state
+                        .references
+                        .lock()
+                        .expect("reference sink")
+                        .push(reference);
+                }
+                axum::Json(json!({ "id": "tax_test", "object": "tax.transaction" }))
+            }),
+        )
+        .route(
+            "/v1/payment_intents",
+            post(|State(state): State<TaxSpy>, body: String| async move {
+                if let Some(amount) = form_field(&body, "amount") {
+                    state.charged.lock().expect("amount sink").push(amount);
+                }
+                axum::Json(json!({
+                    "id": format!("pi_mock_{}", Uuid::new_v4().simple()),
+                    "status": "succeeded",
+                }))
+            }),
+        )
+        .with_state(spy.clone());
+    (app, spy)
+}
+
+async fn tax_row_of(pool: &PgPool, user_id: Uuid) -> (Option<Decimal>, Option<String>) {
+    query_as::<_, (Option<Decimal>, Option<String>)>(
+        "SELECT tax_amount_usd, tax_calculation_id FROM stripe_autopay_intents WHERE user_id = $1",
+    )
+    .bind(user_id)
+    .fetch_one(pool)
+    .await
+    .expect("intent row must exist")
+}
+
+/// The taxed happy path. A $25 top-up is $26.38 ex-tax gross; Massachusetts at
+/// 6.25% adds $1.65, so the card is charged $28.03 — and the balance still
+/// receives exactly $25.00. The ledger's own figures stay ex-tax: `amount_usd`
+/// the credit, `charge_amount_usd` the gross, tax in its own column so fee
+/// revenue is still `charge - credit` for a taxed row.
+#[tokio::test]
+async fn a_taxed_top_up_charges_gross_plus_tax_and_credits_the_top_up() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let _sweep_guard = SWEEP_LOCK.lock().await;
+    disarm_all_autopay(&pool).await;
+
+    let (app, spy) = tax_mock(TaxMock::Charges(165), true);
+    let base = serve(app).await;
+    let user_id = autopay_user(&pool, "taxed", 10, 25).await;
+
+    run_autopay_sweep_once(&pool, &settings(&base)).await;
+
+    assert_eq!(
+        spy.charged.lock().expect("sink").as_slice(),
+        ["2803"],
+        "the card is charged the ex-tax gross plus the tax"
+    );
+    assert_eq!(
+        balance_of(&pool, user_id).await,
+        Decimal::from(25),
+        "tax is never credited"
+    );
+    let (amount_usd, charge_amount_usd) = query_as::<_, (Decimal, Decimal)>(
+        "SELECT amount_usd, charge_amount_usd FROM stripe_autopay_intents WHERE user_id = $1",
+    )
+    .bind(user_id)
+    .fetch_one(&pool)
+    .await
+    .expect("intent row must exist");
+    assert_eq!(
+        amount_usd,
+        Decimal::from(25),
+        "the row stores the net credit"
+    );
+    assert_eq!(
+        charge_amount_usd,
+        Decimal::from_str("26.38").expect("literal"),
+        "charge_amount_usd stays EX-TAX, so fee revenue is still charge - credit",
+    );
+    let (tax_amount_usd, calculation_id) = tax_row_of(&pool, user_id).await;
+    assert_eq!(
+        tax_amount_usd,
+        Some(Decimal::from_str("1.65").expect("literal")),
+        "the tax is frozen in its own column"
+    );
+    assert!(
+        calculation_id.is_some_and(|id| id.starts_with("taxcalc_")),
+        "the calculation that priced it is frozen alongside"
+    );
+
+    // The sale reached the tax reports, exactly once, keyed by the intent id.
+    assert_eq!(spy.transactions.load(Ordering::SeqCst), 1);
+    let references = spy.references.lock().expect("references").clone();
+    assert_eq!(references.len(), 1);
+    assert!(
+        references[0].starts_with("pi_mock_"),
+        "the transaction reference is the PaymentIntent id, which is what makes \
+         a second recording attempt collide instead of double-reporting: {references:?}"
+    );
+
+    query("UPDATE users SET autopay_enabled = FALSE WHERE id = $1")
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .expect("teardown disarm");
+}
+
+/// THE BINDING CONSTRAINT. Autopay must never fail to top up because tax could
+/// not be computed: a degraded-but-successful charge beats a dead one, because
+/// a dead one stops the customer's inference over a figure that is zero
+/// everywhere until a registration exists.
+///
+/// All three ways tax can fail are exercised against the same assertion — the
+/// charge still goes out, for the untaxed gross, and the balance still lands.
+#[tokio::test]
+async fn tax_failures_degrade_the_top_up_instead_of_killing_it() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let _sweep_guard = SWEEP_LOCK.lock().await;
+
+    for (label, behaviour, with_address) in [
+        (
+            "no billing address on the saved card",
+            TaxMock::Charges(165),
+            false,
+        ),
+        ("stripe rejects the address", TaxMock::LocationInvalid, true),
+        ("stripe tax is unavailable", TaxMock::Unavailable, true),
+    ] {
+        disarm_all_autopay(&pool).await;
+        let (app, spy) = tax_mock(behaviour, with_address);
+        let base = serve(app).await;
+        let user_id = autopay_user(&pool, "taxfail", 10, 25).await;
+
+        run_autopay_sweep_once(&pool, &settings(&base)).await;
+
+        assert_eq!(
+            spy.charged.lock().expect("sink").as_slice(),
+            ["2638"],
+            "{label}: the untaxed gross is still charged"
+        );
+        assert_eq!(
+            balance_of(&pool, user_id).await,
+            Decimal::from(25),
+            "{label}: the top-up still lands"
+        );
+        let (tax_amount_usd, calculation_id) = tax_row_of(&pool, user_id).await;
+        assert_eq!(
+            tax_amount_usd,
+            Some(Decimal::ZERO),
+            "{label}: the fallback freezes an explicit zero, so a replay agrees"
+        );
+        assert_eq!(
+            calculation_id, None,
+            "{label}: there is no calculation to record a transaction from"
+        );
+        assert_eq!(
+            spy.transactions.load(Ordering::SeqCst),
+            0,
+            "{label}: nothing is reported to a tax authority"
+        );
+        // No address means no reason to ask Stripe at all — the local
+        // completeness check saves the round trip.
+        if !with_address {
+            assert_eq!(
+                spy.calculations.load(Ordering::SeqCst),
+                0,
+                "{label}: an unusable address is caught before the API call"
+            );
+        }
+
+        query("UPDATE users SET autopay_enabled = FALSE WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .expect("teardown disarm");
+    }
+}
+
+/// The idempotency-critical one.
+///
+/// A reconciliation replay re-POSTs a stranded claim under its ORIGINAL
+/// idempotency key. Stripe's idempotency layer "compares incoming parameters to
+/// those of the original request and errors if they're not the same", so if the
+/// replay recomputed the tax and got a different answer, the `amount` would
+/// differ, Stripe would reject it, and the claim would be terminal-failed even
+/// though the first attempt may already have taken the money.
+///
+/// Here the tax endpoint deliberately CHANGES its answer between the freeze and
+/// the replay. The replay must still send the frozen amount — and must not call
+/// the tax API at all, which is the stronger statement.
+#[tokio::test]
+async fn a_reconciliation_replay_resends_the_frozen_tax_not_a_fresh_one() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let _sweep_guard = SWEEP_LOCK.lock().await;
+    disarm_all_autopay(&pool).await;
+
+    let user_id = autopay_user(&pool, "taxreplay", 10, 25).await;
+
+    // A stranded local claim, backdated past the reconciliation cutoff, with
+    // the tax ALREADY frozen at $1.65 by the attempt whose response was lost.
+    let idempotency_key = Uuid::new_v4().simple().to_string();
+    query(
+        r#"
+        INSERT INTO stripe_autopay_intents
+            (payment_intent_id, user_id, amount_usd, charge_amount_usd,
+             tax_amount_usd, tax_calculation_id, created_at)
+        VALUES ($1, $2, 25, 26.38, 1.65, 'taxcalc_frozen', NOW() - INTERVAL '45 minutes')
+        "#,
+    )
+    .bind(format!("local_{idempotency_key}"))
+    .bind(user_id)
+    .execute(&pool)
+    .await
+    .expect("stranded claim must insert");
+
+    // The world has moved on: this tax endpoint would now price $9.99. If the
+    // replay asked, it would charge a different amount.
+    let (app, spy) = tax_mock(TaxMock::Charges(999), true);
+    let base = serve(app).await;
+
+    run_autopay_sweep_once(&pool, &settings(&base)).await;
+
+    assert_eq!(
+        spy.charged.lock().expect("sink").as_slice(),
+        ["2803"],
+        "the replay re-sends the FROZEN total (2638 + 165), not a freshly priced one"
+    );
+    assert_eq!(
+        spy.calculations.load(Ordering::SeqCst),
+        0,
+        "the replay does not even ask: a frozen tax is reused, which also avoids \
+         paying Stripe for a calculation whose answer would be discarded"
+    );
+    assert_eq!(balance_of(&pool, user_id).await, Decimal::from(25));
+
+    query("UPDATE users SET autopay_enabled = FALSE WHERE id = $1")
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .expect("teardown disarm");
+}
+
+/// A charge collected at Stripe but WITHHELD from an ineligible account is
+/// money that must be refunded, and the refundable amount is what actually left
+/// the card — gross PLUS tax. Refunding only the ex-tax gross would short the
+/// customer by exactly the tax.
+#[tokio::test]
+async fn a_withheld_taxed_charge_is_refundable_for_the_taxed_total() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let user_id = autopay_user(&pool, "withheldtax", 10, 25).await;
+    // Disarm immediately. This test never runs a sweep, so it deliberately does
+    // NOT take SWEEP_LOCK — but `autopay_user` creates an ARMED user, and the
+    // sweep is global, so leaving it armed would make it a candidate for a
+    // concurrent sweep test and corrupt that test's charge counter. (It did.)
+    query("UPDATE users SET autopay_enabled = FALSE WHERE id = $1")
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .expect("this test must not leave an armed user for the sweep to find");
+    let intent_id = format!("pi_withheld_{}", Uuid::new_v4().simple());
+    query(
+        r#"
+        INSERT INTO stripe_autopay_intents
+            (payment_intent_id, user_id, amount_usd, charge_amount_usd,
+             tax_amount_usd, status)
+        VALUES ($1, $2, 25, 26.38, 1.65, 'withheld')
+        "#,
+    )
+    .bind(&intent_id)
+    .bind(user_id)
+    .execute(&pool)
+    .await
+    .expect("withheld row must insert");
+
+    let withheld = zerorouter::billing::withheld_autopay_intents(&pool)
+        .await
+        .expect("withheld query must run");
+    let refundable = withheld
+        .into_iter()
+        .find(|(id, _, _)| *id == intent_id)
+        .map(|(_, _, amount)| amount)
+        .expect("the withheld charge must be listed");
+    assert_eq!(
+        refundable,
+        Decimal::from_str("28.03").expect("literal"),
+        "the operator must refund the TAXED total that left the card, not the ex-tax gross"
+    );
+}
+
+/// The freeze itself, tested directly at the boundary two sweeps race on.
+///
+/// `replay_charge` normally reads the frozen tax and short-circuits before ever
+/// calling `freeze_autopay_tax` a second time, so the first-writer-wins
+/// behaviour is invisible to the end-to-end tests above — a mutation removing
+/// the `COALESCE` passes all of them. It is still load-bearing: a live sweep on
+/// one instance and a reconciliation replay on another can both read NULL and
+/// both price a tax, and if each then charged its own figure under the same
+/// idempotency key, Stripe would reject the second as a parameter mismatch and
+/// the claim would be terminal-failed on a charge that may already have taken
+/// the money. So the race is exercised here explicitly.
+#[tokio::test]
+async fn freezing_a_tax_twice_keeps_the_first_answer_and_its_calculation() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    // Held even though this test never sweeps: it writes pending rows to the
+    // shared intents table, and the sweep tests assert on exactly that table.
+    let _sweep_guard = SWEEP_LOCK.lock().await;
+    let user_id = autopay_user(&pool, "taxfreeze", 10, 25).await;
+    query("UPDATE users SET autopay_enabled = FALSE WHERE id = $1")
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .expect("this test must not leave an armed user for the sweep to find");
+    let claim_id = format!("local_{}", Uuid::new_v4().simple());
+    query(
+        r#"
+        INSERT INTO stripe_autopay_intents
+            (payment_intent_id, user_id, amount_usd, charge_amount_usd)
+        VALUES ($1, $2, 25, 26.38)
+        "#,
+    )
+    .bind(&claim_id)
+    .bind(user_id)
+    .execute(&pool)
+    .await
+    .expect("claim must insert");
+
+    // Racer A prices $1.65.
+    let first = zerorouter::billing::freeze_autopay_tax(
+        &pool,
+        &claim_id,
+        Decimal::from_str("1.65").expect("literal"),
+        Some("taxcalc_first"),
+    )
+    .await
+    .expect("freeze must run")
+    .expect("the pending claim must be found");
+    assert_eq!(first.tax_usd, Decimal::from_str("1.65").expect("literal"));
+    assert_eq!(first.calculation_id.as_deref(), Some("taxcalc_first"));
+
+    // Racer B prices $9.99 against a different calculation. It must be handed
+    // A's answer, not its own — both then POST the same amount.
+    let second = zerorouter::billing::freeze_autopay_tax(
+        &pool,
+        &claim_id,
+        Decimal::from_str("9.99").expect("literal"),
+        Some("taxcalc_second"),
+    )
+    .await
+    .expect("freeze must run")
+    .expect("the pending claim must be found");
+    assert_eq!(
+        second.tax_usd,
+        Decimal::from_str("1.65").expect("literal"),
+        "the first writer's tax wins, so both attempts charge the same total"
+    );
+    assert_eq!(
+        second.calculation_id.as_deref(),
+        Some("taxcalc_first"),
+        "the calculation is frozen as an ATOMIC PAIR with the amount: adopting \
+         the loser's calculation would record a tax figure that was never collected"
+    );
+
+    // A racer that falls back to untaxed FIRST also wins, and must not later
+    // acquire the other racer's calculation id — the pairing bug the CASE
+    // exists to prevent.
+    // A SECOND user: `stripe_autopay_one_pending_per_user` permits only one
+    // pending claim per user, which is the whole point of that index.
+    let other_user = autopay_user(&pool, "taxfreeze2", 10, 25).await;
+    query("UPDATE users SET autopay_enabled = FALSE WHERE id = $1")
+        .bind(other_user)
+        .execute(&pool)
+        .await
+        .expect("this test must not leave an armed user for the sweep to find");
+    let untaxed_claim = format!("local_{}", Uuid::new_v4().simple());
+    query(
+        r#"
+        INSERT INTO stripe_autopay_intents
+            (payment_intent_id, user_id, amount_usd, charge_amount_usd)
+        VALUES ($1, $2, 25, 26.38)
+        "#,
+    )
+    .bind(&untaxed_claim)
+    .bind(other_user)
+    .execute(&pool)
+    .await
+    .expect("second claim must insert");
+    zerorouter::billing::freeze_autopay_tax(&pool, &untaxed_claim, Decimal::ZERO, None)
+        .await
+        .expect("freeze must run")
+        .expect("claim must be found");
+    let after = zerorouter::billing::freeze_autopay_tax(
+        &pool,
+        &untaxed_claim,
+        Decimal::from_str("9.99").expect("literal"),
+        Some("taxcalc_late"),
+    )
+    .await
+    .expect("freeze must run")
+    .expect("claim must be found");
+    assert_eq!(
+        after.tax_usd,
+        Decimal::ZERO,
+        "the untaxed fallback still wins"
+    );
+    assert_eq!(
+        after.calculation_id, None,
+        "a zero tax must not end up paired with a calculation that priced 9.99"
+    );
+}

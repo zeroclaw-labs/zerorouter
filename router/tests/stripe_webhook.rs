@@ -17,7 +17,10 @@ use std::{
     collections::HashMap,
     path::PathBuf,
     str::FromStr,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::Duration,
 };
 
@@ -203,11 +206,20 @@ fn unique_session_id() -> String {
     format!("cs_test_{}", Uuid::new_v4().simple())
 }
 
-fn webhook_app(pool: &PgPool) -> axum::Router {
-    // The webhook arms never call Stripe, so the unreachable default base is
-    // the honest configuration for them.
-    stripe_app(pool, "https://api.stripe.invalid")
-}
+/// The Stripe base the webhook tests run against by default.
+///
+/// The webhook arms make no call that can move money, so an unreachable base is
+/// the honest configuration for most of them.
+///
+/// ONE arm does now reach out: since migration 0021 an autopay success records
+/// its tax transaction with Stripe. That call is deliberately fire-and-forget —
+/// the money is already correct by the time it runs, and a failure is logged
+/// rather than propagated — so pointing it at an unreachable host exercises
+/// exactly the "recording failed" path, and every autopay test in this file
+/// therefore doubles as evidence that a failed recording still returns 200 with
+/// the credit applied. Tests that want to OBSERVE the recording pass a mock to
+/// `post_webhook_against` instead.
+const UNREACHABLE_STRIPE: &str = "https://api.stripe.invalid";
 
 fn stripe_app(pool: &PgPool, api_base: &str) -> axum::Router {
     let config = WebConfig {
@@ -350,6 +362,12 @@ fn reverse_charged_session_event(
 
 /// POST a correctly signed payload at the real handler.
 async fn post_webhook(pool: &PgPool, payload: &str) -> (StatusCode, Value) {
+    post_webhook_against(pool, UNREACHABLE_STRIPE, payload).await
+}
+
+/// `post_webhook` with a caller-chosen Stripe base, so a test can watch what
+/// the arm does with Stripe rather than only what it does with the database.
+async fn post_webhook_against(pool: &PgPool, api_base: &str, payload: &str) -> (StatusCode, Value) {
     // Signed at the current time: the handler checks tolerance against the
     // real clock, so these events are as authentic as Stripe's own.
     let timestamp = Utc::now().timestamp();
@@ -361,7 +379,7 @@ async fn post_webhook(pool: &PgPool, payload: &str) -> (StatusCode, Value) {
         .header("content-type", "application/json")
         .body(Body::from(payload.to_owned()))
         .expect("webhook request should build");
-    let response = webhook_app(pool)
+    let response = stripe_app(pool, api_base)
         .oneshot(request)
         .await
         .expect("webhook request should complete");
@@ -1747,6 +1765,40 @@ fn autopay_intent_event_with_mark(
     .to_string()
 }
 
+/// The same event with the tax metadata migration 0021 added. `tax_cents` is
+/// `Option` so a test can produce all three wire shapes an operator will
+/// actually see: absent (an intent created by the pre-0021 binary, still being
+/// redelivered), `"0"` (asked and the answer was nothing — the shape of every
+/// charge until a registration exists), and a real figure.
+fn autopay_intent_event_with_tax(
+    intent_id: &str,
+    user_id: Uuid,
+    metadata_credit_usd: &str,
+    amount_received: i64,
+    tax_cents: Option<&str>,
+    calculation_id: Option<&str>,
+) -> String {
+    let mut event: serde_json::Value = serde_json::from_str(&autopay_intent_event(
+        "payment_intent.succeeded",
+        intent_id,
+        user_id,
+        metadata_credit_usd,
+        amount_received,
+        "usd",
+    ))
+    .expect("fixture must parse");
+    let metadata = event["data"]["object"]["metadata"]
+        .as_object_mut()
+        .expect("metadata object");
+    if let Some(tax_cents) = tax_cents {
+        metadata.insert("tax_cents".to_owned(), json!(tax_cents));
+    }
+    if let Some(calculation_id) = calculation_id {
+        metadata.insert("tax_calculation".to_owned(), json!(calculation_id));
+    }
+    event.to_string()
+}
+
 async fn enable_autopay(pool: &PgPool, user_id: Uuid) {
     query(
         r#"
@@ -1944,4 +1996,296 @@ async fn foreign_payment_intents_are_ignored() {
     let (status, _) = post_webhook(&pool, &payload).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(balance_of(&pool, user_id).await, Decimal::ZERO);
+}
+
+// ---------------------------------------------------------------------------
+// Autopay sales tax (migration 0021)
+//
+// The invariant under test throughout: the card is charged the ex-tax gross
+// PLUS tax, and the balance still receives EXACTLY the credit. Tax never
+// becomes credit and never becomes revenue.
+// ---------------------------------------------------------------------------
+
+/// The nonzero-tax shape. A $25 top-up is $26.38 gross; Massachusetts at
+/// 6.25% adds $1.65, so Stripe collects $28.03 — and the buyer is credited
+/// $25.00, exactly as an untaxed top-up credits.
+#[tokio::test]
+async fn a_taxed_autopay_recharge_credits_the_credit_not_the_collection() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let user_id = create_user(&pool, "autopay-taxed").await;
+    enable_autopay(&pool, user_id).await;
+    let intent_id = format!("pi_test_{}", Uuid::new_v4().simple());
+
+    let payload = autopay_intent_event_with_tax(
+        &intent_id,
+        user_id,
+        "25",
+        2803,
+        Some("165"),
+        Some("taxcalc_test"),
+    );
+    let (status, _) = post_webhook(&pool, &payload).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        balance_of(&pool, user_id).await,
+        Decimal::from(25),
+        "the tax is collected on top and never credited",
+    );
+
+    // The ledger entry is the NET credit, not the collection and not the gross.
+    let credited = query_scalar::<_, Decimal>(
+        "SELECT amount_usd FROM credit_ledger WHERE stripe_session_id = $1 AND entry_type = 'autopay'",
+    )
+    .bind(&intent_id)
+    .fetch_one(&pool)
+    .await
+    .expect("ledger row must exist");
+    assert_eq!(credited, Decimal::from(25));
+
+    // A redelivery of the SAME taxed event must not credit again. Stripe
+    // retries, and the sweep's inline settle races the webhook on every fast
+    // charge, so this is the ordinary case rather than an exotic one.
+    let (status, _) = post_webhook(&pool, &payload).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(balance_of(&pool, user_id).await, Decimal::from(25));
+    let ledger_rows = query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM credit_ledger WHERE stripe_session_id = $1 AND entry_type = 'autopay'",
+    )
+    .bind(&intent_id)
+    .fetch_one(&pool)
+    .await
+    .expect("ledger must query");
+    assert_eq!(ledger_rows, 1, "a redelivered taxed event credits once");
+}
+
+/// The zero-tax shape, which is what EVERY charge looks like until a tax
+/// registration exists: Stripe was asked, computed nothing, and the collection
+/// equals the bare gross. This must credit exactly as it did before 0021 — the
+/// evidence that the feature ships inert.
+#[tokio::test]
+async fn a_zero_tax_autopay_recharge_credits_exactly_as_before() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let user_id = create_user(&pool, "autopay-zerotax").await;
+    enable_autopay(&pool, user_id).await;
+    let intent_id = format!("pi_test_{}", Uuid::new_v4().simple());
+
+    let payload = autopay_intent_event_with_tax(
+        &intent_id,
+        user_id,
+        "25",
+        2638,
+        Some("0"),
+        Some("taxcalc_zero"),
+    );
+    let (status, _) = post_webhook(&pool, &payload).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(balance_of(&pool, user_id).await, Decimal::from(25));
+}
+
+/// An intent created by the PRE-0021 binary carries no `tax_cents` key at all,
+/// and its `amount_received` is the bare gross. Stripe retries a webhook for
+/// days, so such an event can easily arrive at a binary that already has this
+/// change — and it must still credit. An absent key therefore reads as zero
+/// tax; it is not treated as malformed.
+#[tokio::test]
+async fn an_intent_from_before_tax_existed_still_credits() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let user_id = create_user(&pool, "autopay-pre0021").await;
+    enable_autopay(&pool, user_id).await;
+    let intent_id = format!("pi_test_{}", Uuid::new_v4().simple());
+
+    let payload = autopay_intent_event_with_tax(&intent_id, user_id, "25", 2638, None, None);
+    let (status, _) = post_webhook(&pool, &payload).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(balance_of(&pool, user_id).await, Decimal::from(25));
+}
+
+/// The attack the tax field could conceivably enable, and why it cannot.
+///
+/// `tax_cents` is NOT covered by the provenance HMAC, so a co-tenant who could
+/// somehow reuse a valid mark might try to bend it. It is SUBTRACTED from what
+/// Stripe collected, so the only useful direction is negative — claim a
+/// negative tax and a small collection satisfies a large credit. Negative
+/// values are refused outright, and so is anything unparseable, rather than
+/// being coerced to zero: coercion would turn a garbled figure into a short
+/// payment credited in full.
+#[tokio::test]
+async fn a_tax_figure_that_would_credit_more_than_was_collected_credits_nothing() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let user_id = create_user(&pool, "autopay-taxforge").await;
+    enable_autopay(&pool, user_id).await;
+
+    for (label, amount_received, tax_cents) in [
+        // The real attack: $1.00 collected, a negative tax bending it up to the
+        // $26.38 gross the $25 credit demands.
+        ("negative tax", 100, Some("-2538")),
+        // Unparseable figures are refused, not read as zero.
+        ("not a number", 2638, Some("banana")),
+        ("empty", 2638, Some("")),
+        ("fractional", 2803, Some("165.4")),
+        // A tax that does not reconcile: collected the untaxed gross while
+        // claiming tax was added on top.
+        ("tax claimed but not collected", 2638, Some("165")),
+        // Collected more than gross+tax.
+        ("over-collection", 2900, Some("165")),
+    ] {
+        let intent_id = format!("pi_test_{}", Uuid::new_v4().simple());
+        let payload = autopay_intent_event_with_tax(
+            &intent_id,
+            user_id,
+            "25",
+            amount_received,
+            tax_cents,
+            None,
+        );
+        let (status, _) = post_webhook(&pool, &payload).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{label} must be refused, not credited"
+        );
+        assert_eq!(
+            balance_of(&pool, user_id).await,
+            Decimal::ZERO,
+            "{label} credited something"
+        );
+    }
+}
+
+/// A Stripe stand-in that counts tax-transaction recordings and remembers the
+/// `reference` each one carried.
+async fn mock_tax_transactions() -> (String, Arc<AtomicUsize>, Arc<Mutex<Vec<String>>>) {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let references = Arc::new(Mutex::new(Vec::new()));
+    let sink = (calls.clone(), references.clone());
+    let app = axum::Router::new().route(
+        "/v1/tax/transactions/create_from_calculation",
+        axum::routing::post(move |body: String| {
+            let (calls, references) = sink.clone();
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                if let Some(reference) = body
+                    .split('&')
+                    .filter_map(|pair| pair.split_once('='))
+                    .find(|(key, _)| *key == "reference")
+                    .map(|(_, value)| value.to_owned())
+                {
+                    references.lock().expect("reference sink").push(reference);
+                }
+                axum::Json(json!({ "id": "tax_test", "object": "tax.transaction" }))
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("mock stripe should bind");
+    let address = listener.local_addr().expect("mock stripe address");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    (format!("http://{address}"), calls, references)
+}
+
+/// THE EVENT-ARRIVES-TWICE CASE, for tax.
+///
+/// Stripe retries webhooks, and the sweep's own inline settle races the webhook
+/// on every fast charge, so the same success is routinely processed more than
+/// once. Crediting is already deduplicated by the pending→succeeded transition;
+/// tax REPORTING has to ride on the same guard, because a tax transaction
+/// recorded twice would over-report collected tax to a jurisdiction.
+///
+/// The gate is the settlement OUTCOME, not the event: only the delivery that
+/// actually credited records. The second delivery sees `AlreadySettled` and
+/// records nothing.
+#[tokio::test]
+async fn a_redelivered_taxed_success_records_its_tax_exactly_once() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let user_id = create_user(&pool, "autopay-taxdedup").await;
+    enable_autopay(&pool, user_id).await;
+    let intent_id = format!("pi_test_{}", Uuid::new_v4().simple());
+    let (api_base, calls, references) = mock_tax_transactions().await;
+
+    let payload = autopay_intent_event_with_tax(
+        &intent_id,
+        user_id,
+        "25",
+        2803,
+        Some("165"),
+        Some("taxcalc_dedup"),
+    );
+
+    let (status, _) = post_webhook_against(&pool, &api_base, &payload).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(balance_of(&pool, user_id).await, Decimal::from(25));
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "the crediting delivery records the tax transaction"
+    );
+
+    // Same event again, byte for byte, exactly as Stripe would redeliver it.
+    let (status, _) = post_webhook_against(&pool, &api_base, &payload).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        balance_of(&pool, user_id).await,
+        Decimal::from(25),
+        "no second credit"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "and no second tax transaction: a redelivery must not inflate a tax return"
+    );
+
+    let references = references.lock().expect("references").clone();
+    assert_eq!(
+        references,
+        vec![intent_id.clone()],
+        "the reference is the PaymentIntent id, which Stripe requires to be \
+         unique across all transactions — so even if this gate were lost, \
+         Stripe itself would refuse the duplicate"
+    );
+}
+
+/// A tax transaction that cannot be recorded must not undo a correct credit.
+/// By the time recording runs the card has been charged and the balance
+/// credited; failing the webhook would only make Stripe redeliver an event with
+/// nothing left to settle. So the arm returns 200 and logs, and the credit
+/// stands. (`webhook_app`'s unreachable base is what makes this the default
+/// path for every other autopay test in this file.)
+#[tokio::test]
+async fn a_failed_tax_recording_does_not_disturb_the_credit() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let user_id = create_user(&pool, "autopay-taxrecfail").await;
+    enable_autopay(&pool, user_id).await;
+    let intent_id = format!("pi_test_{}", Uuid::new_v4().simple());
+
+    let payload = autopay_intent_event_with_tax(
+        &intent_id,
+        user_id,
+        "25",
+        2803,
+        Some("165"),
+        Some("taxcalc_unreachable"),
+    );
+    // `post_webhook` points at api.stripe.invalid: the recording cannot succeed.
+    let (status, _) = post_webhook(&pool, &payload).await;
+    assert_eq!(status, StatusCode::OK, "the webhook still succeeds");
+    assert_eq!(
+        balance_of(&pool, user_id).await,
+        Decimal::from(25),
+        "the credit is unaffected by a reporting failure"
+    );
 }

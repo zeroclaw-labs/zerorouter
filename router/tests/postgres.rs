@@ -1072,13 +1072,13 @@ async fn migration_chain_applies_on_a_fresh_database() {
         "request_attempts does carry finish_reason, which is exactly why the \
          missing source column matters"
     );
-    // 20, not 16: 0013 (dispute resolution), 0014 (dispatched reservations),
+    // 21, not 17: 0013 (dispute resolution), 0014 (dispatched reservations),
     // 0015 (released reservations), 0016 (deposit fee), 0017 (stripe observed
-    // reversals), 0018 (autopay withheld state), 0019 (monthly spend rollup)
-    // and 0020 (usage gap and real finish reason) are numbered with a gap so
-    // 0010-0012 stay available to branches in flight. The chain's head is the
-    // highest version applied, not a count of files.
-    assert_eq!(outcome.16, 20, "the chain reaches migration version 20");
+    // reversals), 0018 (autopay withheld state), 0019 (monthly spend rollup),
+    // 0020 (usage gap and real finish reason) and 0021 (autopay tax) are
+    // numbered with a gap so 0010-0012 stay available to branches in flight.
+    // The chain's head is the highest version applied, not a count of files.
+    assert_eq!(outcome.16, 21, "the chain reaches migration version 21");
 }
 
 /// Rewrite the database name in a Postgres URL, keeping any query string

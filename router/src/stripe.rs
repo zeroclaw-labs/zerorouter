@@ -209,8 +209,11 @@
 //! | the deposit fee | revenue; never a ledger row, derivable as `expected_amount_cents - expected_credit_usd * 100` |
 //! | sales tax | collected by Stripe on ZeroRouter's behalf and owed to a taxing jurisdiction — not revenue, not balance, and not recorded here |
 //!
-//! This covers CHECKOUT only. Autopay recharges are raw PaymentIntents, which
-//! Stripe cannot apply automatic tax to at all — see the autopay section below.
+//! The table above describes CHECKOUT, but the same three rules now hold for
+//! autopay: a raw PaymentIntent still takes no `automatic_tax`, so autopay
+//! prices tax through the Tax Calculation API instead and records its own tax
+//! transaction — see the autopay section below. Tax lands nowhere in the ledger
+//! on either path.
 //!
 //! `stripe_checkout_intents.expected_amount_cents` therefore keeps meaning the
 //! **ex-tax** gross ZeroRouter quoted, so fee revenue stays exactly
@@ -2181,32 +2184,204 @@ mod tests {
             );
         }
     }
+
+    // -----------------------------------------------------------------------
+    // Autopay tax location (migration 0021)
+    // -----------------------------------------------------------------------
+
+    fn card_with(address: serde_json::Value) -> Value {
+        serde_json::json!({ "id": "pm_test", "billing_details": { "address": address } })
+    }
+
+    #[test]
+    fn a_complete_billing_address_locates_the_buyer_for_tax() {
+        let card = card_with(serde_json::json!({
+            "line1": "1 Broadway",
+            "city": "Cambridge",
+            "state": "MA",
+            "postal_code": "02142",
+            "country": "US",
+        }));
+        assert_eq!(
+            autopay_tax_address(&card),
+            Ok(TaxAddress {
+                country: "US".to_owned(),
+                postal_code: Some("02142".to_owned()),
+                state: Some("MA".to_owned()),
+                city: Some("Cambridge".to_owned()),
+                line1: Some("1 Broadway".to_owned()),
+            })
+        );
+    }
+
+    #[test]
+    fn a_non_us_buyer_needs_only_a_country() {
+        // Stripe rates most countries from the country code alone; only the US
+        // (and Canada, via postal code or province) needs more. Demanding a
+        // postal code everywhere would push EU buyers onto the untaxed
+        // fallback for no reason.
+        let card = card_with(serde_json::json!({ "country": "IE" }));
+        assert_eq!(
+            autopay_tax_address(&card).map(|address| address.country),
+            Ok("IE".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_card_without_an_address_falls_back_rather_than_inventing_one() {
+        // Stripe only captures billing details on the setup session if the
+        // account is configured to, so this is the ordinary state of a card
+        // saved before that was switched on — not an error.
+        for card in [
+            serde_json::json!({ "id": "pm_test" }),
+            serde_json::json!({ "id": "pm_test", "billing_details": {} }),
+            serde_json::json!({ "id": "pm_test", "billing_details": { "address": null } }),
+            // Present but not an object: refused rather than coerced.
+            serde_json::json!({ "id": "pm_test", "billing_details": { "address": "MA" } }),
+        ] {
+            assert_eq!(
+                autopay_tax_address(&card),
+                Err(TaxFallback::NoBillingAddress),
+                "{card} should yield no billing address"
+            );
+        }
+    }
+
+    #[test]
+    fn an_address_too_thin_to_rate_falls_back_before_calling_stripe() {
+        for address in [
+            // No country at all: the API requires one.
+            serde_json::json!({ "postal_code": "02142" }),
+            serde_json::json!({ "country": null, "postal_code": "02142" }),
+            // Blank and whitespace-only are absent, not a location.
+            serde_json::json!({ "country": "", "postal_code": "02142" }),
+            serde_json::json!({ "country": "   ", "postal_code": "02142" }),
+            // US without a postal code. Stripe cannot rate a US buyer from a
+            // country code alone, NOR from country plus state, so this would be
+            // a guaranteed round trip and error.
+            serde_json::json!({ "country": "US" }),
+            serde_json::json!({ "country": "US", "state": "MA" }),
+            serde_json::json!({ "country": "US", "postal_code": "  " }),
+            // Case must not smuggle a US address past the postal-code rule.
+            serde_json::json!({ "country": "us", "state": "MA" }),
+        ] {
+            assert_eq!(
+                autopay_tax_address(&card_with(address.clone())),
+                Err(TaxFallback::IncompleteAddress),
+                "{address} should be incomplete"
+            );
+        }
+    }
+
+    #[test]
+    fn fallback_reasons_have_stable_log_values() {
+        // These strings are what an operator alerts on ("is autopay silently
+        // charging untaxed?"), so they are part of the contract, not prose.
+        assert_eq!(TaxFallback::NoBillingAddress.as_str(), "no_billing_address");
+        assert_eq!(
+            TaxFallback::IncompleteAddress.as_str(),
+            "incomplete_address"
+        );
+        assert_eq!(
+            TaxFallback::CalculationRejected.as_str(),
+            "calculation_rejected"
+        );
+        assert_eq!(
+            TaxFallback::CalculationUnavailable.as_str(),
+            "calculation_unavailable"
+        );
+        assert_eq!(TAX_FALLBACK_FIELD, "autopay_tax_fallback");
+    }
+
+    #[test]
+    fn the_tax_metadata_keys_are_the_pinned_wire_contract() {
+        // The form parameter and the key the webhook reads back must stay in
+        // lockstep: they are written by one binary and read by another during
+        // a rollout, and a rename that touched only one side would make every
+        // taxed charge look like a short payment and credit nothing.
+        assert_eq!(
+            AUTOPAY_TAX_CENTS_PARAM,
+            format!("metadata[{AUTOPAY_TAX_CENTS_KEY}]")
+        );
+        assert_eq!(
+            AUTOPAY_TAX_CALCULATION_PARAM,
+            format!("metadata[{AUTOPAY_TAX_CALCULATION_KEY}]")
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Autopay (migration 0008): saved-card auto-recharge.
 //
-// ⚠️ AUTOPAY IS NOT TAXED, AND CANNOT BE FROM HERE. Autopay charges the saved
-// card through `POST /v1/payment_intents`, and a raw PaymentIntent has no
-// `automatic_tax` parameter at all — the field does not exist on that endpoint.
-// So the same product, bought the same day by the same customer, collects tax
-// through checkout and no tax through autopay. That asymmetry is deliberate
-// only in the sense that it is what the API allows; it is not a position anyone
-// has taken.
+// AUTOPAY IS TAXED (migration 0021), through the Tax Calculation API rather
+// than `automatic_tax`. See [`calculate_autopay_tax`] for the mechanism and
+// [`autopay_tax_address`] for where the buyer's location comes from.
 //
-// Closing it is a separate piece of work and a money decision, not a parameter:
-// it means calling the Tax Calculation API before the charge, setting the
-// PaymentIntent `amount` from the calculation's total (so `amount_received`
-// stops equalling the gross, exactly as `amount_total` did for checkout), and
-// recording a tax transaction afterwards or the sale never reaches the tax
-// reports. It also raises what an existing autopay customer is charged without
-// their re-consenting, which is the operator's call to make.
+// It remains true that `POST /v1/payment_intents` has no `automatic_tax`
+// parameter — that was checked against the endpoint's full parameter list, not
+// assumed. What is NOT true, and was the operative claim here before, is that
+// this closes off the subject. Two other routes exist, and the one chosen
+// matters enough to record:
 //
-// Until then the corroboration below stays as it was — `amount_received` IS the
-// gross — because nothing in this path can add tax.
+//   1. `hooks[inputs][tax][calculation]` on the PaymentIntent (Stripe's
+//      "simplified" Tax API integration, GA in `2025-11-17.clover`). Stripe
+//      then creates the tax transaction on success AND reverses it on refund,
+//      with no extra call from us. Genuinely nicer bookkeeping — and REJECTED,
+//      because it puts a version-gated parameter on the money path. This
+//      account's default API version is demonstrably older than
+//      `2026-03-25.dahlia` (that is why [`CHECKOUT_API_VERSION`] exists at
+//      all), so whether it accepts `hooks` is unknown, and an unknown-parameter
+//      rejection would fail the CHARGE, not merely the tax. Reaching the
+//      capability would mean pinning the PaymentIntent request to a non-default
+//      API version — moving the money path onto a new API train as a side
+//      effect of a tax change, which is exactly what pinning was declined for
+//      on this client. A top-up must never fail because tax could not be
+//      computed; making the charge itself depend on a tax feature inverts that.
+//
+//   2. Invoices with `automatic_tax`. Rejected for three independent reasons.
+//      It replaces one POST-under-one-idempotency-key with a multi-call
+//      orchestration (invoice item, invoice, finalize), and the entire
+//      exactly-once story here — the `local_<key>` claim, the replay, the
+//      20-hour window — is built on there being exactly one request to replay.
+//      Stripe's own dunning would then retry a failed invoice on ITS schedule,
+//      outside [`billing::AUTOPAY_ELIGIBILITY_PREDICATE`], which is an
+//      uncontrolled second charge path aimed straight at the invariant that a
+//      frozen or indebted account is never charged. And it would compute zero
+//      tax for everyone anyway until a Customer write is added, because Stripe
+//      resolves an invoice's location from the Customer's shipping or billing
+//      address or a DEFAULT payment method, none of which this deployment sets.
+//
+// So: the Tax Calculation API, an unchanged PaymentIntent request shape, and an
+// explicit tax transaction afterwards. Every version-gated parameter stays off
+// the money path; the charge differs from the untaxed one only in `amount`.
+//
+// The ledger invariant is unchanged and is the reason the accounting below
+// barely moves: `amount_usd` is still the NET credit, `charge_amount_usd` is
+// still the EX-TAX gross, and tax is a third quantity in its own column that is
+// neither credited nor counted as revenue. What DID have to change is the
+// corroboration — `amount_received` is no longer the gross — and it changes the
+// same way checkout's did, by subtracting the tax back off before comparing.
 // ---------------------------------------------------------------------------
 
 const AUTOPAY_PURPOSE: &str = "zerorouter_autopay";
+/// The `line_items[0][reference]` on an autopay tax calculation. Stripe only
+/// requires it to be present; it surfaces as the line's label in the Tax
+/// Transactions view, so it says what was sold rather than repeating an id.
+const AUTOPAY_TAX_LINE_REFERENCE: &str = "ZeroRouter credits (autopay)";
+/// Metadata key carrying the tax collected on top of the ex-tax gross, in
+/// cents. The webhook subtracts it from `amount_received` to recover the
+/// ex-tax figure its corroboration is denominated in — the autopay twin of
+/// [`collected_ex_tax_cents`].
+const AUTOPAY_TAX_CENTS_KEY: &str = "tax_cents";
+/// Metadata key carrying the Tax Calculation id, so the webhook can record the
+/// tax transaction without a database round trip.
+const AUTOPAY_TAX_CALCULATION_KEY: &str = "tax_calculation";
+/// The same two keys as form parameters. Spelled out rather than built with
+/// `format!` per charge: the form takes `&str`, and allocating (or worse,
+/// leaking) a constant string on every off-session charge would be a slow leak
+/// on the one path that runs unattended in a loop.
+const AUTOPAY_TAX_CENTS_PARAM: &str = "metadata[tax_cents]";
+const AUTOPAY_TAX_CALCULATION_PARAM: &str = "metadata[tax_calculation]";
 const AUTOPAY_SWEEP_BATCH: i64 = 16;
 /// Pending intents older than this are reconciled against Stripe directly.
 const AUTOPAY_RECONCILE_AFTER_MINUTES: i32 = 30;
@@ -2308,6 +2483,385 @@ fn stripe_client() -> Result<reqwest::Client, StripeHttpError> {
         .timeout(STRIPE_HTTP_TIMEOUT)
         .build()
         .map_err(|_| StripeHttpError::CheckoutFailed)
+}
+
+// ---------------------------------------------------------------------------
+// Autopay sales tax (migration 0021)
+// ---------------------------------------------------------------------------
+
+/// The one structured log field every untaxed-fallback site sets, so "how often
+/// is autopay charging untaxed, and why?" is one query rather than a grep for
+/// prose. The value is one of the [`TaxFallback`] reasons.
+const TAX_FALLBACK_FIELD: &str = "autopay_tax_fallback";
+
+/// Why an autopay charge went out without tax. Every variant is a DEGRADED BUT
+/// SUCCESSFUL top-up: the charge still happens, for the untaxed gross, exactly
+/// as it did before migration 0021. A dead top-up is worse than an untaxed one
+/// — the customer's inference stops — so nothing in the tax path is allowed to
+/// fail the charge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TaxFallback {
+    /// The saved card carries no billing address at all. Stripe collects
+    /// billing details on the setup Checkout Session only if the account's
+    /// settings ask for them, so this is the expected state for cards saved
+    /// before that was configured.
+    NoBillingAddress,
+    /// An address is present but cannot locate a buyer for tax: no country, or
+    /// a US address with no postal code (Stripe cannot rate a US buyer from a
+    /// country code alone, nor from country plus state).
+    IncompleteAddress,
+    /// Stripe understood the request and refused to price it — in practice
+    /// `customer_tax_location_invalid`, an address that looks complete but does
+    /// not resolve.
+    CalculationRejected,
+    /// The Tax API could not be reached, or answered in a shape this code
+    /// cannot read. Distinct from `CalculationRejected` because it is an
+    /// availability problem, not a data problem: the same buyer will probably
+    /// be taxed correctly on the next sweep.
+    CalculationUnavailable,
+}
+
+impl TaxFallback {
+    /// Stable log values. These are grepped and alerted on; do not rename one
+    /// without meaning to break whatever is watching it.
+    fn as_str(self) -> &'static str {
+        match self {
+            TaxFallback::NoBillingAddress => "no_billing_address",
+            TaxFallback::IncompleteAddress => "incomplete_address",
+            TaxFallback::CalculationRejected => "calculation_rejected",
+            TaxFallback::CalculationUnavailable => "calculation_unavailable",
+        }
+    }
+}
+
+/// A buyer location good enough for Stripe Tax, lifted from the saved card.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TaxAddress {
+    country: String,
+    postal_code: Option<String>,
+    state: Option<String>,
+    city: Option<String>,
+    line1: Option<String>,
+}
+
+/// Read a usable tax location off a PaymentMethod object.
+///
+/// # Where this address comes from, and why there is no other candidate
+///
+/// [`ensure_stripe_customer`] creates the Stripe Customer with an email and a
+/// metadata user id and NOTHING ELSE — no `address`, no `shipping`, no
+/// `tax[validate_location]`. So the Customer object holds no location, and
+/// passing `customer` to a tax calculation (which copies the Customer's address
+/// into `customer_details`) would copy nothing. The saved card's
+/// `billing_details.address`, captured by the `mode=setup` Checkout Session, is
+/// the only address Stripe has for an autopay buyer.
+///
+/// The Tax API will not go and find it: "the address provided in the API
+/// request is used directly for tax calculations. There is no fallback to other
+/// address sources such as shipping address, billing address, payment method,
+/// or IP addresses." (That fallback chain exists for Invoices and
+/// Subscriptions, and even there it reaches a payment method only through a
+/// *default* payment method pointer this deployment never sets.) So the address
+/// has to be passed explicitly, and this is where it is read.
+///
+/// It costs no extra API call: `replay_charge` already lists the customer's
+/// payment methods to find the card to charge, and `billing_details` rides
+/// along in that same response.
+///
+/// # What is deliberately NOT done
+///
+/// **No address is invented.** There is no default country, no head-office
+/// fallback, no guess from the card's issuing country. An absent or unusable
+/// address means an untaxed charge and a `no_billing_address` /
+/// `incomplete_address` log line, never a plausible-looking address that would
+/// bill a real jurisdiction for a buyer who might not be in it.
+///
+/// **The address is not copied onto the Customer.** It would be a write to
+/// shared Stripe state on the money path, with no idempotency key, racing
+/// concurrent sweeps, to feed an API that does not read it — and it would
+/// silently change the tax behaviour of any future invoice or subscription
+/// surface, which is the operator's decision to make deliberately rather than
+/// inherit from a top-up.
+///
+/// # The completeness rules
+///
+/// `country` is required by the API. Beyond that this mirrors Stripe's
+/// documented minimums rather than sending a request that is bound to fail: a
+/// US address needs a postal code, because Stripe cannot calculate US tax from
+/// a country code alone *or* from country plus state. Checking locally turns a
+/// guaranteed round trip and error into an immediate, cheaper fallback; the
+/// remote `customer_tax_location_invalid` case is still handled, because an
+/// address can pass these checks and still not resolve.
+fn autopay_tax_address(payment_method: &Value) -> Result<TaxAddress, TaxFallback> {
+    /// Stripe renders unset address components as JSON null; treat a
+    /// whitespace-only string the same as absent so a blank form field cannot
+    /// masquerade as a location.
+    fn field(address: &Value, key: &str) -> Option<String> {
+        let value = address.get(key)?.as_str()?.trim();
+        (!value.is_empty()).then(|| value.to_owned())
+    }
+
+    let address = payment_method
+        .get("billing_details")
+        .and_then(|details| details.get("address"))
+        .filter(|address| address.is_object())
+        .ok_or(TaxFallback::NoBillingAddress)?;
+
+    let country = field(address, "country").ok_or(TaxFallback::IncompleteAddress)?;
+    let postal_code = field(address, "postal_code");
+    if country.eq_ignore_ascii_case("US") && postal_code.is_none() {
+        return Err(TaxFallback::IncompleteAddress);
+    }
+    Ok(TaxAddress {
+        country,
+        postal_code,
+        state: field(address, "state"),
+        city: field(address, "city"),
+        line1: field(address, "line1"),
+    })
+}
+
+/// A priced tax: what to add to the charge, and the calculation that says so.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TaxQuote {
+    tax_usd: Decimal,
+    /// `None` only on the untaxed fallback, where the tax is zero and there is
+    /// no calculation to record a transaction from.
+    calculation_id: Option<String>,
+}
+
+impl TaxQuote {
+    /// The untaxed fallback: charge exactly what this path charged before
+    /// migration 0021.
+    fn untaxed() -> Self {
+        TaxQuote {
+            tax_usd: Decimal::ZERO,
+            calculation_id: None,
+        }
+    }
+}
+
+/// Price the sales tax on one autopay top-up.
+///
+/// The line item is the EX-TAX GROSS — credit plus deposit fee — because that
+/// is the whole consideration the customer pays for the credits, and tax is due
+/// on the consideration, not on the part of it ZeroRouter keeps. It sends no
+/// `tax_code` and no `tax_behavior`, exactly as the checkout path does not:
+/// both come from Tax Settings so the operator can revise a contested
+/// classification without a deploy, and so checkout and autopay cannot drift
+/// into taxing the same product two different ways.
+///
+/// # This function cannot fail the charge
+///
+/// Every error path returns the untaxed fallback and logs it with
+/// [`TAX_FALLBACK_FIELD`]. That is the binding constraint on this whole
+/// feature: with no tax registrations Stripe computes zero tax for everyone
+/// anyway, so an untaxed top-up is today indistinguishable from a taxed one —
+/// but a top-up that FAILED because a tax service was unreachable would stop a
+/// customer's inference over a figure that is currently always zero.
+///
+/// # No API version pin
+///
+/// Unlike [`checkout_client`], this sends nothing version-gated: the endpoint
+/// and the three response fields read here (`id`, `amount_total`,
+/// `tax_amount_exclusive`) are long-stable, and no enum value introduced by a
+/// later API version appears in the request. The checkout pin exists because
+/// being wrong there is a total checkout outage; being wrong here is a logged
+/// fallback. Pinning would also freeze tax computation at one version, when
+/// tracking current rates and rules is the entire point of Stripe Tax.
+async fn calculate_autopay_tax(
+    settings: &StripeSettings,
+    client: &reqwest::Client,
+    user_id: Uuid,
+    payment_method: &Value,
+    gross_cents: i64,
+) -> TaxQuote {
+    let address = match autopay_tax_address(payment_method) {
+        Ok(address) => address,
+        Err(reason) => {
+            tracing::warn!(
+                %user_id,
+                { TAX_FALLBACK_FIELD } = reason.as_str(),
+                "autopay top-up charged without tax: the saved card has no usable billing address"
+            );
+            return TaxQuote::untaxed();
+        }
+    };
+
+    let gross = gross_cents.to_string();
+    let mut form: Vec<(&str, &str)> = vec![
+        ("currency", CHECKOUT_CURRENCY),
+        ("line_items[0][amount]", &gross),
+        ("line_items[0][reference]", AUTOPAY_TAX_LINE_REFERENCE),
+        ("customer_details[address][country]", &address.country),
+        // Required whenever an address is given. `billing` is the truth: this
+        // is the card's billing address, not a shipping destination.
+        ("customer_details[address_source]", "billing"),
+    ];
+    for (key, value) in [
+        (
+            "customer_details[address][postal_code]",
+            &address.postal_code,
+        ),
+        ("customer_details[address][state]", &address.state),
+        ("customer_details[address][city]", &address.city),
+        ("customer_details[address][line1]", &address.line1),
+    ] {
+        if let Some(value) = value {
+            form.push((key, value));
+        }
+    }
+
+    let response = client
+        .post(format!("{}/v1/tax/calculations", settings.api_base))
+        .bearer_auth(&settings.secret_key)
+        .form(&form)
+        .send()
+        .await;
+    let response = match response {
+        Ok(response) => response,
+        Err(_) => {
+            tracing::warn!(
+                %user_id,
+                { TAX_FALLBACK_FIELD } = TaxFallback::CalculationUnavailable.as_str(),
+                "autopay top-up charged without tax: the Stripe Tax API could not be reached"
+            );
+            return TaxQuote::untaxed();
+        }
+    };
+    let status = response.status();
+    if !status.is_success() {
+        // A 4xx is the buyer's address (`customer_tax_location_invalid` and
+        // friends); a 5xx is Stripe. Both fall back, but they are different
+        // operational problems and the log says which.
+        let reason = if status.is_client_error() {
+            TaxFallback::CalculationRejected
+        } else {
+            TaxFallback::CalculationUnavailable
+        };
+        tracing::warn!(
+            %user_id,
+            status = status.as_u16(),
+            { TAX_FALLBACK_FIELD } = reason.as_str(),
+            "autopay top-up charged without tax: Stripe refused to calculate it"
+        );
+        return TaxQuote::untaxed();
+    }
+    let Ok(body) = response.json::<Value>().await else {
+        tracing::warn!(
+            %user_id,
+            { TAX_FALLBACK_FIELD } = TaxFallback::CalculationUnavailable.as_str(),
+            "autopay top-up charged without tax: the tax calculation response did not parse"
+        );
+        return TaxQuote::untaxed();
+    };
+
+    // `tax_amount_exclusive` is "the amount of tax to be collected on top of
+    // the line item prices" — the exclusive figure, which is the only one that
+    // can be right here: the ToS prices credits exclusive of tax and the fee
+    // margin assumes the gross arrives intact. A calculation that came back
+    // INCLUSIVE would mean Tax Settings is on `Inclusive`, which is the same
+    // misconfiguration that breaks checkout; refusing to read it keeps autopay
+    // charging the correct (untaxed) amount instead of quietly collecting a tax
+    // carved out of ZeroRouter's own margin.
+    let inclusive = body
+        .get("tax_amount_inclusive")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let exclusive = body.get("tax_amount_exclusive").and_then(Value::as_i64);
+    let calculation_id = body.get("id").and_then(Value::as_str);
+    let (Some(tax_cents), Some(calculation_id)) = (exclusive, calculation_id) else {
+        tracing::warn!(
+            %user_id,
+            { TAX_FALLBACK_FIELD } = TaxFallback::CalculationUnavailable.as_str(),
+            "autopay top-up charged without tax: the tax calculation omitted its id or exclusive tax"
+        );
+        return TaxQuote::untaxed();
+    };
+    if tax_cents < 0 || inclusive != 0 {
+        tracing::error!(
+            %user_id,
+            tax_cents,
+            inclusive,
+            { TAX_FALLBACK_FIELD } = TaxFallback::CalculationRejected.as_str(),
+            "autopay top-up charged without tax: the calculation was negative or tax-inclusive, which would carve tax out of the deposit fee — check Tax Settings' default tax behavior"
+        );
+        return TaxQuote::untaxed();
+    }
+    TaxQuote {
+        tax_usd: Decimal::from(tax_cents) / Decimal::ONE_HUNDRED,
+        calculation_id: Some(calculation_id.to_owned()),
+    }
+}
+
+/// Turn the calculation that priced a settled charge into a recorded tax
+/// TRANSACTION, which is what actually reaches Stripe's tax reports and the
+/// filing export. A calculation alone is only a quote: "the Tax Transactions
+/// page only includes transactions and not calculations".
+///
+/// # Why this is safe to call more than once
+///
+/// Stripe requires the `reference` to be "unique across all transactions,
+/// including reversals", so passing the PaymentIntent id makes the endpoint
+/// itself the deduplicator: the first call records, and a second call for the
+/// same charge is refused by Stripe rather than double-reporting the tax. That
+/// is belt and braces — the caller only reaches here when
+/// [`billing::settle_autopay_intent`] reported `Credited`, which the
+/// pending→succeeded transition already guarantees happens exactly once per
+/// intent — but it means a redelivered event can never inflate a tax return
+/// even if that guard were ever weakened.
+///
+/// # Why a failure here is logged rather than propagated
+///
+/// The money is already correct at this point: the card was charged and the
+/// balance was credited. A failure to record leaves the collected tax missing
+/// from the filing report, which is a reporting defect an operator must fix,
+/// not a reason to fail a webhook that would then be redelivered and find
+/// nothing left to settle. The log carries the calculation id precisely so it
+/// can be replayed by hand.
+async fn record_autopay_tax_transaction(
+    settings: &StripeSettings,
+    client: &reqwest::Client,
+    payment_intent_id: &str,
+    calculation_id: &str,
+) {
+    let form: [(&str, &str); 2] = [
+        ("calculation", calculation_id),
+        ("reference", payment_intent_id),
+    ];
+    let response = client
+        .post(format!(
+            "{}/v1/tax/transactions/create_from_calculation",
+            settings.api_base
+        ))
+        .bearer_auth(&settings.secret_key)
+        .form(&form)
+        .send()
+        .await;
+    match response {
+        Ok(response) if response.status().is_success() => {
+            tracing::info!(
+                payment_intent = %payment_intent_id,
+                tax_calculation = %calculation_id,
+                "autopay tax transaction recorded"
+            );
+        }
+        Ok(response) => {
+            tracing::error!(
+                payment_intent = %payment_intent_id,
+                tax_calculation = %calculation_id,
+                status = response.status().as_u16(),
+                "autopay tax was COLLECTED but its tax transaction was not recorded; it will be missing from the Stripe Tax filing report until an operator creates it from this calculation"
+            );
+        }
+        Err(_) => {
+            tracing::error!(
+                payment_intent = %payment_intent_id,
+                tax_calculation = %calculation_id,
+                "autopay tax was COLLECTED but the tax transaction call could not be sent; it will be missing from the Stripe Tax filing report until an operator creates it from this calculation"
+            );
+        }
+    }
 }
 
 // POST /api/billing/autopay/setup — a Checkout session in `setup` mode that
@@ -2565,21 +3119,57 @@ async fn handle_autopay_intent_event(
         tracing::warn!(payment_intent = %intent_id, "autopay success event missing corroboration fields");
         return Err(StripeHttpError::MalformedEvent);
     };
-    // The metadata credit is NET; `amount_received` is the GROSS Stripe
-    // collected. Recompute the gross the fee formula demands for this credit and
-    // require Stripe to have collected exactly it — the autopay twin of the
-    // checkout Layer-1 self-check. Recomputed from the net credit, not trusting
-    // metadata[gross_usd].
+    // The metadata credit is NET; `amount_received` is what Stripe actually
+    // collected, which since migration 0021 is the GROSS PLUS TAX. Recompute
+    // the gross the fee formula demands for this credit and require Stripe to
+    // have collected exactly it once the tax is taken back off — the autopay
+    // twin of the checkout Layer-1 self-check, and the exact same manoeuvre
+    // [`collected_ex_tax_cents`] performs there. Recomputed from the net
+    // credit, not trusting metadata[gross_usd].
     let expected_gross = deposit_fee_quote(credit_usd).gross_usd;
     let Some(expected_gross_cents) = usd_to_cents(expected_gross) else {
         return Err(StripeHttpError::MalformedEvent);
     };
-    if expected_gross_cents != amount_received || currency != CHECKOUT_CURRENCY {
+    // An ABSENT key is a pre-0021 intent: nothing in this path could add tax
+    // then, so `amount_received` is the bare gross and zero is the truthful
+    // reading. A PRESENT key must parse to a non-negative integer — anything
+    // else is refused outright rather than coerced to zero, because coercing
+    // would turn a garbled tax into a short payment credited in full.
+    //
+    // Note the direction of trust. `tax_cents` is not covered by the provenance
+    // HMAC, and it does not need to be: it is SUBTRACTED from what Stripe says
+    // it collected, so raising it only raises the bar for `amount_received`.
+    // There is no value — the non-negative guard forecloses the negative ones —
+    // that lets a smaller collection satisfy a larger credit.
+    let reported_tax = object
+        .get("metadata")
+        .and_then(|metadata| metadata.get(AUTOPAY_TAX_CENTS_KEY));
+    let tax_cents = match reported_tax {
+        None | Some(Value::Null) => 0,
+        Some(reported) => {
+            let parsed = reported
+                .as_str()
+                .and_then(|raw| raw.parse::<i64>().ok())
+                .filter(|cents| *cents >= 0);
+            let Some(parsed) = parsed else {
+                tracing::error!(
+                    payment_intent = %intent_id,
+                    metadata_user_id = %user_id,
+                    "autopay success event carries an unusable tax figure; crediting nothing"
+                );
+                return Err(StripeHttpError::AmountMismatch);
+            };
+            parsed
+        }
+    };
+    let collected_ex_tax = amount_received.checked_sub(tax_cents);
+    if collected_ex_tax != Some(expected_gross_cents) || currency != CHECKOUT_CURRENCY {
         tracing::error!(
             payment_intent = %intent_id,
             metadata_user_id = %user_id,
             expected_gross_cents,
             amount_received,
+            tax_cents,
             %currency,
             "autopay success event does not corroborate its metadata; crediting nothing"
         );
@@ -2595,6 +3185,33 @@ async fn handle_autopay_intent_event(
     .await
     .map_err(|_| StripeHttpError::BillingUnavailable)?;
     tracing::info!(payment_intent = %intent_id, ?outcome, "autopay charge settled");
+
+    // Put the sale into Stripe's tax reports, and do it exactly once.
+    //
+    // The gate is `Credited`, not "the event said succeeded": the
+    // pending→succeeded transition inside `settle_autopay_intent` fires once per
+    // intent, so a redelivered event — Stripe retries, and the sweep's inline
+    // settle races the webhook on every fast charge — comes back
+    // `AlreadySettled` and records nothing. A `Withheld` outcome records nothing
+    // either, and deliberately: that money is queued for an operator refund, so
+    // reporting tax on it would have to be reversed again.
+    //
+    // A ZERO-tax calculation is recorded too, on the same terms as a positive
+    // one. With no registrations every calculation comes back zero, so a
+    // `tax_cents > 0` gate would record nothing at all today — and the
+    // zero-rated transactions are exactly the ones that evidence sales volume
+    // per jurisdiction, which is what says when a registration becomes
+    // required. The condition is therefore "we asked Stripe Tax and it
+    // answered" (a calculation id exists), not "the answer was nonzero".
+    if outcome == billing::AutopayOutcome::Credited
+        && let Some(calculation_id) = object
+            .get("metadata")
+            .and_then(|metadata| metadata.get(AUTOPAY_TAX_CALCULATION_KEY))
+            .and_then(Value::as_str)
+        && let Ok(client) = stripe_client()
+    {
+        record_autopay_tax_transaction(stripe, &client, intent_id, calculation_id).await;
+    }
     Ok(received())
 }
 
@@ -2818,12 +3435,10 @@ async fn replay_charge(
         );
     }
     let methods: Value = response.json().await?;
-    let Some(payment_method) = methods
+    let Some(card) = methods
         .get("data")
         .and_then(Value::as_array)
         .and_then(|data| data.first())
-        .and_then(|method| method.get("id"))
-        .and_then(Value::as_str)
     else {
         // No saved card: the claim itself becomes the terminal failed
         // intent, which both counts the strike and releases the slot —
@@ -2832,24 +3447,93 @@ async fn replay_charge(
         billing::fail_autopay_intent(pool, &format!("local_{idempotency_key}")).await?;
         anyhow::bail!("no saved card payment method");
     };
+    let Some(payment_method) = card.get("id").and_then(Value::as_str) else {
+        billing::fail_autopay_intent(pool, &format!("local_{idempotency_key}")).await?;
+        anyhow::bail!("no saved card payment method");
+    };
 
     // `topup_usd` is the NET credit the user wants; the fee rides on top and
     // Stripe collects the gross.
     let quote = deposit_fee_quote(topup_usd);
-    let Some(amount_cents) = usd_to_cents(quote.gross_usd) else {
+    let Some(gross_cents) = usd_to_cents(quote.gross_usd) else {
         billing::fail_autopay_intent(pool, &format!("local_{idempotency_key}")).await?;
         anyhow::bail!("top-up gross is not a whole cent");
     };
+
+    // ---- Sales tax (migration 0021) --------------------------------------
+    //
+    // Priced BEFORE the POST and frozen onto the claim row, in that order,
+    // because Stripe's idempotency layer compares the parameters of a replay
+    // against the original request and rejects a mismatch. A reconciliation
+    // replay of this same claim must therefore send the SAME `amount`, which it
+    // can only do if the tax is a stored fact rather than a fresh computation.
+    //
+    // Reusing an already-frozen tax also skips the Stripe Tax call entirely on
+    // a replay — Stripe bills per calculation, and a second answer would be
+    // discarded anyway.
+    let claim_id = format!("local_{idempotency_key}");
+    let frozen = billing::autopay_tax(pool, &claim_id).await?;
+    let tax = match frozen {
+        Some(tax) => TaxQuote {
+            tax_usd: tax.tax_usd,
+            calculation_id: tax.calculation_id,
+        },
+        None => {
+            let priced = calculate_autopay_tax(settings, &client, user_id, card, gross_cents).await;
+            // The freeze is what makes this attempt's figure authoritative —
+            // or adopts a concurrent racer's, if one got here first. Either
+            // way both attempts POST the same amount. A `None` means the claim
+            // is no longer pending (settled or failed underneath us), in which
+            // case there is nothing left to charge.
+            match billing::freeze_autopay_tax(
+                pool,
+                &claim_id,
+                priced.tax_usd,
+                priced.calculation_id.as_deref(),
+            )
+            .await?
+            {
+                Some(frozen) => TaxQuote {
+                    tax_usd: frozen.tax_usd,
+                    calculation_id: frozen.calculation_id,
+                },
+                None => anyhow::bail!("autopay claim is no longer pending; not charging"),
+            }
+        }
+    };
+    let Some(tax_cents) = usd_to_cents(tax.tax_usd).filter(|cents| *cents >= 0) else {
+        // Unreachable through `calculate_autopay_tax`, which only ever yields
+        // whole non-negative cents; reachable through a hand-edited row. Refuse
+        // rather than charge an amount nobody can reconstruct.
+        billing::fail_autopay_intent(pool, &claim_id).await?;
+        anyhow::bail!("frozen autopay tax is not a whole non-negative cent");
+    };
+    let Some(amount_cents) = gross_cents.checked_add(tax_cents) else {
+        billing::fail_autopay_intent(pool, &claim_id).await?;
+        anyhow::bail!("taxed autopay total overflows");
+    };
+
     let amount = amount_cents.to_string();
     let user_id_text = user_id.to_string();
     let credit_usd = topup_usd.to_string();
     let fee_usd = quote.fee_usd.to_string();
     let gross_usd = quote.gross_usd.to_string();
+    let tax_cents_text = tax_cents.to_string();
     // Provenance HMACs the NET credit, unchanged — the webhook recomputes it
     // from metadata[credit_usd] exactly as before. fee/gross are informational,
     // and the webhook re-derives the gross it corroborates from the net credit.
+    //
+    // The tax is deliberately NOT added to the HMAC input, for two reasons.
+    // Rollout: an intent created by the pre-0021 binary carries a mark over
+    // `purpose|user_id|credit_usd`, and widening the input would make this
+    // binary reject its success webhook as unprovenanced and never credit a
+    // charge that already took the customer's money. Safety: it buys nothing.
+    // The webhook requires `amount_received - tax_cents == expected_gross` with
+    // `tax_cents >= 0`, so a forged tax can only ever demand MORE money, never
+    // less — there is no value of it that credits a purchase Stripe did not
+    // collect in full.
     let provenance = autopay_provenance(settings, user_id, &credit_usd);
-    let form: Vec<(&str, &str)> = vec![
+    let mut form: Vec<(&str, &str)> = vec![
         ("amount", &amount),
         ("currency", CHECKOUT_CURRENCY),
         ("customer", &customer),
@@ -2863,6 +3547,13 @@ async fn replay_charge(
         ("metadata[gross_usd]", &gross_usd),
         ("metadata[provenance]", &provenance),
     ];
+    // Always sent, including as "0": its ABSENCE is what tells the webhook it
+    // is looking at a pre-0021 intent whose `amount_received` is the bare
+    // gross, so an explicit zero and a missing key must stay distinguishable.
+    form.push((AUTOPAY_TAX_CENTS_PARAM, &tax_cents_text));
+    if let Some(calculation_id) = tax.calculation_id.as_deref() {
+        form.push((AUTOPAY_TAX_CALCULATION_PARAM, calculation_id));
+    }
 
     // HIGH-2: the last line of defense, immediately before money moves. A
     // dispute-freeze — and the balance reversal that drives the account into a
@@ -2936,12 +3627,24 @@ async fn replay_charge(
             .ok_or_else(|| anyhow::anyhow!("payment intent response missing id"))?;
         billing::attach_autopay_intent(pool, idempotency_key, intent_id).await?;
         if body.get("status").and_then(Value::as_str) == Some("succeeded") {
-            billing::settle_autopay_intent(
+            let outcome = billing::settle_autopay_intent(
                 pool,
                 intent_id,
                 Some((user_id, topup_usd, quote.gross_usd)),
             )
             .await?;
+            // Record the tax ONLY on the settlement that actually credited.
+            // `settle_autopay_intent` makes the pending→succeeded transition
+            // exactly once, so exactly one of this inline path and the
+            // `payment_intent.succeeded` webhook — whichever gets there first —
+            // sees `Credited`; the other sees `AlreadySettled` and records
+            // nothing. That is what keeps a sale from being reported twice to a
+            // tax authority when both fire, which they routinely do.
+            if outcome == billing::AutopayOutcome::Credited
+                && let Some(calculation_id) = tax.calculation_id.as_deref()
+            {
+                record_autopay_tax_transaction(settings, &client, intent_id, calculation_id).await;
+            }
         }
         return Ok(());
     }
