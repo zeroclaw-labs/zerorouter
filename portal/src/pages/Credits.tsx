@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import type { FormEvent } from 'react'
 import { useSearchParams } from 'react-router-dom'
 import { EmbeddedCheckout, EmbeddedCheckoutProvider } from '@stripe/react-stripe-js'
@@ -38,6 +38,19 @@ const CHECKOUT_NOTICES: readonly string[] = ['success', 'retry', 'expired', 'unk
 
 function isCheckoutNotice(value: string | null): value is CheckoutNotice {
   return value !== null && CHECKOUT_NOTICES.includes(value)
+}
+
+/**
+ * How long to wait for Stripe's iframe to appear before declaring the mount
+ * failed. Generous — this is a slow-network allowance, not a latency budget —
+ * but finite, because the alternative is an empty box with no explanation.
+ */
+const STRIPE_MOUNT_TIMEOUT_MS = 15_000
+
+/** Where the embedded payment form is in its lifecycle. */
+type MountState = {
+  state: 'idle' | 'creating' | 'mounting' | 'ready' | 'failed'
+  error: string | null
 }
 
 /**
@@ -95,7 +108,6 @@ export function Credits() {
   const [preset, setPreset] = useState<string | null>('25.00')
   const [custom, setCustom] = useState('')
   const [formError, setFormError] = useState<string | null>(null)
-  const [submitting, setSubmitting] = useState(false)
   const [unavailable, setUnavailable] = useState(false)
   // Modal state. `stage` is 'amount' while the customer picks what to buy and
   // 'pay' once Stripe's form is mounted; `payingAmount` is the amount the
@@ -104,6 +116,11 @@ export function Credits() {
   const [modalOpen, setModalOpen] = useState(false)
   const [stage, setStage] = useState<'amount' | 'pay'>('amount')
   const [payingAmount, setPayingAmount] = useState<string | null>(null)
+  const [clientSecret, setClientSecret] = useState<string | null>(null)
+  const [mount, setMount] = useState<MountState>({ state: 'idle', error: null })
+  // Bumped by the retry button to re-run the session-creation effect.
+  const [retryCount, setRetryCount] = useState(0)
+  const embedRef = useRef<HTMLDivElement | null>(null)
   // The server-priced deposit for the current amount. Null until it lands (or
   // when the amount is invalid / billing is off); the fee is never computed here.
   const [quote, setQuote] = useState<Quote | null>(null)
@@ -196,14 +213,81 @@ export function Credits() {
     [publishableKey],
   )
 
+  // Create the Checkout Session ourselves rather than handing Stripe a
+  // `fetchClientSecret` callback.
+  //
+  // Two reasons, both about failure. A rejecting `fetchClientSecret` is
+  // swallowed inside react-stripe-js — it stores the resulting promise in a
+  // ref with no `.catch`, so the rejection is unhandled and we get no chance
+  // to render anything. And with the callback form there is no state to
+  // distinguish "still creating" from "created, waiting for the iframe".
+  // Fetching it here gives both, and `clientSecret` is a first-class provider
+  // option, so nothing is lost.
+  useEffect(() => {
+    if (stage !== 'pay' || payingAmount === null) return
+    let active = true
+    setMount({ state: 'creating', error: null })
+    setClientSecret(null)
+    api
+      .checkout(payingAmount)
+      .then((session) => {
+        if (!active) return
+        setClientSecret(session.client_secret)
+        setMount({ state: 'mounting', error: null })
+      })
+      .catch((err: unknown) => {
+        if (!active) return
+        if (err instanceof ApiError && err.code === 'billing_unavailable') {
+          setUnavailable(true)
+          setModalOpen(false)
+          return
+        }
+        setMount({
+          state: 'failed',
+          error:
+            err instanceof Error
+              ? err.message
+              : 'The payment form could not be started. Please try again.',
+        })
+      })
+    return () => {
+      active = false
+    }
+  }, [stage, payingAmount, retryCount])
+
+  // Stripe.js can fail to mount with no error we can observe: js.stripe.com
+  // blocked by a network or an extension, or a publishable key from the wrong
+  // account. The old redirect flow could not fail this way — the browser
+  // either reached Stripe's page or visibly did not — so an empty box that
+  // stays empty forever is a regression in failure VISIBILITY, not just
+  // polish. Watch for the iframe Stripe injects and give up out loud.
+  useEffect(() => {
+    if (mount.state !== 'mounting') return
+    const deadline = Date.now() + STRIPE_MOUNT_TIMEOUT_MS
+    const timer = window.setInterval(() => {
+      if (embedRef.current?.querySelector('iframe') != null) {
+        window.clearInterval(timer)
+        setMount({ state: 'ready', error: null })
+      } else if (Date.now() > deadline) {
+        window.clearInterval(timer)
+        setMount({
+          state: 'failed',
+          error:
+            'The secure payment form did not load. An ad blocker or network policy may be ' +
+            'blocking js.stripe.com.',
+        })
+      }
+    }, 250)
+    return () => window.clearInterval(timer)
+  }, [mount.state, clientSecret])
+
   if (user === null) return null
 
   const billingOff = unavailable || publishableKey === null
 
-  // Move from picking an amount to paying for it. The Checkout Session is not
-  // created here — `fetchClientSecret` below is what calls the server, once,
-  // when Stripe's form mounts. Keeping it there means a customer who opens the
-  // modal and closes it again has cost nothing: no session, no intent row.
+  // Move from picking an amount to paying for it. The Checkout Session is
+  // created by the effect above, once, when this stage is entered — so a
+  // customer who opens the modal and closes it again has cost nothing.
   function goToPayment(event: FormEvent) {
     event.preventDefault()
     const amount = normalizeAmount(chosen)
@@ -216,33 +300,12 @@ export function Credits() {
     setStage('pay')
   }
 
-  // Stripe calls this when it mounts the embedded form. It must resolve to the
-  // session's client secret, or reject — react-stripe-js has no other channel
-  // for reporting the failure, so the error is surfaced through our own state.
-  const fetchClientSecret = useCallback(async () => {
-    if (payingAmount === null) throw new Error('No amount selected.')
-    setSubmitting(true)
-    try {
-      const session = await api.checkout(payingAmount)
-      return session.client_secret
-    } catch (err) {
-      if (err instanceof ApiError && err.code === 'billing_unavailable') {
-        setUnavailable(true)
-        setModalOpen(false)
-      } else {
-        toast(err instanceof Error ? err.message : 'Checkout failed.', 'error')
-        setStage('amount')
-      }
-      throw err
-    } finally {
-      setSubmitting(false)
-    }
-  }, [payingAmount, toast])
-
   function closeCheckout() {
     setModalOpen(false)
     setStage('amount')
     setPayingAmount(null)
+    setClientSecret(null)
+    setMount({ state: 'idle', error: null })
   }
 
   async function saveCard() {
@@ -467,18 +530,47 @@ export function Credits() {
                 calculate any sales tax due. We never see your card details — the form below is
                 Stripe's.
               </p>
-              <div className="checkout-embed">
-                {submitting && <Loading label="Opening secure payment" />}
-                <EmbeddedCheckoutProvider
-                  // Remount on a changed amount so a stale session's iframe is
-                  // torn down rather than left showing the previous price.
-                  key={payingAmount ?? 'none'}
-                  stripe={stripePromise}
-                  options={{ fetchClientSecret }}
-                >
-                  <EmbeddedCheckout />
-                </EmbeddedCheckoutProvider>
-              </div>
+              {mount.state === 'failed' ? (
+                <div className="checkout-embed">
+                  <Banner kind="error">{mount.error}</Banner>
+                  <div className="modal-actions">
+                    <button className="btn btn-ghost" type="button" onClick={closeCheckout}>
+                      Close
+                    </button>
+                    <button
+                      className="btn btn-primary"
+                      type="button"
+                      onClick={() => setRetryCount((n) => n + 1)}
+                    >
+                      Try again
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                <div className="checkout-embed" ref={embedRef}>
+                  {mount.state !== 'ready' && (
+                    <Loading
+                      label={
+                        mount.state === 'creating'
+                          ? 'Preparing your payment'
+                          : 'Opening secure payment'
+                      }
+                    />
+                  )}
+                  {clientSecret !== null && (
+                    <EmbeddedCheckoutProvider
+                      // Keyed by the secret, so a new session always gets a
+                      // fresh provider and a stale iframe is torn down rather
+                      // than left showing the previous price.
+                      key={clientSecret}
+                      stripe={stripePromise}
+                      options={{ clientSecret }}
+                    >
+                      <EmbeddedCheckout />
+                    </EmbeddedCheckoutProvider>
+                  )}
+                </div>
+              )}
             </>
           )}
         </Modal>

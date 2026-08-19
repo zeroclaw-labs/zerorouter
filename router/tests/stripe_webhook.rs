@@ -783,6 +783,10 @@ async fn the_amount_and_recipient_guards_still_fire_on_a_taxed_session() {
 /// mock Stripe below.
 type CapturedForm = Arc<Mutex<Option<HashMap<String, String>>>>;
 
+/// The `Stripe-Version` header the router sent, if any. `None` means the
+/// request would have run at whatever version the ACCOUNT is pinned to.
+type CapturedVersion = Arc<Mutex<Option<String>>>;
+
 /// The client secret the mock Stripe below mints, derived from the session id
 /// exactly as Stripe derives it (`{session_id}_secret_{opaque}`).
 fn client_secret_for(session_id: &str) -> String {
@@ -800,24 +804,49 @@ fn client_secret_for(session_id: &str) -> String {
 /// `client_secret`, and `url: null`. A `hosted_page` session is the mirror
 /// image, and the router must not accept one — mounting the form needs the
 /// secret, so a session that only came back with a url is unusable.
-async fn mock_checkout_stripe(session_id: String) -> (String, CapturedForm) {
+async fn mock_checkout_stripe(session_id: String) -> (String, CapturedForm, CapturedVersion) {
     let captured: CapturedForm = Arc::new(Mutex::new(None));
+    let version: CapturedVersion = Arc::new(Mutex::new(None));
     let app = Router::new()
         .route(
             "/v1/checkout/sessions",
             post(
-                |State((captured, session_id)): State<(CapturedForm, String)>,
+                |State((captured, version, session_id)): State<(
+                    CapturedForm,
+                    CapturedVersion,
+                    String,
+                )>,
+                 headers: axum::http::HeaderMap,
                  Form(form): Form<HashMap<String, String>>| async move {
-                    *captured.lock().expect("captured form must lock") = Some(form);
+                    *version.lock().expect("captured version must lock") = headers
+                        .get(stripe::STRIPE_VERSION_HEADER)
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::to_owned);
+                    let previous = {
+                        let mut form_slot = captured.lock().expect("captured form must lock");
+                        let previous = form_slot.is_some();
+                        *form_slot = Some(form);
+                        previous
+                    };
+                    // Real Stripe mints a NEW session id for every create. The
+                    // first call keeps the caller's id so a test can look the
+                    // intent up; later calls diverge, which is what makes an
+                    // absent reuse guard show up as several intent rows rather
+                    // than as a duplicate-key error.
+                    let id = if previous {
+                        format!("{session_id}x{}", Uuid::new_v4().simple())
+                    } else {
+                        session_id.clone()
+                    };
                     axum::Json(json!({
-                        "id": session_id,
+                        "id": id,
                         "url": Value::Null,
-                        "client_secret": client_secret_for(&session_id),
+                        "client_secret": client_secret_for(&id),
                     }))
                 },
             ),
         )
-        .with_state((captured.clone(), session_id));
+        .with_state((captured.clone(), version.clone(), session_id));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("mock stripe should bind");
@@ -825,7 +854,7 @@ async fn mock_checkout_stripe(session_id: String) -> (String, CapturedForm) {
     tokio::spawn(async move {
         let _ = axum::serve(listener, app).await;
     });
-    (format!("http://{address}"), captured)
+    (format!("http://{address}"), captured, version)
 }
 
 /// Drive the real `POST /api/billing/checkout` handler as an authenticated
@@ -880,10 +909,26 @@ async fn checkout_session_form_is_the_pinned_stripe_wire_contract() {
         .await
         .expect("user email must query");
     let session_id = unique_session_id();
-    let (api_base, captured) = mock_checkout_stripe(session_id.clone()).await;
+    let (api_base, captured, version) = mock_checkout_stripe(session_id.clone()).await;
 
     let (status, body) = post_checkout(&pool, &api_base, user_id, "25.00").await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
+
+    // The API version pin. `ui_mode=embedded_page` does not exist before
+    // Dahlia renamed the enum, so an unpinned request runs at whatever version
+    // the ACCOUNT defaults to — and an account older than Dahlia rejects the
+    // session outright, breaking every purchase. A sandbox cannot catch that
+    // (it defaults to the version current when it was created), so this
+    // assertion is the only thing standing between a dropped header and a live
+    // checkout outage.
+    assert_eq!(
+        version
+            .lock()
+            .expect("captured version must lock")
+            .as_deref(),
+        Some(stripe::CHECKOUT_API_VERSION),
+        "the checkout session create must pin the Stripe API version"
+    );
 
     let form = captured
         .lock()
@@ -990,7 +1035,7 @@ async fn the_checkout_session_asks_stripe_to_calculate_tax() {
     };
     let user_id = create_user(&pool, "automatic-tax").await;
     let session_id = unique_session_id();
-    let (api_base, captured) = mock_checkout_stripe(session_id).await;
+    let (api_base, captured, _version) = mock_checkout_stripe(session_id).await;
 
     let (status, body) = post_checkout(&pool, &api_base, user_id, "25.00").await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
@@ -1285,6 +1330,120 @@ async fn checkout_status_refuses_a_session_this_deployment_never_priced() {
         "an unrecorded session must not reach Stripe"
     );
     assert_nothing_credited(&pool, user_id, "unknown session status read").await;
+}
+
+/// Repeated status polls collapse onto a small number of Stripe reads.
+///
+/// The endpoint is customer-triggered and takes no argument that bounds its
+/// cost, so without a cache one authenticated user refreshing the return page
+/// is a one-to-one amplifier onto Stripe's rate limit — and a 429 there does
+/// not just break their page, it breaks checkout and autopay for everyone.
+/// Ownership is enforced before the cache is consulted, so this cannot be used
+/// to read anyone else's session either.
+#[tokio::test]
+async fn repeated_status_polls_do_not_hammer_stripe() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let user_id = create_user(&pool, "status-poll").await;
+    let session_id = unique_session_id();
+    record_checkout_intent(&pool, &session_id, user_id, 2_638, Decimal::from(25), "usd")
+        .await
+        .expect("intent must record");
+
+    let (api_base, calls) = mock_status_stripe(session_id.clone(), "open").await;
+    for _ in 0..25 {
+        let (status, body) = get_checkout_status(&pool, &api_base, user_id, &session_id).await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        assert_eq!(body.get("status").and_then(Value::as_str), Some("open"));
+    }
+
+    let outbound = *calls.lock().expect("counter must lock");
+    assert!(
+        outbound <= 2,
+        "25 polls inside the cache window must collapse to at most 2 Stripe reads, got {outbound}"
+    );
+    assert_nothing_credited(&pool, user_id, "repeated status polls").await;
+}
+
+/// Re-opening the payment step for the same amount reuses the session instead
+/// of minting another.
+///
+/// Every unmount/remount of Stripe's form calls the checkout endpoint again —
+/// Cancel, Escape, backdrop click and "Change amount" all unmount it. Nothing
+/// deletes `stripe_checkout_intents` rows, so without reuse one hesitant
+/// customer leaves a trail of sessions behind for a single purchase.
+#[tokio::test]
+async fn remounting_the_same_amount_reuses_one_checkout_session() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let user_id = create_user(&pool, "session-reuse").await;
+    let session_id = unique_session_id();
+    let (api_base, _captured, _version) = mock_checkout_stripe(session_id.clone()).await;
+
+    let (status, first) = post_checkout(&pool, &api_base, user_id, "25.00").await;
+    assert_eq!(status, StatusCode::OK, "body: {first}");
+    // Three more mounts at the same price, as a customer toggling the modal
+    // would produce.
+    for _ in 0..3 {
+        let (status, again) = post_checkout(&pool, &api_base, user_id, "25.00").await;
+        assert_eq!(status, StatusCode::OK, "body: {again}");
+        assert_eq!(
+            again.get("client_secret"),
+            first.get("client_secret"),
+            "the same amount must hand back the same session"
+        );
+    }
+
+    // Exactly one intent row exists for this buyer: the reused session's.
+    let intents =
+        query_scalar::<_, i64>("SELECT COUNT(*) FROM stripe_checkout_intents WHERE user_id = $1")
+            .bind(user_id)
+            .fetch_one(&pool)
+            .await
+            .expect("intent count must query");
+    assert_eq!(
+        intents, 1,
+        "four mounts of the same amount must leave one pending purchase, not four"
+    );
+
+    // A DIFFERENT amount is a different price and must never reuse the
+    // session priced for the first one.
+    let other_session = unique_session_id();
+    let (other_base, _c, _v) = mock_checkout_stripe(other_session).await;
+    let (status, other) = post_checkout(&pool, &other_base, user_id, "50.00").await;
+    assert_eq!(status, StatusCode::OK, "body: {other}");
+    assert_ne!(
+        other.get("client_secret"),
+        first.get("client_secret"),
+        "a different amount must get its own session"
+    );
+}
+
+/// A session id that cannot be a Stripe id is refused before it reaches the
+/// database or an outbound URL.
+#[tokio::test]
+async fn a_malformed_session_id_is_refused_without_touching_anything() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let user_id = create_user(&pool, "status-malformed").await;
+    let (api_base, calls) = mock_status_stripe("cs_unused".to_owned(), "complete").await;
+
+    for bogus in ["%00", "../../secrets", "pi_123", ""] {
+        let (status, _) = get_checkout_status(&pool, &api_base, user_id, bogus).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "{bogus:?} is not a checkout session id"
+        );
+    }
+    assert_eq!(
+        *calls.lock().expect("counter must lock"),
+        0,
+        "a malformed id must never reach Stripe"
+    );
 }
 
 /// The status endpoint is session-authenticated like every other portal

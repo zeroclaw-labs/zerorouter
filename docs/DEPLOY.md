@@ -124,6 +124,42 @@ name until this repository took it over). To cut it over:
 >
 > Treat the HTTPS listener as a blocker for any external user traffic.
 
+## Checkout is pinned to a Stripe API version
+
+The two checkout calls — creating a Checkout Session and reading one back for
+the return page — send `Stripe-Version: 2026-03-25.dahlia` explicitly. **Do not
+remove that pin, and do not assume the account's dashboard version can satisfy
+it.**
+
+The embedded form is requested with `ui_mode=embedded_page`. That enum value
+does not exist before Dahlia: the release renamed `hosted`/`embedded`/`custom`
+to `hosted_page`/`embedded_page`/`elements`, and the changelog marks it a
+breaking change. An unpinned request runs at whatever version the *account*
+defaults to, so on an account created before Dahlia, Stripe rejects the session
+outright — `POST /api/billing/checkout` returns 502 `checkout_failed` and
+**nobody can buy credits**. It fails on the first real purchase, not at startup.
+
+Two things make this easy to miss:
+
+- **A green sandbox does not prove live works.** A sandbox defaults to the API
+  version current when the sandbox was created, so a recently made sandbox
+  silently passes while an older live account fails.
+- **The client is already on Dahlia.** The portal loads Stripe.js from the
+  `dahlia` bundle and calls `createEmbeddedCheckoutPage` (itself a Dahlia
+  rename). Stripe's guidance is to keep Stripe.js and the server-side API
+  version on the same release train, which the pin does.
+
+Scope is deliberate: **only the two checkout calls are pinned.** The autopay
+paths (PaymentIntents, Customers, the setup-mode session) keep the account
+default, because they send nothing version-sensitive and Dahlia carries
+breaking Payments changes that this integration has not audited. Upgrading the
+account's default API version is therefore safe for checkout — it is pinned —
+but is still an autopay decision, not a checkout one.
+
+Webhook payloads are unaffected either way: Stripe renders events at the
+account's (or the endpoint's) configured version, not at the version of the
+request that created the object.
+
 ## Autopay: what deployment must provide
 
 Autopay ships enabled in the binary — there is no feature flag. What it

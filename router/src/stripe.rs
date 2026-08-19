@@ -274,6 +274,40 @@ const CHECKOUT_PRODUCT_NAME: &str = "ZeroRouter credits";
 /// page. Stripe's enum spells this `embedded_page` (`hosted_page` is the
 /// default, and `elements` is the lower-level Checkout-elements mode).
 const CHECKOUT_UI_MODE: &str = "embedded_page";
+/// Header Stripe reads to pin the API version of a request. Lowercase because
+/// `HeaderName::from_static` requires it; HTTP header names are
+/// case-insensitive and reqwest normalizes to lowercase on the wire anyway.
+pub const STRIPE_VERSION_HEADER: &str = "stripe-version";
+/// The API version the checkout requests are pinned to, and **the reason they
+/// have to be**.
+///
+/// [`CHECKOUT_UI_MODE`] does not exist before this version. Dahlia renamed the
+/// `ui_mode` enum (`hosted`/`embedded`/`custom` →
+/// `hosted_page`/`embedded_page`/`elements`) and the changelog marks it
+/// BREAKING; `2026-03-25.dahlia` is the opening version of that release train,
+/// so it is the earliest version that accepts `embedded_page`.
+///
+/// Without this header a request runs at whatever version the **account** is
+/// pinned to in the dashboard. An account created before Dahlia would reject
+/// `ui_mode=embedded_page` outright, turning every purchase into a 502
+/// `checkout_failed` — a total checkout outage that no test here would catch,
+/// because the mock accepts any form. It is also not something a sandbox can
+/// clear: a sandbox defaults to the version current when it was created, so a
+/// green sandbox says nothing about an older live account.
+///
+/// The opening version is deliberately chosen over the newest Dahlia release.
+/// Later versions in a train are additive by policy, so nothing is lost, and
+/// pinning the opener avoids inheriting later breaking changes — `2026-07-29`
+/// renames a Checkout `collected_information` property, which this integration
+/// does not read today but would silently depend on if the pin drifted forward.
+///
+/// This matches the client: the portal loads Stripe.js from the `dahlia`
+/// bundle (it calls `createEmbeddedCheckoutPage`, itself a Dahlia rename), and
+/// Stripe's guidance is to keep Stripe.js and the server-side API version on
+/// the same release train.
+///
+/// **Scope: the two checkout calls only.** See [`checkout_client`].
+pub const CHECKOUT_API_VERSION: &str = "2026-03-25.dahlia";
 /// The portal route Checkout returns the browser to once the payment attempt
 /// finishes. `{CHECKOUT_SESSION_ID}` is Stripe's template variable, replaced
 /// with the real session id at redirect time — it is deliberately NOT a format
@@ -457,6 +491,11 @@ enum StripeHttpError {
     /// price for the authenticated user. Deliberately indistinguishable from
     /// "no such session".
     SessionNotFound,
+    /// Stripe could not be asked what a session's status is. Distinct from
+    /// [`Self::CheckoutFailed`] because nothing was being created — saying "the
+    /// session could not be created" on a read misdirects whoever reads the
+    /// log or the toast.
+    StatusUnavailable,
     UnknownUser,
     DatabaseUnavailable,
 }
@@ -507,6 +546,12 @@ impl IntoResponse for StripeHttpError {
                 "That checkout session was not found.",
                 "session_not_found",
             ),
+            Self::StatusUnavailable => (
+                StatusCode::BAD_GATEWAY,
+                "The payment status could not be read from Stripe just now. Your credits still \
+                 arrive on their own if the payment went through — check the ledger.",
+                "status_unavailable",
+            ),
             Self::UnknownUser => (
                 StatusCode::BAD_REQUEST,
                 "The webhook event references an unknown user.",
@@ -556,6 +601,36 @@ async fn create_checkout(
     // Credit and fee are each whole cents, so the gross is too; refuse rather
     // than quote a sub-cent unit_amount Stripe would reject.
     let gross_cents = usd_to_cents(quote.gross_usd).ok_or(StripeHttpError::InvalidAmount)?;
+
+    // Reuse an unpaid session this buyer already has at this exact price
+    // rather than minting a second one.
+    //
+    // The portal unmounts Stripe's form on Cancel, Escape, backdrop click and
+    // "Change amount", and mounts it again on the next Continue — each mount
+    // calls this endpoint. Without this, one indecisive customer buying $25
+    // once produces several Checkout Sessions and several
+    // `stripe_checkout_intents` rows, none of which anything deletes.
+    //
+    // Safe because the key is `(user, gross_cents)`: the secret handed back
+    // belongs to a session priced identically to the one this request would
+    // have created, for the same person. Entries are dropped as soon as a
+    // status read shows the session is no longer `open` (see
+    // [`forget_session`]), and expire on their own well inside Stripe's 24h
+    // session lifetime, so a paid or stale session is never re-served.
+    if let Ok(cache) = reuse_cache().lock()
+        && let Some(entry) = cache.get(&(user.user_id, gross_cents))
+        && entry.at.elapsed() < SESSION_REUSE_TTL
+    {
+        tracing::debug!(
+            user_id = %user.user_id,
+            stripe_session_id = %entry.session_id,
+            "reusing an open checkout session instead of creating another"
+        );
+        return Ok(Json(
+            serde_json::json!({ "client_secret": entry.client_secret }),
+        ));
+    }
+
     let session = create_checkout_session(
         stripe,
         CheckoutSessionParams {
@@ -605,6 +680,19 @@ async fn create_checkout(
         gross_usd = %quote.gross_usd,
         "created stripe checkout session"
     );
+    // Only cached AFTER the intent row is durable. Caching earlier would let a
+    // failed insert still hand out a secret for a session the webhook would
+    // refuse to credit.
+    if let Ok(mut cache) = reuse_cache().lock() {
+        cache.insert(
+            (user.user_id, gross_cents),
+            ReuseEntry {
+                session_id: session.id.clone(),
+                client_secret: session.client_secret.clone(),
+                at: std::time::Instant::now(),
+            },
+        );
+    }
     // Shape change from the redirect era: this used to return `{"url"}`, the
     // Stripe-hosted page to send the browser to. An `embedded_page` session has
     // no such url — Stripe returns `url: null` — so returning one would mean
@@ -624,6 +712,70 @@ async fn create_checkout(
 #[derive(Debug, Deserialize)]
 struct CheckoutStatusParams {
     session_id: String,
+}
+
+/// How long a session's status may be served from memory before Stripe is
+/// asked again. Short enough that the return page still feels live, long
+/// enough that a client refreshing in a loop cannot turn one customer into a
+/// stream of Stripe reads.
+const STATUS_CACHE_TTL: Duration = Duration::from_secs(8);
+
+/// How long a created-but-unpaid session may be handed back to the same buyer
+/// for the same amount instead of creating a second one.
+///
+/// Well under Stripe's 24h session expiry, so a reused session is always still
+/// mountable. The cap matters because nothing deletes
+/// `stripe_checkout_intents` rows: every abandoned mount used to leave one
+/// behind, and opening the modal, closing it, and reopening it three times
+/// created three sessions for one purchase.
+const SESSION_REUSE_TTL: Duration = Duration::from_secs(600);
+
+/// Stripe's prefix for Checkout Session ids. Anything else cannot be one, so
+/// it is refused before it reaches a database query or a URL.
+const CHECKOUT_SESSION_ID_PREFIX: &str = "cs_";
+
+struct StatusEntry {
+    status: String,
+    at: std::time::Instant,
+}
+
+struct ReuseEntry {
+    session_id: String,
+    client_secret: String,
+    at: std::time::Instant,
+}
+
+/// Cached session statuses, keyed by session id.
+fn status_cache() -> &'static std::sync::Mutex<std::collections::HashMap<String, StatusEntry>> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, StatusEntry>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
+/// Reusable unpaid sessions, keyed by `(user, ex-tax gross in cents)`.
+///
+/// Keyed by the buyer AND the price so a reused session can never be one
+/// quoted for a different amount — the client secret handed back always
+/// belongs to a session priced exactly as this request would have priced it.
+fn reuse_cache() -> &'static std::sync::Mutex<std::collections::HashMap<(Uuid, i64), ReuseEntry>> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<(Uuid, i64), ReuseEntry>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
+/// Drop a session from both caches once it is known to be unusable (paid,
+/// expired, or gone). Without this a customer who pays $25 and immediately
+/// buys another $25 would be handed the completed session back.
+fn forget_session(user_id: Uuid, gross_cents: i64, session_id: &str) {
+    if let Ok(mut cache) = reuse_cache().lock()
+        && cache
+            .get(&(user_id, gross_cents))
+            .is_some_and(|entry| entry.session_id == session_id)
+    {
+        cache.remove(&(user_id, gross_cents));
+    }
 }
 
 /// GET /api/billing/checkout/status?session_id=S — report whether a Checkout
@@ -660,6 +812,12 @@ async fn checkout_status(
     let Some(stripe) = ctx.config.stripe.as_ref() else {
         return Err(StripeHttpError::BillingUnavailable);
     };
+    // Shape-check before anything else. A Checkout Session id always starts
+    // `cs_`; without this a caller could send `%00` or an arbitrary string and
+    // get a database round trip and an error log line out of it.
+    if !params.session_id.starts_with(CHECKOUT_SESSION_ID_PREFIX) {
+        return Err(StripeHttpError::SessionNotFound);
+    }
     let intent = billing::checkout_intent(&ctx.pool, &params.session_id)
         .await
         .map_err(|error| {
@@ -672,8 +830,79 @@ async fn checkout_status(
     let Some(intent) = intent.filter(|intent| intent.user_id == user.user_id) else {
         return Err(StripeHttpError::SessionNotFound);
     };
-    let status = retrieve_session_status(stripe, &intent.stripe_session_id).await?;
+
+    // Serve a recent answer rather than re-asking Stripe. The ownership check
+    // above has already run, so a cache hit is never a way to read someone
+    // else's session.
+    if let Ok(cache) = status_cache().lock()
+        && let Some(entry) = cache.get(&intent.stripe_session_id)
+        && entry.at.elapsed() < STATUS_CACHE_TTL
+    {
+        return Ok(Json(serde_json::json!({ "status": entry.status })));
+    }
+
+    let status = retrieve_session_status(stripe, &intent.stripe_session_id)
+        .await
+        .map_err(|_| StripeHttpError::StatusUnavailable)?;
+
+    // A session that is no longer open must not be handed back to the next
+    // purchase of the same amount.
+    if status != "open" {
+        forget_session(
+            intent.user_id,
+            intent.expected_amount_cents,
+            &intent.stripe_session_id,
+        );
+    }
+    if let Ok(mut cache) = status_cache().lock() {
+        cache.insert(
+            intent.stripe_session_id.clone(),
+            StatusEntry {
+                status: status.clone(),
+                at: std::time::Instant::now(),
+            },
+        );
+    }
     Ok(Json(serde_json::json!({ "status": status })))
+}
+
+/// The HTTP client shared by the two checkout calls.
+///
+/// One client, built once: `reqwest::Client` owns the connection pool, so a
+/// fresh one per request means a fresh TLS handshake per request. The status
+/// endpoint is customer-triggered and can be called in a loop, which made
+/// per-call construction a way to burn connections against Stripe.
+///
+/// **Only the checkout create and status retrieve use this.** The autopay
+/// paths keep their own [`stripe_client`] deliberately: this client pins
+/// [`CHECKOUT_API_VERSION`] on every request, and autopay creates
+/// PaymentIntents, Customers, and setup-mode sessions that have not been
+/// audited against Dahlia's breaking Payments changes. None of them send
+/// `ui_mode`, so none of them need the pin, and moving them onto a new API
+/// version as a side effect of an embedded-checkout change would be exactly
+/// the kind of silent money-path shift this repo does not do.
+fn checkout_client() -> Result<&'static reqwest::Client, CheckoutError> {
+    static CLIENT: std::sync::OnceLock<Option<reqwest::Client>> = std::sync::OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            let mut headers = reqwest::header::HeaderMap::new();
+            // Pinned as a DEFAULT header on the client rather than per call, so
+            // a future request added to this client cannot forget it.
+            headers.insert(
+                reqwest::header::HeaderName::from_static(STRIPE_VERSION_HEADER),
+                reqwest::header::HeaderValue::from_static(CHECKOUT_API_VERSION),
+            );
+            reqwest::Client::builder()
+                .timeout(STRIPE_HTTP_TIMEOUT)
+                .default_headers(headers)
+                .build()
+                .ok()
+        })
+        .as_ref()
+        .ok_or_else(|| {
+            tracing::warn!("stripe HTTP client construction failed");
+            CheckoutError::Client
+        })
 }
 
 /// Read a Checkout Session's `status` (`open`, `complete`, or `expired`) from
@@ -683,14 +912,7 @@ async fn retrieve_session_status(
     settings: &StripeSettings,
     session_id: &str,
 ) -> Result<String, CheckoutError> {
-    let client = reqwest::Client::builder()
-        .timeout(STRIPE_HTTP_TIMEOUT)
-        .build()
-        .map_err(|_| {
-            tracing::warn!("stripe HTTP client construction failed");
-            CheckoutError::Client
-        })?;
-    let response = client
+    let response = checkout_client()?
         .get(checkout_session_url(settings, session_id))
         .bearer_auth(&settings.secret_key)
         .send()
@@ -910,13 +1132,7 @@ async fn create_checkout_session(
     settings: &StripeSettings,
     params: CheckoutSessionParams<'_>,
 ) -> Result<CheckoutSession, CheckoutError> {
-    let client = reqwest::Client::builder()
-        .timeout(STRIPE_HTTP_TIMEOUT)
-        .build()
-        .map_err(|_| {
-            tracing::warn!("stripe HTTP client construction failed");
-            CheckoutError::Client
-        })?;
+    let client = checkout_client()?;
     let unit_amount = params.unit_amount_cents.to_string();
     let user_id = params.user_id.to_string();
     let credit_usd = params.credit_usd.to_string();
@@ -945,10 +1161,6 @@ async fn create_checkout_session(
     //   `customer_email` only. (The autopay path does keep a Stripe Customer
     //   per user, but checkout has never used it and attaching one here would
     //   change which address Checkout taxes against.)
-    // - `billing_address_collection=required`. Stripe's guidance is not to
-    //   force it for a session with no attached customer: Checkout already
-    //   collects the address automatic tax needs, and requiring it only adds
-    //   friction.
     // - `customer_creation=always`. Stripe notes that Google Pay is only
     //   offered under Stripe Tax when a shipping address is collected or a
     //   saved customer exists — but this deployment offers Apple Pay, not
