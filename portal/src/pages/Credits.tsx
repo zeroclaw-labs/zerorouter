@@ -305,8 +305,9 @@ export function Credits() {
             <p className="field-hint">Minimum $5.00. Credits are spent by usage at the listed tier rates.</p>
             {quote !== null && (
               <p className="field-hint quote-line">
-                You pay {formatUsd(quote.gross)} (includes {formatUsd(quote.fee)} processing fee) →
-                receive {formatUsd(quote.credit)} credit.
+                You pay {formatUsd(quote.gross)} (includes {formatUsd(quote.fee)} processing fee)
+                plus any applicable tax → receive {formatUsd(quote.credit)} credit. Stripe shows the
+                tax before you confirm.
               </p>
             )}
             {formError !== null && <Banner kind="error">{formError}</Banner>}
@@ -314,7 +315,7 @@ export function Credits() {
               {submitting
                 ? 'Redirecting to checkout…'
                 : quote !== null
-                  ? `Pay ${formatUsd(quote.gross)} → get ${formatUsd(quote.credit)} credit`
+                  ? `Pay ${formatUsd(quote.gross)} + tax → get ${formatUsd(quote.credit)} credit`
                   : normalized !== null
                     ? `Buy ${formatUsd(normalized)} of credits`
                     : 'Buy credits'}

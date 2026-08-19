@@ -48,6 +48,147 @@
 //! | `charge.dispute.created` | freeze the account and reverse the credit (migration 0009) |
 //! | `charge.refunded` | reverse the credit; no freeze (migration 0009) |
 //!
+//! # Sales tax
+//!
+//! Checkout Sessions are created with `automatic_tax[enabled]=true` and
+//! **nothing else**. Stripe determines whether tax is due from the buyer's
+//! address and the registrations configured in the dashboard, and it takes the
+//! product tax code and the tax behavior from Tax Settings, because this
+//! request deliberately specifies neither: "If you don't specify a tax code,
+//! Stripe Tax uses the default tax code from your Tax Settings", and the same
+//! fallback governs tax behavior.
+//!
+//! ## Why the policy lives in the dashboard and not here
+//!
+//! Because it is not settled, and it is not ours to settle. The correct
+//! treatment of prepaid credits is genuinely contested — Massachusetts has
+//! published authority pointing at redemption-time (M.G.L. c. 64H § 1's "rights
+//! and credits" exclusion, Directive 12-4, LR 16-1) while a draft revision of
+//! 830 CMR 64H.1.3 points the other way, and no US authority addresses per-token
+//! AI APIs at all. That is an accountant's determination, it is likely to
+//! change, and Stripe's own guidance to integrators is not to make the legal
+//! classification on the seller's behalf.
+//!
+//! A value in this file would mean every revision of that determination is a
+//! code change, a review, and a deploy. In Tax Settings it is a dropdown, it
+//! takes effect immediately, and one setting governs checkout and any future
+//! Stripe-billed surface alike rather than each hardcoding its own answer. The
+//! research behind the recommended selections is preserved below — it is real
+//! work and the operator will need it — but as guidance for what to choose in
+//! the dashboard, not as a value this code transmits.
+//!
+//! Not sending `tax_behavior` has a second benefit: Stripe refuses to change a
+//! `tax_behavior` once set on a Price, so pinning it per session pinned it
+//! per session forever. Leaving it to Tax Settings keeps it revisable.
+//!
+//! ## What to select in Tax Settings
+//!
+//! **Default tax behavior — must be `Exclusive`** (or `Automatic`, which
+//! resolves to exclusive for USD and CAD; equivalent here because
+//! [`CHECKOUT_CURRENCY`] is USD, but `Exclusive` stays correct if a second
+//! currency is ever added). This is not a preference. The ToS says prices are
+//! exclusive of taxes; [`DEPOSIT_FEE_FLOOR_USD`] is sized so the gross covers
+//! the credit plus Stripe's per-charge cost, so tax carved OUT of the gross
+//! would consume more than the whole margin on the smallest deposit; and the
+//! ledger records the ex-tax gross, so a session that carved tax out of it
+//! collected less than ZeroRouter sold. **Selecting `Inclusive` does not
+//! silently under-collect — it stops purchases working**: every session then
+//! arrives at the webhook as a short payment and credits nothing. That is the
+//! designed outcome (money is never credited against money that did not
+//! arrive), but it is a total checkout outage, so get this one right.
+//!
+//! **Preset product tax code — recommended starting selection
+//! `txcd_10105001`** (AIaaS – Cloud Based – Personal Use), pending the
+//! accountant. Two separate questions sit behind it.
+//!
+//! *Which product?* Answered with reasonable confidence. Stripe publishes
+//! dedicated AI-service codes and asks sellers to match delivery model and
+//! customer; ZeroRouter is delivered entirely over the cloud with nothing
+//! downloaded, which is the "Cloud Based" pair (`txcd_10105001` personal /
+//! `txcd_10105002` business). Stripe explicitly warns against the generic
+//! `txcd_10000000` for US sales. Personal use is the half ZeroRouter can
+//! actually evidence — checkout is self-serve and no business identifier or tax
+//! ID is collected — and of the two it errs toward collecting.
+//!
+//! *When is tax due?* Not answered, by anyone. The sale-versus-redemption
+//! question above is unresolved, and a product tax code cannot express timing,
+//! so no selection here settles it. What the architecture settles is narrower:
+//! redemption is a metered balance debit in [`crate::billing`] with no Stripe
+//! object and no tax computation, so a stored-value code (`txcd_10502000`, which
+//! Stripe calls multi-purpose) defers tax to a point that will never collect it
+//! — in practice a choice to collect nothing anywhere. Avoid `txcd_00000000`
+//! (Nontaxable) for a different reason: it makes Stripe's
+//! `taxability_reason=not_collecting` indistinguishable from a missing
+//! registration, hiding real misconfiguration. Massachusetts DOR issues letter
+//! rulings for exactly this situation (830 CMR 62C.3.1(6)).
+//!
+//! Whichever is selected, it does not fix transactions already taken: Stripe
+//! cannot retroactively correct a sale that collected the wrong tax.
+//!
+//! ## Where the tax lands
+//!
+//! Nowhere in ZeroRouter's ledger, and that is the point:
+//!
+//! | Money | Where it goes |
+//! |---|---|
+//! | `credit_usd` | the user's spendable balance, via a `purchase` ledger row |
+//! | the deposit fee | revenue; never a ledger row, derivable as `expected_amount_cents - expected_credit_usd * 100` |
+//! | sales tax | collected by Stripe on ZeroRouter's behalf and owed to a taxing jurisdiction — not revenue, not balance, and not recorded here |
+//!
+//! This covers CHECKOUT only. Autopay recharges are raw PaymentIntents, which
+//! Stripe cannot apply automatic tax to at all — see the autopay section below.
+//!
+//! `stripe_checkout_intents.expected_amount_cents` therefore keeps meaning the
+//! **ex-tax** gross ZeroRouter quoted, so fee revenue stays exactly
+//! `gross - credit` and tax can never be mistaken for either. The consequence
+//! is that it no longer equals the amount Stripe charged the card; the tax
+//! figures live at Stripe (Tax reports, the balance transaction) and nowhere
+//! else, so reconciling ZeroRouter against a Stripe payout means adding the
+//! tax back from Stripe's side. Recording tax locally would need a new column
+//! and so a migration.
+//!
+//! ## What this means for the webhook
+//!
+//! "The amount charged equals the gross" stopped being true. Every
+//! ZeroRouter-side figure is ex-tax, so the corroborations compare against
+//! [`collected_ex_tax_cents`] — the money that moved, less the part that is
+//! not ours — never against `amount_total` directly.
+//!
+//! ## Operator prerequisites — three different failure modes
+//!
+//! Every tax decision now lives in dashboard state that no deployment step
+//! checks, and the pieces fail in three unrelated ways:
+//!
+//! 1. **Stripe Tax not activated on the account** — Stripe rejects the session
+//!    creation outright (`stripe_tax_inactive`), so `POST /api/billing/checkout`
+//!    returns 502 `checkout_failed` and NOBODY can buy credits. Loud, total, and
+//!    immediate on deploy.
+//! 2. **Default tax behavior set to `Inclusive`** — sessions are created fine
+//!    and the customer pays, but the tax is carved out of ZeroRouter's price
+//!    instead of added to it, so every event reaches the webhook as a short
+//!    payment and credits nothing. Purchases fail closed: money collected, no
+//!    credit, `amount_mismatch` in Stripe's webhook dashboard. Correct
+//!    behaviour, awful outcome — set `Exclusive` (or `Automatic`).
+//! 3. **Activated, but no registration covering the buyer** — Stripe accepts
+//!    the session and calculates zero tax. Checkout works, purchases credit
+//!    normally, and nothing in these logs says tax is not being collected. This
+//!    is the quiet one, and it is the failure Stripe itself calls the most
+//!    common Stripe Tax mistake.
+//!
+//! Note the shape of that list: since this request no longer carries the tax
+//! code or the behavior, a wrong preset in Tax Settings is now the ONLY thing
+//! standing between a correct deployment and mode 2. The trade is deliberate —
+//! the policy becomes revisable without a deploy — but it moves a load-bearing
+//! setting out of code review, so it belongs in the deployment checklist
+//! instead. `docs/DEPLOY.md` carries it.
+//!
+//! Ordering: activation and the presets must precede deployment; registration
+//! must precede the first live purchase, because Stripe cannot retroactively
+//! correct a transaction that collected the wrong tax. All of it is per
+//! environment — a sandbox's registrations do not carry to live mode. Neither
+//! the code nor a green test proves tax is being collected: only a real
+//! transaction with a non-zero tax line does.
+//!
 //! Everything else is acknowledged without action so Stripe stops retrying it.
 //! **The Stripe endpoint must be subscribed to the events above** — an event
 //! Stripe does not send is an event this code never runs (see
@@ -500,6 +641,17 @@ const DEPOSIT_FEE_RATE: Decimal = Decimal::from_parts(55, 0, 0, false, 3);
 /// Below this floor the percentage fee ($0.28 on $5) would not clear the $0.30
 /// fixed component and every small deposit would lose money. `Decimal` literal
 /// 80 / 10^2 = 0.80.
+///
+/// **Stripe Tax narrows that headroom and this number has NOT been re-sized for
+/// it.** Two costs move once tax is collected: the percentage card fee applies
+/// to the taxed total rather than the gross, and Stripe Tax bills roughly 0.5%
+/// per transaction in jurisdictions where the seller is registered. On the same
+/// smallest deposit at Massachusetts' 6.25% — $5.80 gross, $0.36 tax, $6.16
+/// charged — that is 0.029*6.16 + 0.30 + 0.005*6.16 = $0.510, leaving $0.290
+/// rather than $0.332. Still above water, so nothing here changes; re-pricing
+/// the floor is an owner decision, not a side effect of enabling tax. Note the
+/// erosion is bounded to jurisdictions with an active registration, because
+/// Stripe Tax only bills where it actually calculates.
 const DEPOSIT_FEE_FLOOR_USD: Decimal = Decimal::from_parts(80, 0, 0, false, 2);
 
 /// A priced deposit: the credit the user picked, the fee charged on top, and
@@ -599,7 +751,36 @@ async fn create_checkout_session(
     // session was sold at without a database read; the corroboration still
     // RECOMPUTES gross from credit (deposit_fee_quote) rather than trusting
     // these attacker-writable fields.
-    let form: [(&str, &str); 12] = [
+    //
+    // `unit_amount` remains the EX-TAX gross. `automatic_tax[enabled]` asks
+    // Stripe to determine the tax from the buyer's address and the dashboard's
+    // registrations and add it on top — so the card is charged more than
+    // `unit_amount`, and the webhook compares against `amount_total` minus that
+    // tax rather than against `amount_total`.
+    //
+    // Deliberately NOT sent — each of these is a decision, not an oversight:
+    //
+    // - `product_data[tax_code]` and `price_data[tax_behavior]`. Omitting them
+    //   is what puts the tax POLICY in Tax Settings, where the operator can
+    //   revise it without a deploy; see the module docs for what to select
+    //   there and why the classification is not ours to hardcode. Stripe falls
+    //   back to the Tax Settings presets for exactly this reason.
+    // - `customer_update[address]=auto`. It is only valid alongside a
+    //   `customer`, and this session attaches none — it identifies the buyer by
+    //   `customer_email` only. (The autopay path does keep a Stripe Customer
+    //   per user, but checkout has never used it and attaching one here would
+    //   change which address Checkout taxes against.)
+    // - `billing_address_collection=required`. Stripe's guidance is not to
+    //   force it for a session with no attached customer: Checkout already
+    //   collects the address automatic tax needs, and requiring it only adds
+    //   friction.
+    // - `customer_creation=always`. Stripe notes that Google Pay is only
+    //   offered under Stripe Tax when a shipping address is collected or a
+    //   saved customer exists — but this deployment offers Apple Pay, not
+    //   Google Pay, and `ensure_stripe_customer` already mints one Customer per
+    //   user for autopay. Setting it here would create a SECOND, Checkout-owned
+    //   customer on every purchase, duplicating records for one human.
+    let form: [(&str, &str); 13] = [
         ("mode", "payment"),
         ("line_items[0][price_data][currency]", CHECKOUT_CURRENCY),
         ("line_items[0][price_data][unit_amount]", &unit_amount),
@@ -608,6 +789,7 @@ async fn create_checkout_session(
             CHECKOUT_PRODUCT_NAME,
         ),
         ("line_items[0][quantity]", "1"),
+        ("automatic_tax[enabled]", "true"),
         ("metadata[user_id]", &user_id),
         ("metadata[credit_usd]", &credit_usd),
         ("metadata[fee_usd]", &fee_usd),
@@ -765,13 +947,29 @@ async fn stripe_webhook(
         );
         return Err(StripeHttpError::MalformedEvent);
     };
-    // The metadata credit is NET; `amount_total` is the GROSS Stripe collected.
-    // Recompute the gross the fee formula demands for this credit and require
-    // Stripe to have collected exactly it. Recomputing from `credit_usd` via the
-    // one fee helper — NOT trusting the attacker-writable `metadata[gross_usd]`
-    // — keeps this a self-check on the event: forged metadata on a session we
-    // did create cannot make `amount_total` agree with an inflated credit. This
-    // is independent of the intent row Layer 2 checks; both must hold.
+    // Sales tax rides ON TOP of the price (`tax_behavior=exclusive`), so
+    // `amount_total` is no longer the price ZeroRouter sold — it is the price
+    // plus whatever Stripe Tax added. Strip the tax back off before comparing
+    // against anything ZeroRouter quoted; see [`collected_ex_tax_cents`].
+    let Some(collected) = collected_ex_tax_cents(object, amount_total_cents) else {
+        tracing::error!(
+            stripe_session_id = %session_id,
+            metadata_user_id = %user_id,
+            amount_total_cents,
+            reported_tax = ?object.get("total_details").and_then(|details| details.get("amount_tax")),
+            "stripe webhook rejected: paid session's tax breakdown does not reconcile with the \
+             money collected; crediting nothing"
+        );
+        return Err(StripeHttpError::AmountMismatch);
+    };
+    // The metadata credit is NET; `collected.ex_tax_cents` is the GROSS Stripe
+    // collected for the line item. Recompute the gross the fee formula demands
+    // for this credit and require Stripe to have collected exactly it.
+    // Recomputing from `credit_usd` via the one fee helper — NOT trusting the
+    // attacker-writable `metadata[gross_usd]` — keeps this a self-check on the
+    // event: forged metadata on a session we did create cannot make the money
+    // collected agree with an inflated credit. This is independent of the intent
+    // row Layer 2 checks; both must hold.
     let expected_gross = deposit_fee_quote(credit_usd).gross_usd;
     let Some(expected_gross_cents) = usd_to_cents(expected_gross) else {
         tracing::warn!(
@@ -780,7 +978,7 @@ async fn stripe_webhook(
         );
         return Err(StripeHttpError::MalformedEvent);
     };
-    if expected_gross_cents != amount_total_cents || currency != CHECKOUT_CURRENCY {
+    if expected_gross_cents != collected.ex_tax_cents || currency != CHECKOUT_CURRENCY {
         // Loud and detailed: this is the shape of a credit-minting attempt,
         // not a transient fault. Everything logged here is already public to
         // whoever produced the event.
@@ -789,6 +987,8 @@ async fn stripe_webhook(
             metadata_user_id = %user_id,
             metadata_credit_usd = %credit_usd,
             expected_gross_cents,
+            collected_ex_tax_cents = collected.ex_tax_cents,
+            tax_cents = collected.tax_cents,
             amount_total_cents,
             %currency,
             expected_currency = CHECKOUT_CURRENCY,
@@ -835,14 +1035,18 @@ async fn stripe_webhook(
         );
         return Err(StripeHttpError::UnknownSession);
     };
+    // `expected_amount_cents` is the EX-TAX gross ZeroRouter quoted, so it is
+    // compared against the ex-tax money collected, not against `amount_total`.
     if intent.user_id != user_id
-        || intent.expected_amount_cents != amount_total_cents
+        || intent.expected_amount_cents != collected.ex_tax_cents
         || intent.currency != currency
     {
         tracing::error!(
             stripe_session_id = %session_id,
             metadata_user_id = %user_id,
             recorded_user_id = %intent.user_id,
+            collected_ex_tax_cents = collected.ex_tax_cents,
+            tax_cents = collected.tax_cents,
             amount_total_cents,
             recorded_amount_cents = intent.expected_amount_cents,
             %currency,
@@ -907,6 +1111,66 @@ async fn stripe_webhook(
 
 fn received() -> Json<Value> {
     Json(serde_json::json!({ "received": true }))
+}
+
+/// What a paid Checkout Session actually collected, split into the price
+/// ZeroRouter sold and the sales tax Stripe added to it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CollectedAmounts {
+    /// The money collected for the line item itself — the figure every
+    /// ZeroRouter-side amount is compared against.
+    ex_tax_cents: i64,
+    /// Sales tax, collected on ZeroRouter's behalf and owed to a taxing
+    /// jurisdiction. Never revenue, never credit; carried only so it can be
+    /// logged.
+    tax_cents: i64,
+}
+
+/// Take the sales tax back off what Stripe collected.
+///
+/// # Why this exists
+///
+/// Before Stripe Tax, `amount_total` WAS the price: the session collected
+/// exactly the gross ZeroRouter quoted, so the two could be compared directly.
+/// With `automatic_tax` and `tax_behavior=exclusive` the card is charged
+/// `gross + tax`, and every ZeroRouter-side figure — the fee formula's
+/// recomputed gross, the `stripe_checkout_intents.expected_amount_cents` quote
+/// — is still ex-tax. Comparing them against `amount_total` would reject every
+/// taxed purchase, taking the customer's money and crediting nothing.
+///
+/// # Why it subtracts rather than reading `amount_subtotal`
+///
+/// Stripe also reports `amount_subtotal`, the line-item total BEFORE discounts
+/// and taxes. Using it would be wrong in the direction that costs money: a
+/// session carrying a coupon has `amount_subtotal` above what the customer
+/// actually paid, so ZeroRouter would credit against money it never received.
+/// `amount_total - amount_tax` is by construction "the money that moved, less
+/// the part that is not ours", which is exactly the quantity the corroborations
+/// need. Anything that makes the two differ — a discount, a shipping line, tax
+/// carved out of the price by an accidental `tax_behavior=inclusive` — lands as
+/// a short payment and is refused by the caller's equality check, which is the
+/// correct outcome for all three.
+///
+/// # Fail-closed reading
+///
+/// `total_details` absent, or present without `amount_tax`, reads as zero tax:
+/// that is the pre-Stripe-Tax shape and the conservative direction, since a
+/// session that really did collect tax then fails the caller's equality check
+/// rather than passing it. Anything present but unusable — a negative tax, a
+/// tax that is not an integer number of cents, a subtraction that would
+/// overflow — returns `None` and credits nothing.
+fn collected_ex_tax_cents(object: &Value, amount_total_cents: i64) -> Option<CollectedAmounts> {
+    let tax_cents = match object
+        .get("total_details")
+        .and_then(|details| details.get("amount_tax"))
+    {
+        None | Some(Value::Null) => 0,
+        Some(reported) => reported.as_i64().filter(|cents| *cents >= 0)?,
+    };
+    Some(CollectedAmounts {
+        ex_tax_cents: amount_total_cents.checked_sub(tax_cents)?,
+        tax_cents,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1318,6 +1582,82 @@ mod tests {
         }
     }
 
+    fn session_with_tax(reported_tax: Value) -> Value {
+        serde_json::json!({ "total_details": { "amount_tax": reported_tax } })
+    }
+
+    #[test]
+    fn tax_is_taken_back_off_what_stripe_collected() {
+        // No tax reported at all — every session created before Stripe Tax was
+        // enabled — reads as the whole amount being price.
+        assert_eq!(
+            collected_ex_tax_cents(&serde_json::json!({}), 2_638),
+            Some(CollectedAmounts {
+                ex_tax_cents: 2_638,
+                tax_cents: 0
+            })
+        );
+        // `total_details` present but silent about tax reads the same way.
+        assert_eq!(
+            collected_ex_tax_cents(&serde_json::json!({ "total_details": {} }), 2_638),
+            Some(CollectedAmounts {
+                ex_tax_cents: 2_638,
+                tax_cents: 0
+            })
+        );
+        // Exclusive tax: the card was charged $28.03 for a $26.38 price.
+        assert_eq!(
+            collected_ex_tax_cents(&session_with_tax(serde_json::json!(165)), 2_803),
+            Some(CollectedAmounts {
+                ex_tax_cents: 2_638,
+                tax_cents: 165
+            })
+        );
+        // A zero tax line is not the same as no tax line, but it reads the same.
+        assert_eq!(
+            collected_ex_tax_cents(&session_with_tax(serde_json::json!(0)), 2_638),
+            Some(CollectedAmounts {
+                ex_tax_cents: 2_638,
+                tax_cents: 0
+            })
+        );
+    }
+
+    #[test]
+    fn an_unusable_tax_figure_yields_nothing_to_compare() {
+        // Every one of these would otherwise be read as some number of cents
+        // and silently change what counts as a matching payment.
+        for reported in [
+            serde_json::json!(-1),
+            serde_json::json!("165"),
+            serde_json::json!(165.5),
+            serde_json::json!(true),
+            serde_json::json!([165]),
+        ] {
+            assert_eq!(
+                collected_ex_tax_cents(&session_with_tax(reported.clone()), 2_803),
+                None,
+                "{reported} must not be readable as tax"
+            );
+        }
+        // A tax larger than the total, or a subtraction that would wrap: the
+        // event is incoherent, so there is nothing to corroborate against.
+        assert_eq!(
+            collected_ex_tax_cents(&session_with_tax(serde_json::json!(i64::MAX)), i64::MIN),
+            None
+        );
+        // A tax exceeding the total is arithmetically fine but describes money
+        // that cannot have moved; it survives here and is refused by the
+        // caller's equality check against the quoted gross.
+        assert_eq!(
+            collected_ex_tax_cents(&session_with_tax(serde_json::json!(5_000)), 2_638),
+            Some(CollectedAmounts {
+                ex_tax_cents: -2_362,
+                tax_cents: 5_000
+            })
+        );
+    }
+
     #[test]
     fn signature_headers_parse_strictly() {
         // Candidates must be the length of a hex SHA-256 digest; anything
@@ -1367,6 +1707,25 @@ mod tests {
 
 // ---------------------------------------------------------------------------
 // Autopay (migration 0008): saved-card auto-recharge.
+//
+// ⚠️ AUTOPAY IS NOT TAXED, AND CANNOT BE FROM HERE. Autopay charges the saved
+// card through `POST /v1/payment_intents`, and a raw PaymentIntent has no
+// `automatic_tax` parameter at all — the field does not exist on that endpoint.
+// So the same product, bought the same day by the same customer, collects tax
+// through checkout and no tax through autopay. That asymmetry is deliberate
+// only in the sense that it is what the API allows; it is not a position anyone
+// has taken.
+//
+// Closing it is a separate piece of work and a money decision, not a parameter:
+// it means calling the Tax Calculation API before the charge, setting the
+// PaymentIntent `amount` from the calculation's total (so `amount_received`
+// stops equalling the gross, exactly as `amount_total` did for checkout), and
+// recording a tax transaction afterwards or the sale never reaches the tax
+// reports. It also raises what an existing autopay customer is charged without
+// their re-consenting, which is the operator's call to make.
+//
+// Until then the corroboration below stays as it was — `amount_received` IS the
+// gross — because nothing in this path can add tax.
 // ---------------------------------------------------------------------------
 
 const AUTOPAY_PURPOSE: &str = "zerorouter_autopay";

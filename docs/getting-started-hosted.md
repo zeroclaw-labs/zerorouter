@@ -17,9 +17,13 @@ it, so a fresh account cannot make calls yet.
 
 On the **Credits** page, pick an amount ($5.00 minimum) — checkout happens on
 Stripe. **Deposits carry a processing fee, charged on top of the credit:
-5.5% of the amount, with a minimum of $0.80.** The page quotes the exact
-split — you pay $X, you receive $Y of credit — before you commit; the quote
-is priced by the server with the same arithmetic the charge uses.
+5.5% of the amount, with a minimum of $0.80.** The page quotes that split —
+you pay $X, you receive $Y of credit — before you commit; the quote is priced
+by the server with the same arithmetic the charge uses. **Sales tax, where it
+applies, is added on top of that figure**, so the card is charged more than
+the quote shows; Stripe determines it from your billing address and displays
+it on the checkout page before you confirm. Tax is never credited — you
+receive the same $Y either way.
 
 The same page can optionally arm autopay: a saved card tops the balance up
 whenever it falls below a threshold you set. Three failed charges in a row

@@ -146,6 +146,79 @@ needs from the environment:
 The sweep itself (charge candidates, reconcile stale intents, three-strikes
 disable) starts with serve mode and needs no configuration.
 
+## Stripe Tax must be configured BEFORE this deploys
+
+Checkout Sessions are created with `automatic_tax[enabled]=true` and nothing
+else. The code sends no rate, no jurisdiction, **no product tax code, and no
+tax behavior** — all of it comes from Tax Settings, deliberately, so the
+operator can revise a contested tax classification without a deploy. The
+dashboard is therefore not optional configuration around this feature, it
+**is** the feature. No environment variable and no code path checks any of
+it, and no test can: the tests prove one parameter is sent, not that Stripe
+was configured to act on it.
+
+Three distinct things go wrong when it is missing, and only one is loud:
+
+1. **Stripe Tax not activated on the account.** Stripe rejects the session
+   creation (`stripe_tax_inactive`), so `POST /api/billing/checkout`
+   returns 502 `checkout_failed` and **nobody can buy credits at all**.
+   This is immediate and total on deploy — activate first.
+2. **Default tax behavior left as `Inclusive`.** Stripe carves the tax out
+   of ZeroRouter's price instead of adding it on top, so every purchase
+   reaches the webhook as a short payment and **credits nothing**: the
+   customer is charged, no balance appears, and `amount_mismatch` piles up
+   in Stripe's webhook dashboard. The webhook is behaving correctly — it
+   refuses to credit against money that did not arrive — but the effect is
+   a total checkout outage with money moving. Since the request no longer
+   pins the behavior, this setting is now the only thing preventing it.
+3. **Activated, but no registration covering the buyer.** Stripe accepts
+   the session and calculates zero tax. Checkout works, credits land, and
+   nothing in the logs says tax is not being collected. This is the quiet
+   failure, and Stripe cannot retroactively correct a sale that collected
+   the wrong tax — so registrations must exist before the first live
+   purchase, not after the first complaint.
+
+Operator steps, in order, in **each** environment (a sandbox's tax
+registrations do not carry to live mode; Tax Settings must be verified per
+environment):
+
+1. Dashboard → **Tax → Settings**: activate Stripe Tax and set the head
+   office address (Cambridge, MA). `automatic_tax` calculates nothing while
+   the settings status is `pending`.
+2. Dashboard → **Tax → Settings → Include tax in prices**: set the default
+   tax behavior to **Exclusive**. (`Automatic` is equivalent today — it
+   resolves to exclusive for USD and CAD — but `Exclusive` stays correct if
+   a second currency is ever priced.) **Do not leave this on `Inclusive`;
+   see failure mode 2 above.** ZeroRouter's ToS says prices are exclusive of
+   taxes, and the deposit-fee margin assumes the gross arrives intact.
+3. Dashboard → **Tax → Settings → preset product tax code**: set it. The
+   recommended starting selection is **`txcd_10105001`** (AIaaS – Cloud
+   Based – Personal Use). The reasoning, the alternatives, and the
+   **unresolved question of whether tax is due when credits are bought or
+   when they are spent** are written up in the `# Sales tax` section of
+   `router/src/stripe.rs`. That question is an open item for the operator's
+   accountant — Massachusetts DOR issues letter rulings for exactly this
+   situation — and nothing in the code settles it. Because the code no
+   longer sends a tax code, changing this selection later is a dashboard
+   edit with no deploy.
+4. Dashboard → **Tax → Registrations**: add the Massachusetts registration
+   and confirm it shows as *Collecting*. With a head office in
+   Massachusetts the business is not a remote seller, so this registration
+   is required on physical presence, not on a sales threshold.
+5. Run one real purchase and confirm the session carries a non-zero tax
+   line and that the credit still lands. A green test suite is not
+   evidence.
+
+Two consequences worth planning for:
+
+- **Stripe Tax costs roughly 0.5% per transaction** where a registration
+  applies, on top of card processing. The deposit fee has not been re-sized
+  for it; the arithmetic is in the `DEPOSIT_FEE_FLOOR_USD` comment.
+- **Autopay is not taxed and cannot be**, because a raw PaymentIntent has
+  no `automatic_tax` parameter. The same credits bought through autopay
+  collect no tax. Closing that gap needs the Tax Calculation API and is a
+  separate decision.
+
 ## Credit enforcement is on by default
 
 `ZEROROUTER_REQUIRE_CREDITS` **defaults to `true`**. It previously defaulted
