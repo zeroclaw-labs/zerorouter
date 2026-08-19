@@ -333,6 +333,22 @@ pub struct CandidateDrift {
     /// model this file described before conditional rates existed.
     pub recorded_conditional: Vec<(u64, ModelRates)>,
     pub upstream_cost: ModelRates,
+    /// The conditional bands the SOURCE publishes, as `(size, rates)` in the
+    /// order it publishes them — the structured `cost.tiers[]` and never the
+    /// misnamed convenience key ([`SourceCost::tiers`]).
+    ///
+    /// Only tiers measured on prompt size ([`SourceCostTier::measures_prompt_size`])
+    /// appear here. A bound measured on something else is not a prompt-token
+    /// threshold however well its number lines up, and putting it in this list
+    /// would let anything reading the list compare two quantities that do not
+    /// denote the same thing — the exact confusion [`Verdict::UnsupportedTierKind`]
+    /// exists to refuse. That verdict fires on the same input, so nothing is
+    /// lost by leaving it out here.
+    ///
+    /// Machine-readable beside the already-rendered [`Self::upstream_tier`],
+    /// because a second catalog can only be cross-checked against numbers, not
+    /// against a display string.
+    pub upstream_conditional: Vec<(u64, ModelRates)>,
     /// The tier's BASE sell rate — what the customer pays below every
     /// threshold.
     pub sell: ModelRates,
@@ -574,7 +590,11 @@ pub fn reconcile(catalog: &TierCatalog, source: &str) -> Vec<CandidateDrift> {
 /// The seam exists so the exemption can be tested for what it is — a rule
 /// about candidates — without a test having to install a global inventory to
 /// make one true, which would leak into every other test in the binary.
-fn reconcile_with(
+/// `pub(crate)` for exactly that reason and no other: [`crate::corroborate`]'s
+/// tests need a real [`Verdict::Unreconcilable`] finding to prove the
+/// exemption carries across to the second source, and hand-building one would
+/// prove only that the test can build a struct.
+pub(crate) fn reconcile_with(
     catalog: &TierCatalog,
     source: &str,
     settles_free: &dyn Fn(&crate::config::TierCandidate) -> bool,
@@ -687,6 +707,20 @@ fn reconcile_with(
                     .map(|conditional| (conditional.min_prompt_tokens, conditional.rates))
                     .collect(),
                 upstream_cost,
+                upstream_conditional: upstream_conditional
+                    .iter()
+                    .filter(|tier| tier.measures_prompt_size())
+                    .map(|tier| {
+                        (
+                            tier.tier.size,
+                            ModelRates {
+                                input_per_mtok: tier.input,
+                                output_per_mtok: tier.output,
+                                cached_input_per_mtok: tier.cache_read,
+                            },
+                        )
+                    })
+                    .collect(),
                 sell: definition.rates.base(),
                 sell_conditional: definition
                     .rates
@@ -863,6 +897,35 @@ mod tests {
             note.contains("0.4") && note.contains("1.8"),
             "the tier's own rates belong in the report: {note}"
         );
+    }
+
+    #[test]
+    fn the_sources_bands_reach_the_report_as_numbers_not_only_as_a_display_string() {
+        // `upstream_tier` is a sentence for a human. A SECOND catalog can only
+        // be cross-checked against numbers, so the same bands travel
+        // structured — and from the same structured field, never the
+        // convenience key whose name is the lie.
+        let catalog = catalog_with("gpt-5.6-luna", rates(0.2, 0.02, 1.2), rates(0.2, 0.02, 1.2));
+        let found = reconcile(&catalog, TIERED_SOURCE);
+        assert_eq!(
+            found[0].upstream_conditional,
+            vec![(272_000, rates(0.4, 0.04, 1.8))],
+            "the structured cost.tiers[] band, at its real 272,000 boundary"
+        );
+    }
+
+    #[test]
+    fn a_band_measured_on_something_other_than_prompt_size_is_not_a_prompt_threshold() {
+        // `upstream_conditional` is a list of PROMPT-token thresholds. An
+        // output-length bound of 272,000 is not one, and letting it into the
+        // list would hand every later reader — the second-source cross-check
+        // included — two numbers that do not denote the same quantity and look
+        // like they do. `UnsupportedTierKind` fires on this same input, so the
+        // fact is not lost, only kept out of a list it does not belong in.
+        let catalog = catalog_with("gpt-5.6-luna", rates(0.2, 0.02, 1.2), rates(0.2, 0.02, 1.2));
+        let found = reconcile(&catalog, OUTPUT_TIERED_SOURCE);
+        assert_eq!(found[0].verdict, Verdict::UnsupportedTierKind);
+        assert_eq!(found[0].upstream_conditional, vec![]);
     }
 
     #[test]

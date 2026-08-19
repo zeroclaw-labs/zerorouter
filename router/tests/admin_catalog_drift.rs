@@ -24,6 +24,14 @@ fn args(providers: Option<PathBuf>, source_file: PathBuf) -> AdminArgs {
         command: AdminCommand::CatalogDrift(CatalogDriftArgs {
             source_url: zerorouter::drift::DEFAULT_SOURCE_URL.to_owned(),
             source_file: Some(source_file),
+            // The second source stays OFF here. This test is about the edge
+            // catalog's provider inventory, and it must keep proving what it
+            // proved before corroboration existed — including that the command
+            // touches no network. `tests/admin_catalog_drift_corroboration.rs`
+            // is where the second source is exercised.
+            corroborate: false,
+            corroborate_url: zerorouter::corroborate::DEFAULT_CORROBORATION_URL.to_owned(),
+            corroborate_file: None,
             tiers: Some(fixture("local_candidates_tiers.toml")),
             providers,
             allow_drift: false,

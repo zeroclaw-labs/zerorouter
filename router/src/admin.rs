@@ -78,6 +78,26 @@ pub struct CatalogDriftArgs {
     /// Read the source from a file instead of the network (offline / CI).
     #[arg(long)]
     pub source_file: Option<std::path::PathBuf>,
+    /// Cross-check the reconciliation above against a SECOND public catalog,
+    /// so a single source cannot be silently wrong. Advisory: it corroborates
+    /// where the vendors reprice, reports rate differences as information, and
+    /// cannot change the exit code — see `src/corroborate.rs`.
+    ///
+    /// OPT-IN rather than on by default, deliberately. The daily CI workflow
+    /// runs this command bare, so a default-on second fetch would put a third
+    /// party's availability into a job that is supposed to answer one question
+    /// about `tiers.toml`. It cannot redden that job even so — nothing here is
+    /// actionable — but it could slow it, and the corroboration is for a human
+    /// reading the report, not for a robot reading the exit code.
+    #[arg(long)]
+    pub corroborate: bool,
+    /// The second catalog. Only consulted with --corroborate.
+    #[arg(long, default_value = crate::corroborate::DEFAULT_CORROBORATION_URL)]
+    pub corroborate_url: String,
+    /// Read the second source from a file instead of the network (offline /
+    /// CI). Implies --corroborate.
+    #[arg(long)]
+    pub corroborate_file: Option<std::path::PathBuf>,
     /// Tier file to check. Defaults to the same path the server serves.
     #[arg(long)]
     pub tiers: Option<std::path::PathBuf>,
@@ -1141,6 +1161,19 @@ async fn catalog_drift(args: CatalogDriftArgs) -> Result<()> {
         }
     }
 
+    // The SECOND source, if asked for. Printed before the summary below so
+    // the exit-deciding lines stay last in the log, and separated from it so
+    // nothing here reads as a finding: this section corroborates, it does not
+    // adjudicate. It cannot fail — see `print_corroboration`.
+    if args.corroborate || args.corroborate_file.is_some() {
+        print_corroboration(
+            &findings,
+            &args.corroborate_url,
+            args.corroborate_file.as_deref(),
+        )
+        .await;
+    }
+
     let actionable: Vec<_> = findings
         .iter()
         .filter(|f| f.verdict.is_actionable() || f.has_actionable_metadata_drift())
@@ -1187,4 +1220,154 @@ async fn catalog_drift(args: CatalogDriftArgs) -> Result<()> {
             .as_ref()
             .map_or(args.source_url.clone(), |p| p.display().to_string())
     )
+}
+
+/// Print the second source's cross-check.
+///
+/// **Returns nothing and cannot fail**, and that is the whole contract rather
+/// than an oversight. A flaky third party must never redden CI or block an
+/// operator, so every way this can go wrong — unreachable, slow, HTTP 503, an
+/// HTML error page where JSON was promised — prints one line and the command
+/// finishes exactly as it would have. There is no `?` in here and no path from
+/// anything it discovers to the exit code; `crate::drift::Verdict` governs
+/// that alone, as it did before this existed.
+async fn print_corroboration(
+    findings: &[crate::drift::CandidateDrift],
+    url: &str,
+    file: Option<&std::path::Path>,
+) {
+    use crate::corroborate::{Finding, corroborate, fetch};
+
+    let origin = file.map_or_else(|| url.to_owned(), |path| path.display().to_string());
+    let document = match file {
+        Some(path) => tokio::fs::read_to_string(path)
+            .await
+            .map_err(|error| anyhow::anyhow!("could not be read ({error})")),
+        None => fetch(url).await,
+    };
+    let report = match document.and_then(|document| corroborate(findings, &document)) {
+        Ok(report) => report,
+        Err(error) => {
+            println!("\nSecond source ({origin}): SKIPPED — {error:#}.");
+            println!("  Corroboration is advisory; the verdict above is unchanged.");
+            return;
+        }
+    };
+
+    let exempt = if report.exempt == 0 {
+        String::new()
+    } else {
+        format!(
+            "; {} exempt ({})",
+            report.exempt,
+            crate::drift::Verdict::Unreconcilable.label()
+        )
+    };
+
+    if report.is_clean() {
+        println!("\nSecond source ({origin}) — corroboration only, never authoritative:");
+        println!(
+            "  {} candidate(s) cross-checked, boundaries agree, no rate differences{exempt}.",
+            report.checked()
+        );
+        return;
+    }
+
+    println!("\nSecond source ({origin}) — corroboration only, never authoritative.");
+    println!("It is a RESELLER and runs promotions, so a rate difference is ITS price rather");
+    println!("than an error. Nothing below changes the verdict above or the exit code.");
+    println!("  {} candidate(s) cross-checked{exempt}.", report.checked());
+
+    let thresholds = |thresholds: &[u64]| {
+        if thresholds.is_empty() {
+            "flat".to_owned()
+        } else {
+            thresholds
+                .iter()
+                .map(|threshold| format!("≥{threshold}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
+    };
+
+    // The prominent half. A threshold is a fact about the VENDOR's billing
+    // rule, which a reseller has no commercial reason to move — so two
+    // catalogs placing the boundaries differently means one of them is simply
+    // wrong, and that is the failure this section was built to catch.
+    let disagreements = report.structure_disagreements();
+    if !disagreements.is_empty() {
+        println!("\n  BOUNDARIES DISAGREE — two catalogs cannot both be right about where a");
+        println!("  vendor reprices. This is the corroboration that counts:");
+        for entry in &disagreements {
+            let Finding::Checked(checked) = &entry.finding else {
+                continue;
+            };
+            println!(
+                "    {:<32} primary {} | second {} | tiers.toml {}",
+                entry.candidate_id,
+                thresholds(&checked.structure.primary),
+                thresholds(&checked.structure.second),
+                thresholds(&checked.structure.recorded),
+            );
+        }
+    }
+
+    let ignored: Vec<_> = report
+        .entries
+        .iter()
+        .filter_map(|entry| match &entry.finding {
+            Finding::Checked(checked) if checked.structure.unmodelled > 0 => {
+                Some((entry.candidate_id.as_str(), checked.structure.unmodelled))
+            }
+            _ => None,
+        })
+        .collect();
+    if !ignored.is_empty() {
+        println!("\n  the second source also reprices on a dimension this comparison does not");
+        println!("  model (a time-of-day promotion, say); those bands were not compared:");
+        for (id, count) in &ignored {
+            println!("    {id:<32} {count} override(s) ignored");
+        }
+    }
+
+    let missing = report.not_listed();
+    if !missing.is_empty() {
+        println!(
+            "\n  not listed by the second source ({}) — a coverage gap, or a pin whose id",
+            missing.len()
+        );
+        println!("  does not map into its namespace. Not actionable; worth a human's eye:");
+        for id in &missing {
+            println!("    {id}");
+        }
+    }
+
+    let unpriced = report.unpriced();
+    if !unpriced.is_empty() {
+        println!("\n  one source priced these and the other did not, so there was nothing to");
+        println!("  compare:");
+        for id in &unpriced {
+            println!("    {id}");
+        }
+    }
+
+    let deltas = report.rate_deltas();
+    if !deltas.is_empty() {
+        println!("\n  rate differences (INFORMATIONAL — a reseller's price is its own):");
+        for (id, delta) in &deltas {
+            println!(
+                "    {:<32} {:<14} {:<13} {} vs {}{}",
+                id,
+                delta
+                    .band
+                    .map_or_else(|| "base".to_owned(), |band| format!("≥{band} tok")),
+                delta.dimension,
+                delta.primary,
+                delta.second,
+                delta
+                    .ratio()
+                    .map_or_else(String::new, |ratio| format!("  ({ratio:.2}x)")),
+            );
+        }
+    }
 }

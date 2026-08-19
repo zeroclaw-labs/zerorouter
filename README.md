@@ -181,6 +181,37 @@ Two config files, no code:
 as `local $0 rung` and never fail the command, because no public model catalog
 lists a model running on your hardware.
 
+### A second opinion on the prices
+
+`catalog-drift` decides against models.dev alone, and a single source can be
+silently wrong — it once appeared to disagree with the rest of the world about
+where `openai/gpt-5.6-luna` reprices, because it publishes each context band
+twice and one of the two spellings has the boundary baked into its *name*.
+`--corroborate` cross-checks the same reconciliation against OpenRouter
+(`--corroborate-url`, or `--corroborate-file` for offline runs):
+
+```
+zerorouter admin catalog-drift --corroborate
+```
+
+Two rules govern what it does with the answer, and they are not the same rule:
+
+- **Where the vendors reprice** — the thresholds, and whether a model has bands
+  at all — is corroboration worth reading. Two catalogs cannot both be right
+  about a vendor's billing rule, so a disagreement there is reported
+  prominently.
+- **The rates are informational.** OpenRouter is a reseller and runs
+  promotions, so its price is *its* price: today it sells `openai/gpt-5.6-sol`
+  at half models.dev's list rate, and the ZeroRouter catalog follows models.dev
+  deliberately. Differences print with their ratio and mean nothing on their
+  own.
+
+It is **advisory in both directions**: nothing the second source says can change
+the exit code, and a second source that is unreachable, slow, or garbled prints
+one line and the command finishes normally. Opt-in, so the daily drift workflow
+keeps answering one question about `tiers.toml` and takes on no dependency on a
+third party's uptime.
+
 ## Environment variables
 
 Absence disables a feature; misconfiguration aborts startup. See the

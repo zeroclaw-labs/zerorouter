@@ -1,0 +1,66 @@
+schema_version = 1
+
+# A two-pin catalog for `tests/admin_catalog_drift_corroboration.rs`, which
+# drives the real `zerorouter admin catalog-drift` binary to prove that the
+# SECOND pricing source cannot move the exit code.
+#
+# Deliberately NOT `config/tiers.toml`: that file's prices are a live billing
+# belief that changes when a vendor changes, and a test asserting an exact exit
+# code against it would fail the day someone updates a rate for a reason that
+# has nothing to do with this test.
+#
+# Both upstreams are SHIPPED providers, so the command needs no operator
+# inventory and this test binary never installs one. No `metadata` tables and
+# no `limit` in the paired source fixtures either — an undeclared field is a
+# non-actionable `undeclared` row, and leaving both sides silent keeps the
+# reconciliation about prices alone.
+#
+# One pin reprices past a threshold and one is flat, because "the two sources
+# agree there is no boundary" is a claim worth exercising alongside "the two
+# sources agree where the boundary is".
+
+[tiers."openai/gpt-5.6-luna"]
+
+[tiers."openai/gpt-5.6-luna".rates]
+input_per_mtok = 0.20
+cached_input_per_mtok = 0.02
+output_per_mtok = 1.20
+
+[[tiers."openai/gpt-5.6-luna".rates.conditional]]
+min_prompt_tokens = 272000
+input_per_mtok = 0.40
+cached_input_per_mtok = 0.04
+output_per_mtok = 1.80
+
+[[tiers."openai/gpt-5.6-luna".candidates]]
+id = "openai/gpt-5.6-luna"
+provider = "openai"
+model = "gpt-5.6-luna"
+
+[tiers."openai/gpt-5.6-luna".candidates.rates]
+input_per_mtok = 0.20
+cached_input_per_mtok = 0.02
+output_per_mtok = 1.20
+
+[[tiers."openai/gpt-5.6-luna".candidates.rates.conditional]]
+min_prompt_tokens = 272000
+input_per_mtok = 0.40
+cached_input_per_mtok = 0.04
+output_per_mtok = 1.80
+
+[tiers."anthropic/claude-sonnet-5"]
+
+[tiers."anthropic/claude-sonnet-5".rates]
+input_per_mtok = 2.00
+cached_input_per_mtok = 0.20
+output_per_mtok = 10.00
+
+[[tiers."anthropic/claude-sonnet-5".candidates]]
+id = "anthropic/claude-sonnet-5"
+provider = "anthropic"
+model = "claude-sonnet-5"
+
+[tiers."anthropic/claude-sonnet-5".candidates.rates]
+input_per_mtok = 2.00
+cached_input_per_mtok = 0.20
+output_per_mtok = 10.00

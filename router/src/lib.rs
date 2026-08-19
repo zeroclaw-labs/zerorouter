@@ -3,6 +3,7 @@ pub mod api;
 pub mod auth;
 pub mod billing;
 pub mod config;
+pub mod corroborate;
 pub mod db;
 pub mod device;
 pub mod drift;
