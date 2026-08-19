@@ -50,12 +50,80 @@
 //!
 //! # Sales tax
 //!
-//! Checkout Sessions are created with `automatic_tax[enabled]=true`: Stripe
-//! determines whether tax is due from the buyer's address and the
-//! registrations configured in the Stripe dashboard. **No rate and no
-//! jurisdiction is encoded here**, deliberately — the only tax facts in this
-//! file are the product tax code and the fact that tax is charged ON TOP of
-//! the price (see [`CHECKOUT_TAX_CODE`] and [`CHECKOUT_TAX_BEHAVIOR`]).
+//! Checkout Sessions are created with `automatic_tax[enabled]=true` and
+//! **nothing else**. Stripe determines whether tax is due from the buyer's
+//! address and the registrations configured in the dashboard, and it takes the
+//! product tax code and the tax behavior from Tax Settings, because this
+//! request deliberately specifies neither: "If you don't specify a tax code,
+//! Stripe Tax uses the default tax code from your Tax Settings", and the same
+//! fallback governs tax behavior.
+//!
+//! ## Why the policy lives in the dashboard and not here
+//!
+//! Because it is not settled, and it is not ours to settle. The correct
+//! treatment of prepaid credits is genuinely contested — Massachusetts has
+//! published authority pointing at redemption-time (M.G.L. c. 64H § 1's "rights
+//! and credits" exclusion, Directive 12-4, LR 16-1) while a draft revision of
+//! 830 CMR 64H.1.3 points the other way, and no US authority addresses per-token
+//! AI APIs at all. That is an accountant's determination, it is likely to
+//! change, and Stripe's own guidance to integrators is not to make the legal
+//! classification on the seller's behalf.
+//!
+//! A value in this file would mean every revision of that determination is a
+//! code change, a review, and a deploy. In Tax Settings it is a dropdown, it
+//! takes effect immediately, and one setting governs checkout and any future
+//! Stripe-billed surface alike rather than each hardcoding its own answer. The
+//! research behind the recommended selections is preserved below — it is real
+//! work and the operator will need it — but as guidance for what to choose in
+//! the dashboard, not as a value this code transmits.
+//!
+//! Not sending `tax_behavior` has a second benefit: Stripe refuses to change a
+//! `tax_behavior` once set on a Price, so pinning it per session pinned it
+//! per session forever. Leaving it to Tax Settings keeps it revisable.
+//!
+//! ## What to select in Tax Settings
+//!
+//! **Default tax behavior — must be `Exclusive`** (or `Automatic`, which
+//! resolves to exclusive for USD and CAD; equivalent here because
+//! [`CHECKOUT_CURRENCY`] is USD, but `Exclusive` stays correct if a second
+//! currency is ever added). This is not a preference. The ToS says prices are
+//! exclusive of taxes; [`DEPOSIT_FEE_FLOOR_USD`] is sized so the gross covers
+//! the credit plus Stripe's per-charge cost, so tax carved OUT of the gross
+//! would consume more than the whole margin on the smallest deposit; and the
+//! ledger records the ex-tax gross, so a session that carved tax out of it
+//! collected less than ZeroRouter sold. **Selecting `Inclusive` does not
+//! silently under-collect — it stops purchases working**: every session then
+//! arrives at the webhook as a short payment and credits nothing. That is the
+//! designed outcome (money is never credited against money that did not
+//! arrive), but it is a total checkout outage, so get this one right.
+//!
+//! **Preset product tax code — recommended starting selection
+//! `txcd_10105001`** (AIaaS – Cloud Based – Personal Use), pending the
+//! accountant. Two separate questions sit behind it.
+//!
+//! *Which product?* Answered with reasonable confidence. Stripe publishes
+//! dedicated AI-service codes and asks sellers to match delivery model and
+//! customer; ZeroRouter is delivered entirely over the cloud with nothing
+//! downloaded, which is the "Cloud Based" pair (`txcd_10105001` personal /
+//! `txcd_10105002` business). Stripe explicitly warns against the generic
+//! `txcd_10000000` for US sales. Personal use is the half ZeroRouter can
+//! actually evidence — checkout is self-serve and no business identifier or tax
+//! ID is collected — and of the two it errs toward collecting.
+//!
+//! *When is tax due?* Not answered, by anyone. The sale-versus-redemption
+//! question above is unresolved, and a product tax code cannot express timing,
+//! so no selection here settles it. What the architecture settles is narrower:
+//! redemption is a metered balance debit in [`crate::billing`] with no Stripe
+//! object and no tax computation, so a stored-value code (`txcd_10502000`, which
+//! Stripe calls multi-purpose) defers tax to a point that will never collect it
+//! — in practice a choice to collect nothing anywhere. Avoid `txcd_00000000`
+//! (Nontaxable) for a different reason: it makes Stripe's
+//! `taxability_reason=not_collecting` indistinguishable from a missing
+//! registration, hiding real misconfiguration. Massachusetts DOR issues letter
+//! rulings for exactly this situation (830 CMR 62C.3.1(6)).
+//!
+//! Whichever is selected, it does not fix transactions already taken: Stripe
+//! cannot retroactively correct a sale that collected the wrong tax.
 //!
 //! ## Where the tax lands
 //!
@@ -86,27 +154,40 @@
 //! [`collected_ex_tax_cents`] — the money that moved, less the part that is
 //! not ours — never against `amount_total` directly.
 //!
-//! ## Operator prerequisites — two different failure modes
+//! ## Operator prerequisites — three different failure modes
 //!
-//! This flag depends on dashboard state that no deployment step checks, and it
-//! fails in two unrelated ways depending on which piece is missing:
+//! Every tax decision now lives in dashboard state that no deployment step
+//! checks, and the pieces fail in three unrelated ways:
 //!
 //! 1. **Stripe Tax not activated on the account** — Stripe rejects the session
 //!    creation outright (`stripe_tax_inactive`), so `POST /api/billing/checkout`
 //!    returns 502 `checkout_failed` and NOBODY can buy credits. Loud, total, and
 //!    immediate on deploy.
-//! 2. **Activated, but no registration covering the buyer** — Stripe accepts
+//! 2. **Default tax behavior set to `Inclusive`** — sessions are created fine
+//!    and the customer pays, but the tax is carved out of ZeroRouter's price
+//!    instead of added to it, so every event reaches the webhook as a short
+//!    payment and credits nothing. Purchases fail closed: money collected, no
+//!    credit, `amount_mismatch` in Stripe's webhook dashboard. Correct
+//!    behaviour, awful outcome — set `Exclusive` (or `Automatic`).
+//! 3. **Activated, but no registration covering the buyer** — Stripe accepts
 //!    the session and calculates zero tax. Checkout works, purchases credit
 //!    normally, and nothing in these logs says tax is not being collected. This
 //!    is the quiet one, and it is the failure Stripe itself calls the most
 //!    common Stripe Tax mistake.
 //!
-//! So activation must precede deployment, and registration must precede the
-//! first live purchase — Stripe cannot retroactively correct a transaction that
-//! collected the wrong tax. Registrations are per environment; a sandbox's do
-//! not carry to live mode. `docs/DEPLOY.md` lists the steps. Neither the code
-//! nor a green test proves tax is being collected: only a real transaction with
-//! a non-zero tax line does.
+//! Note the shape of that list: since this request no longer carries the tax
+//! code or the behavior, a wrong preset in Tax Settings is now the ONLY thing
+//! standing between a correct deployment and mode 2. The trade is deliberate —
+//! the policy becomes revisable without a deploy — but it moves a load-bearing
+//! setting out of code review, so it belongs in the deployment checklist
+//! instead. `docs/DEPLOY.md` carries it.
+//!
+//! Ordering: activation and the presets must precede deployment; registration
+//! must precede the first live purchase, because Stripe cannot retroactively
+//! correct a transaction that collected the wrong tax. All of it is per
+//! environment — a sandbox's registrations do not carry to live mode. Neither
+//! the code nor a green test proves tax is being collected: only a real
+//! transaction with a non-zero tax line does.
 //!
 //! Everything else is acknowledged without action so Stripe stops retrying it.
 //! **The Stripe endpoint must be subscribed to the events above** — an event
@@ -163,88 +244,6 @@ const CHARGE_REFUNDED_EVENT: &str = "charge.refunded";
 /// has already left the ZeroRouter balance at Stripe by the time it arrives.
 const DISPUTE_CREATED_EVENT: &str = "charge.dispute.created";
 const CHECKOUT_PRODUCT_NAME: &str = "ZeroRouter credits";
-/// Stripe product tax code: **AIaaS - Cloud Based - Personal Use**.
-///
-/// ⚠️ **UNCONFIRMED TAX POSITION — needs the operator's accountant.** This is a
-/// legal classification wearing the costume of a constant. It is recorded here
-/// with its reasoning, and with the argument against it, because an auditor
-/// will ask and because the reasoning is genuinely contestable. Stripe's own
-/// guidance is that an integrator must not make this call for the seller.
-///
-/// # What this code says
-///
-/// That ZeroRouter is selling cloud-delivered AI inference, taxed at the point
-/// of sale. Stripe publishes dedicated AI-service codes and asks sellers to
-/// match delivery model and customer; ZeroRouter is delivered entirely over the
-/// cloud with nothing downloaded, which is the "Cloud Based" pair
-/// (`txcd_10105001` personal / `txcd_10105002` business). Stripe explicitly
-/// warns against the generic `txcd_10000000` for US sales. Personal use is the
-/// half of that pair ZeroRouter can actually evidence: checkout is self-serve
-/// and no business identifier or tax ID is collected (`tax_id_collection` is
-/// off), so classifying every sale as business use would be an assumption the
-/// seller cannot support. Of the two readings it also errs toward collecting
-/// rather than under-collecting.
-///
-/// # The argument this code is WRONG, which has real support
-///
-/// What the customer buys here is not inference — it is a prepaid balance,
-/// spendable later. Massachusetts has published, on-point authority that the
-/// sale of stored value is not itself a taxable event, and that tax attaches on
-/// redemption instead: M.G.L. c. 64H § 1 excludes "rights and credits" from
-/// tangible personal property, Letter Ruling 81-4 holds a gift certificate's
-/// transfer is not a sale of TPP, and Directive 12-4 says tax on a redeemable
-/// voucher "is due when the vouchers are redeemed, not when they are issued".
-/// On that reading this code taxes the wrong event, and `txcd_10502000` ("Gift
-/// Card") is the better description.
-///
-/// Two things argue back. First, that authority is framed around goods and
-/// meals and around certificates redeemable at a THIRD party; a prepayment to
-/// the same seller for that seller's own single service is a different animal,
-/// and no Massachusetts source squarely covers it (nor does any US authority
-/// address per-token AI APIs at all). Second, and decisively for the code as it
-/// stands: ZeroRouter has no redemption-time tax mechanism and no plausible
-/// route to one. Redemption is a metered debit against a balance in
-/// `crate::billing` — no Stripe object exists at that moment and no tax is
-/// computed. Choosing the gift-card code defers tax to a point in the system
-/// that will never collect it, so in practice it is a choice to collect no tax
-/// anywhere. Collecting at sale is therefore the only behaviour this
-/// architecture can actually deliver, which is a fact about the code, not an
-/// argument about the law.
-///
-/// # What to do about it
-///
-/// The disagreement is over WHEN tax is due, and a product tax code cannot
-/// express timing — so no value here resolves it. Massachusetts DOR issues
-/// letter rulings for exactly this situation, and a pending draft revision of
-/// 830 CMR 64H.1.3 speaks directly to "purchase of tokens, credits, virtual
-/// currency, or scrip". Until the operator's accountant rules:
-///
-/// - `txcd_10105001` (here) — tax collected at purchase, on the full ex-tax
-///   gross including the deposit fee.
-/// - `txcd_10105002` — the same, if the accountant says the customer base is
-///   business use (which would also argue for enabling `tax_id_collection`).
-/// - `txcd_10502000` — stored value; expect no tax at purchase, and note that
-///   ZeroRouter would then collect none at redemption either.
-/// - `txcd_00000000` — nontaxable; avoid, because it makes Stripe's
-///   `taxability_reason=not_collecting` indistinguishable from a missing
-///   registration and so hides a real misconfiguration.
-///
-/// Whichever is chosen, changing it later does not fix transactions already
-/// taken: Stripe cannot retroactively correct a sale that collected the wrong
-/// tax.
-const CHECKOUT_TAX_CODE: &str = "txcd_10105001";
-/// Tax is added ON TOP of the quoted price, never carved out of it.
-///
-/// The ToS says so ("Prices are exclusive of taxes"), and the deposit-fee math
-/// requires it: [`DEPOSIT_FEE_FLOOR_USD`] is sized so the gross covers the
-/// credit granted plus Stripe's per-charge cost, so any tax taken OUT of the
-/// gross would come straight out of that margin — on the smallest deposit it
-/// would take more than the whole $0.332 of headroom. Inclusive tax would also
-/// contradict the ledger: the intent row records the ex-tax gross, so a session
-/// that carved tax out of it collected less than ZeroRouter sold. The webhook
-/// enforces this rather than assuming it — an inclusive-tax session arrives as
-/// a short payment and credits nothing (see [`collected_ex_tax_cents`]).
-const CHECKOUT_TAX_BEHAVIOR: &str = "exclusive";
 /// The one ISO-4217 currency ZeroRouter prices checkout in. Quoted to Stripe
 /// at session creation, stored on the pending record, and re-checked against
 /// the webhook's `currency` — an amount match alone is not proof of the price,
@@ -753,15 +752,19 @@ async fn create_checkout_session(
     // RECOMPUTES gross from credit (deposit_fee_quote) rather than trusting
     // these attacker-writable fields.
     //
-    // `unit_amount` remains the EX-TAX gross. With `automatic_tax` on and
-    // `tax_behavior=exclusive`, Stripe determines the tax from the buyer's
-    // address and the registrations configured in the dashboard, and adds it on
-    // top — so the card is charged more than `unit_amount`, and the webhook
-    // compares against `amount_total` minus that tax rather than against
-    // `amount_total`.
+    // `unit_amount` remains the EX-TAX gross. `automatic_tax[enabled]` asks
+    // Stripe to determine the tax from the buyer's address and the dashboard's
+    // registrations and add it on top — so the card is charged more than
+    // `unit_amount`, and the webhook compares against `amount_total` minus that
+    // tax rather than against `amount_total`.
     //
-    // Deliberately NOT sent:
+    // Deliberately NOT sent — each of these is a decision, not an oversight:
     //
+    // - `product_data[tax_code]` and `price_data[tax_behavior]`. Omitting them
+    //   is what puts the tax POLICY in Tax Settings, where the operator can
+    //   revise it without a deploy; see the module docs for what to select
+    //   there and why the classification is not ours to hardcode. Stripe falls
+    //   back to the Tax Settings presets for exactly this reason.
     // - `customer_update[address]=auto`. It is only valid alongside a
     //   `customer`, and this session attaches none — it identifies the buyer by
     //   `customer_email` only. (The autopay path does keep a Stripe Customer
@@ -771,21 +774,19 @@ async fn create_checkout_session(
     //   force it for a session with no attached customer: Checkout already
     //   collects the address automatic tax needs, and requiring it only adds
     //   friction.
-    let form: [(&str, &str); 15] = [
+    // - `customer_creation=always`. Stripe notes that Google Pay is only
+    //   offered under Stripe Tax when a shipping address is collected or a
+    //   saved customer exists — but this deployment offers Apple Pay, not
+    //   Google Pay, and `ensure_stripe_customer` already mints one Customer per
+    //   user for autopay. Setting it here would create a SECOND, Checkout-owned
+    //   customer on every purchase, duplicating records for one human.
+    let form: [(&str, &str); 13] = [
         ("mode", "payment"),
         ("line_items[0][price_data][currency]", CHECKOUT_CURRENCY),
         ("line_items[0][price_data][unit_amount]", &unit_amount),
         (
             "line_items[0][price_data][product_data][name]",
             CHECKOUT_PRODUCT_NAME,
-        ),
-        (
-            "line_items[0][price_data][product_data][tax_code]",
-            CHECKOUT_TAX_CODE,
-        ),
-        (
-            "line_items[0][price_data][tax_behavior]",
-            CHECKOUT_TAX_BEHAVIOR,
         ),
         ("line_items[0][quantity]", "1"),
         ("automatic_tax[enabled]", "true"),

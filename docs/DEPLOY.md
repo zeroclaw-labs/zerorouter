@@ -148,21 +148,30 @@ disable) starts with serve mode and needs no configuration.
 
 ## Stripe Tax must be configured BEFORE this deploys
 
-Checkout Sessions are created with `automatic_tax[enabled]=true`. The code
-sends no rate and no jurisdiction — taxability is entirely Stripe's
-determination from the buyer's address and the registrations in the
-dashboard — so the dashboard is not optional configuration, it is the
-feature. There is no environment variable and no code path that checks any
-of it.
+Checkout Sessions are created with `automatic_tax[enabled]=true` and nothing
+else. The code sends no rate, no jurisdiction, **no product tax code, and no
+tax behavior** — all of it comes from Tax Settings, deliberately, so the
+operator can revise a contested tax classification without a deploy. The
+dashboard is therefore not optional configuration around this feature, it
+**is** the feature. No environment variable and no code path checks any of
+it, and no test can: the tests prove one parameter is sent, not that Stripe
+was configured to act on it.
 
-Two distinct things go wrong when it is missing, and only one of them is
-loud:
+Three distinct things go wrong when it is missing, and only one is loud:
 
 1. **Stripe Tax not activated on the account.** Stripe rejects the session
    creation (`stripe_tax_inactive`), so `POST /api/billing/checkout`
    returns 502 `checkout_failed` and **nobody can buy credits at all**.
    This is immediate and total on deploy — activate first.
-2. **Activated, but no registration covering the buyer.** Stripe accepts
+2. **Default tax behavior left as `Inclusive`.** Stripe carves the tax out
+   of ZeroRouter's price instead of adding it on top, so every purchase
+   reaches the webhook as a short payment and **credits nothing**: the
+   customer is charged, no balance appears, and `amount_mismatch` piles up
+   in Stripe's webhook dashboard. The webhook is behaving correctly — it
+   refuses to credit against money that did not arrive — but the effect is
+   a total checkout outage with money moving. Since the request no longer
+   pins the behavior, this setting is now the only thing preventing it.
+3. **Activated, but no registration covering the buyer.** Stripe accepts
    the session and calculates zero tax. Checkout works, credits land, and
    nothing in the logs says tax is not being collected. This is the quiet
    failure, and Stripe cannot retroactively correct a sale that collected
@@ -176,18 +185,29 @@ environment):
 1. Dashboard → **Tax → Settings**: activate Stripe Tax and set the head
    office address (Cambridge, MA). `automatic_tax` calculates nothing while
    the settings status is `pending`.
-2. Dashboard → **Tax → Registrations**: add the Massachusetts registration
+2. Dashboard → **Tax → Settings → Include tax in prices**: set the default
+   tax behavior to **Exclusive**. (`Automatic` is equivalent today — it
+   resolves to exclusive for USD and CAD — but `Exclusive` stays correct if
+   a second currency is ever priced.) **Do not leave this on `Inclusive`;
+   see failure mode 2 above.** ZeroRouter's ToS says prices are exclusive of
+   taxes, and the deposit-fee margin assumes the gross arrives intact.
+3. Dashboard → **Tax → Settings → preset product tax code**: set it. The
+   recommended starting selection is **`txcd_10105001`** (AIaaS – Cloud
+   Based – Personal Use). The reasoning, the alternatives, and the
+   **unresolved question of whether tax is due when credits are bought or
+   when they are spent** are written up in the `# Sales tax` section of
+   `router/src/stripe.rs`. That question is an open item for the operator's
+   accountant — Massachusetts DOR issues letter rulings for exactly this
+   situation — and nothing in the code settles it. Because the code no
+   longer sends a tax code, changing this selection later is a dashboard
+   edit with no deploy.
+4. Dashboard → **Tax → Registrations**: add the Massachusetts registration
    and confirm it shows as *Collecting*. With a head office in
    Massachusetts the business is not a remote seller, so this registration
    is required on physical presence, not on a sales threshold.
-3. Confirm the product tax code and tax behavior the code sends are the
-   intended ones — see `CHECKOUT_TAX_CODE` in `router/src/stripe.rs`, which
-   carries the reasoning and the **unresolved question of whether tax is due
-   when credits are bought or when they are spent**. That is an open item
-   for the operator's accountant, not something the code settles.
-4. Run one real purchase and confirm the session carries a non-zero tax
-   line. A green test suite is not evidence: the tests prove the parameters
-   are sent, not that Stripe collected anything.
+5. Run one real purchase and confirm the session carries a non-zero tax
+   line and that the credit still lands. A green test suite is not
+   evidence.
 
 Two consequences worth planning for:
 

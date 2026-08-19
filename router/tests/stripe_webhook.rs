@@ -887,12 +887,10 @@ async fn checkout_session_form_is_the_pinned_stripe_wire_contract() {
             "line_items[0][price_data][product_data][name]",
             "ZeroRouter credits",
         ),
-        (
-            "line_items[0][price_data][product_data][tax_code]",
-            "txcd_10105001",
-        ),
-        ("line_items[0][price_data][tax_behavior]", "exclusive"),
         ("line_items[0][quantity]", "1"),
+        // The whole of ZeroRouter's tax integration. No tax code and no tax
+        // behavior: those are Tax Settings' job, so the operator can revise the
+        // classification without a deploy.
         ("automatic_tax[enabled]", "true"),
         ("metadata[user_id]", &user_id.to_string()),
         ("metadata[credit_usd]", "25.00"),
@@ -930,16 +928,15 @@ async fn checkout_session_form_is_the_pinned_stripe_wire_contract() {
     assert_eq!(intent.user_id, user_id);
 }
 
-/// The three parameters that make Stripe compute tax at all, asserted on their
-/// own so that losing any one of them fails for an obvious reason.
+/// The one parameter that makes Stripe compute tax, and the two that must NOT
+/// be sent so the dashboard keeps owning the policy.
 ///
-/// Each does a distinct job: without `automatic_tax[enabled]` Stripe never
-/// calculates, without a `tax_code` it falls back to the account preset for a
-/// product it knows nothing about, and without `tax_behavior=exclusive` the tax
-/// could be carved out of ZeroRouter's own margin instead of added on top.
-/// None of them fails loudly in production if dropped — the session is created
-/// happily and simply collects the wrong amount — which is why they are pinned
-/// here.
+/// Dropping `automatic_tax[enabled]` does not fail loudly in production: the
+/// session is created happily and simply collects nothing. Re-adding a
+/// `tax_code` or a `tax_behavior` does not fail loudly either — it quietly
+/// takes the classification back out of Tax Settings, so the operator's next
+/// revision of an unsettled legal question silently does not apply to checkout.
+/// Both directions are invisible without this test.
 #[tokio::test]
 async fn the_checkout_session_asks_stripe_to_calculate_tax() {
     let Some(pool) = connect().await else {
@@ -962,17 +959,18 @@ async fn the_checkout_session_asks_stripe_to_calculate_tax() {
         Some("true"),
         "Stripe must be asked to determine the tax"
     );
+    // Tax POLICY belongs to Tax Settings, not to this request. Stripe falls
+    // back to the account presets for both, which is what lets the operator
+    // revise a contested classification without shipping code.
     assert_eq!(
-        form.get("line_items[0][price_data][product_data][tax_code]")
-            .map(String::as_str),
-        Some("txcd_10105001"),
-        "the product must be classified as cloud-delivered AI-as-a-service"
+        form.get("line_items[0][price_data][product_data][tax_code]"),
+        None,
+        "the product tax code must come from Tax Settings, not from here"
     );
     assert_eq!(
-        form.get("line_items[0][price_data][tax_behavior]")
-            .map(String::as_str),
-        Some("exclusive"),
-        "tax rides on top of the price, never out of it"
+        form.get("line_items[0][price_data][tax_behavior]"),
+        None,
+        "the tax behavior must come from Tax Settings, not from here"
     );
     // No rate and no jurisdiction may be encoded anywhere in the request:
     // taxability is Stripe's determination from the buyer's address and the
