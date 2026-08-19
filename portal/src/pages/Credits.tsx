@@ -489,7 +489,8 @@ export function Credits() {
                 <p className="field-hint quote-line">
                   You pay {formatUsd(quote.gross)} (includes {formatUsd(quote.fee)} processing fee)
                   plus any applicable tax → receive {formatUsd(quote.credit)} credit. The exact tax
-                  appears on the next step, once you enter your billing address.
+                  appears on the next step, once you enter your billing address. Businesses can
+                  enter a VAT or tax ID there for reverse charge.
                 </p>
               )}
               {formError !== null && <Banner kind="error">{formError}</Banner>}
