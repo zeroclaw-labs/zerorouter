@@ -132,7 +132,17 @@ jobs:
         run: pnpm install --frozen-lockfile
       - name: Install Playwright chromium
         working-directory: portal
-        run: npx playwright install --with-deps chromium
+        # The CDN download has hung indefinitely on GitHub runners (twice on
+        # 2026-08-19, eating the full job timeout with the suite never run).
+        # Kill each attempt at 5 minutes and retry; a healthy install takes
+        # well under one.
+        timeout-minutes: 18
+        run: |
+          for attempt in 1 2 3; do
+            timeout 300 npx playwright install --with-deps chromium && exit 0
+            echo "::warning::Playwright install attempt ${attempt} failed or hung"
+          done
+          exit 1
       - name: Build portal
         working-directory: portal
         run: pnpm build
