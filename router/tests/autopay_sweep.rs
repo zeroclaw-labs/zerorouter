@@ -146,6 +146,7 @@ async fn serve(app: Router) -> String {
 fn settings(api_base: &str) -> StripeSettings {
     StripeSettings {
         secret_key: "sk_test_mock".to_owned(),
+        publishable_key: "pk_test_mock".to_owned(),
         webhook_secret: "whsec_mock".to_owned(),
         checkout_min_usd: Decimal::from(5),
         checkout_max_usd: Decimal::from(1000),

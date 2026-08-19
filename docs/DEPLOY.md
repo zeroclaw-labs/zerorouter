@@ -82,6 +82,16 @@ name until this repository took it over). To cut it over:
      not secret and may be plain env; remember the OIDC group is
      all-or-nothing — a partial group aborts the task at startup, which the
      circuit breaker will surface as a rollback.)
+   - **`STRIPE_PUBLISHABLE_KEY` (`pk_...`) — required, and new.** The Stripe
+     group is all-or-nothing like the OIDC one, so a task definition that
+     carries the secret key and the webhook secret but not this one **aborts
+     at startup** and the circuit breaker rolls the deployment back. It is
+     not a secret (the portal serves it to every signed-in browser over
+     `/api/me`, and Stripe.js sends it from the client), so plain env is
+     fine — but it IS environment-specific: use the sandbox `pk_test_...` in
+     a sandbox and the live `pk_live_...` in production, matching whichever
+     `STRIPE_SECRET_KEY` is set. A mismatched pair fails when a customer
+     tries to pay, not at startup.
 4. **Deploy**: run the `Deploy Router` workflow manually, or merge to
    `main` (the workflow triggers on push to `main`). Verify the run's
    deployment summary and that

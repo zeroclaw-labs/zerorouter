@@ -87,6 +87,7 @@ fn webhook_app(pool: &PgPool) -> axum::Router {
         oidc: None,
         stripe: Some(StripeSettings {
             secret_key: "sk_test_unused".to_owned(),
+            publishable_key: "pk_test_unused".to_owned(),
             webhook_secret: SECRET.to_owned(),
             checkout_min_usd: Decimal::from(5),
             checkout_max_usd: Decimal::from(1000),

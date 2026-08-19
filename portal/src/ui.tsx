@@ -203,11 +203,59 @@ export function Loading({ label = 'Loading' }: { label?: string }) {
   return <p className="loading">{label}…</p>
 }
 
-export function Modal({ title, children }: { title: string; children: ReactNode }) {
+/**
+ * A centred modal dialog.
+ *
+ * `onClose` is optional: some modals (the one-shot "API key created" panel)
+ * own their own dismissal through their action buttons and must NOT be
+ * escapable, because closing them loses the only copy of a secret. When it is
+ * supplied the modal gains the usual affordances — a close button, Escape, and
+ * a click on the backdrop.
+ *
+ * `wide` gives the dialog room for content that cannot reflow below ~500px,
+ * such as Stripe's embedded payment form.
+ */
+export function Modal({
+  title,
+  children,
+  onClose,
+  wide = false,
+}: {
+  title: string
+  children: ReactNode
+  onClose?: () => void
+  wide?: boolean
+}) {
+  useEffect(() => {
+    if (onClose === undefined) return
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') onClose()
+    }
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [onClose])
+
   return (
-    <div className="modal-overlay" role="dialog" aria-modal="true" aria-label={title}>
-      <div className="modal">
-        <h2 className="modal-title">{title}</h2>
+    <div
+      className="modal-overlay"
+      role="dialog"
+      aria-modal="true"
+      aria-label={title}
+      // Backdrop-only: a click that started inside the dialog (a drag out of a
+      // text field, say) must not dismiss it and lose entered payment details.
+      onMouseDown={onClose === undefined ? undefined : (e) => {
+        if (e.target === e.currentTarget) onClose()
+      }}
+    >
+      <div className={`modal${wide ? ' modal-wide' : ''}`}>
+        <div className="modal-head">
+          <h2 className="modal-title">{title}</h2>
+          {onClose !== undefined && (
+            <button type="button" className="modal-close" onClick={onClose} aria-label="Close">
+              ×
+            </button>
+          )}
+        </div>
         {children}
       </div>
     </div>

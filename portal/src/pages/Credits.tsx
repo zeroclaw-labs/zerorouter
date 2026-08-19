@@ -1,6 +1,9 @@
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import type { FormEvent } from 'react'
 import { useSearchParams } from 'react-router-dom'
+import { EmbeddedCheckout, EmbeddedCheckoutProvider } from '@stripe/react-stripe-js'
+import { loadStripe } from '@stripe/stripe-js'
+import type { Stripe } from '@stripe/stripe-js'
 import { api, ApiError } from '../api'
 import type { AutopayStatus, Quote } from '../api'
 import {
@@ -8,6 +11,7 @@ import {
   Banner,
   EmptyState,
   Loading,
+  Modal,
   Stat,
   formatSignedUsd,
   formatTime,
@@ -19,6 +23,37 @@ import {
 } from '../ui'
 
 const PRESETS = ['10.00', '25.00', '100.00']
+
+/**
+ * What the `/credits/return` route concluded about a finished payment attempt.
+ *
+ * `success` means Stripe reported the session `complete` — the payment was
+ * taken. It does NOT mean the credit has landed: crediting is driven by the
+ * signed `checkout.session.completed` webhook, so the banner promises the
+ * money is coming, never that the balance has already moved.
+ */
+type CheckoutNotice = 'success' | 'retry' | 'expired' | 'unknown'
+
+const CHECKOUT_NOTICES: readonly string[] = ['success', 'retry', 'expired', 'unknown']
+
+function isCheckoutNotice(value: string | null): value is CheckoutNotice {
+  return value !== null && CHECKOUT_NOTICES.includes(value)
+}
+
+/**
+ * `loadStripe` injects the js.stripe.com script and must not be called on
+ * every render. The publishable key arrives from the server (`/api/me`) rather
+ * than from the bundle, so the promise cannot simply be a module constant —
+ * this memoizes it per key instead, which gives the same "called once" result
+ * without hardcoding the account.
+ */
+let stripeCache: { key: string; promise: Promise<Stripe | null> } | null = null
+function stripeFor(publishableKey: string): Promise<Stripe | null> {
+  if (stripeCache === null || stripeCache.key !== publishableKey) {
+    stripeCache = { key: publishableKey, promise: loadStripe(publishableKey) }
+  }
+  return stripeCache.promise
+}
 
 /**
  * Validate and normalize a user-entered amount to a `"NN.NN"` decimal string.
@@ -56,12 +91,19 @@ export function Credits() {
 
   const ledger = useLoad(() => api.ledger(50), [])
   const autopay = useLoad(() => api.autopay(), [])
-  const [notice, setNotice] = useState<'success' | 'cancelled' | null>(null)
+  const [notice, setNotice] = useState<CheckoutNotice | null>(null)
   const [preset, setPreset] = useState<string | null>('25.00')
   const [custom, setCustom] = useState('')
   const [formError, setFormError] = useState<string | null>(null)
   const [submitting, setSubmitting] = useState(false)
   const [unavailable, setUnavailable] = useState(false)
+  // Modal state. `stage` is 'amount' while the customer picks what to buy and
+  // 'pay' once Stripe's form is mounted; `payingAmount` is the amount the
+  // mounted session was created for, and keys the provider so that going back
+  // and choosing a different amount tears the old session's iframe down.
+  const [modalOpen, setModalOpen] = useState(false)
+  const [stage, setStage] = useState<'amount' | 'pay'>('amount')
+  const [payingAmount, setPayingAmount] = useState<string | null>(null)
   // The server-priced deposit for the current amount. Null until it lands (or
   // when the amount is invalid / billing is off); the fee is never computed here.
   const [quote, setQuote] = useState<Quote | null>(null)
@@ -78,18 +120,27 @@ export function Credits() {
   const [autopaySubmitting, setAutopaySubmitting] = useState(false)
   const [cardSubmitting, setCardSubmitting] = useState(false)
 
-  // Absorb the ?checkout=success|cancelled and ?autopay=saved|cancelled
-  // returns from Stripe exactly once.
+  // Absorb the ?checkout=... and ?autopay=saved|cancelled returns exactly
+  // once. `checkout` is now set by the /credits/return route (which reads the
+  // session status) rather than by Stripe redirecting to a success/cancel url.
   useEffect(() => {
     const checkout = searchParams.get('checkout')
     const card = searchParams.get('autopay')
     if (checkout === null && card === null) return
     const next = new URLSearchParams(searchParams)
-    if (checkout === 'success' || checkout === 'cancelled') {
+    if (isCheckoutNotice(checkout)) {
       setNotice(checkout)
       if (checkout === 'success') {
         void refresh()
         ledger.reload()
+      }
+      // The payment did not go through, so put the customer back where they
+      // were — the modal, on the amount step — rather than making them find
+      // the button again.
+      if (checkout === 'retry') {
+        setStage('amount')
+        setPayingAmount(null)
+        setModalOpen(true)
       }
     }
     next.delete('checkout')
@@ -137,9 +188,23 @@ export function Credits() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [normalized])
 
+  // The key is server configuration, so Stripe.js can only be loaded once the
+  // session has. `null` means this deployment has no Stripe billing at all.
+  const publishableKey = user?.stripe_publishable_key ?? null
+  const stripePromise = useMemo(
+    () => (publishableKey === null ? null : stripeFor(publishableKey)),
+    [publishableKey],
+  )
+
   if (user === null) return null
 
-  async function buy(event: FormEvent) {
+  const billingOff = unavailable || publishableKey === null
+
+  // Move from picking an amount to paying for it. The Checkout Session is not
+  // created here — `fetchClientSecret` below is what calls the server, once,
+  // when Stripe's form mounts. Keeping it there means a customer who opens the
+  // modal and closes it again has cost nothing: no session, no intent row.
+  function goToPayment(event: FormEvent) {
     event.preventDefault()
     const amount = normalizeAmount(chosen)
     if (amount === null) {
@@ -147,18 +212,37 @@ export function Credits() {
       return
     }
     setFormError(null)
+    setPayingAmount(amount)
+    setStage('pay')
+  }
+
+  // Stripe calls this when it mounts the embedded form. It must resolve to the
+  // session's client secret, or reject — react-stripe-js has no other channel
+  // for reporting the failure, so the error is surfaced through our own state.
+  const fetchClientSecret = useCallback(async () => {
+    if (payingAmount === null) throw new Error('No amount selected.')
     setSubmitting(true)
     try {
-      const session = await api.checkout(amount)
-      window.location.assign(session.url)
+      const session = await api.checkout(payingAmount)
+      return session.client_secret
     } catch (err) {
-      setSubmitting(false)
       if (err instanceof ApiError && err.code === 'billing_unavailable') {
         setUnavailable(true)
+        setModalOpen(false)
       } else {
         toast(err instanceof Error ? err.message : 'Checkout failed.', 'error')
+        setStage('amount')
       }
+      throw err
+    } finally {
+      setSubmitting(false)
     }
+  }, [payingAmount, toast])
+
+  function closeCheckout() {
+    setModalOpen(false)
+    setStage('amount')
+    setPayingAmount(null)
   }
 
   async function saveCard() {
@@ -238,12 +322,24 @@ export function Credits() {
 
       {notice === 'success' && (
         <Banner kind="success" onDismiss={() => setNotice(null)}>
-          Checkout complete. Credits appear as soon as Stripe confirms the payment — usually within seconds.
+          Payment received. Credits appear as soon as Stripe confirms the payment — usually within
+          seconds.
         </Banner>
       )}
-      {notice === 'cancelled' && (
+      {notice === 'retry' && (
         <Banner kind="info" onDismiss={() => setNotice(null)}>
-          Checkout cancelled — you have not been charged.
+          That payment was not completed — you have not been charged. Pick an amount to try again.
+        </Banner>
+      )}
+      {notice === 'expired' && (
+        <Banner kind="info" onDismiss={() => setNotice(null)}>
+          That checkout expired before it was paid — you have not been charged.
+        </Banner>
+      )}
+      {notice === 'unknown' && (
+        <Banner kind="info" onDismiss={() => setNotice(null)}>
+          We could not confirm that payment just now. If it went through, the credits will still
+          appear here — the ledger below is the record.
         </Banner>
       )}
       {autopayNotice === 'saved' && (
@@ -265,64 +361,128 @@ export function Credits() {
         <div className="panel-head">
           <h2>Add credits</h2>
         </div>
-        {unavailable ? (
-          <div className="panel-body">
+        <div className="panel-body">
+          {billingOff ? (
             <Banner kind="info">Billing is not enabled on this deployment.</Banner>
-          </div>
-        ) : (
-          <form className="buy" onSubmit={buy}>
-            <div className="preset-row" role="group" aria-label="Amount">
-              {PRESETS.map((p) => (
-                <button
-                  key={p}
-                  type="button"
-                  className={`preset${preset === p && custom.trim() === '' ? ' selected' : ''}`}
-                  onClick={() => {
-                    setPreset(p)
-                    setCustom('')
-                    setFormError(null)
-                  }}
-                >
-                  ${p.slice(0, -3)}
-                </button>
-              ))}
-              <label className="custom-amount">
-                <span className="currency" aria-hidden="true">
-                  $
-                </span>
-                <input
-                  inputMode="decimal"
-                  placeholder="Custom"
-                  aria-label="Custom amount in dollars"
-                  value={custom}
-                  onChange={(e) => {
-                    setCustom(e.target.value)
-                    setFormError(null)
-                  }}
-                />
-              </label>
-            </div>
-            <p className="field-hint">Minimum $5.00. Credits are spent by usage at the listed tier rates.</p>
-            {quote !== null && (
-              <p className="field-hint quote-line">
-                You pay {formatUsd(quote.gross)} (includes {formatUsd(quote.fee)} processing fee)
-                plus any applicable tax → receive {formatUsd(quote.credit)} credit. Stripe shows the
-                tax before you confirm.
+          ) : (
+            <>
+              <p className="field-hint">
+                Credits are spent by usage at the listed tier rates. Minimum $5.00.
               </p>
-            )}
-            {formError !== null && <Banner kind="error">{formError}</Banner>}
-            <button className="btn btn-primary" type="submit" disabled={submitting}>
-              {submitting
-                ? 'Redirecting to checkout…'
-                : quote !== null
-                  ? `Pay ${formatUsd(quote.gross)} + tax → get ${formatUsd(quote.credit)} credit`
-                  : normalized !== null
-                    ? `Buy ${formatUsd(normalized)} of credits`
-                    : 'Buy credits'}
-            </button>
-          </form>
-        )}
+              <button
+                className="btn btn-primary"
+                type="button"
+                style={{ marginTop: 12 }}
+                onClick={() => {
+                  setFormError(null)
+                  setStage('amount')
+                  setPayingAmount(null)
+                  setModalOpen(true)
+                }}
+              >
+                Add credits
+              </button>
+            </>
+          )}
+        </div>
       </section>
+
+      {modalOpen && !billingOff && (
+        <Modal title="Add credits" onClose={closeCheckout} wide>
+          {stage === 'amount' ? (
+            <form className="buy" onSubmit={goToPayment}>
+              <div className="preset-row" role="group" aria-label="Amount">
+                {PRESETS.map((p) => (
+                  <button
+                    key={p}
+                    type="button"
+                    className={`preset${preset === p && custom.trim() === '' ? ' selected' : ''}`}
+                    onClick={() => {
+                      setPreset(p)
+                      setCustom('')
+                      setFormError(null)
+                    }}
+                  >
+                    ${p.slice(0, -3)}
+                  </button>
+                ))}
+                <label className="custom-amount">
+                  <span className="currency" aria-hidden="true">
+                    $
+                  </span>
+                  <input
+                    inputMode="decimal"
+                    placeholder="Custom"
+                    aria-label="Custom amount in dollars"
+                    value={custom}
+                    onChange={(e) => {
+                      setCustom(e.target.value)
+                      setFormError(null)
+                    }}
+                  />
+                </label>
+              </div>
+              {quote !== null && (
+                <p className="field-hint quote-line">
+                  You pay {formatUsd(quote.gross)} (includes {formatUsd(quote.fee)} processing fee)
+                  plus any applicable tax → receive {formatUsd(quote.credit)} credit. The exact tax
+                  appears on the next step, once you enter your billing address.
+                </p>
+              )}
+              {formError !== null && <Banner kind="error">{formError}</Banner>}
+              <div className="modal-actions">
+                <button className="btn btn-ghost" type="button" onClick={closeCheckout}>
+                  Cancel
+                </button>
+                <button className="btn btn-primary" type="submit">
+                  {quote !== null
+                    ? `Continue — ${formatUsd(quote.gross)} + tax`
+                    : normalized !== null
+                      ? `Continue — ${formatUsd(normalized)} of credits`
+                      : 'Continue'}
+                </button>
+              </div>
+            </form>
+          ) : (
+            <>
+              <div className="checkout-summary">
+                <p className="field-hint">
+                  {quote !== null ? (
+                    <>
+                      {formatUsd(quote.gross)} (includes {formatUsd(quote.fee)} processing fee) plus
+                      tax → {formatUsd(quote.credit)} credit.
+                    </>
+                  ) : (
+                    <>Paying for {formatUsd(payingAmount)} of credits.</>
+                  )}{' '}
+                  <button className="linkish" type="button" onClick={() => setStage('amount')}>
+                    Change amount
+                  </button>
+                </p>
+              </div>
+              {/* In ZeroRouter's own voice, above Stripe's form, because the
+                  address field appears without explanation otherwise. */}
+              <p className="checkout-note">
+                A billing address is required to verify your identity, help prevent fraud, and
+                calculate any sales tax due. We never see your card details — the form below is
+                Stripe's.
+              </p>
+              <div className="checkout-embed">
+                {submitting && <Loading label="Opening secure payment" />}
+                <EmbeddedCheckoutProvider
+                  // Remount on a changed amount so a stale session's iframe is
+                  // torn down rather than left showing the previous price.
+                  key={payingAmount ?? 'none'}
+                  stripe={stripePromise}
+                  options={{ fetchClientSecret }}
+                >
+                  <EmbeddedCheckout />
+                </EmbeddedCheckoutProvider>
+              </div>
+            </>
+          )}
+        </Modal>
+      )}
 
       <section className="panel">
         <div className="panel-head">
@@ -333,7 +493,7 @@ export function Credits() {
             </Badge>
           )}
         </div>
-        {unavailable ? (
+        {billingOff ? (
           <div className="panel-body">
             <Banner kind="info">Billing is not enabled on this deployment.</Banner>
           </div>

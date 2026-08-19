@@ -23,6 +23,11 @@ export interface Me {
   email: string
   credit_balance_usd: string
   created_at: string
+  /** Stripe publishable key for this deployment, or null when billing is off.
+   * Server-provided rather than baked into the bundle: it differs between the
+   * test and live Stripe accounts, so a hardcoded key would be wrong for one
+   * of them. Publishable by design — Stripe.js sends it from the browser. */
+  stripe_publishable_key: string | null
 }
 
 export interface ApiKey {
@@ -81,8 +86,23 @@ export interface LedgerEntry {
   note: string | null
 }
 
-export interface CheckoutSession {
+/** A Stripe-hosted page to redirect to. Still the shape of the autopay card
+ * setup, which remains a redirect; credit purchase no longer uses it. */
+export interface RedirectSession {
   url: string
+}
+
+/** An embedded Checkout Session: the secret the browser mounts the payment
+ * form with. There is no url — an `embedded_page` session has none. */
+export interface CheckoutClientSecret {
+  client_secret: string
+}
+
+/** Display-only status of a Checkout Session. `complete` means Stripe took the
+ * payment; it does NOT mean credit has landed. Crediting is webhook-driven and
+ * this value never causes it — see `router/src/stripe.rs`. */
+export interface CheckoutStatus {
+  status: 'complete' | 'open' | 'expired' | string
 }
 
 /** One row of the public catalog (`GET /v1/models`). Prices are decimal
@@ -204,13 +224,18 @@ export const api = {
       `/api/billing/ledger?limit=${limit}`,
     ).then((r) => r.entries),
   checkout: (amountUsd: string) =>
-    request<CheckoutSession>('POST', '/api/billing/checkout', { amount_usd: amountUsd }),
+    request<CheckoutClientSecret>('POST', '/api/billing/checkout', { amount_usd: amountUsd }),
+  checkoutStatus: (sessionId: string) =>
+    request<CheckoutStatus>(
+      'GET',
+      `/api/billing/checkout/status?session_id=${encodeURIComponent(sessionId)}`,
+    ),
   quote: (creditUsd: string) =>
     request<Quote>('GET', `/api/billing/quote?credit=${encodeURIComponent(creditUsd)}`),
   autopay: () => request<AutopayStatus>('GET', '/api/billing/autopay'),
   putAutopay: (update: AutopayUpdate) =>
     request<AutopayStatus>('PUT', '/api/billing/autopay', update),
-  autopaySetup: () => request<CheckoutSession>('POST', '/api/billing/autopay/setup'),
+  autopaySetup: () => request<RedirectSession>('POST', '/api/billing/autopay/setup'),
   deviceLookup: (userCode: string) =>
     request<DeviceLookup>('POST', '/api/device/lookup', { user_code: userCode }),
   deviceApprove: (userCode: string) =>

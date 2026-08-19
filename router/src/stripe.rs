@@ -1,10 +1,12 @@
 //! Minimal hand-rolled Stripe integration: Checkout Session creation,
 //! webhook signature verification, and prepaid-credit application.
 //!
-//! The `async-stripe` SDK is deliberately not used — ZeroRouter needs exactly
-//! two interactions (create a Checkout Session, verify and apply a
-//! `checkout.session.completed` webhook), both small enough to implement
-//! against the documented wire formats. The webhook path is fail-closed: a
+//! The `async-stripe` SDK is deliberately not used — ZeroRouter needs a
+//! handful of interactions (create a Checkout Session, read one back for
+//! display, verify and apply a `checkout.session.completed` webhook), each
+//! small enough to implement against the documented wire formats. Only the
+//! first and third can move money; see [`checkout_status`] for why the second
+//! cannot. The webhook path is fail-closed: a
 //! missing or invalid signature, a stale timestamp, or unknown/malformed
 //! metadata rejects the event and credits nothing. Replays are idempotent —
 //! `crate::billing::credit_purchase` anchors each purchase to the unique
@@ -47,6 +49,24 @@
 //! | `payment_intent.succeeded` / `.payment_failed` | settle or fail an autopay charge (migration 0008) |
 //! | `charge.dispute.created` | freeze the account and reverse the credit (migration 0009) |
 //! | `charge.refunded` | reverse the credit; no freeze (migration 0009) |
+//!
+//! # Where the payment form lives
+//!
+//! Inside the portal, not on a Stripe-hosted page. Sessions are created with
+//! `ui_mode=embedded_page`, which makes Stripe return a `client_secret`
+//! instead of a redirect `url`; the portal mounts the form in a modal with
+//! Stripe.js, and the customer never leaves the Credits page. `success_url`
+//! and `cancel_url` cannot be sent in this mode — Stripe rejects them — so a
+//! single `return_url` carrying the `{CHECKOUT_SESSION_ID}` template variable
+//! replaces both, and the page it lands on reads the session's status to
+//! decide what to show.
+//!
+//! **None of that changes what moves money.** The return page is a display
+//! surface: it asks [`checkout_status`], which is read-only and refuses
+//! sessions the caller does not own. Credit is applied by the signed webhook
+//! and nothing else, exactly as before, so a customer who closes the tab
+//! before returning is still credited and a customer who forges the return
+//! page's answer gains nothing.
 //!
 //! # Sales tax
 //!
@@ -234,6 +254,12 @@ const WEBHOOK_TOLERANCE: Duration = Duration::from_secs(300);
 fn checkout_sessions_url(settings: &StripeSettings) -> String {
     format!("{}/v1/checkout/sessions", settings.api_base)
 }
+/// Retrieval url for one session. The id is not percent-encoded because it has
+/// already been matched against a `stripe_checkout_intents` row written by this
+/// deployment — it is our own stored id, not the caller's string.
+fn checkout_session_url(settings: &StripeSettings, session_id: &str) -> String {
+    format!("{}/v1/checkout/sessions/{session_id}", settings.api_base)
+}
 const STRIPE_HTTP_TIMEOUT: Duration = Duration::from_secs(15);
 const CHECKOUT_COMPLETED_EVENT: &str = "checkout.session.completed";
 const CHECKOUT_ASYNC_SUCCEEDED_EVENT: &str = "checkout.session.async_payment_succeeded";
@@ -244,6 +270,15 @@ const CHARGE_REFUNDED_EVENT: &str = "charge.refunded";
 /// has already left the ZeroRouter balance at Stripe by the time it arrives.
 const DISPUTE_CREATED_EVENT: &str = "charge.dispute.created";
 const CHECKOUT_PRODUCT_NAME: &str = "ZeroRouter credits";
+/// Render Checkout as a form inside the portal rather than on a Stripe-hosted
+/// page. Stripe's enum spells this `embedded_page` (`hosted_page` is the
+/// default, and `elements` is the lower-level Checkout-elements mode).
+const CHECKOUT_UI_MODE: &str = "embedded_page";
+/// The portal route Checkout returns the browser to once the payment attempt
+/// finishes. `{CHECKOUT_SESSION_ID}` is Stripe's template variable, replaced
+/// with the real session id at redirect time — it is deliberately NOT a format
+/// placeholder, so it must survive into the request verbatim.
+const CHECKOUT_RETURN_PATH: &str = "/credits/return?session_id={CHECKOUT_SESSION_ID}";
 /// The one ISO-4217 currency ZeroRouter prices checkout in. Quoted to Stripe
 /// at session creation, stored on the pending record, and re-checked against
 /// the webhook's `currency` — an amount match alone is not proof of the price,
@@ -393,6 +428,10 @@ fn parse_signature_header(header: &str) -> Result<ParsedSignatureHeader<'_>, Web
 pub fn router() -> Router<WebCtx> {
     Router::new()
         .route("/api/billing/checkout", post(create_checkout))
+        .route(
+            "/api/billing/checkout/status",
+            axum::routing::get(checkout_status),
+        )
         .route("/api/billing/quote", axum::routing::get(checkout_quote))
         .route(
             "/api/billing/autopay",
@@ -414,6 +453,10 @@ enum StripeHttpError {
     AmountMismatch,
     /// A paid session ZeroRouter has no pending-purchase record for.
     UnknownSession,
+    /// The portal asked about a Checkout Session that this deployment did not
+    /// price for the authenticated user. Deliberately indistinguishable from
+    /// "no such session".
+    SessionNotFound,
     UnknownUser,
     DatabaseUnavailable,
 }
@@ -458,6 +501,11 @@ impl IntoResponse for StripeHttpError {
                 StatusCode::BAD_REQUEST,
                 "The webhook event references a checkout session this deployment did not create.",
                 "unknown_session",
+            ),
+            Self::SessionNotFound => (
+                StatusCode::NOT_FOUND,
+                "That checkout session was not found.",
+                "session_not_found",
             ),
             Self::UnknownUser => (
                 StatusCode::BAD_REQUEST,
@@ -517,16 +565,15 @@ async fn create_checkout(
             fee_usd: quote.fee_usd,
             gross_usd: quote.gross_usd,
             unit_amount_cents: gross_cents,
-            success_url: ctx.config.absolute_url("/credits?checkout=success"),
-            cancel_url: ctx.config.absolute_url("/credits?checkout=cancelled"),
+            return_url: ctx.config.absolute_url(CHECKOUT_RETURN_PATH),
         },
     )
     .await?;
-    // Persist what this session is worth BEFORE handing back the redirect
-    // url. The session id only exists after Stripe mints it, so the record
+    // Persist what this session is worth BEFORE handing back the client
+    // secret. The session id only exists after Stripe mints it, so the record
     // cannot precede the session — but it can precede the user ever seeing
-    // the payment page. If this insert fails the url is withheld, so the
-    // session is unreachable and expires unpaid rather than becoming a
+    // the payment form. If this insert fails the secret is withheld, so the
+    // session is unmountable and expires unpaid rather than becoming a
     // payment the webhook would (correctly) refuse to credit.
     if let Err(error) = billing::record_checkout_intent(
         &ctx.pool,
@@ -546,7 +593,7 @@ async fn create_checkout(
             stripe_session_id = %session.id,
             %error,
             "stripe checkout session created but its pending purchase record could not be \
-             persisted; withholding the redirect url so the session is never paid"
+             persisted; withholding the client secret so the session is never paid"
         );
         return Err(StripeHttpError::CheckoutFailed);
     }
@@ -558,7 +605,124 @@ async fn create_checkout(
         gross_usd = %quote.gross_usd,
         "created stripe checkout session"
     );
-    Ok(Json(serde_json::json!({ "url": session.url })))
+    // Shape change from the redirect era: this used to return `{"url"}`, the
+    // Stripe-hosted page to send the browser to. An `embedded_page` session has
+    // no such url — Stripe returns `url: null` — so returning one would mean
+    // inventing it. The portal is the only consumer of this endpoint, and it
+    // mounts the form in place; `/api/billing/autopay/setup` is a separate
+    // endpoint and still returns `{"url"}` because card setup remains a
+    // redirect.
+    Ok(Json(
+        serde_json::json!({ "client_secret": session.client_secret }),
+    ))
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/billing/checkout/status
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct CheckoutStatusParams {
+    session_id: String,
+}
+
+/// GET /api/billing/checkout/status?session_id=S — report whether a Checkout
+/// Session finished, so the return page can say "paid" or re-open the form.
+///
+/// # THIS ENDPOINT NEVER CREDITS, AND NOTHING IT RETURNS IS TRUSTED AS PAYMENT
+///
+/// It is **display only**. Crediting stays exactly where it was: the
+/// `checkout.session.completed` webhook, behind an HMAC, behind the two
+/// corroborations documented at the top of this module. That separation is the
+/// whole point of the split — the browser is told what to render, and the
+/// ledger is moved by an event Stripe signed. A customer who calls this
+/// endpoint, or who edits its response, changes what their own screen says and
+/// nothing else; a customer who never loads the return page at all is still
+/// credited, because the webhook does not depend on them coming back.
+///
+/// It performs no writes of any kind. There is no code path from here into
+/// [`billing::credit_purchase`].
+///
+/// # Whose session this is
+///
+/// `session_id` is supplied by the client, so it is not trusted as an
+/// authorization: the session is first looked up in `stripe_checkout_intents`
+/// — the row this deployment wrote when it priced the session — and the
+/// authenticated user must be the one it was priced for. Anything else reads
+/// as not-found, so this cannot be used to enumerate sessions or to observe
+/// another customer's purchase. Stripe is only consulted after that check
+/// passes.
+async fn checkout_status(
+    State(ctx): State<WebCtx>,
+    user: PortalUser,
+    Query(params): Query<CheckoutStatusParams>,
+) -> Result<Json<Value>, StripeHttpError> {
+    let Some(stripe) = ctx.config.stripe.as_ref() else {
+        return Err(StripeHttpError::BillingUnavailable);
+    };
+    let intent = billing::checkout_intent(&ctx.pool, &params.session_id)
+        .await
+        .map_err(|error| {
+            tracing::error!(%error, "checkout intent lookup failed");
+            StripeHttpError::DatabaseUnavailable
+        })?;
+    // A session this deployment never priced, and a session priced for someone
+    // else, are the same answer on purpose — distinguishing them would confirm
+    // the existence of another user's session.
+    let Some(intent) = intent.filter(|intent| intent.user_id == user.user_id) else {
+        return Err(StripeHttpError::SessionNotFound);
+    };
+    let status = retrieve_session_status(stripe, &intent.stripe_session_id).await?;
+    Ok(Json(serde_json::json!({ "status": status })))
+}
+
+/// Read a Checkout Session's `status` (`open`, `complete`, or `expired`) from
+/// Stripe. Only the status is parsed — no money field is read here, because no
+/// decision made from this response involves money.
+async fn retrieve_session_status(
+    settings: &StripeSettings,
+    session_id: &str,
+) -> Result<String, CheckoutError> {
+    let client = reqwest::Client::builder()
+        .timeout(STRIPE_HTTP_TIMEOUT)
+        .build()
+        .map_err(|_| {
+            tracing::warn!("stripe HTTP client construction failed");
+            CheckoutError::Client
+        })?;
+    let response = client
+        .get(checkout_session_url(settings, session_id))
+        .bearer_auth(&settings.secret_key)
+        .send()
+        .await
+        .map_err(|error| {
+            tracing::warn!(
+                timeout = error.is_timeout(),
+                "stripe checkout session retrieval failed"
+            );
+            CheckoutError::Request
+        })?;
+    let status = response.status();
+    if !status.is_success() {
+        tracing::warn!(
+            status = status.as_u16(),
+            "stripe rejected the checkout session retrieval"
+        );
+        return Err(CheckoutError::Status);
+    }
+    let session: CheckoutSessionStatusResponse = response.json().await.map_err(|_| {
+        tracing::warn!("stripe checkout session retrieval could not be parsed");
+        CheckoutError::MalformedResponse
+    })?;
+    session.status.ok_or_else(|| {
+        tracing::warn!("stripe checkout session retrieval is missing the status");
+        CheckoutError::MalformedResponse
+    })
+}
+
+#[derive(Debug, Deserialize)]
+struct CheckoutSessionStatusResponse {
+    status: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -695,19 +859,30 @@ struct CheckoutSessionParams<'a> {
     gross_usd: Decimal,
     /// The gross, in cents — the `unit_amount` Stripe actually charges.
     unit_amount_cents: i64,
-    success_url: String,
-    cancel_url: String,
+    /// Where Checkout sends the browser once the payment attempt finishes.
+    /// Carries the `{CHECKOUT_SESSION_ID}` template variable, which Stripe
+    /// substitutes before redirecting.
+    return_url: String,
 }
 
 struct CheckoutSession {
     id: String,
-    url: String,
+    /// The value the browser mounts Embedded Checkout with. This is NOT a
+    /// bearer credential for the session's money — it only lets Stripe.js
+    /// render the payment form — but it is still session-scoped, so it is
+    /// returned to the one authenticated user the session was priced for and
+    /// never logged.
+    client_secret: String,
 }
 
 #[derive(Debug, Deserialize)]
 struct CheckoutSessionResponse {
     id: String,
-    url: Option<String>,
+    /// Present only for `ui_mode=embedded_page`. A `hosted_page` session
+    /// returns `url` and a null `client_secret`; the reverse holds here, so a
+    /// missing `client_secret` means the `ui_mode` did not take effect and the
+    /// session is unusable to this integration.
+    client_secret: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -780,8 +955,24 @@ async fn create_checkout_session(
     //   Google Pay, and `ensure_stripe_customer` already mints one Customer per
     //   user for autopay. Setting it here would create a SECOND, Checkout-owned
     //   customer on every purchase, duplicating records for one human.
+    // - `billing_address_collection=required`. Still deliberately absent, and
+    //   the default `auto` is what makes the embedded form ask for an address
+    //   at all: Stripe's own description of `auto` is that with `automatic_tax`
+    //   enabled, "Checkout will collect the minimum number of fields required
+    //   for tax calculation". Forcing `required` would collect a full address
+    //   where a postal code would have done.
+    //
+    // `ui_mode=embedded_page` is what makes Stripe mint a `client_secret` and
+    // render the form inside the portal instead of on a Stripe-hosted page.
+    // It is mutually exclusive with the redirect urls: Stripe documents
+    // `success_url` and `cancel_url` as "not allowed if ui_mode is
+    // `embedded_page`", so both are gone and `return_url` replaces them. The
+    // `{CHECKOUT_SESSION_ID}` template variable is substituted by Checkout on
+    // the way back, which is how the return route knows which session to ask
+    // about.
     let form: [(&str, &str); 13] = [
         ("mode", "payment"),
+        ("ui_mode", CHECKOUT_UI_MODE),
         ("line_items[0][price_data][currency]", CHECKOUT_CURRENCY),
         ("line_items[0][price_data][unit_amount]", &unit_amount),
         (
@@ -795,8 +986,7 @@ async fn create_checkout_session(
         ("metadata[fee_usd]", &fee_usd),
         ("metadata[gross_usd]", &gross_usd),
         ("customer_email", params.customer_email),
-        ("success_url", &params.success_url),
-        ("cancel_url", &params.cancel_url),
+        ("return_url", &params.return_url),
     ];
     let response = client
         .post(checkout_sessions_url(settings))
@@ -823,13 +1013,13 @@ async fn create_checkout_session(
         tracing::warn!("stripe checkout session response could not be parsed");
         CheckoutError::MalformedResponse
     })?;
-    let Some(url) = session.url else {
-        tracing::warn!("stripe checkout session response is missing the redirect url");
+    let Some(client_secret) = session.client_secret else {
+        tracing::warn!("stripe checkout session response is missing the client secret");
         return Err(CheckoutError::MalformedResponse);
     };
     Ok(CheckoutSession {
         id: session.id,
-        url,
+        client_secret,
     })
 }
 
@@ -1451,6 +1641,7 @@ mod tests {
     fn settings() -> StripeSettings {
         StripeSettings {
             secret_key: "sk_test_unused".to_owned(),
+            publishable_key: "pk_test_unused".to_owned(),
             webhook_secret: "whsec_unused".to_owned(),
             checkout_min_usd: Decimal::from(5),
             checkout_max_usd: Decimal::from(1000),
