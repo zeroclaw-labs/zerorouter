@@ -146,18 +146,30 @@ export function Models() {
         <span className="mono">/v1</span> and request a model by its id.
       </p>
 
-      {/* The label needs a referent, and the honest one is unflattering today:
-          every lane runs on an ordinary API account, so the zero-retention
-          section is empty. Saying so here is the point — a catalog that labels
-          every lane and then hides the tally would be labelling for show. */}
+      {/* The label needs a referent, and the tally is stated either way. It was
+          zero until 2026-08-20 and the page said so plainly; it is now two, and
+          the same sentence has to carry that without overclaiming. A catalog
+          that labels every lane and then hides the count would be labelling for
+          show — in whichever direction the count happens to run. */}
       <p className="page-note">
         <strong>Retention</strong> is what the upstream provider does with your prompt after it
         answers. Zero-retention lanes are listed first.{' '}
         {zeroLanes === 0
-          ? 'No lane currently carries a zero-retention label: every model above runs on a standard API account, and those providers retain data under their own published policies. We only apply a zero-retention label once a zero-data-retention arrangement is in force with that provider.'
-          : `${zeroLanes} of ${tiers.length} lanes carry a zero-retention arrangement; the rest run on standard API accounts and the provider retains data under its own published policy.`}{' '}
+          ? 'No lane currently carries a zero-retention label: every model above runs on a standard API account, and those providers retain data under their own published policies. We only apply a zero-retention label once zero data retention is in force with that provider.'
+          : `${zeroLanes} of ${tiers.length} lanes are zero retention: the provider writes nothing to durable storage. The rest run on standard API accounts and the provider retains data under its own published policy.`}{' '}
         Hover a label for the provider’s exact statement and the date we last verified it.
       </p>
+      {/* Stated only when there is a premium to explain. Two lanes here serve
+          the same models as cheaper ones above, and a storefront that shows the
+          higher price without the reason reads as a markup — which it is not:
+          every lane is sold at what it costs, and this one costs more. */}
+      {zeroLanes > 0 && (
+        <p className="page-note">
+          A zero-retention lane can cost more than the same model on a standard account. That
+          difference is the provider’s own price, passed through like every other rate on this
+          page — ZeroRouter takes no margin on either.
+        </p>
+      )}
     </div>
   )
 }

@@ -18,6 +18,15 @@
       "credential_env": "GEMINI_API_KEY",
       "secret_name": "gemini-api-key",
       "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
+    },
+    {
+      "key": "bedrock",
+      "adapter": "anthropic",
+      "credential_env": "BEDROCK_API_KEY",
+      "secret_name": "bedrock-api-key",
+      "base_url": "https://bedrock-mantle.{region}.api.aws/anthropic/v1/messages",
+      "region_env": "BEDROCK_REGION",
+      "unreconcilable_reason": "models.dev files Bedrock under `amazon-bedrock` and prices the bare model id `anthropic.claude-sonnet-5` at the GLOBAL cross-region rate (2.00/10.00). The mantle endpoint is in-region only and cannot use a global inference profile, so it meters the IN-REGION SKU, which is 10% higher (2.20/11.00). Reconciling against that source would report `ok` while the recorded basis was 10% under what AWS invoices. The authority for these rates is the AWS Price List API, offer AmazonBedrockFoundationModels, usagetype `<REGION>_{input,output,cache_read}_tokens_standard-Units` — the unqualified `_standard` class, NOT `_global_standard`. Re-verify with: curl -s --compressed https://pricing.us-east-1.amazonaws.com/offers/v1.0/aws/AmazonBedrockFoundationModels/current/us-east-1/index.json"
     }
   ]
 }

@@ -200,18 +200,28 @@ test('the models catalog labels every lane with its retention posture', async ({
   }
 
   // And the page explains what the label means rather than leaving a bare word
-  // in a column. Today's honest state: no lane carries a zero-retention label.
+  // in a column. The shipped catalog carries zero-retention lanes since
+  // 2026-08-20, so the footnote must render its COUNTED branch — the
+  // "no lane currently carries" copy would now be a false statement, and it is
+  // asserted absent rather than merely not asserted present.
   await expect(page.getByText(/zero-retention lanes are listed first/i)).toBeVisible()
-  await expect(page.getByText(/no lane currently carries a zero-retention label/i)).toBeVisible()
+  await expect(page.getByText(/lanes are zero retention/i)).toBeVisible()
+  await expect(page.getByText(/no lane currently carries a zero-retention label/i)).toHaveCount(0)
+
+  // A zero-retention lane can be dearer than the same model on a standard
+  // account, so the page has to say why — otherwise the storefront shows a
+  // higher price for identical weights and reads as a markup.
+  await expect(page.getByText(/passed through like every other rate/i)).toBeVisible()
 
   // Ordering, read off the rendered table: once a zero-retention lane appears,
-  // no retaining lane may precede it. Vacuously true for today's all-standard
-  // catalog, and the guard that fails the day a ZDR lane is pinned and the
-  // page's own sort is not updated with it.
-  const labels = await rows.locator('td:last-child').allTextContents()
-  const lastZero = labels.map((t) => t.trim()).lastIndexOf('zero retention')
-  const firstStandard = labels.map((t) => t.trim()).indexOf('provider retains data')
-  if (lastZero >= 0 && firstStandard >= 0) {
-    expect(lastZero).toBeLessThan(firstStandard)
-  }
+  // no retaining lane may precede it. This was VACUOUS until the catalog had a
+  // zero lane to sort; it is now a real assertion, and it fails if this page's
+  // own sort (which re-sorts for vendor grouping and would otherwise undo the
+  // router's order) drops its retention rank.
+  const labels = (await rows.locator('td:last-child').allTextContents()).map((t) => t.trim())
+  const lastZero = labels.lastIndexOf('zero retention')
+  const firstStandard = labels.indexOf('provider retains data')
+  expect(lastZero).toBeGreaterThanOrEqual(0)
+  expect(firstStandard).toBeGreaterThanOrEqual(0)
+  expect(lastZero).toBeLessThan(firstStandard)
 })

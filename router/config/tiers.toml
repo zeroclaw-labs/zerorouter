@@ -213,6 +213,67 @@ verified = "2026-08-20"
 source_sha256 = "820771399fff49b8d589a7e5830511175237c8b47fc541955092450e32c1cf92"
 openrouter_slug = "google-ai-studio"
 
+# THE FIRST ZERO-RETENTION LANE (2026-08-20), and the one pin here whose
+# evidence is not a vendor's prose about what they generally do.
+#
+# ZeroRouter's AWS account has `data_retention_mode` set to `none` on BOTH
+# Bedrock control planes — the classic one
+# (`bedrock.us-east-1.amazonaws.com/data-retention`) and the mantle plane
+# (`bedrock-mantle.us-east-1.api.aws/v1/data_retention`) — verified by GET
+# returning `{"mode": "none"}` on the date below.
+#
+# WHY THIS SATISFIES THE `zero` RULE WITHOUT A SIGNED ZDR CONTRACT. The rule
+# (docs/DEPLOY.md) asks for a "signed or confirmed zero-data-retention
+# arrangement in force with that provider, covering the account that lane
+# dispatches on". What backs this pin is stronger than a contract, not weaker:
+# it is an ENFORCED CONFIGURATION on the account itself, plus AWS's published
+# semantics for the value that configuration holds. A contract is a promise a
+# human must honour; this is a setting the platform enforces on every request,
+# and AWS states the enforcement is consistent "across the Messages, Chat
+# Completions, and Responses APIs" — the mode is not per-call and cannot be
+# overridden by a request. AWS further documents that a model requiring
+# retention is BLOCKED rather than silently downgraded under this mode, so the
+# failure direction is closed: a lane that could not honour zero retention
+# returns an error instead of quietly retaining.
+#
+# The account-level rule still holds and is what makes this pin correct at
+# PROVIDER level: `data_retention_mode` is a property of the account (and
+# optionally the project), never of a model, so one setting covers every model
+# reached on this key — exactly the shape `[retention.<provider>]` describes.
+#
+# RE-VERIFICATION IS TWO CHECKS, not one, and this is the only pin where the
+# second exists. `admin retention-drift` hashes the docs page below, which
+# catches AWS REWORDING what `none` means. It cannot catch the account setting
+# being changed — no public page states what this account is configured to. The
+# live half is therefore a separate, credentialed check:
+#
+#   curl https://bedrock-mantle.us-east-1.api.aws/v1/data_retention \
+#     -H "x-api-key: $BEDROCK_API_KEY"        # expect {"mode":"none"}
+#
+# and it is wired up as `admin retention-drift --bedrock-live`, opt-in so CI
+# stays deterministic without credentials. Run BOTH before re-pinning `verified`.
+#
+# Note the mode enum has a fourth value, `inherit`, which is the DEFAULT for a
+# new account and resolves outward (project -> account -> model default). A GET
+# returning `inherit` is not a zero-retention account; only a literal `none` is.
+#
+# `openrouter_slug` is `amazon-bedrock`, and there is a `google-vertex`-shaped
+# trap next to it: OpenRouter also publishes `claude-on-aws`
+# (`retainsPrompts: true`, 30 days), which is a DIFFERENT product — Anthropic's
+# own managed capacity on AWS, not the operator's Bedrock account. The lane here
+# is Bedrock on ZeroRouter's own account, so `amazon-bedrock` is the join.
+# Its `retainsPrompts: false` happens to agree with this pin; treat that as
+# coincidence rather than corroboration — it describes OPENROUTER's Bedrock
+# account, which has its own retention configuration and knows nothing about
+# ours. The evidence for this pin is the GET above, not a third party.
+[retention.bedrock]
+posture = "zero"
+description = "AWS Bedrock under account data_retention_mode: none — no request or response data is written to durable storage by AWS or shared with the model provider, enforced across the Messages, Chat Completions, and Responses APIs."
+source_url = "https://docs.aws.amazon.com/bedrock/latest/userguide/data-retention.html"
+verified = "2026-08-20"
+source_sha256 = "7cb04795622b5f7cac43a5d7a216e699f045da24dfbb84de7998cc5204d0cedf"
+openrouter_slug = "amazon-bedrock"
+
 # ---------------------------------------------------------------------------
 # PINS — you get this model, at cost, and it does not change.
 # ---------------------------------------------------------------------------
@@ -552,3 +613,141 @@ min_prompt_tokens = 200000
 input_per_mtok = 4.00
 cached_input_per_mtok = 0.40
 output_per_mtok = 18.00
+
+# ---------------------------------------------------------------------------
+# BEDROCK (added 2026-08-20) — THE ZERO-RETENTION LANES.
+#
+# Same two Claude models the `anthropic/*` pins above serve, reached instead
+# through the operator's AWS Bedrock account, whose `data_retention_mode` is
+# `none` (see `[retention.bedrock]`). The lane exists for the posture, not for
+# the price: it costs MORE than the first-party lane and sells at that cost, so
+# a customer choosing `bedrock/claude-sonnet-5` over `anthropic/claude-sonnet-5`
+# is buying zero retention and paying the premium AWS charges for it.
+#
+# WHY THE IDS ARE `bedrock/*` RATHER THAN `anthropic/*`. The two lanes serve the
+# same weights and could not both be keyed `anthropic/claude-sonnet-5` — a
+# concrete candidate id is unique file-wide. More importantly they are different
+# products: one retains under Anthropic's 30-day policy and one retains nothing,
+# and a customer must be able to ADDRESS that difference. `owned_by` publishes
+# as `bedrock` accordingly, naming the account that actually serves the request.
+#
+# WHY THE WIRE IS THE ANTHROPIC MESSAGES API AND NOT CHAT COMPLETIONS. Bedrock's
+# mantle plane does serve an OpenAI-compatible `/v1/chat/completions`, but
+# Claude is NOT on it: the Sonnet 5 and Opus 5 model cards mark Chat Completions
+# and Responses unsupported, and Messages supported. So these candidates
+# dispatch over the SAME `anthropic` adapter the first-party lane uses, pointed
+# at `https://bedrock-mantle.{region}.api.aws/anthropic/v1/messages`, which
+# takes the identical `x-api-key` + `anthropic-version` headers that wire
+# already sends. See `config/providers.json`.
+#
+# WHY FABLE IS NOT HERE, and do not add it without re-reading this. Bedrock
+# publishes `allowed_modes` per model, and `anthropic.claude-fable-5` allows
+# ONLY `provider_data_share` — the opposite end of the enum from `none`. Under a
+# zero-retention account AWS reports that model `status: unavailable` and blocks
+# requests to it rather than quietly retaining, so a `bedrock/claude-fable-5`
+# tier would be a lane that cannot serve. It joins this section only if Anthropic
+# grants ZDR eligibility for fable-class on Bedrock, at which point its
+# `allowed_modes` gains `none` and the model card is the thing to re-read.
+#
+# PRICING IS PASS-THROUGH, basis == sell — and THESE LANES COST 10% MORE THAN
+# THE `anthropic/*` ONES ABOVE. That is correct, it is not a markup, and it is
+# the single most likely thing for someone to "fix" later, so here is the whole
+# argument.
+#
+# AWS prices Anthropic models in exactly two on-demand classes. Read them
+# yourself from the AWS Price List API, offer `AmazonBedrockFoundationModels`,
+# servicename "Claude Sonnet 5 (Amazon Bedrock Edition)" (verified 2026-08-20,
+# us-east-1):
+#
+#   curl -s --compressed \
+#     https://pricing.us-east-1.amazonaws.com/offers/v1.0/aws/\
+# AmazonBedrockFoundationModels/current/us-east-1/index.json
+#
+#   usagetype                                        sonnet 5   opus 5
+#   USE1_input_tokens_global_standard-Units             2.00      5.00
+#   USE1_input_tokens_standard-Units                    2.20      5.50
+#   USE1_output_tokens_global_standard-Units           10.00     25.00
+#   USE1_output_tokens_standard-Units                  11.00     27.50
+#   USE1_cache_read_tokens_global_standard-Units        0.20      0.50
+#   USE1_cache_read_tokens_standard-Units               0.22      0.55
+#
+# There is no third class. `_global_standard` is what a GLOBAL cross-region
+# inference profile (`global.anthropic.claude-sonnet-5`) meters against; the
+# unqualified `_standard` is everything else. The mantle endpoint is in-region
+# only — AWS documents cross-region inference as unsupported there and the model
+# cards mark the geo and global inference ids N/A for it — so a mantle call
+# cannot reach the global class, and `_standard` is what it bills. Those are the
+# numbers below.
+#
+# So the zero-retention lane costs the in-region premium, and the customer pays
+# exactly that and no more. Sonnet at 2.20/11.00 here against 2.00/10.00 on the
+# `anthropic/*` lane is the price of zero retention, priced through at cost like
+# everything else in this file. DO NOT "correct" it to 2.00/10.00: that sells
+# this lane below what AWS invoices, on every token.
+#
+# ONE INFERENCE IS LOAD-BEARING AND IS NOT LITERALLY DOCUMENTED. No AWS sentence
+# says "mantle meters usagetype X". It is forced by elimination — two classes
+# exist, mantle cannot use the global one — and it is the kind of thing to close
+# empirically rather than argue about: after the first real invocation, read the
+# Cost and Usage Report line item and confirm the `usagetype` reads
+# `..._input_tokens_standard-Units` and not `..._global_standard-Units`. That is
+# the operator's post-launch verification step; docs/DEPLOY.md records it.
+#
+# `admin catalog-drift` DOES NOT RECONCILE THESE TWO TIERS, deliberately, and
+# that is a real gap rather than a convenience. models.dev carries Bedrock under
+# `amazon-bedrock` and prices the bare id `anthropic.claude-sonnet-5` at 2.00 —
+# the GLOBAL rate, under a key that means in-region. Joining to it was
+# implemented and then removed: it reported `ok` over a basis 10% under the
+# invoice, which is worse than no check, because it is a check that says
+# everything is fine. The exemption is declared in `config/providers.json`
+# (`unreconcilable_reason`), prints its reason on every drift run, and means
+# these rates have NO automated check — re-verify them by hand with the curl
+# above when AWS moves anything.
+[tiers."bedrock/claude-sonnet-5"]
+
+[tiers."bedrock/claude-sonnet-5".rates]
+input_per_mtok = 2.20
+cached_input_per_mtok = 0.22
+output_per_mtok = 11.00
+
+[[tiers."bedrock/claude-sonnet-5".candidates]]
+id = "bedrock/claude-sonnet-5"
+provider = "bedrock"
+# The bare, unprefixed model id. Mantle is in-region only, so the geo (`us.`)
+# and global (`global.`) inference-profile ids the runtime endpoint accepts are
+# documented N/A here — sending one is an error, not a routing preference.
+model = "anthropic.claude-sonnet-5"
+
+[tiers."bedrock/claude-sonnet-5".candidates.metadata]
+context_window = 1000000
+max_output_tokens = 128000
+input_modalities = ["text", "image", "pdf"]
+tool_call = true
+
+[tiers."bedrock/claude-sonnet-5".candidates.rates]
+input_per_mtok = 2.20
+cached_input_per_mtok = 0.22
+output_per_mtok = 11.00
+
+[tiers."bedrock/claude-opus-5"]
+
+[tiers."bedrock/claude-opus-5".rates]
+input_per_mtok = 5.50
+cached_input_per_mtok = 0.55
+output_per_mtok = 27.50
+
+[[tiers."bedrock/claude-opus-5".candidates]]
+id = "bedrock/claude-opus-5"
+provider = "bedrock"
+model = "anthropic.claude-opus-5"
+
+[tiers."bedrock/claude-opus-5".candidates.metadata]
+context_window = 1000000
+max_output_tokens = 128000
+input_modalities = ["text", "image", "pdf"]
+tool_call = true
+
+[tiers."bedrock/claude-opus-5".candidates.rates]
+input_per_mtok = 5.50
+cached_input_per_mtok = 0.55
+output_per_mtok = 27.50

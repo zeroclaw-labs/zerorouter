@@ -124,6 +124,22 @@ pub struct RetentionDriftArgs {
     /// teaches people to bump the date.
     #[arg(long)]
     pub max_age_days: Option<i64>,
+    /// Additionally ask AWS whether the Bedrock account is still configured
+    /// `data_retention_mode: none`, the setting `[retention.bedrock]`'s `zero`
+    /// posture rests on.
+    ///
+    /// Needs `BEDROCK_API_KEY` and `BEDROCK_REGION` — the same variables the
+    /// router dispatches with — so it is opt-in and the credential-free daily
+    /// job is unaffected. Unlike `--corroborate` it is NOT advisory: it reads
+    /// ZeroRouter's own account rather than a third party's opinion, so when
+    /// asked for it decides the exit code, and being unable to run it is a
+    /// failure rather than a pass.
+    ///
+    /// Run it before re-pinning a Bedrock posture. The page hash and this
+    /// answer are two different claims — the hash catches AWS rewording what
+    /// `none` means, and only this catches the account being flipped out of it.
+    #[arg(long)]
+    pub bedrock_live: bool,
     /// Report and exit zero even when a page changed.
     #[arg(long)]
     pub allow_drift: bool,
@@ -1183,6 +1199,30 @@ async fn catalog_drift(args: CatalogDriftArgs) -> Result<()> {
         );
     }
 
+    // Lanes the source cannot price, with the declared argument for why —
+    // printed on EVERY run, and that is the point rather than verbosity. This
+    // verdict is the one place the reconciliation is switched off, so the
+    // reasoning has to stay in front of whoever reads the report; an exemption
+    // nobody re-reads is indistinguishable from a lane somebody forgot.
+    let uncovered: Vec<_> = findings
+        .iter()
+        .filter(|f| f.verdict == crate::drift::Verdict::NotCoveredBySource)
+        .collect();
+    if !uncovered.is_empty() {
+        println!("\nNot reconciled — the source cannot price these lanes. Their rates have NO");
+        println!("automated check; re-verify them by hand against the authority named below:");
+        let mut seen = std::collections::BTreeSet::new();
+        for found in &uncovered {
+            println!("  {} ({})", found.candidate_id, found.provider);
+            if seen.insert(found.provider.as_str()) {
+                println!(
+                    "      {}",
+                    found.unreconcilable_reason.as_deref().unwrap_or("-")
+                );
+            }
+        }
+    }
+
     // Every model whose upstream reprices past a threshold, with what the file
     // records beside what the source publishes. The rows that matter are the
     // ones where the file records nothing — those bill past the boundary at a
@@ -1443,11 +1483,45 @@ async fn retention_drift(args: RetentionDriftArgs) -> Result<()> {
         .await;
     }
 
+    // NOT advisory — see `--bedrock-live`. Its verdict joins the page verdicts
+    // in deciding the exit code, so it is resolved before the summary below.
+    let live = if args.bedrock_live {
+        Some(check_bedrock_live().await)
+    } else {
+        None
+    };
+    if let Some(verdict) = &live {
+        println!("\nBedrock account data_retention_mode: {}", verdict.label());
+        match verdict {
+            crate::retention::LiveVerdict::Confirmed => println!(
+                "  mode = \"{}\" — the account setting still backs the `zero` posture.",
+                crate::retention::BEDROCK_ZERO_RETENTION_MODE
+            ),
+            crate::retention::LiveVerdict::Contradicted { mode } => {
+                println!("  mode = \"{mode}\", not \"none\".");
+                println!(
+                    "  THE PUBLISHED LABEL IS NOW FALSE: `/v1/models` is telling customers their"
+                );
+                println!(
+                    "  prompts are never stored. Restore the account setting, or change the pin."
+                );
+            }
+            crate::retention::LiveVerdict::Unavailable { detail } => {
+                println!("  {detail}");
+                println!(
+                    "  A check that could not run is not a check that passed — the live half of"
+                );
+                println!("  this claim is unverified until it does.");
+            }
+        }
+    }
+
+    let live_actionable = live.as_ref().is_some_and(|v| v.is_actionable());
     let actionable: Vec<_> = checks
         .iter()
         .filter(|found| found.verdict.is_actionable())
         .collect();
-    if actionable.is_empty() {
+    if actionable.is_empty() && !live_actionable {
         println!(
             "\n{} retention claim(s) re-verified, every policy page unchanged.",
             checks.len()
@@ -1455,7 +1529,9 @@ async fn retention_drift(args: RetentionDriftArgs) -> Result<()> {
         return Ok(());
     }
 
-    println!("\n{} retention claim(s) need a human:", actionable.len());
+    if !actionable.is_empty() {
+        println!("\n{} retention claim(s) need a human:", actionable.len());
+    }
     for found in &actionable {
         match found.verdict {
             Verdict::Changed => {
@@ -1488,12 +1564,29 @@ async fn retention_drift(args: RetentionDriftArgs) -> Result<()> {
             Verdict::Unchanged => unreachable!("filtered to actionable verdicts"),
         }
     }
-    println!("\nA changed page does NOT mean the posture flipped. Read the page, confirm what the");
-    println!(
-        "posture should be, then update `verified` and `source_sha256` in the tier file. A ZDR"
-    );
-    println!("label may only be pinned against a signed arrangement — see docs/DEPLOY.md.");
+    if !actionable.is_empty() {
+        println!(
+            "\nA changed page does NOT mean the posture flipped. Read the page, confirm what the"
+        );
+        println!(
+            "posture should be, then update `verified` and `source_sha256` in the tier file. A ZDR"
+        );
+        println!("label may only be pinned against a signed arrangement — see docs/DEPLOY.md.");
+    }
 
+    // `--allow-drift` releases the PAGE checks and nothing else. Its whole
+    // meaning is "the evidence moved and I have decided that is tolerable for
+    // now", which is a judgement a human can defensibly make about a reworded
+    // policy page. It is not a judgement anyone can make about an account that
+    // reports it is retaining data while the catalog publishes that it is not:
+    // that is a false statement to customers, and there is no unblocking it —
+    // fix the account or change the pin.
+    if live_actionable {
+        anyhow::bail!(
+            "the Bedrock account's live retention mode does not back the `zero` posture \
+             `[retention.bedrock]` publishes; --allow-drift does not cover this"
+        );
+    }
     if args.allow_drift {
         return Ok(());
     }
@@ -1502,6 +1595,48 @@ async fn retention_drift(args: RetentionDriftArgs) -> Result<()> {
          deliberately, or pass --allow-drift",
         actionable.len()
     )
+}
+
+/// Ask AWS what this account's Bedrock retention mode is, reading the same
+/// environment variables the router dispatches with.
+///
+/// The variable NAMES come from the provider inventory rather than being
+/// restated here, so a rename in `config/providers.json` moves the router and
+/// this check together. A deployment with no Bedrock entry at all gets
+/// `Unavailable` rather than a panic — the flag is then simply asking about an
+/// upstream this build does not have.
+async fn check_bedrock_live() -> crate::retention::LiveVerdict {
+    use crate::retention::LiveVerdict;
+
+    let Some((credential_env, region_env)) = crate::providers::provider_env_names("bedrock") else {
+        return LiveVerdict::Unavailable {
+            detail: "this build's provider inventory has no `bedrock` entry".to_owned(),
+        };
+    };
+    let Some(region_env) = region_env else {
+        return LiveVerdict::Unavailable {
+            detail: "the `bedrock` provider entry names no region_env".to_owned(),
+        };
+    };
+    let read = |name: &str| {
+        std::env::var(name)
+            .ok()
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+    };
+    let (Some(credential), Some(region)) = (read(&credential_env), read(&region_env)) else {
+        return LiveVerdict::Unavailable {
+            detail: format!(
+                "set {credential_env} and {region_env} to run this check; both are unset or blank"
+            ),
+        };
+    };
+    match crate::retention::fetch_bedrock_retention(&region, &credential).await {
+        Ok(document) => crate::retention::check_live_mode(&document),
+        Err(error) => LiveVerdict::Unavailable {
+            detail: format!("{error:#}"),
+        },
+    }
 }
 
 /// Map a claim's subject to a filename for `--source-dir`.

@@ -29,23 +29,33 @@ Provider candidates become available when their corresponding variables are pres
 
 ```text
 ANTHROPIC_API_KEY
-BEDROCK_API_KEY
-DEEPINFRA_API_KEY
-FIREWORKS_API_KEY
-TOGETHER_API_KEY
+OPENAI_API_KEY
+GEMINI_API_KEY
+BEDROCK_API_KEY   (+ BEDROCK_REGION, see below)
 ```
 
-Do not commit these values or place them in Terraform variables.
+Do not commit these values or place them in Terraform variables. The list above
+is whatever `config/providers.json` entries name in `credential_env`; that file
+is the source of truth, and this list is a convenience copy of it.
 
-The initial Terraform example injects only `BEDROCK_API_KEY`. The private-beta
-fallbacks let that credential serve `zero/low-cost` through MiniMax M2.5 and
-`zero/balanced` through DeepSeek V3.2. `zero/high-end` remains unavailable until
-the account owner completes Anthropic's Bedrock first-time-use form. Western
-OpenAI-compatible providers remain ahead of the Bedrock fallbacks when their
-credentials are enabled. `/v1/models` deliberately remains the stable full
-catalog rather than changing with credential availability.
+`/v1/models` deliberately remains the stable full catalog rather than changing
+with credential availability, so a lane whose key is absent is still advertised
+and fails at dispatch rather than vanishing from the storefront.
 
-`BEDROCK_API_KEY` is an Amazon Bedrock service-specific bearer key, not the AWS access-key ID and secret used for Terraform. The configured Claude models also require the account owner to complete Anthropic's first-time-use form in Bedrock. The pinned Bedrock provider does not stream upstream responses or report cache-read/cache-write token counts: `stream: true` is emitted as SSE after the full Converse response, and cached-token metering cannot be validated in Bedrock-only mode.
+`BEDROCK_API_KEY` is an Amazon Bedrock API key (an IAM service-specific
+credential), not the AWS access-key ID and secret used for Terraform.
+**`BEDROCK_REGION` must be set alongside it** — the endpoint carries the region
+in its hostname (`bedrock-mantle.{region}.api.aws`), and with no region the
+Bedrock rungs drop out of every route exactly as a missing key would. Nothing is
+defaulted: a guessed region would silently move customer prompts across a
+boundary the operator did not choose.
+
+The Bedrock lane reaches Claude over the **Anthropic Messages API** on Bedrock's
+mantle plane (`/anthropic/v1/messages`), not the OpenAI-compatible
+`/v1/chat/completions` that plane also serves — AWS's model cards mark Chat
+Completions and Responses unsupported for Claude, and Messages supported. It
+therefore rides the same wire the first-party Anthropic lane uses, which already
+sends the `x-api-key` and `anthropic-version` headers that endpoint takes.
 
 Start the service:
 
