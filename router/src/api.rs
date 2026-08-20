@@ -1041,6 +1041,7 @@ fn decimal_to_f64(value: rust_decimal::Decimal) -> f64 {
 pub fn app(state: RouterState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
+        .route("/transparency", get(crate::transparency::transparency))
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(chat_completions))
         .with_state(state)
