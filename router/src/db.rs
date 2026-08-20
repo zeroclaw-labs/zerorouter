@@ -947,6 +947,15 @@ pub async fn migrate(pool: &PgPool) -> Result<()> {
                 Cow::Borrowed(include_str!("../migrations/0021_autopay_tax.sql")),
                 false,
             ),
+            Migration::new(
+                22,
+                Cow::Borrowed("checkout intent cleanup"),
+                MigrationType::Simple,
+                Cow::Borrowed(include_str!(
+                    "../migrations/0022_checkout_intent_cleanup.sql"
+                )),
+                false,
+            ),
         ]),
         ignore_missing: false,
         locking: true,

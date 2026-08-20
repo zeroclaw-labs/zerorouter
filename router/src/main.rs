@@ -89,6 +89,10 @@ async fn serve() -> Result<()> {
     // inference cannot go unbilled because one transaction lost a connection.
     state.spawn_settlement_recovery();
     state.spawn_estimator_refresher();
+    // Unconditional, unlike the autopay sweep below: the abandoned checkout
+    // rows it removes are ZeroRouter's own and outlive whether Stripe is
+    // configured right now.
+    state.spawn_checkout_intent_cleanup();
     if let Some(stripe) = web_config.as_ref().and_then(|config| config.stripe.clone()) {
         state.spawn_autopay_sweep(stripe);
     }
