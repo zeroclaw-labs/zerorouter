@@ -25,6 +25,7 @@ mod sqlx;
 pub mod stripe;
 #[cfg(feature = "testing")]
 pub mod testing;
+pub mod transparency;
 pub mod user;
 pub mod web;
 pub mod wire;

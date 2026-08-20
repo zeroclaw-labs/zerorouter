@@ -76,6 +76,12 @@ COPY router/config/tiers.toml /etc/zerorouter/tiers.toml
 ENV ZEROROUTER_BIND=0.0.0.0:8080
 ENV ZEROROUTER_TIERS_PATH=/etc/zerorouter/tiers.toml
 ENV ZEROROUTER_PORTAL_DIST=/srv/portal
+# The commit this image claims to be built from, served by /transparency and
+# checkable against the build-provenance attestation the deploy workflow
+# publishes for the image digest. Empty on local builds, and that is the
+# truthful value: an unattested build has no provenance to cite.
+ARG SOURCE_COMMIT=""
+ENV ZEROROUTER_SOURCE_COMMIT=${SOURCE_COMMIT}
 EXPOSE 8080
 
 USER 10001:10001
