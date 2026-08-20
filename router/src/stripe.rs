@@ -1320,7 +1320,7 @@ fn checkout_session_form(
         return Err(CheckoutError::Mispriced);
     }
 
-    let mut form: Vec<(String, String)> = Vec::with_capacity(18);
+    let mut form: Vec<(String, String)> = Vec::with_capacity(19);
     let mut push = |key: &str, value: &str| form.push((key.to_owned(), value.to_owned()));
     push("mode", "payment");
     push("ui_mode", CHECKOUT_UI_MODE);
@@ -1378,6 +1378,45 @@ fn checkout_session_form(
     // and does not do; the short version is that it changes the TAX, never the
     // credit, so the webhook's ex-tax accounting is untouched by it.
     //
+    // `billing_address_collection=required` makes the form ALWAYS collect a
+    // full billing address. This was deliberately left at the default `auto`
+    // until ZeroRouter registered for California sales tax, and the
+    // registration is what changed the answer. Under `auto`, Stripe decides how
+    // much address to ask for: the API reference's own words are that with
+    // `automatic_tax` enabled Checkout "will collect the minimum number of
+    // fields required for tax calculation". California is a district-tax state
+    // — city, county and special-district rates stack, and their boundaries cut
+    // BELOW ZIP granularity, so two addresses sharing a postal code can owe
+    // different rates. An address that is merely enough to identify a ZIP is
+    // therefore not necessarily enough to identify a RATE.
+    //
+    // Whether `auto` would in practice already ask a Californian for the full
+    // address is genuinely ambiguous in Stripe's docs: the Tax guide describes
+    // the default collection precision as `full`, which "collects a full
+    // billing address" in "locations where additional address details improve
+    // tax accuracy", while the API reference's `auto` wording above reads as
+    // minimal. `required` makes the question moot — it is a guarantee that does
+    // not depend on Stripe's per-location judgement, on which of those two
+    // descriptions is current, or on either of them staying true. For a
+    // registration that makes ZeroRouter liable for remitting the right
+    // district rate, a guarantee is worth more than a shorter form.
+    //
+    // It composes with `automatic_tax` rather than competing with it. Stripe
+    // documents `automatic_tax[enabled]` as itself "collect[ing] any billing
+    // address information necessary for tax calculation", so the two set
+    // independent floors and the stricter one wins; there is no combination in
+    // which requiring MORE address yields a worse tax answer. Stripe documents
+    // `billing_address_collection=required` alongside `automatic_tax[enabled]`
+    // and `ui_mode=embedded_page` in a single worked example, so the trio is a
+    // supported shape and not an inference. The one documented conflict is with
+    // `automatic_tax[address_collection_precision]=minimal`, which this module
+    // does not send — see below.
+    //
+    // The buyer-facing cost is a longer form, and the portal already promises
+    // it: the copy above Stripe's iframe says a billing address is required to
+    // verify identity, prevent fraud and calculate sales tax. This makes that
+    // sentence true unconditionally rather than usually.
+    //
     // Deliberately NOT sent — each of these is a decision, not an oversight:
     //
     // - `product_data[tax_code]` and `price_data[tax_behavior]`. Omitting them
@@ -1410,12 +1449,14 @@ fn checkout_session_form(
     //   Setting it would create a SECOND, Checkout-owned customer on every
     //   purchase — `ensure_stripe_customer` already mints one per user for
     //   autopay — duplicating records for one human to buy nothing.
-    // - `billing_address_collection=required`. Still deliberately absent, and
-    //   the default `auto` is what makes the embedded form ask for an address
-    //   at all: Stripe's own description of `auto` is that with `automatic_tax`
-    //   enabled, "Checkout will collect the minimum number of fields required
-    //   for tax calculation". Forcing `required` would collect a full address
-    //   where a postal code would have done.
+    // - `automatic_tax[address_collection_precision]`. Unset, which is the
+    //   `full` default. The `minimal` alternative shortens the form to the
+    //   least address Stripe can compute a tax from — the opposite of what the
+    //   California registration needs — and Stripe documents it as INCOMPATIBLE
+    //   with `billing_address_collection=required` below, so setting it would
+    //   also start rejecting every session. It is named here so that a future
+    //   attempt to shorten the checkout form finds the conflict written down
+    //   rather than discovering it as a 400.
     //
     // `ui_mode=embedded_page` is what makes Stripe mint a `client_secret` and
     // render the form inside the portal instead of on a Stripe-hosted page.
@@ -1427,6 +1468,7 @@ fn checkout_session_form(
     // about.
     push("automatic_tax[enabled]", "true");
     push("tax_id_collection[enabled]", "true");
+    push("billing_address_collection", "required");
     push("metadata[user_id]", &params.user_id.to_string());
     push("metadata[credit_usd]", &params.credit_usd.to_string());
     push("metadata[fee_usd]", &params.fee_usd.to_string());
@@ -2426,7 +2468,7 @@ mod tests {
                 Some("1")
             );
         }
-        assert_eq!(form.len(), 18, "the two-line form is exactly 18 parameters");
+        assert_eq!(form.len(), 19, "the two-line form is exactly 19 parameters");
     }
 
     /// The fee line is derived, never re-derived: whatever the fee happens to
@@ -2470,7 +2512,28 @@ mod tests {
                 .all(|(key, _)| !key.starts_with("line_items[1]")),
             "a zero-amount line item is rejected by Stripe and must not be sent"
         );
-        assert_eq!(form.len(), 14, "the one-line form is exactly 14 parameters");
+        assert_eq!(form.len(), 15, "the one-line form is exactly 15 parameters");
+    }
+
+    /// The billing address is REQUIRED on every session shape, not just the
+    /// two-line one.
+    ///
+    /// The counts above would still pass if the parameter rode in only on the
+    /// path that happens to have a fee line, so this asserts the value itself
+    /// on both shapes. It is a tax input: ZeroRouter is registered in
+    /// California, where district taxes stack below ZIP granularity, and the
+    /// default `auto` collects only what Stripe judges the lookup to need.
+    #[test]
+    fn every_checkout_shape_requires_a_full_billing_address() {
+        for (credit_cents, gross_cents) in [(2_500, 2_638), (2_500, 2_500), (500, 580)] {
+            let form = checkout_session_form(&split_params(credit_cents, gross_cents))
+                .expect("form must build");
+            assert_eq!(
+                form_value(&form, "billing_address_collection"),
+                Some("required"),
+                "credit {credit_cents} against gross {gross_cents} must require the address"
+            );
+        }
     }
 
     /// A split that cannot be sold is refused before Stripe sees it.
