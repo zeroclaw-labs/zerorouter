@@ -1134,6 +1134,12 @@ async fn checkout_session_form_is_the_pinned_stripe_wire_contract() {
         // its default `never` is the optional mode, and the alternative would
         // block every EU consumer from buying.
         ("tax_id_collection[enabled]", "true"),
+        // Always collect a FULL billing address rather than leaving the amount
+        // of address up to Stripe. The default `auto` collects only what the
+        // tax lookup is judged to need, which in a district-tax state can be
+        // less than the address the rate actually depends on. See the module
+        // comment for why the California registration is what changed this.
+        ("billing_address_collection", "required"),
         ("metadata[user_id]", &user_id.to_string()),
         ("metadata[credit_usd]", "25.00"),
         ("metadata[fee_usd]", "1.38"),
@@ -1152,6 +1158,18 @@ async fn checkout_session_form_is_the_pinned_stripe_wire_contract() {
     .map(|(key, value)| (key.to_owned(), value.to_owned()))
     .collect();
     assert_eq!(form, expected, "the Checkout Session form moved");
+
+    // Said once more on its own, because the equality above pins it only as
+    // one entry among nineteen: a full billing address is REQUIRED. ZeroRouter
+    // is registered in California, where the rate stacks district taxes below
+    // ZIP granularity, so the address is a tax input and not merely a fraud
+    // signal. If this ever silently reverts to the default `auto`, the tax
+    // Stripe calculates can be wrong while every other assertion still passes.
+    assert_eq!(
+        form.get("billing_address_collection").map(String::as_str),
+        Some("required"),
+        "checkout must always collect a full billing address"
+    );
 
     // `customer_update` is only valid alongside a `customer`, and this session
     // attaches none. Sending it would make Stripe reject every checkout, so its
