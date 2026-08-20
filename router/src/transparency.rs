@@ -158,7 +158,22 @@ async fn container_image(metadata_uri: &str) -> (Option<String>, Option<String>)
             .filter(|value| !value.is_empty())
             .map(str::to_owned)
     };
-    (field("Image"), field("ImageDigest"))
+    let image = field("Image");
+    // ECS does not always populate ImageDigest — the live task's metadata
+    // (first observed on the 2f3dde1 deploy) reported it empty while `Image`
+    // itself was digest-pinned (`...:tag@sha256:...`), because the deploy
+    // workflow registers the task definition with a pinned reference. The
+    // digest embedded in the reference is the same fact from the same
+    // authority, so falling back to it is what keeps the attestations/verify
+    // half of the chain populated instead of null.
+    let image_digest = field("ImageDigest").or_else(|| {
+        image
+            .as_deref()
+            .and_then(|image| image.split_once('@'))
+            .map(|(_, digest)| digest.to_owned())
+            .filter(|digest| digest.starts_with("sha256:"))
+    });
+    (image, image_digest)
 }
 
 /// The cached report. Only a complete answer is cached: if the metadata env
