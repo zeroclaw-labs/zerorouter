@@ -1305,3 +1305,744 @@ async fn the_accrual_row_lock_is_bounded_by_lock_timeout() {
 
     holder.rollback().await.expect("holder must release");
 }
+
+// ---------------------------------------------------------------------------
+// Per-key expiry and credit limits (migration 0023)
+// ---------------------------------------------------------------------------
+//
+// Two independent guards on the same hot path, and the tests below are written
+// to fail in BOTH directions for each: an expired key admitted is caught, and a
+// live key refused is caught. A guard that only ever refuses is not a guard,
+// it is an outage.
+
+/// A key with the 0023 fields set. `spend_cap_usd` is deliberately large in
+/// these tests so the OPERATOR ceiling never binds first and the assertions are
+/// about the customer's own limit.
+async fn create_limited_key(
+    pool: &PgPool,
+    user_id: Uuid,
+    expires_at_sql: &str,
+    credit_limit_usd: Option<Decimal>,
+    credit_limit_window: Option<&str>,
+) -> AuthenticatedKey {
+    let key_id = Uuid::new_v4();
+    query(&format!(
+        r#"
+        INSERT INTO api_keys (
+            id, user_id, key_hash, name,
+            spend_cap_usd, velocity_cap_tokens_per_min,
+            expires_at, credit_limit_usd, credit_limit_window
+        )
+        VALUES ($1, $2, $3, 'limits-integration', 100000, 100000000, {expires_at_sql}, $4, $5)
+        "#
+    ))
+    .bind(key_id)
+    .bind(user_id)
+    .bind(hash_api_key(&generate_api_key()))
+    .bind(credit_limit_usd)
+    .bind(credit_limit_window)
+    .execute(pool)
+    .await
+    .expect("limited test API key must insert");
+    AuthenticatedKey {
+        id: key_id,
+        user_id,
+        default_priority: None,
+    }
+}
+
+/// How close `NOW()` is to the next UTC day boundary, in seconds.
+///
+/// The window tests seed an event one second before a boundary and then assert
+/// what admission counts on the other side of it. If the suite happens to run
+/// across midnight UTC, "one second before today" becomes "one second before
+/// tomorrow" partway through and the assertion is about a different window than
+/// the seed was. That is a ~1-in-86,400 flake, which on a busy CI is a real one.
+/// Rather than paper over it with a retry, the affected tests bail out loudly
+/// when they are too close to a boundary to be deterministic.
+async fn seconds_to_utc_day_boundary(pool: &PgPool) -> f64 {
+    query_scalar::<_, f64>(
+        r#"
+        SELECT EXTRACT(EPOCH FROM (
+            (date_trunc('day', NOW() AT TIME ZONE 'UTC') + INTERVAL '1 day') AT TIME ZONE 'UTC'
+            - NOW()
+        ))::DOUBLE PRECISION
+        "#,
+    )
+    .fetch_one(pool)
+    .await
+    .expect("boundary distance must query")
+}
+
+/// Expiry is enforced, and it is enforced in BOTH directions: the lapsed key is
+/// refused and the two keys that must still work are not.
+///
+/// The third arm is the one that catches an over-eager guard. A predicate
+/// written `expires_at < NOW()` without the NULL arm refuses every key that
+/// predates 0023 — every key in production — and a test that only checked the
+/// expired case would pass while the router refused all traffic.
+#[tokio::test]
+async fn an_expired_key_is_refused_and_unexpired_keys_are_not() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let user_id = create_user(&pool, "expiry-both-ways").await;
+
+    let expired =
+        create_limited_key(&pool, user_id, "NOW() - INTERVAL '1 second'", None, None).await;
+    let future = create_limited_key(&pool, user_id, "NOW() + INTERVAL '1 hour'", None, None).await;
+    let never = create_limited_key(&pool, user_id, "NULL", None, None).await;
+
+    assert!(
+        matches!(
+            admit(&pool, &expired, 100, Decimal::new(1, 2)).await,
+            UsageAdmission::Unauthorized
+        ),
+        "a key past its expires_at must be refused"
+    );
+    assert!(
+        matches!(
+            admit(&pool, &future, 100, Decimal::new(1, 2)).await,
+            UsageAdmission::Allowed(_)
+        ),
+        "a key whose expiry is still ahead of it must be admitted"
+    );
+    assert!(
+        matches!(
+            admit(&pool, &never, 100, Decimal::new(1, 2)).await,
+            UsageAdmission::Allowed(_)
+        ),
+        "a key with NULL expires_at never expires and must be admitted — this is \
+         every key that predates migration 0023"
+    );
+}
+
+/// An expired key and a revoked key are refused with the SAME answer, so the
+/// refusal cannot be used to tell them apart.
+///
+/// Admission must not become an oracle. If expiry produced a distinguishable
+/// outcome, a caller holding a key could learn whether it had been deliberately
+/// revoked (someone acted) or had merely lapsed (nobody did) — and, at the
+/// authenticator, a probe could separate "this hash exists but expired" from
+/// "this hash is unknown".
+#[tokio::test]
+async fn an_expired_key_is_refused_exactly_as_a_revoked_one_is() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let user_id = create_user(&pool, "expiry-indistinguishable").await;
+
+    let expired =
+        create_limited_key(&pool, user_id, "NOW() - INTERVAL '1 second'", None, None).await;
+    let revoked = create_limited_key(&pool, user_id, "NULL", None, None).await;
+    query("UPDATE api_keys SET disabled = TRUE WHERE id = $1")
+        .bind(revoked.id)
+        .execute(&pool)
+        .await
+        .expect("revocation must apply");
+
+    let expired_outcome = admit(&pool, &expired, 100, Decimal::new(1, 2)).await;
+    let revoked_outcome = admit(&pool, &revoked, 100, Decimal::new(1, 2)).await;
+    assert!(
+        matches!(expired_outcome, UsageAdmission::Unauthorized)
+            && matches!(revoked_outcome, UsageAdmission::Unauthorized),
+        "expiry and revocation must both surface as Unauthorized, so the refusal \
+         does not say which"
+    );
+
+    // The same property one layer up: the authenticator refuses an expired key
+    // with the same `Invalid` it gives an unknown one, and never caches it.
+    let authenticator = zerorouter::auth::KeyAuthenticator::new();
+    let plaintext = generate_api_key();
+    query(
+        r#"
+        INSERT INTO api_keys (id, user_id, key_hash, name, expires_at)
+        VALUES ($1, $2, $3, 'lapsed', NOW() - INTERVAL '1 second')
+        "#,
+    )
+    .bind(Uuid::new_v4())
+    .bind(user_id)
+    .bind(hash_api_key(&plaintext))
+    .execute(&pool)
+    .await
+    .expect("lapsed key must insert");
+    assert!(
+        authenticator.authenticate(&pool, &plaintext).await.is_err(),
+        "the authenticator must refuse a lapsed key rather than cache it"
+    );
+}
+
+/// A lifetime limit (no reset cadence) binds on everything the key has ever
+/// spent, including spend from a previous calendar month.
+///
+/// The previous-month arm is what separates "lifetime" from "monthly". If the
+/// lifetime case were wired to the 0019 month rollup by mistake, every limit
+/// would silently reset on the 1st and this is the only test that would notice.
+#[tokio::test]
+async fn a_lifetime_credit_limit_never_resets() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let user_id = create_user(&pool, "limit-lifetime").await;
+    let key = create_limited_key(&pool, user_id, "NULL", Some(Decimal::ONE), None).await;
+
+    // Spent in a previous calendar month, and it must still count.
+    seed_event_at(
+        &pool,
+        &key,
+        "date_trunc('month', NOW() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC' - INTERVAL '1 second'",
+        Decimal::new(90, 2),
+    )
+    .await;
+
+    assert!(
+        matches!(
+            admit(&pool, &key, 100, Decimal::new(5, 2)).await,
+            UsageAdmission::Allowed(_)
+        ),
+        "$0.90 spent against a $1 lifetime limit still leaves room for $0.05"
+    );
+    assert!(
+        matches!(
+            admit(&pool, &key, 100, Decimal::new(20, 2)).await,
+            UsageAdmission::KeyCreditLimitExceeded
+        ),
+        "$0.90 spent plus a $0.20 worst-case reserve exceeds a $1 lifetime limit, \
+         and last month's spend counts because a lifetime limit never resets"
+    );
+}
+
+/// The window-reset boundary, for the daily cadence: spend recorded one second
+/// before the reset must not be counted after it.
+///
+/// This is the test that fails if the bucket read uses `>=` against the wrong
+/// instant, if the DATE grain is replaced by something with a sub-day
+/// component, or if the window start is computed from a rolling `NOW() -
+/// INTERVAL '1 day'` instead of the calendar day.
+#[tokio::test]
+async fn a_daily_credit_limit_does_not_count_spend_from_before_the_reset() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let remaining = seconds_to_utc_day_boundary(&pool).await;
+    assert!(
+        remaining > 60.0,
+        "this test seeds one second either side of a UTC day boundary and cannot \
+         be deterministic when the suite is running across one ({remaining:.0}s \
+         to the next boundary); re-run shortly"
+    );
+    let user_id = create_user(&pool, "limit-daily").await;
+    let key = create_limited_key(&pool, user_id, "NULL", Some(Decimal::ONE), Some("daily")).await;
+
+    // The last second of YESTERDAY, UTC. Far more than the limit.
+    seed_event_at(
+        &pool,
+        &key,
+        "date_trunc('day', NOW() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC' - INTERVAL '1 second'",
+        Decimal::from(50),
+    )
+    .await;
+    assert!(
+        matches!(
+            admit(&pool, &key, 100, Decimal::new(50, 2)).await,
+            UsageAdmission::Allowed(_)
+        ),
+        "$50 spent one second before today's reset must not count against today's \
+         $1 window"
+    );
+
+    // The same money, today, does bind.
+    seed_event_at(&pool, &key, "NOW()", Decimal::new(95, 2)).await;
+    assert!(
+        matches!(
+            admit(&pool, &key, 100, Decimal::new(50, 2)).await,
+            UsageAdmission::KeyCreditLimitExceeded
+        ),
+        "$0.95 spent today plus a $0.50 reserve exceeds the $1 daily window"
+    );
+}
+
+/// The same boundary for the weekly cadence, whose window starts on Monday
+/// 00:00 UTC (`date_trunc('week', ...)`).
+#[tokio::test]
+async fn a_weekly_credit_limit_counts_from_monday_utc() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let remaining = seconds_to_utc_day_boundary(&pool).await;
+    assert!(
+        remaining > 60.0,
+        "this test straddles a UTC day boundary and cannot be deterministic when \
+         the suite is running across one ({remaining:.0}s remaining); re-run shortly"
+    );
+    let user_id = create_user(&pool, "limit-weekly").await;
+    let key = create_limited_key(&pool, user_id, "NULL", Some(Decimal::ONE), Some("weekly")).await;
+
+    // The last second before this week began.
+    seed_event_at(
+        &pool,
+        &key,
+        "date_trunc('week', NOW() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC' - INTERVAL '1 second'",
+        Decimal::from(50),
+    )
+    .await;
+    assert!(
+        matches!(
+            admit(&pool, &key, 100, Decimal::new(50, 2)).await,
+            UsageAdmission::Allowed(_)
+        ),
+        "last week's spend must not count against this week's window"
+    );
+
+    // The first second of this week does count — the inclusive end of the range.
+    seed_event_at(
+        &pool,
+        &key,
+        "date_trunc('week', NOW() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'",
+        Decimal::new(95, 2),
+    )
+    .await;
+    assert!(
+        matches!(
+            admit(&pool, &key, 100, Decimal::new(50, 2)).await,
+            UsageAdmission::KeyCreditLimitExceeded
+        ),
+        "spend at the very start of the week is INSIDE the window: an off-by-one \
+         on the lower bound would let a whole Monday escape the limit"
+    );
+}
+
+/// The monthly cadence reads the 0019 rollup — the same value the operator
+/// ceiling already reads — and resets on the 1st.
+#[tokio::test]
+async fn a_monthly_credit_limit_resets_with_the_calendar_month() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let user_id = create_user(&pool, "limit-monthly").await;
+    let key = create_limited_key(&pool, user_id, "NULL", Some(Decimal::ONE), Some("monthly")).await;
+
+    seed_event_at(
+        &pool,
+        &key,
+        "date_trunc('month', NOW() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC' - INTERVAL '1 second'",
+        Decimal::from(50),
+    )
+    .await;
+    assert!(
+        matches!(
+            admit(&pool, &key, 100, Decimal::new(50, 2)).await,
+            UsageAdmission::Allowed(_)
+        ),
+        "last month's spend must not count against this month's window"
+    );
+
+    seed_event_at(&pool, &key, "NOW()", Decimal::new(95, 2)).await;
+    assert!(
+        matches!(
+            admit(&pool, &key, 100, Decimal::new(50, 2)).await,
+            UsageAdmission::KeyCreditLimitExceeded
+        ),
+        "$0.95 spent this month plus a $0.50 reserve exceeds the $1 monthly window"
+    );
+}
+
+/// A key with no credit limit is completely unaffected — the compatibility
+/// claim the whole migration rests on.
+///
+/// It spends far past what any of the limits above would have allowed, and must
+/// be admitted every time. The only thing that may still refuse it is the
+/// OPERATOR ceiling, which is set high here so it does not.
+#[tokio::test]
+async fn a_key_with_no_credit_limit_is_unchanged_by_the_feature() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let user_id = create_user(&pool, "limit-absent").await;
+    let key = create_limited_key(&pool, user_id, "NULL", None, None).await;
+
+    for _ in 0..5 {
+        spend(&pool, &key, Decimal::from(100)).await;
+    }
+    assert!(
+        matches!(
+            admit(&pool, &key, 100, Decimal::from(100)).await,
+            UsageAdmission::Allowed(_)
+        ),
+        "a key with credit_limit_usd IS NULL is unlimited and must never be \
+         refused by the 0023 gate, however much it has spent"
+    );
+}
+
+/// The operator ceiling and the customer's limit are separate, and each refusal
+/// says which one bound.
+///
+/// A caller acts on the code: `spend_cap_exceeded` means talk to the operator,
+/// `key_credit_limit_exceeded` means it is your own budget. Collapsing them
+/// would send every customer down the wrong path half the time.
+#[tokio::test]
+async fn the_two_spend_ceilings_are_reported_separately() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let user_id = create_user(&pool, "limit-vs-cap").await;
+
+    // Customer limit binds, operator ceiling does not.
+    let customer = create_limited_key(&pool, user_id, "NULL", Some(Decimal::ONE), None).await;
+    seed_event_at(&pool, &customer, "NOW()", Decimal::new(99, 2)).await;
+    assert!(
+        matches!(
+            admit(&pool, &customer, 100, Decimal::from(5)).await,
+            UsageAdmission::KeyCreditLimitExceeded
+        ),
+        "the customer's own limit must report as itself, not as the operator cap"
+    );
+
+    // Operator ceiling binds while the customer limit has room. Both are set,
+    // and the operator's is the tighter one, so it is the one reported — the
+    // answer the customer cannot fix by editing their own budget.
+    let operator = {
+        let key_id = Uuid::new_v4();
+        query(
+            r#"
+            INSERT INTO api_keys (
+                id, user_id, key_hash, name,
+                spend_cap_usd, velocity_cap_tokens_per_min, credit_limit_usd
+            )
+            VALUES ($1, $2, $3, 'operator-tighter', 1, 100000000, 100000)
+            "#,
+        )
+        .bind(key_id)
+        .bind(user_id)
+        .bind(hash_api_key(&generate_api_key()))
+        .execute(&pool)
+        .await
+        .expect("operator-capped key must insert");
+        AuthenticatedKey {
+            id: key_id,
+            user_id,
+            default_priority: None,
+        }
+    };
+    assert!(
+        matches!(
+            admit(&pool, &operator, 100, Decimal::from(5)).await,
+            UsageAdmission::SpendExceeded
+        ),
+        "when the operator ceiling is the tighter of the two it must be the one \
+         reported: raising the customer's own limit would not help"
+    );
+}
+
+/// Both 0023 counters equal a fresh sum of the ledger they derive from — the
+/// attribution guarantee, checked the same way the 0019 rollup's is.
+///
+/// A counter that drifts from `usage_events` is worse than a slow one: the
+/// divergence is permanent (nothing recomputes it) and invisible (admission
+/// goes on enforcing the wrong number), so the limit a customer sees and the
+/// limit that binds quietly part ways.
+#[tokio::test]
+async fn the_derived_spend_counters_never_drift_from_the_ledger() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let user_id = create_user(&pool, "counter-truth").await;
+    let key = create_limited_key(&pool, user_id, "NULL", None, None).await;
+
+    // Settled through the real path, plus backdated rows in other buckets.
+    spend(&pool, &key, Decimal::new(125, 2)).await;
+    spend(&pool, &key, Decimal::new(37, 2)).await;
+    seed_event_at(
+        &pool,
+        &key,
+        "NOW() - INTERVAL '3 days'",
+        Decimal::new(41, 2),
+    )
+    .await;
+    seed_event_at(
+        &pool,
+        &key,
+        "NOW() - INTERVAL '40 days'",
+        Decimal::new(7, 2),
+    )
+    .await;
+
+    let day_disagreements = query_scalar::<_, i64>(
+        r#"
+        SELECT COUNT(*)
+        FROM (
+            SELECT api_key_id, usage_event_utc_day(ts) AS day, SUM(cost_usd) AS spend
+            FROM usage_events
+            GROUP BY 1, 2
+        ) AS truth
+        FULL OUTER JOIN usage_key_day_spend AS rollup
+          ON rollup.api_key_id = truth.api_key_id AND rollup.day = truth.day
+        WHERE truth.api_key_id IS NULL
+           OR rollup.api_key_id IS NULL
+           OR truth.spend <> rollup.spend_usd
+        "#,
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("day counter consistency must query");
+    assert_eq!(
+        day_disagreements, 0,
+        "every usage_key_day_spend bucket must equal a fresh sum of the ledger \
+         rows it derives from, and no bucket may exist on one side only"
+    );
+
+    let total_disagreements = query_scalar::<_, i64>(
+        r#"
+        SELECT COUNT(*)
+        FROM (
+            SELECT api_key_id, SUM(cost_usd) AS spend
+            FROM usage_events
+            GROUP BY 1
+        ) AS truth
+        FULL OUTER JOIN usage_key_total_spend AS rollup
+          ON rollup.api_key_id = truth.api_key_id
+        WHERE truth.api_key_id IS NULL
+           OR rollup.api_key_id IS NULL
+           OR truth.spend <> rollup.spend_usd
+        "#,
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("total counter consistency must query");
+    assert_eq!(
+        total_disagreements, 0,
+        "every usage_key_total_spend row must equal the key's whole ledger"
+    );
+}
+
+/// Neither derived counter may be written by hand.
+///
+/// The fence is what makes the "cannot drift" claim above hold over time: with
+/// it, the ONLY writer is the accrual trigger. Without it, one stray UPDATE
+/// leaves a key enforcing a number no ledger supports, forever and silently.
+#[tokio::test]
+async fn the_derived_spend_counters_refuse_direct_writes() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let user_id = create_user(&pool, "counter-fence").await;
+    let key = create_limited_key(&pool, user_id, "NULL", None, None).await;
+    spend(&pool, &key, Decimal::new(10, 2)).await;
+
+    let day_write = query("UPDATE usage_key_day_spend SET spend_usd = 0 WHERE api_key_id = $1")
+        .bind(key.id)
+        .execute(&pool)
+        .await;
+    assert!(
+        day_write.is_err(),
+        "a hand-written UPDATE against usage_key_day_spend must be refused by the \
+         database, not merely discouraged by convention"
+    );
+    let total_write = query("UPDATE usage_key_total_spend SET spend_usd = 0 WHERE api_key_id = $1")
+        .bind(key.id)
+        .execute(&pool)
+        .await;
+    assert!(
+        total_write.is_err(),
+        "a hand-written UPDATE against usage_key_total_spend must be refused"
+    );
+    let total_insert =
+        query("INSERT INTO usage_key_total_spend (api_key_id, spend_usd) VALUES ($1, 999)")
+            .bind(Uuid::new_v4())
+            .execute(&pool)
+            .await;
+    assert!(
+        total_insert.is_err(),
+        "a hand-written INSERT must be refused too — the fence is about who \
+         writes, not about what they wrote"
+    );
+}
+
+/// The number the portal SHOWS and the number admission ENFORCES are the same
+/// number.
+///
+/// They are computed by two different SQL statements — admission's is one arm
+/// of a hot-path query built for a single key, the portal's is a per-row
+/// expression over a list — so nothing but a test binds them together. If they
+/// drift, a customer reads "$0.40 of $1.00" on a page whose next request is
+/// refused, and every support conversation starts from a lie.
+///
+/// Checked at the boundary rather than at some comfortable midpoint, because
+/// the boundary is where a disagreement of one cent becomes visible.
+#[tokio::test]
+async fn the_portal_reports_the_window_spend_admission_enforces() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let remaining = seconds_to_utc_day_boundary(&pool).await;
+    assert!(
+        remaining > 60.0,
+        "this test seeds either side of a UTC day boundary and cannot be \
+         deterministic when the suite is running across one ({remaining:.0}s \
+         remaining); re-run shortly"
+    );
+    let user_id = create_user(&pool, "limit-wire").await;
+    let key = create_limited_key(&pool, user_id, "NULL", Some(Decimal::ONE), Some("daily")).await;
+    // Spend on BOTH sides of the reset, deliberately. Seeding only today's
+    // would make this test pass against any window at least as wide as today —
+    // including a portal that read a different one — and it would then be
+    // pinning nothing. The out-of-window amount is large enough that reporting
+    // it would be unmistakable.
+    seed_event_at(
+        &pool,
+        &key,
+        "date_trunc('day', NOW() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC' - INTERVAL '1 second'",
+        Decimal::from(50),
+    )
+    .await;
+    seed_event_at(&pool, &key, "NOW()", Decimal::new(60, 2)).await;
+
+    let app = portal_app(&pool);
+    let cookie = portal_cookie(&pool, user_id).await;
+    let (status, body) = send(
+        &app,
+        Request::builder()
+            .uri("/api/keys")
+            .header(header::COOKIE, &cookie)
+            .body(Body::empty())
+            .expect("GET request should build"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let listed = body["keys"]
+        .as_array()
+        .expect("keys must be an envelope array")
+        .iter()
+        .find(|row| row["id"].as_str() == Some(&key.id.to_string()))
+        .expect("the limited key must be listed")
+        .clone();
+
+    assert_eq!(
+        listed["credit_limit_usd"].as_str(),
+        Some("1"),
+        "the limit is echoed as stored"
+    );
+    assert_eq!(listed["credit_limit_window"].as_str(), Some("daily"));
+    let reported = Decimal::from_str(
+        listed["credit_limit_used_usd"]
+            .as_str()
+            .expect("used must be reported for a limited key"),
+    )
+    .expect("reported usage must parse as a decimal");
+    assert_eq!(
+        reported,
+        Decimal::new(60, 2),
+        "the portal must report THIS window's settled spend and nothing from \
+         before the reset"
+    );
+
+    // The boundary proof: with $0.60 reported used against a $1 limit, a
+    // request reserving exactly the remaining $0.40 is admitted and one cent
+    // more is refused. That can only hold if admission is reading the same
+    // $0.60 the portal just displayed.
+    let remaining = Decimal::ONE - reported;
+    assert!(
+        matches!(
+            admit(&pool, &key, 100, remaining).await,
+            UsageAdmission::Allowed(_)
+        ),
+        "a reserve of exactly the reported remainder must fit"
+    );
+    assert!(
+        matches!(
+            admit(&pool, &key, 100, remaining + Decimal::new(1, 2)).await,
+            UsageAdmission::KeyCreditLimitExceeded
+        ),
+        "one cent past the reported remainder must not"
+    );
+}
+
+/// Minting through the portal records expiry and the limit, and a key minted
+/// with none of them is exactly the key this endpoint minted before 0023.
+#[tokio::test]
+async fn the_portal_mints_keys_with_expiry_and_a_credit_limit() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let user_id = create_user(&pool, "limit-mint").await;
+    let app = portal_app(&pool);
+    let cookie = portal_cookie(&pool, user_id).await;
+
+    let expires_at = "2099-01-01T00:00:00Z";
+    let (status, body) = send(
+        &app,
+        post_json(
+            "/api/keys",
+            &cookie,
+            json!({
+                "name": "contractor",
+                "expires_at": expires_at,
+                "credit_limit_usd": "25",
+                "credit_limit_window": "weekly",
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "mint should succeed: {body}");
+    assert_eq!(body["credit_limit_usd"].as_str(), Some("25"));
+    assert_eq!(body["credit_limit_window"].as_str(), Some("weekly"));
+    assert_eq!(
+        body["credit_limit_used_usd"].as_str(),
+        Some("0"),
+        "a key that has never been used has spent none of its limit"
+    );
+    assert!(
+        body["expires_at"]
+            .as_str()
+            .is_some_and(|at| at.starts_with("2099")),
+        "the expiry is echoed as recorded, not silently dropped: {body}"
+    );
+
+    // The unchanged path: name only.
+    let (status, body) = send(
+        &app,
+        post_json("/api/keys", &cookie, json!({ "name": "plain" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert!(
+        body["expires_at"].is_null()
+            && body["credit_limit_usd"].is_null()
+            && body["credit_limit_window"].is_null()
+            && body["credit_limit_used_usd"].is_null(),
+        "a name-only mint must still produce a never-expiring, unlimited key: {body}"
+    );
+
+    // A cadence with no limit would mint an UNLIMITED key from a request that
+    // plainly asked for a budget, so it is refused rather than dropped.
+    let (status, _) = send(
+        &app,
+        post_json(
+            "/api/keys",
+            &cookie,
+            json!({ "name": "windowed", "credit_limit_window": "daily" }),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a reset cadence with no limit must be refused"
+    );
+
+    // An expiry already in the past mints a key that can never authenticate.
+    let (status, _) = send(
+        &app,
+        post_json(
+            "/api/keys",
+            &cookie,
+            json!({ "name": "stillborn", "expires_at": "2000-01-01T00:00:00Z" }),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "an expiry in the past must be refused at mint"
+    );
+}

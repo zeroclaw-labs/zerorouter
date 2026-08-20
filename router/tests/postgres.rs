@@ -808,6 +808,8 @@ async fn migration_chain_applies_on_a_fresh_database() {
         bool,
         bool,
         bool,
+        bool,
+        bool,
         i64,
     )> = async {
         let pool = PgPoolOptions::new()
@@ -984,6 +986,59 @@ async fn migration_chain_applies_on_a_fresh_database() {
         )
         .fetch_one(&pool)
         .await?;
+        // 0023 is three key columns and two derived counters, and it is only
+        // useful if all of it arrives: the columns without the counters give
+        // admission a limit it cannot measure, and the counters without their
+        // accrual trigger read as zero spend for every key — a limit that never
+        // binds. The `disabled`-style CHECK on the cadence is probed too,
+        // because admission switches on that keyword set and a row parked
+        // outside it is a limit that silently enforces nothing.
+        let key_limits_exist = query_scalar::<_, bool>(
+            r#"
+            SELECT (
+                SELECT COUNT(*) FROM information_schema.columns
+                WHERE table_name = 'api_keys'
+                  AND column_name IN ('expires_at', 'credit_limit_usd', 'credit_limit_window')
+            ) = 3
+            AND EXISTS (
+                SELECT 1 FROM information_schema.tables
+                WHERE table_name = 'usage_key_day_spend'
+            ) AND EXISTS (
+                SELECT 1 FROM information_schema.tables
+                WHERE table_name = 'usage_key_total_spend'
+            ) AND EXISTS (
+                SELECT 1 FROM pg_trigger
+                WHERE tgname = 'usage_events_accrue_spend_windows'
+                  AND NOT tgisinternal
+            ) AND EXISTS (
+                SELECT 1 FROM pg_constraint
+                WHERE conname = 'api_keys_credit_limit_window_is_known'
+            ) AND EXISTS (
+                SELECT 1 FROM pg_constraint
+                WHERE conname = 'api_keys_credit_limit_window_needs_a_limit'
+            )
+            "#,
+        )
+        .fetch_one(&pool)
+        .await?;
+        // All three 0023 key columns must be NULLABLE with no default. That is
+        // the whole compatibility story for the feature: every key that existed
+        // before it reads NULL — never expires, unlimited — and admission's
+        // added predicate and added gate are both no-ops for them. A DEFAULT
+        // appearing here would silently give every pre-existing key an expiry
+        // or a budget it never asked for.
+        let key_limit_columns_are_nullable_with_no_default = query_scalar::<_, bool>(
+            r#"
+            SELECT COUNT(*) = 3
+            FROM information_schema.columns
+            WHERE table_name = 'api_keys'
+              AND column_name IN ('expires_at', 'credit_limit_usd', 'credit_limit_window')
+              AND is_nullable = 'YES'
+              AND column_default IS NULL
+            "#,
+        )
+        .fetch_one(&pool)
+        .await?;
         let version = query_scalar::<_, i64>("SELECT MAX(version) FROM _sqlx_migrations")
             .fetch_one(&pool)
             .await?;
@@ -1006,6 +1061,8 @@ async fn migration_chain_applies_on_a_fresh_database() {
             attempts_have_source,
             attempts_have_reason,
             checkout_intent_delete_is_guarded,
+            key_limits_exist,
+            key_limit_columns_are_nullable_with_no_default,
             version,
         ))
     }
@@ -1016,7 +1073,7 @@ async fn migration_chain_applies_on_a_fresh_database() {
         .execute(&admin)
         .await;
 
-    let outcome = outcome.expect("the 0001->0022 chain must apply on a fresh database");
+    let outcome = outcome.expect("the 0001->0023 chain must apply on a fresh database");
     assert!(outcome.0, "request_attempts exists after the fresh chain");
     assert!(
         outcome.1,
@@ -1097,14 +1154,24 @@ async fn migration_chain_applies_on_a_fresh_database() {
          settled row, a ledger-corroborated row, and a row Stripe can still \
          complete are each refused by the database itself"
     );
-    // 22, not 18: 0013 (dispute resolution), 0014 (dispatched reservations),
+    assert!(
+        outcome.17,
+        "the 0023 key-limit columns, both derived spend counters, their accrual \
+         trigger, and the cadence constraints all exist after the chain"
+    );
+    assert!(
+        outcome.18,
+        "the 0023 key columns are nullable with no default, so every key that \
+         predates them reads NULL: never expires, unlimited"
+    );
+    // 23, not 19: 0013 (dispute resolution), 0014 (dispatched reservations),
     // 0015 (released reservations), 0016 (deposit fee), 0017 (stripe observed
     // reversals), 0018 (autopay withheld state), 0019 (monthly spend rollup),
-    // 0020 (usage gap and real finish reason), 0021 (autopay tax) and 0022
-    // (checkout intent cleanup) are numbered with a gap so 0010-0012 stay
-    // available to branches in flight. The chain's head is the highest version
-    // applied, not a count of files.
-    assert_eq!(outcome.17, 22, "the chain reaches migration version 22");
+    // 0020 (usage gap and real finish reason), 0021 (autopay tax), 0022
+    // (checkout intent cleanup) and 0023 (key expiry and credit limits) are
+    // numbered with a gap so 0010-0012 stay available to branches in flight.
+    // The chain's head is the highest version applied, not a count of files.
+    assert_eq!(outcome.19, 23, "the chain reaches migration version 23");
 }
 
 /// Rewrite the database name in a Postgres URL, keeping any query string

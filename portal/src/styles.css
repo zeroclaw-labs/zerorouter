@@ -899,6 +899,29 @@ input {
   max-width: 340px;
 }
 
+/* The key form carries four inputs since expiry and credit limits (migration
+   0023), which no longer fit one line on a narrow viewport. Wrapping rather
+   than shrinking keeps every control at a usable width instead of squeezing
+   all four toward illegible. */
+.create-key {
+  flex-wrap: wrap;
+  align-items: center;
+  border-bottom: none;
+  padding-bottom: 8px;
+}
+
+.create-key .field {
+  max-width: 220px;
+  width: auto;
+  flex: 1 1 160px;
+}
+
+.create-key-hint {
+  padding: 0 18px 16px;
+  border-bottom: 1px solid var(--border);
+  margin: 0;
+}
+
 /* ── activate ────────────────────────────────────────────────────────── */
 
 .activate {
