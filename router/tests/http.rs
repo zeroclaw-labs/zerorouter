@@ -270,8 +270,9 @@ async fn models_are_materialized_from_tiers_toml() {
     // One row per model PIN, keyed by its OpenRouter-standard {vendor}/{model}
     // id. The pre-rename catalog published a `zero/*` alias row AND a concrete
     // candidate row per model (14 rows); each pin now equals its candidate, so
-    // it contributes exactly one row — ten models, ten rows.
-    assert_eq!(data.len(), 10);
+    // it contributes exactly one row — twelve models, twelve rows (the two
+    // Bedrock zero-retention lanes joined on 2026-08-20).
+    assert_eq!(data.len(), 12);
     assert!(data.iter().all(|model| model["object"] == "model"));
 
     let ids = data
@@ -289,6 +290,8 @@ async fn models_are_materialized_from_tiers_toml() {
             "anthropic/claude-haiku-4-5",
             "anthropic/claude-opus-5",
             "anthropic/claude-sonnet-5",
+            "bedrock/claude-opus-5",
+            "bedrock/claude-sonnet-5",
             "google/gemini-3.1-pro-preview",
             "google/gemini-3.5-flash-lite",
             "google/gemini-3.7-flash",
@@ -296,7 +299,11 @@ async fn models_are_materialized_from_tiers_toml() {
             "openai/gpt-5.6-sol",
             "openai/gpt-5.6-terra",
         ]),
-        "exactly the ten vendor-named pins — no zero/* alias, no gpt-5.3-codex"
+        "exactly the twelve vendor-named pins — no zero/* alias, no gpt-5.3-codex. \
+         The two `bedrock/*` ids serve the same weights as their `anthropic/*` \
+         namesakes and are deliberately addressable apart from them: one lane \
+         retains under Anthropic's 30-day policy and one retains nothing, which \
+         is a difference a customer must be able to ask for by name"
     );
 
     // `owned_by` is the vendor, matching OpenRouter — never the string
@@ -600,17 +607,60 @@ async fn every_shipped_lane_publishes_a_retention_posture() {
         );
     }
 
-    // The shipped catalog's honest state, asserted rather than assumed: every
-    // lane is a standard API account and the zero-retention section is EMPTY.
-    // A ZDR arrangement landing should flip this deliberately, with a signed
-    // agreement behind it — see docs/DEPLOY.md.
-    let zero = data
+    // The shipped catalog's state, asserted rather than assumed. It was EMPTY
+    // until 2026-08-20 and is now exactly two lanes — and it is pinned by NAME
+    // rather than by count, because the thing that must not happen quietly is a
+    // lane ACQUIRING this label, not the tally moving. A count of two would
+    // still pass if someone relabelled `anthropic/*` zero and dropped Bedrock.
+    //
+    // A lane arriving in this list is a legal-adjacent claim about a customer's
+    // data. It arrives only with evidence behind it — for these two, an enforced
+    // `data_retention_mode: none` on the operator's AWS account plus AWS's
+    // published semantics for that value. See docs/DEPLOY.md.
+    let zero: Vec<&str> = data
         .iter()
         .filter(|model| model["retention"]["posture"] == "zero")
-        .count();
+        .map(|model| model["id"].as_str().expect("id is a string"))
+        .collect();
     assert_eq!(
-        zero, 0,
-        "no shipped lane may claim zero retention until a ZDR arrangement exists for it"
+        zero,
+        ["bedrock/claude-opus-5", "bedrock/claude-sonnet-5"],
+        "no lane may claim zero retention without a confirmed arrangement or an \
+         enforced account configuration behind it"
+    );
+}
+
+/// The ordering claim, over the SHIPPED catalog rather than a fixture.
+///
+/// `zero_retention_lanes_sort_before_standard_ones` proves the sort works on a
+/// catalog built to exercise it. This proves the product actually ships in that
+/// order, and until 2026-08-20 it could not: with every lane `standard` the
+/// claim was vacuous, and any sort at all would have passed. Now that two lanes
+/// carry `zero`, flipping `RetentionPosture::ordering_rank` — or dropping the
+/// sort in `ModelList::from_listing` — fails here against the real file.
+#[tokio::test]
+async fn the_shipped_catalog_lists_its_zero_retention_lanes_first() {
+    let data = listed_models(RouterState::new(tier_config_path())).await;
+    let postures: Vec<&str> = data
+        .iter()
+        .map(|model| {
+            model["retention"]["posture"]
+                .as_str()
+                .expect("every lane publishes a posture")
+        })
+        .collect();
+
+    let first_standard = postures
+        .iter()
+        .position(|posture| *posture == "standard")
+        .expect("the shipped catalog still has retaining lanes");
+    let last_zero = postures
+        .iter()
+        .rposition(|posture| *posture == "zero")
+        .expect("the shipped catalog now has zero-retention lanes");
+    assert!(
+        last_zero < first_standard,
+        "a retaining lane precedes a zero-retention one in the published order: {postures:?}"
     );
 }
 
@@ -629,6 +679,8 @@ async fn bundled_tier_catalog_has_expected_virtual_models() {
             "anthropic/claude-haiku-4-5",
             "anthropic/claude-opus-5",
             "anthropic/claude-sonnet-5",
+            "bedrock/claude-opus-5",
+            "bedrock/claude-sonnet-5",
             "google/gemini-3.1-pro-preview",
             "google/gemini-3.5-flash-lite",
             "google/gemini-3.7-flash",
@@ -636,9 +688,14 @@ async fn bundled_tier_catalog_has_expected_virtual_models() {
             "openai/gpt-5.6-sol",
             "openai/gpt-5.6-terra",
         ],
-        "the ten vendor-named model pins (Gemini flash + flash-lite added \
+        "the twelve vendor-named model pins (Gemini flash + flash-lite added \
          2026-08-18; Gemini Pro joined them once conditional rates could \
-         express the 200,000-token boundary Google prices it at)"
+         express the 200,000-token boundary Google prices it at; the two \
+         Bedrock zero-retention lanes on 2026-08-20). Note there is NO \
+         `bedrock/claude-fable-5`: Bedrock publishes `allowed_modes` per model \
+         and fable-class allows only `provider_data_share`, so under this \
+         account's `none` mode AWS reports it unavailable and blocks requests \
+         to it — a lane that could not serve"
     );
 
     // One upstream each, and only from the providers ZeroRouter integrates
@@ -652,8 +709,8 @@ async fn bundled_tier_catalog_has_expected_virtual_models() {
         );
         let provider = tier.candidates[0].provider.as_str();
         assert!(
-            provider == "openai" || provider == "anthropic" || provider == "google",
-            "{tier_id} routes to {provider}, which is not in the MVP inventory"
+            matches!(provider, "openai" | "anthropic" | "google" | "bedrock"),
+            "{tier_id} routes to {provider}, which is not in the shipped inventory"
         );
     }
 }
@@ -951,6 +1008,10 @@ async fn a_basis_hike_above_sell_withholds_that_tier_and_nothing_else() {
             "anthropic/claude-fable-5",
             "anthropic/claude-haiku-4-5",
             "anthropic/claude-opus-5",
+            // The Bedrock lanes are untouched by a first-party Anthropic
+            // repricing: different account, different rate card, own pins.
+            "bedrock/claude-opus-5",
+            "bedrock/claude-sonnet-5",
             "google/gemini-3.1-pro-preview",
             "google/gemini-3.5-flash-lite",
             "google/gemini-3.7-flash",
@@ -996,10 +1057,14 @@ async fn a_basis_hike_above_sell_withholds_that_tier_and_nothing_else() {
     assert_eq!(sell.input_per_mtok, Some(2.00));
     assert_eq!(sell.output_per_mtok, Some(10.00));
 
-    // And the public catalog stops advertising what it cannot serve: the nine
-    // surviving pins, one row each.
+    // And the public catalog stops advertising what it cannot serve: the eleven
+    // surviving pins, one row each. `bedrock/claude-sonnet-5` is among the
+    // survivors and that is the point of naming it — the two lanes serve the
+    // same weights on different accounts, so a repricing of the first-party
+    // one withholds only the first-party one.
     let listed = listed_model_ids(RouterState::new(path)).await;
-    assert_eq!(listed.len(), 9);
+    assert_eq!(listed.len(), 11);
+    assert!(listed.iter().any(|id| id == "bedrock/claude-sonnet-5"));
     assert!(listed.iter().any(|id| id == "openai/gpt-5.6-luna"));
     assert!(listed.iter().any(|id| id == "anthropic/claude-haiku-4-5"));
 
@@ -1024,7 +1089,7 @@ async fn the_shipped_catalog_withholds_no_tier_today() {
         "the shipped catalog withholds {:?}",
         catalog.unavailable.keys().collect::<Vec<_>>()
     );
-    assert_eq!(catalog.tiers.len(), 10);
+    assert_eq!(catalog.tiers.len(), 12);
 }
 
 /// Every conditional rate the shipped catalog declares, transcribed from
@@ -1106,7 +1171,7 @@ async fn every_shipped_conditional_rate_is_the_one_the_vendor_publishes() {
 // rungs across >=2 providers). Every tier is pass-through until a second
 // provider serves a model class again.
 const ROUTED_TIERS: [&str; 0] = [];
-const PASS_THROUGH_TIERS: [&str; 10] = [
+const PASS_THROUGH_TIERS: [&str; 12] = [
     // Model pins, keyed by their OpenRouter-standard {vendor}/{model} ids.
     "openai/gpt-5.6-luna",
     "anthropic/claude-haiku-4-5",
@@ -1118,6 +1183,16 @@ const PASS_THROUGH_TIERS: [&str; 10] = [
     "google/gemini-3.7-flash",
     "google/gemini-3.5-flash-lite",
     "google/gemini-3.1-pro-preview",
+    // The Bedrock zero-retention lanes (2026-08-20). Pass-through like every
+    // other pin, and note what that means here: they cost 10% MORE than the
+    // `anthropic/*` lanes serving the same weights, because the mantle
+    // endpoint is in-region only and AWS meters in-region traffic at a 10%
+    // premium over the global inference profile. Selling that through at cost
+    // is the promise; the assertion below (candidate rates == tier rates) is
+    // what holds it, and it would equally catch someone "fixing" these down to
+    // 2.00/10.00 on the sell side only.
+    "bedrock/claude-sonnet-5",
+    "bedrock/claude-opus-5",
 ];
 
 #[tokio::test]

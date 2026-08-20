@@ -168,6 +168,37 @@ pub enum Verdict {
     /// at all since stage 2 — `validate_zero_price` refuses it — but this file
     /// does not depend on that being true.)
     Unreconcilable,
+    /// The upstream has DECLARED that the reconciliation source cannot price
+    /// it, and said why (`unreconcilable_reason`, `config/providers.json`).
+    ///
+    /// Distinct from [`Self::Unreconcilable`], which covers a rung that costs
+    /// nothing and that no catalog will ever cover. This one is a rung that
+    /// costs real money and that the source *appears* to cover — the dangerous
+    /// case, and the reason the exemption has to be declared rather than
+    /// inferred. Bedrock is the instance: models.dev carries
+    /// `amazon-bedrock/anthropic.claude-sonnet-5` at 2.00/10.00, which is the
+    /// GLOBAL cross-region rate, while ZeroRouter dials the in-region-only
+    /// mantle endpoint that AWS meters at the unqualified `_standard` SKU,
+    /// 2.20/11.00. A join on the provider key was implemented and then removed:
+    /// it produced `ok` on a basis 10% below the invoice, which is worse than
+    /// no check at all, because it is a check that says everything is fine.
+    ///
+    /// **Not actionable, and it prints its reason on every run.** Not
+    /// actionable because there is nothing an operator could edit to make it
+    /// go away — the source does not carry this SKU class at any key — and a
+    /// permanently red row is how a report stops being read. Printing the
+    /// declared reason every time is what stops it becoming a silent skip: the
+    /// argument for the gap, and the authority the rates actually came from,
+    /// are in front of whoever reads the report.
+    ///
+    /// The honest cost, recorded here rather than left to be discovered: these
+    /// candidates have NO automated price check. If AWS moves the in-region
+    /// rate, nothing in CI will notice. That is a real regression in coverage
+    /// for this lane, accepted because the alternative on offer was a false
+    /// green, and mitigated only by the re-verification command in the
+    /// declaration. Wiring the AWS Price List API as a second drift source
+    /// would close it properly and is the right next piece of work.
+    NotCoveredBySource,
     /// The upstream reprices the whole request above a measured threshold and
     /// the CATALOG declares no conditional rates at all, so every request past
     /// the boundary is billed at a basis ZeroRouter does not actually pay.
@@ -223,6 +254,7 @@ impl Verdict {
             Self::Unpriced => "unpriced upstream",
             Self::Missing => "NOT IN SOURCE",
             Self::Unreconcilable => "local $0 rung",
+            Self::NotCoveredBySource => "source cannot price",
             Self::TieredUpstream => "TIERED UPSTREAM",
             Self::UnsupportedTierKind => "UNMODELLED TIER",
         }
@@ -232,7 +264,9 @@ impl Verdict {
     /// source simply has nothing to say, and failing on it would train
     /// operators to ignore the alarm. Neither does `Unreconcilable`, for the
     /// reason spelled out on that variant. `TieredUpstream` now does — see its
-    /// variant for why the call changed.
+    /// variant for why the call changed. Neither does `NotCoveredBySource`:
+    /// there is no edit that would resolve it, and its declared reason prints
+    /// on every run so the gap is argued rather than hidden.
     #[must_use]
     pub const fn is_actionable(&self) -> bool {
         matches!(
@@ -374,6 +408,13 @@ pub struct CandidateDrift {
     /// see [`upstream_tier_note`]. `None` means one flat rate at every size,
     /// which is what a single-rate catalog row can honestly express.
     pub upstream_tier: Option<String>,
+    /// This upstream's declared reason for being outside the source's coverage,
+    /// carried so the report can print it beside the row.
+    ///
+    /// `Some` exactly when the verdict is [`Verdict::NotCoveredBySource`]. It
+    /// travels on the finding rather than being looked up again at print time
+    /// so the reason shown is the one the verdict was decided from.
+    pub unreconcilable_reason: Option<String>,
 }
 
 impl CandidateDrift {
@@ -579,9 +620,12 @@ fn metadata_drift(recorded: &ModelMetadata, upstream: &ModelMetadata) -> Vec<Met
 /// is precisely the one an operator most wants an upstream number for.
 #[must_use]
 pub fn reconcile(catalog: &TierCatalog, source: &str) -> Vec<CandidateDrift> {
-    reconcile_with(catalog, source, &|candidate| {
-        crate::providers::provider_settles_free(&candidate.provider)
-    })
+    reconcile_with(
+        catalog,
+        source,
+        &|candidate| crate::providers::provider_settles_free(&candidate.provider),
+        &crate::providers::provider_unreconcilable_reason,
+    )
 }
 
 /// [`reconcile`], with the "does this candidate's provider settle free?"
@@ -594,10 +638,17 @@ pub fn reconcile(catalog: &TierCatalog, source: &str) -> Vec<CandidateDrift> {
 /// tests need a real [`Verdict::Unreconcilable`] finding to prove the
 /// exemption carries across to the second source, and hand-building one would
 /// prove only that the test can build a struct.
+///
+/// `unreconcilable_reason` is supplied the same way and for the same reason: it
+/// asks the provider inventory whether this upstream has DECLARED that the
+/// source cannot price it ([`crate::providers::provider_unreconcilable_reason`]),
+/// which is a fact about a deployment's configuration rather than something
+/// this module can derive from a rate table.
 pub(crate) fn reconcile_with(
     catalog: &TierCatalog,
     source: &str,
     settles_free: &dyn Fn(&crate::config::TierCandidate) -> bool,
+    unreconcilable_reason: &dyn Fn(&str) -> Option<String>,
 ) -> Vec<CandidateDrift> {
     let providers: BTreeMap<String, SourceProvider> =
         serde_json::from_str(source).unwrap_or_default();
@@ -641,11 +692,18 @@ pub(crate) fn reconcile_with(
                 .map(|cost| cost.tiers.as_slice())
                 .unwrap_or_default();
 
-            // Checked before the source is consulted at all: a $0 rung on an
-            // upstream that bills nobody is not a model the source failed to
-            // mention, it is a model the source is not about.
+            // Both exemptions are checked before the source is consulted at
+            // all, and they are checked FIRST for the same reason: whether a
+            // row exists over there decides nothing when the row could not
+            // mean what it appears to mean. A $0 rung on an upstream that bills
+            // nobody is not a model the source failed to mention, it is a model
+            // the source is not about; a declared-unreconcilable upstream may
+            // well have a row, and comparing against it is the failure.
+            let declared_unreconcilable = unreconcilable_reason(&candidate.provider);
             let verdict = if candidate.rates_are_zero() && settles_free(candidate) {
                 Verdict::Unreconcilable
+            } else if declared_unreconcilable.is_some() {
+                Verdict::NotCoveredBySource
             } else {
                 match entry {
                     None => Verdict::Missing,
@@ -730,6 +788,7 @@ pub(crate) fn reconcile_with(
                     .collect(),
                 metadata_drift: metadata_drift(&candidate.metadata, &upstream_metadata),
                 upstream_tier: entry.and_then(upstream_tier_note),
+                unreconcilable_reason: declared_unreconcilable,
                 recorded_metadata: candidate.metadata.clone(),
                 upstream_metadata,
             });
@@ -1426,7 +1485,7 @@ mod tests {
         // there is no metadata noise to go with it: the source has nothing to
         // say about this model, and silence upstream is never disagreement.
         let catalog = catalog_on("local-llama", free());
-        let found = reconcile_with(&catalog, SOURCE, &|_| true);
+        let found = reconcile_with(&catalog, SOURCE, &|_| true, &|_| None);
 
         assert_eq!(found[0].verdict, Verdict::Unreconcilable);
         assert!(!found[0].verdict.is_actionable());
@@ -1443,7 +1502,7 @@ mod tests {
         // failing. (`validate_zero_price` refuses such a file outright since
         // stage 2; this does not depend on that.)
         let shipped_but_free = catalog_on("anthropic", free());
-        let found = reconcile_with(&shipped_but_free, SOURCE, &|_| false);
+        let found = reconcile_with(&shipped_but_free, SOURCE, &|_| false, &|_| None);
         assert_eq!(found[0].verdict, Verdict::Missing);
         assert!(found[0].verdict.is_actionable());
 
@@ -1451,9 +1510,86 @@ mod tests {
         // gets a real answer even though that answer is `NOT IN SOURCE`. Only
         // the intersection is exempt.
         let operator_but_priced = catalog_on("local-llama", rates(1.0, 0.1, 5.0));
-        let found = reconcile_with(&operator_but_priced, SOURCE, &|_| true);
+        let found = reconcile_with(&operator_but_priced, SOURCE, &|_| true, &|_| None);
         assert_eq!(found[0].verdict, Verdict::Missing);
         assert!(found[0].verdict.is_actionable());
+    }
+
+    /// The Bedrock exemption, and the specific trap it exists to avoid.
+    ///
+    /// A declaring upstream is NOT one the source has never heard of. models.dev
+    /// does carry Bedrock, at a key a mapping could reach, priced at the GLOBAL
+    /// cross-region rate — while ZeroRouter dials the in-region-only mantle
+    /// endpoint AWS meters 10% higher. So the fixture below deliberately makes
+    /// the source ANSWER, and answer with the wrong SKU class: it is built to
+    /// reconcile cleanly against a basis that is 10% under the invoice.
+    #[test]
+    fn a_declared_exemption_beats_a_source_row_that_would_have_matched() {
+        const GLOBAL_RATE_SOURCE: &str = r#"{
+            "bedrock": {"models": {"anthropic.claude-sonnet-5": {
+                "cost": {"input": 2.0, "output": 10.0, "cache_read": 0.2}
+            }}}
+        }"#;
+        let mut tiers = BTreeMap::new();
+        tiers.insert(
+            "bedrock/claude-sonnet-5".to_owned(),
+            TierDefinition {
+                rates: RateSchedule::flat(rates(2.2, 0.22, 11.0)),
+                retention: None,
+                candidates: vec![TierCandidate {
+                    id: "bedrock/claude-sonnet-5".to_owned(),
+                    provider: "bedrock".to_owned(),
+                    model: "anthropic.claude-sonnet-5".to_owned(),
+                    rates: RateSchedule::flat(rates(2.2, 0.22, 11.0)),
+                    metadata: ModelMetadata::default(),
+                }],
+            },
+        );
+        let catalog = TierCatalog {
+            schema_version: 1,
+            tiers,
+            retention: BTreeMap::new(),
+            unavailable: BTreeMap::new(),
+        };
+
+        // WITHOUT the declaration the source disagrees, and it disagrees in the
+        // direction that reads as our file being wrong — 2.2 recorded against
+        // 2.0 published. An operator "fixing" that would move the basis 10%
+        // BELOW what AWS invoices. This is the row the exemption removes.
+        let unguarded = reconcile_with(&catalog, GLOBAL_RATE_SOURCE, &|_| false, &|_| None);
+        assert_eq!(unguarded[0].verdict, Verdict::BasisDrift);
+        assert!(unguarded[0].verdict.is_actionable());
+
+        // WITH it the verdict is the declared gap, it is not actionable, and
+        // the reason travels on the finding so the report can argue the case.
+        let guarded = reconcile_with(&catalog, GLOBAL_RATE_SOURCE, &|_| false, &|provider| {
+            (provider == "bedrock").then(|| "global rate, we pay in-region".to_owned())
+        });
+        assert_eq!(guarded[0].verdict, Verdict::NotCoveredBySource);
+        assert!(!guarded[0].verdict.is_actionable());
+        assert_eq!(guarded[0].verdict.label(), "source cannot price");
+        assert_eq!(
+            guarded[0].unreconcilable_reason.as_deref(),
+            Some("global rate, we pay in-region")
+        );
+    }
+
+    #[test]
+    fn the_exemption_is_scoped_to_the_declaring_provider_alone() {
+        // A resolver that answers for one upstream must not quiet another. If
+        // this ever fails, one provider's declared gap has become everybody's
+        // silence, which is the whole reconciliation switched off by accident.
+        let catalog = catalog_with(
+            "claude-sonnet-5",
+            rates(9.0, 0.9, 9.0),
+            rates(9.0, 0.9, 9.0),
+        );
+        let found = reconcile_with(&catalog, SOURCE, &|_| false, &|provider| {
+            (provider == "bedrock").then(|| "declared elsewhere".to_owned())
+        });
+        assert_eq!(found[0].verdict, Verdict::BasisDrift);
+        assert!(found[0].verdict.is_actionable());
+        assert_eq!(found[0].unreconcilable_reason, None);
     }
 
     #[test]

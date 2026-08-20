@@ -39,9 +39,27 @@ defines it:
 - **Provider keys** are injected from AWS Secrets Manager via
   task-definition `secrets`, never plain env in Terraform or the task
   definition. The set the shipped `providers.json` can consume is whatever
-  its entries' `credential_env` name — today `ANTHROPIC_API_KEY` and
-  `OPENAI_API_KEY`. A provider whose key is absent is simply not a
-  candidate — set only what the catalog actually routes to.
+  its entries' `credential_env` name — today `ANTHROPIC_API_KEY`,
+  `OPENAI_API_KEY`, `GEMINI_API_KEY`, and `BEDROCK_API_KEY`. A provider whose
+  key is absent is simply not a candidate — set only what the catalog actually
+  routes to.
+- **`BEDROCK_REGION`** — plain env, not a secret; a region is not a credential.
+  It is **required whenever `BEDROCK_API_KEY` is set**, because the Bedrock
+  endpoint carries the region in its hostname
+  (`bedrock-mantle.{region}.api.aws`). Unset, the Bedrock rungs drop out of
+  every route exactly as a missing key would, and the rest of the catalog keeps
+  serving; `/v1/models` still lists them, as it does for any credential-less
+  lane. No region is defaulted on purpose: `us-east-1` is the plausible guess
+  that would silently route an eu-west-1 deployment's prompts to Virginia.
+
+  **Not every region serves every model.** The mantle endpoint exists in a
+  subset of regions, and in-region Claude availability is narrower still —
+  `anthropic.claude-sonnet-5` in-region is us-east-1, eu-west-1, and
+  eu-north-1 (plus us-gov-west-1, priced 1.2x rather than 1.1x). Pointing
+  `BEDROCK_REGION` at a mantle region that does not serve the model — us-west-2,
+  say — produces failing calls rather than a fallback, because mantle is
+  in-region only and cannot reach a cross-region inference profile. Beta runs
+  us-east-1.
 - **Platform**: ARM64 on Fargate; the workflow builds `linux/arm64` only.
 
 The deploy workflow re-registers the task-definition family's latest ACTIVE
@@ -440,27 +458,72 @@ The labels are pinned in `router/config/tiers.toml` under `[retention.<provider>
 and are never written by any tool — the same rule prices follow, for a sharper
 reason: a retention label is a claim to a customer about their own data.
 
-**Today every lane is `standard` and the zero-retention section is empty.** All
-three upstreams (`anthropic`, `openai`, `google`) are ordinary API accounts.
-That is correct, and the catalog says so plainly rather than implying otherwise.
+**Today two lanes are `zero` and the rest are `standard`.** `anthropic`,
+`openai`, and `google` are ordinary API accounts. `bedrock` — the two
+`bedrock/claude-*` lanes, added 2026-08-20 — is the first zero-retention
+upstream, and it got there by configuration rather than by contract. The section
+below on enforced configuration is why that counts.
 
 ### The rule for `posture = "zero"`
 
 > A lane may be labelled zero-retention **only when a signed or confirmed
 > zero-data-retention arrangement is in force with that provider, covering the
-> account that lane dispatches on.**
+> account that lane dispatches on** — or when the provider **enforces** zero
+> retention as a setting on that account, with published semantics for what the
+> setting means.
 
 Not because the vendor *offers* ZDR to somebody. Not because a policy page says
 data is not used for training — **training and retention are different claims**,
-and all three current providers disclaim training while still retaining. When
+and all three standard providers disclaim training while still retaining. When
 in doubt, write `standard`. A wrong `standard` costs a little marketing; a wrong
 `zero` is a false statement to a customer about their data, and the kind of
 claim a regulator or a plaintiff reads literally.
 
-The one exception that needs no vendor: a **local rung on your own hardware**
-(see `examples/edge/tiers.toml`). Even there, confirm your inference server is
-not writing prompts to a request log before you label it — several do by
-default.
+#### Enforced configuration, and why it satisfies the rule
+
+The rule was written for contracts, because that is how every major vendor sold
+ZDR when it was written. Bedrock does it differently, and the difference is in
+our favour rather than a loophole in it.
+
+AWS exposes `data_retention_mode` as an account-level (or project-level) setting
+with four values, and ZeroRouter's account is set to `none` on both control
+planes. AWS publishes what that value means:
+
+> No request or response data is written to durable storage by AWS or shared
+> with the model provider… Chat Completions and Messages requests are never
+> retained.
+
+and what its scope is:
+
+> the setting is enforced consistently across the Messages, Chat Completions,
+> and Responses APIs
+
+**A setting the platform enforces on every request is stronger evidence than a
+contract, not weaker.** A contract is a promise a human honours; this is a
+control that cannot be overridden per call. AWS also documents the failure
+direction as closed: a model that *requires* retention is **blocked** under this
+mode rather than silently downgraded, so a lane that could not honour the claim
+returns an error instead of quietly retaining.
+
+Two conditions come with accepting configuration as evidence, and both are
+load-bearing:
+
+1. **The setting must be verified live, not assumed.** A contract cannot be
+   turned off by someone clicking through a console; a setting can. That is what
+   `--bedrock-live` below exists for, and it is why the Bedrock pin is the only
+   one with two re-verification steps instead of one.
+2. **The published semantics must be pinned like any other evidence.** The
+   `source_url` for a configuration-backed pin is the page defining what the
+   value means, so `retention-drift` catches AWS *rewording* the guarantee. It
+   is the same loop as every other pin, over a different kind of claim.
+
+`inherit`, not `default`, is the value a never-configured AWS account reports —
+it means "no opinion at this scope". Only a literal `none` backs a `zero` label.
+
+The one exception that needs no vendor at all: a **local rung on your own
+hardware** (see `examples/edge/tiers.toml`). Even there, confirm your inference
+server is not writing prompts to a request log before you label it — several do
+by default.
 
 ### Changing a posture
 
@@ -516,12 +579,81 @@ arrangement of yours is invisible to it. Expect a `zero` pin to look like a
 disagreement there. Note also that `google` corroborates against
 `google-ai-studio`, not `google-vertex` — different products, different
 policies, and the slug is pinned explicitly in the file for exactly that reason.
+`bedrock` has the same trap: it joins `amazon-bedrock`, **not** `claude-on-aws`,
+which is Anthropic's own managed capacity on AWS and reports 30-day retention.
+
+### The live half of the Bedrock claim
+
+The page hash cannot see the account. It catches AWS rewording what `none`
+means; it cannot catch someone flipping the account to `default`, and after that
+flip every check above still passes while `/v1/models` keeps telling customers
+their prompts are never stored. So the Bedrock posture has a second check:
+
+```bash
+cd router
+BEDROCK_API_KEY=... BEDROCK_REGION=us-east-1 \
+  ./target/debug/zerorouter admin retention-drift \
+    --tiers config/tiers.toml --bedrock-live
+```
+
+It calls `GET https://bedrock-mantle.$BEDROCK_REGION.api.aws/v1/data_retention`
+(note the underscore — the classic control plane spells it `/data-retention`)
+and expects `{"mode":"none"}`. Run **both** halves before re-pinning a Bedrock
+`verified` date.
+
+Three deliberate differences from `--corroborate`:
+
+- **It is not advisory.** It reads ZeroRouter's own account, not a third party's
+  opinion, so when asked for it decides the exit code.
+- **It is opt-in** so the daily CI job, which holds no AWS credentials, stays
+  deterministic and green without them.
+- **`--allow-drift` does not cover it.** That flag means "the evidence moved and
+  I accept that for now", which is a defensible call about a reworded page. It
+  is not a defensible call about an account that reports it is retaining while
+  the catalog publishes that it is not — fix the account or change the pin.
+
+Asking for the check and being unable to run it (credential unset, rotated, or
+AWS unreachable) is a **failure**, not a pass: a check that could not run has
+not verified anything.
 
 ### If a provider's posture actually changes
 
 Raise `standard` first. A lane labelled `standard` that is really zero costs
 nothing but a missed selling point; a lane labelled `zero` that is really
 standard is the failure this whole mechanism exists to prevent.
+
+## Bedrock: confirm the billing SKU after the first real request
+
+The two `bedrock/claude-*` lanes are pinned at AWS's **in-region** rates —
+Sonnet 5 at 2.20/0.22/11.00 and Opus 5 at 5.50/0.55/27.50 per MTok, 10% above
+the `anthropic/*` lanes serving the same weights. That premium is correct and
+priced straight through: the mantle endpoint is in-region only, and AWS charges
+in-region traffic 10% more than a global cross-region inference profile. Do not
+"correct" it downward — that sells the lane below what AWS invoices, on every
+token.
+
+**One step of that reasoning is an inference and should be closed empirically.**
+AWS publishes exactly two on-demand SKU classes per model — `_standard` and
+`_global_standard` — but no sentence states which one a mantle call meters
+against. It is forced by elimination (mantle cannot use a global inference
+profile), and the invoice is what settles it. After the first real Bedrock
+request, open the Cost and Usage Report and read the line item:
+
+- `usagetype` ending `_input_tokens_standard-Units` — as pinned, nothing to do.
+- `usagetype` ending `_input_tokens_global_standard-Units` — the pins are 10%
+  **high**, and the lane is selling above cost. Correct both basis and sell.
+
+These two tiers are also the only ones `admin catalog-drift` does not reconcile,
+so nothing in CI will catch an AWS price move on them. The exemption, its
+reasoning, and the re-verification command are declared in
+`router/config/providers.json` under `unreconcilable_reason`, and printed on
+every drift run. Re-read it by hand when AWS changes anything:
+
+```bash
+curl -s --compressed \
+  https://pricing.us-east-1.amazonaws.com/offers/v1.0/aws/\
+AmazonBedrockFoundationModels/current/us-east-1/index.json
+```
 
 ## Rollback
 

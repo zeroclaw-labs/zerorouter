@@ -80,7 +80,54 @@ struct ProviderMetadata {
     display_name: Option<String>,
     #[serde(default)]
     base_url: Option<String>,
+    /// The environment variable holding the AWS region this upstream's
+    /// endpoint is addressed in, for an entry whose `base_url` carries the
+    /// [`REGION_PLACEHOLDER`].
+    ///
+    /// Exists for exactly one shape of upstream: a regional endpoint whose
+    /// host contains the region, where hardcoding one region into the shipped
+    /// inventory would silently send a deployment in another region's traffic —
+    /// and its prompts — across a boundary the operator did not choose. Bedrock
+    /// is that shape (`bedrock-mantle.{region}.api.aws`), and it is in-region
+    /// only, so the region is not a detail the endpoint can shrug off.
+    ///
+    /// Present iff the `base_url` interpolates, enforced both ways by
+    /// [`ProviderMetadata::validate_region`]. A placeholder with nothing to fill
+    /// it would dial a host named `{region}`; a `region_env` with no placeholder
+    /// names a variable that could never be read, which is a claim about
+    /// configuration that is not true.
+    #[serde(default)]
+    region_env: Option<String>,
+    /// Why the public catalog `admin catalog-drift` reconciles against cannot
+    /// price this upstream, and where its rates really come from.
+    ///
+    /// **Presence is the exemption; the text is the justification, and it is
+    /// required rather than decorative** — the same rule a retention pin's
+    /// evidence fields follow. A declaration with nothing behind it would let
+    /// "we could not be bothered to check" wear the same shape as a real,
+    /// argued gap, and this field disables the one alarm that guards margin.
+    /// Blank is refused at load ([`ProviderMetadata::validate_reconciliation`]).
+    ///
+    /// It exists for a fault that has no honest fix inside the reconciliation:
+    /// models.dev DOES carry Bedrock, under `amazon-bedrock`, and prices the
+    /// bare id `anthropic.claude-sonnet-5` at the GLOBAL cross-region rate.
+    /// ZeroRouter dials the mantle endpoint, which is in-region only and cannot
+    /// use a global inference profile, so AWS meters the unqualified `_standard`
+    /// SKU — 10% dearer. Joining the two would have reported `ok` over a basis
+    /// 10% under the invoice, which is precisely the silent-margin failure
+    /// [`crate::drift`] was written to break. Mapping the provider key to
+    /// `amazon-bedrock` was tried and rejected for that reason: a green row
+    /// against the wrong SKU class is worse than an admitted gap.
+    ///
+    /// It is deliberately NOT a way to skip a lane quietly. A declaring
+    /// provider's candidates still appear in every report, under their own
+    /// verdict, with this text printed beside them on every run.
+    #[serde(default)]
+    unreconcilable_reason: Option<String>,
 }
+
+/// The token a regional `base_url` writes where its region belongs.
+const REGION_PLACEHOLDER: &str = "{region}";
 
 /// Whether an upstream's traffic costs anyone money.
 ///
@@ -314,6 +361,8 @@ impl ProviderInventory {
             }
             provider.validate_credential()?;
             provider.validate_settlement()?;
+            provider.validate_region()?;
+            provider.validate_reconciliation()?;
             if !keys.insert(provider.key.as_str()) {
                 return Err(ProviderBuildError::InvalidInventory {
                     detail: format!("duplicate provider key {}", provider.key),
@@ -411,6 +460,108 @@ impl ProviderMetadata {
         Ok(())
     }
 
+    /// Enforce that an exemption from price reconciliation states its case.
+    ///
+    /// `unreconcilable_reason` turns off the alarm that guards margin for every
+    /// candidate on this upstream. A present-but-blank one would do that while
+    /// asserting nothing, and would be indistinguishable in the report from a
+    /// gap somebody actually thought about — so an empty string is refused
+    /// exactly as a blank retention-pin field is. Writing the sentence is the
+    /// cost of the exemption, and it is the whole cost.
+    fn validate_reconciliation(&self) -> Result<(), ProviderBuildError> {
+        if self
+            .unreconcilable_reason
+            .as_deref()
+            .is_some_and(|reason| reason.trim().is_empty())
+        {
+            return Err(ProviderBuildError::InvalidInventory {
+                detail: format!(
+                    "provider {} declares an empty unreconcilable_reason; that field exempts every \
+                     candidate on this upstream from price reconciliation, so it must say why the \
+                     public catalog cannot price it and where the real rates come from",
+                    self.key
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    /// Enforce the region declaration: a `base_url` interpolates iff the entry
+    /// names the variable that fills it.
+    ///
+    /// Refused in BOTH directions, and neither is tidiness:
+    ///
+    /// - A `{region}` with no `region_env` has nothing to resolve it. The
+    ///   substitution would not happen, and the wire would POST this provider's
+    ///   credential and the customer's prompt to a host literally named
+    ///   `bedrock-mantle.{region}.api.aws` — a DNS failure on a good day, and a
+    ///   domain somebody else can register on a bad one.
+    /// - A `region_env` with no `{region}` names a variable nothing reads. The
+    ///   entry then claims to be region-configurable while dialling a fixed
+    ///   host, so an operator who sets the variable and redeploys gets traffic
+    ///   in the old region and no indication of it.
+    ///
+    /// The same present-iff-required shape as
+    /// [`ProviderMetadata::validate_credential`], for the same reason: a
+    /// half-written declaration is refused rather than half-applied.
+    fn validate_region(&self) -> Result<(), ProviderBuildError> {
+        let interpolates = self
+            .base_url
+            .as_deref()
+            .is_some_and(|url| url.contains(REGION_PLACEHOLDER));
+        let declared = self
+            .region_env
+            .as_deref()
+            .is_some_and(|name| !name.trim().is_empty());
+        match (interpolates, declared) {
+            (true, false) => Err(ProviderBuildError::InvalidInventory {
+                detail: format!(
+                    "provider {} writes {REGION_PLACEHOLDER} in its base_url and declares no \
+                     region_env to fill it; the placeholder would survive into the request URL \
+                     and send this provider's credential to a host named {REGION_PLACEHOLDER}",
+                    self.key
+                ),
+            }),
+            (false, true) => Err(ProviderBuildError::InvalidInventory {
+                detail: format!(
+                    "provider {} declares region_env but its base_url has no {REGION_PLACEHOLDER} \
+                     to substitute; the entry would read as region-configurable while dialling a \
+                     fixed host, so setting that variable would change nothing",
+                    self.key
+                ),
+            }),
+            _ => Ok(()),
+        }
+    }
+
+    /// This entry's endpoint with its region substituted, or `None` when the
+    /// region cannot be resolved.
+    ///
+    /// `None` is NOT an error here, and that is the whole design: an
+    /// unresolvable region makes this provider unavailable exactly as a missing
+    /// credential does (see [`build_with_credentials`]), so a deployment that
+    /// forgot `BEDROCK_REGION` loses its Bedrock rungs and keeps serving
+    /// everything else. Guessing a default region would be the alternative, and
+    /// it is the wrong one: `us-east-1` is a plausible guess that silently
+    /// routes an eu-west-1 deployment's prompts to Virginia.
+    fn endpoint<F>(&self, mut read_env: F) -> Option<Option<String>>
+    where
+        F: FnMut(&str) -> Option<String>,
+    {
+        let Some(base_url) = self.base_url.as_deref() else {
+            return Some(None);
+        };
+        if !base_url.contains(REGION_PLACEHOLDER) {
+            return Some(Some(base_url.to_owned()));
+        }
+        // Validated present whenever the placeholder is, so an empty name here
+        // is unreachable; reading it as "no region" keeps this total rather
+        // than panicking.
+        let region_env = self.region_env.as_deref().unwrap_or_default();
+        let region = read_env(region_env)?;
+        Some(Some(base_url.replace(REGION_PLACEHOLDER, &region)))
+    }
+
     fn validate_credential(&self) -> Result<(), ProviderBuildError> {
         let declared = |value: &Option<String>| {
             value
@@ -488,6 +639,47 @@ pub fn provider_settles_free(provider: &str) -> bool {
             .provider(provider)
             .is_some_and(|metadata| metadata.settlement == SettlementDeclaration::Free)
     })
+}
+
+/// This upstream's declared reason for being outside the reconciliation
+/// source's coverage, if it declares one.
+///
+/// `None` — the overwhelmingly common case — means the provider is reconciled
+/// exactly as it always was. `Some(reason)` means `admin catalog-drift` has no
+/// trustworthy row to compare against and says so in the report, quoting this
+/// text so the gap is argued in front of the operator on every run rather than
+/// hidden in a config file.
+///
+/// Read from the inventory rather than from a table inside `drift.rs`, for the
+/// reason [`provider_settles_free`] gives: the inventory is where per-upstream
+/// facts live, and a second list elsewhere is a second list to drift.
+#[must_use]
+pub fn provider_unreconcilable_reason(provider: &str) -> Option<String> {
+    ProviderInventory::load().ok().and_then(|inventory| {
+        inventory
+            .provider(provider)
+            .and_then(|metadata| metadata.unreconcilable_reason.clone())
+    })
+}
+
+/// The environment variables one provider reads: its credential, and its region
+/// when it has a regional endpoint.
+///
+/// Exposed so a tool that must talk to an upstream OUTSIDE the request path —
+/// `admin retention-drift --bedrock-live`, which calls Bedrock's control API
+/// rather than its inference API — reads the same variable names the router
+/// itself dispatches with, instead of restating them somewhere else. Two lists
+/// of environment variable names is two lists to drift, and the failure would be
+/// silent in the worst way: a live retention check reading a variable nobody
+/// sets reports "cannot verify" forever while the router serves happily.
+#[must_use]
+pub fn provider_env_names(provider: &str) -> Option<(String, Option<String>)> {
+    let inventory = ProviderInventory::load().ok()?;
+    let metadata = inventory.provider(provider)?;
+    Some((
+        metadata.credential_env.clone()?,
+        metadata.region_env.clone(),
+    ))
 }
 
 #[derive(Debug, Error)]
@@ -710,6 +902,25 @@ where
         let provider = if let Some(provider) = providers.get(provider_key) {
             Arc::clone(provider)
         } else {
+            // The endpoint before the credential, because an unresolvable
+            // region makes this provider unavailable for the same reason and by
+            // the same mechanism a missing key does — the rung drops out and
+            // the rest of the route serves. A test-seam override is a complete
+            // URL supplied by a harness, so it wins and never interpolates.
+            let endpoint = match base_url_override(provider_key) {
+                Some(url) => Some(Some(url)),
+                None => metadata.endpoint(&mut credential_for),
+            };
+            let Some(endpoint) = endpoint else {
+                // Named in the same list a missing credential reports. Both
+                // answer the operator's one question — which environment
+                // variable is this deployment missing — and an endpoint this
+                // provider cannot address is as disqualifying as a key it
+                // cannot present.
+                missing_credentials.push(metadata.region_env.clone().unwrap_or_default());
+                unavailable.insert(provider_key);
+                continue;
+            };
             let credential = match metadata.credential {
                 // A keyless upstream has nothing to look up, so it can never be
                 // the rung a route loses to a missing key — which is the whole
@@ -733,7 +944,12 @@ where
                     credential
                 }
             };
-            let provider = create_provider(metadata, &credential, max_output_tokens)?;
+            let provider = create_provider(
+                metadata,
+                &credential,
+                max_output_tokens,
+                endpoint.as_deref(),
+            )?;
             providers.insert(provider_key, Arc::clone(&provider));
             provider
         };
@@ -788,14 +1004,19 @@ fn base_url_override(key: &str) -> Option<String> {
     Some(value)
 }
 
+/// Put one upstream behind its wire.
+///
+/// `effective_base_url` is resolved by the caller rather than read from
+/// `metadata` here, because resolving it can FAIL — a regional endpoint whose
+/// region variable is unset has no address — and the caller is the one that can
+/// answer that failure correctly, by dropping the rung instead of the route.
 fn create_provider(
     metadata: &ProviderMetadata,
     credential: &str,
     max_output_tokens: u32,
+    effective_base_url: Option<&str>,
 ) -> Result<Arc<dyn ModelProvider>, ProviderBuildError> {
     let alias = metadata.key.as_str();
-    let override_url = base_url_override(alias);
-    let effective_base_url = override_url.as_deref().or(metadata.base_url.as_deref());
     let provider: Arc<dyn ModelProvider> = match metadata.adapter {
         ProviderAdapter::Anthropic => Arc::new(AnthropicWire::new(
             alias,
@@ -851,12 +1072,14 @@ mod tests {
 
     #[test]
     fn supported_provider_check_uses_constructor_table() {
-        // The MVP inventory: two providers, both on ZeroRouter-owned wires.
-        for provider in ["anthropic", "openai"] {
+        for provider in ["anthropic", "openai", "google", "bedrock"] {
             assert!(is_supported_provider(provider));
         }
-        // Retired with the git dependency that supplied their adapters.
-        for provider in ["bedrock", "deepinfra", "fireworks", "together", "minimax"] {
+        // Retired with the git dependency that supplied their adapters, and
+        // still gone. `bedrock` used to sit in this list; it came BACK on
+        // 2026-08-20 as the zero-retention lane, on ZeroRouter's own Messages
+        // wire rather than the pinned Converse adapter that once served it.
+        for provider in ["deepinfra", "fireworks", "together", "minimax"] {
             assert!(
                 !is_supported_provider(provider),
                 "{provider} is no longer in the inventory"
@@ -885,13 +1108,59 @@ mod tests {
             .iter()
             .map(|provider| (provider.key.as_str(), provider.adapter))
             .collect();
+        //
+        // Bedrock joined on 2026-08-20 on the ANTHROPIC adapter, which is the
+        // surprising half and the reason it is pinned here. Bedrock's mantle
+        // plane does serve an OpenAI-compatible `/v1/chat/completions`, and the
+        // obvious move was to put it on the chat-completions wire beside
+        // Google. AWS's model cards say otherwise: Claude marks Chat
+        // Completions and Responses unsupported and Messages supported, so the
+        // lane rides the Messages wire — which already sends the `x-api-key`
+        // and `anthropic-version` headers that endpoint takes.
         assert_eq!(
             adapters,
             [
                 ("anthropic", ProviderAdapter::Anthropic),
                 ("openai", ProviderAdapter::OpenAiResponses),
                 ("google", ProviderAdapter::ChatCompletions),
+                ("bedrock", ProviderAdapter::Anthropic),
             ]
+        );
+
+        // Bedrock is a SECOND entry on the Anthropic adapter, and the two must
+        // stay distinguishable in every way that matters: its own key, its own
+        // credential, its own endpoint. Sharing a wire is not sharing an
+        // account, and the whole point of the lane is that the account differs.
+        let bedrock = inventory.provider("bedrock").expect("bedrock is shipped");
+        let anthropic = inventory
+            .provider("anthropic")
+            .expect("anthropic is shipped");
+        assert_ne!(bedrock.credential_env, anthropic.credential_env);
+        assert_eq!(bedrock.credential_env.as_deref(), Some("BEDROCK_API_KEY"));
+        assert_eq!(bedrock.secret_name.as_deref(), Some("bedrock-api-key"));
+        assert_eq!(bedrock.settlement, SettlementDeclaration::Metered);
+        assert_eq!(bedrock.credential, CredentialRequirement::Required);
+        assert!(
+            anthropic.base_url.is_none(),
+            "the first-party Anthropic entry still owns its endpoint; only the \
+             Bedrock one overrides, and it must not drag Anthropic's traffic with it"
+        );
+
+        // The endpoint is REGIONAL and says so. Both halves are asserted
+        // because either one alone is a live foot-gun: a placeholder with no
+        // variable dials a host named `{region}`, and a hardcoded region sends
+        // an eu-west-1 deployment's prompts to Virginia.
+        let base_url = bedrock
+            .base_url
+            .as_deref()
+            .expect("bedrock declares its endpoint");
+        assert!(base_url.contains(REGION_PLACEHOLDER), "{base_url}");
+        assert_eq!(bedrock.region_env.as_deref(), Some("BEDROCK_REGION"));
+        assert!(
+            base_url.ends_with("/anthropic/v1/messages"),
+            "the Messages wire posts to the URL verbatim, so the entry must carry \
+             the full mantle path — NOT the /v1/chat/completions surface, which \
+             AWS documents Claude as not supporting: {base_url}"
         );
 
         // Google bills like any other vendor: the free lane is entered only by
@@ -933,8 +1202,13 @@ mod tests {
 
         // And it builds a client, through the same constructor a production
         // route uses.
-        let provider = create_provider(metadata, "secret", crate::provider::BASELINE_MAX_TOKENS)
-            .expect("the chat-completions arm builds");
+        let provider = create_provider(
+            metadata,
+            "secret",
+            crate::provider::BASELINE_MAX_TOKENS,
+            metadata.base_url.as_deref(),
+        )
+        .expect("the chat-completions arm builds");
         assert_eq!(provider.alias(), "local-llama");
         assert!(provider.supports_streaming());
     }
@@ -1054,7 +1328,10 @@ mod tests {
             .iter()
             .map(|provider| provider.key.as_str())
             .collect();
-        assert_eq!(keys, ["anthropic", "openai", "google", "local-llama"]);
+        assert_eq!(
+            keys,
+            ["anthropic", "openai", "google", "bedrock", "local-llama"]
+        );
 
         let local = inventory
             .provider("local-llama")
@@ -1289,6 +1566,177 @@ mod tests {
             .map(|candidate| candidate.definition().id.as_str())
             .collect();
         assert_eq!(ids, ["local"]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Regional endpoints (2026-08-20): Bedrock's mantle host carries the region
+    // in its name, so the shipped entry interpolates rather than hardcoding one.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn a_regional_base_url_must_name_the_variable_that_fills_it() {
+        // The foot-gun: without a `region_env` the placeholder survives into
+        // the request URL, so this provider's credential and the customer's
+        // prompt go to a host literally named `bedrock-mantle.{region}.api.aws`
+        // — a domain ZeroRouter does not own and somebody else could.
+        let error = assemble(
+            r#"{
+                "key": "regional",
+                "adapter": "chat_completions",
+                "credential_env": "REGIONAL_API_KEY",
+                "secret_name": "regional-api-key",
+                "base_url": "https://svc.{region}.example.test/v1/chat/completions"
+            }"#,
+        )
+        .expect_err("a placeholder with nothing to fill it must be refused");
+        let detail = error.to_string();
+        assert!(detail.contains("regional"), "{detail}");
+        assert!(detail.contains("{region}"), "{detail}");
+    }
+
+    #[test]
+    fn a_region_variable_with_no_placeholder_to_fill_is_refused_too() {
+        // The other direction, and it is not tidiness. The entry reads as
+        // region-configurable while dialling a fixed host, so an operator who
+        // sets the variable and redeploys gets traffic in the old region and
+        // nothing anywhere says so.
+        let error = assemble(
+            r#"{
+                "key": "fixed",
+                "adapter": "chat_completions",
+                "credential_env": "FIXED_API_KEY",
+                "secret_name": "fixed-api-key",
+                "base_url": "https://svc.example.test/v1/chat/completions",
+                "region_env": "FIXED_REGION"
+            }"#,
+        )
+        .expect_err("a region_env with no placeholder must be refused");
+        assert!(error.to_string().contains("fixed"), "{error}");
+    }
+
+    #[test]
+    fn a_regional_endpoint_resolves_its_region_from_the_declared_variable() {
+        // The substitution itself, over the SHIPPED Bedrock entry rather than a
+        // fixture, so the assertion is about the endpoint real traffic goes to.
+        let inventory = ProviderInventory::load().expect("inventory should load");
+        let bedrock = inventory.provider("bedrock").expect("bedrock is shipped");
+
+        let resolved = bedrock
+            .endpoint(|name| (name == "BEDROCK_REGION").then(|| "eu-west-1".to_owned()))
+            .expect("a resolvable region yields an endpoint")
+            .expect("the entry declares a base_url");
+        assert_eq!(
+            resolved,
+            "https://bedrock-mantle.eu-west-1.api.aws/anthropic/v1/messages"
+        );
+        assert!(
+            !resolved.contains(REGION_PLACEHOLDER),
+            "no placeholder may survive into a dialled URL: {resolved}"
+        );
+
+        // A non-regional entry is untouched by any of this.
+        let google = inventory.provider("google").expect("google is shipped");
+        assert_eq!(
+            google.endpoint(|_| None).expect("no region to resolve"),
+            google.base_url.clone()
+        );
+    }
+
+    #[test]
+    fn an_unresolvable_region_drops_the_rung_and_not_the_route() {
+        // The failure mode, and it is chosen rather than inherited. A
+        // deployment that sets BEDROCK_API_KEY but forgets BEDROCK_REGION has
+        // no address for that upstream, and the alternative to dropping the
+        // rung would be defaulting a region — where `us-east-1` is the
+        // plausible guess that silently routes an eu-west-1 deployment's
+        // prompts to Virginia. So it behaves exactly as a missing credential
+        // does: this rung goes, the rest of the route serves.
+        let inventory = ProviderInventory::load().expect("inventory should load");
+        let route = build_with_credentials(
+            &inventory,
+            vec![
+                candidate("bedrock-rung", "bedrock"),
+                candidate("anthropic-rung", "anthropic"),
+            ],
+            crate::provider::BASELINE_MAX_TOKENS,
+            // Every credential present; the REGION is what is missing.
+            |name| (name != "BEDROCK_REGION").then(|| "secret".to_owned()),
+        )
+        .expect("the other rungs still build");
+        let ids: Vec<&str> = route
+            .candidates()
+            .iter()
+            .map(|candidate| candidate.definition().id.as_str())
+            .collect();
+        assert_eq!(ids, ["anthropic-rung"]);
+
+        // And with the region present it is back, on its own client rather
+        // than sharing the first-party Anthropic one — same adapter, different
+        // account, and conflating them would send Bedrock traffic to
+        // api.anthropic.com under the wrong key.
+        let route = build_with_credentials(
+            &inventory,
+            vec![
+                candidate("bedrock-rung", "bedrock"),
+                candidate("anthropic-rung", "anthropic"),
+            ],
+            crate::provider::BASELINE_MAX_TOKENS,
+            |_| Some("secret".to_owned()),
+        )
+        .expect("a fully configured route builds");
+        let ids: Vec<&str> = route
+            .candidates()
+            .iter()
+            .map(|candidate| candidate.definition().id.as_str())
+            .collect();
+        assert_eq!(ids, ["bedrock-rung", "anthropic-rung"]);
+        assert!(
+            !Arc::ptr_eq(&route.candidates[0].provider, &route.candidates[1].provider),
+            "two providers on one adapter must not share a client"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // The price-reconciliation exemption.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn an_exemption_from_price_reconciliation_must_state_its_case() {
+        // This field turns off the alarm that guards margin for every candidate
+        // on an upstream. A blank one would do that while asserting nothing,
+        // and would read in the report exactly like a gap somebody argued.
+        let error = assemble(
+            r#"{
+                "key": "silent",
+                "adapter": "chat_completions",
+                "credential_env": "SILENT_API_KEY",
+                "secret_name": "silent-api-key",
+                "base_url": "https://svc.example.test/v1/chat/completions",
+                "unreconcilable_reason": "   "
+            }"#,
+        )
+        .expect_err("a blank exemption must be refused");
+        let detail = error.to_string();
+        assert!(detail.contains("silent"), "{detail}");
+        assert!(detail.contains("unreconcilable_reason"), "{detail}");
+    }
+
+    #[test]
+    fn only_the_declaring_provider_is_exempt_from_reconciliation() {
+        // The narrowness that makes the exemption tolerable. Bedrock declares
+        // one; nothing else does, and a lane that stopped being reconciled by
+        // accident is the failure this asserts against.
+        assert!(
+            provider_unreconcilable_reason("bedrock")
+                .is_some_and(|reason| reason.contains("_standard")),
+            "bedrock's exemption must name the SKU class its rates really come from"
+        );
+        for provider in ["anthropic", "openai", "google"] {
+            assert!(
+                provider_unreconcilable_reason(provider).is_none(),
+                "{provider} must still be reconciled against the public catalog"
+            );
+        }
     }
 
     #[test]

@@ -102,6 +102,10 @@ fn args(tiers: &Path, source_dir: &Path) -> AdminArgs {
             tiers: Some(tiers.to_path_buf()),
             providers: None,
             max_age_days: None,
+            // The live Bedrock check stays OFF for the same reason the second
+            // source does: this suite proves the primary check touches no
+            // network, and that one needs both a credential and AWS.
+            bedrock_live: false,
             allow_drift: false,
         }),
     }

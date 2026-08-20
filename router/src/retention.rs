@@ -308,6 +308,159 @@ pub async fn fetch(url: &str) -> Result<String> {
 }
 
 // ---------------------------------------------------------------------------
+// The live half of the Bedrock claim.
+//
+// Everything above answers "did the EVIDENCE move?" by hashing a page. That is
+// the only question available for a pin whose posture rests on a vendor's
+// published policy, because no API states what a contract says.
+//
+// `[retention.bedrock]` is the one pin where a second question is both askable
+// and necessary, and the difference is worth stating plainly. Its posture does
+// not rest on a contract; it rests on a SETTING on the operator's own AWS
+// account, and settings change. Hashing AWS's docs page catches AWS rewording
+// what `none` means. It cannot catch someone flipping the account to `default`,
+// and after that flip every check above still passes while `/v1/models`
+// continues telling customers their prompts are never stored. That is the
+// failure this exists to close.
+//
+// It is OPT-IN (`--bedrock-live`) and that is not timidity. The daily CI job
+// runs without AWS credentials by design, and a check that needs a secret must
+// not be able to redden a job that cannot hold one. What it is NOT is advisory:
+// unlike `--corroborate`, this reads ZeroRouter's OWN account rather than a
+// third party's opinion, so when it is asked for it decides the exit code.
+// Asking for it and not being able to run it is a failure too — a credential
+// that rotated out must not read as a pass.
+// ---------------------------------------------------------------------------
+
+/// Bedrock's account-scoped retention setting, on the mantle control plane.
+///
+/// Its own constant rather than something derived from the provider entry's
+/// `base_url`: that URL addresses the INFERENCE surface
+/// (`/anthropic/v1/messages`) and this is a different API on the same host, so
+/// deriving one from the other by string surgery would couple two contracts
+/// that AWS versions separately. The region is the only shared part, and it is
+/// read from the same environment variable the router dispatches with.
+///
+/// Note the underscore: the mantle plane spells this `/v1/data_retention` while
+/// the classic control plane spells it `/data-retention`. Both are real; this
+/// checks the mantle one because that is the plane ZeroRouter dispatches on.
+pub const BEDROCK_RETENTION_URL_TEMPLATE: &str =
+    "https://bedrock-mantle.{region}.api.aws/v1/data_retention";
+
+/// The only mode value that backs a `zero` posture.
+///
+/// Note what is NOT here. The enum also has `inherit`, which is the DEFAULT for
+/// a new account and means "defer to a broader scope" — so an account that has
+/// never been configured answers `inherit`, not `none`, and reading anything
+/// other than a literal `none` as zero-retention would turn an unconfigured
+/// account into a zero-retention claim.
+pub const BEDROCK_ZERO_RETENTION_MODE: &str = "none";
+
+/// What the live check found.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LiveVerdict {
+    /// The account reports the mode that backs the pin.
+    Confirmed,
+    /// The account reports some other mode. **The pinned label is now false**,
+    /// which is a different and far more serious finding than a moved page.
+    Contradicted { mode: String },
+    /// The check was asked for and could not be run — no credential, no region,
+    /// or the request failed. Actionable: a check that cannot run is not a check
+    /// that passed, and treating it as one is how a rotated credential silently
+    /// disables the only thing watching a live claim.
+    Unavailable { detail: String },
+}
+
+impl LiveVerdict {
+    #[must_use]
+    pub const fn is_actionable(&self) -> bool {
+        !matches!(self, Self::Confirmed)
+    }
+
+    #[must_use]
+    pub const fn label(&self) -> &'static str {
+        match self {
+            Self::Confirmed => "CONFIRMED",
+            Self::Contradicted { .. } => "CONTRADICTED",
+            Self::Unavailable { .. } => "COULD NOT CHECK",
+        }
+    }
+}
+
+/// The account's retention mode, as the control plane reports it.
+///
+/// Parsed permissively on purpose. AWS's own docs disagree with themselves
+/// about the shape — the user guide prints `updated_at` where the API reference
+/// types `updatedAt`, and the two planes differ in casing and in whether the
+/// timestamp is an epoch integer or an ISO string. None of that is the field
+/// this cares about, so everything except `mode` is ignored rather than modeled;
+/// a struct that insisted on the rest would fail on a documentation-accurate
+/// response for reasons that have nothing to do with retention.
+#[derive(Debug, Deserialize)]
+struct DataRetention {
+    mode: Option<String>,
+}
+
+/// Read the retention mode out of a control-plane response body.
+///
+/// Split from the fetch so the one piece of judgment here — what counts as an
+/// answer — is testable without a network or a credential.
+pub fn parse_retention_mode(document: &str) -> Result<String> {
+    let parsed: DataRetention = serde_json::from_str(document)
+        .context("the data-retention response was not the expected JSON")?;
+    // An absent or blank `mode` is an error rather than a default. This value
+    // decides whether a zero-retention label keeps being published, and the one
+    // reading it must never be able to conclude "zero" from a response that did
+    // not say so.
+    parsed
+        .mode
+        .map(|mode| mode.trim().to_owned())
+        .filter(|mode| !mode.is_empty())
+        .context("the data-retention response carried no mode")
+}
+
+/// Compare a control-plane response against the mode a `zero` pin requires.
+#[must_use]
+pub fn check_live_mode(document: &str) -> LiveVerdict {
+    match parse_retention_mode(document) {
+        Ok(mode) if mode.eq_ignore_ascii_case(BEDROCK_ZERO_RETENTION_MODE) => {
+            LiveVerdict::Confirmed
+        }
+        Ok(mode) => LiveVerdict::Contradicted { mode },
+        Err(error) => LiveVerdict::Unavailable {
+            detail: format!("{error:#}"),
+        },
+    }
+}
+
+/// Ask Bedrock's mantle control plane what this account's retention mode is.
+///
+/// `x-api-key`, not `Authorization: Bearer`. Bedrock's auth header splits by API
+/// surface rather than by host: the OpenAI-compatible `/v1/*` inference routes
+/// take a bearer token, while the mantle control routes — this one included —
+/// take `x-api-key`. Both carry the same Bedrock API key, so there is one
+/// credential and two header spellings, and getting it wrong is a 403 that reads
+/// like a permissions problem.
+pub async fn fetch_bedrock_retention(region: &str, credential: &str) -> Result<String> {
+    let url = BEDROCK_RETENTION_URL_TEMPLATE.replace("{region}", region);
+    let response = reqwest::Client::new()
+        .get(&url)
+        .header("x-api-key", credential)
+        .timeout(FETCH_TIMEOUT)
+        .send()
+        .await
+        .with_context(|| format!("fetching the Bedrock retention mode from {url}"))?;
+    let status = response.status();
+    if !status.is_success() {
+        anyhow::bail!("Bedrock retention endpoint {url} answered HTTP {status}");
+    }
+    response
+        .text()
+        .await
+        .with_context(|| format!("reading the Bedrock retention body from {url}"))
+}
+
+// ---------------------------------------------------------------------------
 // Corroboration — advisory only, exactly as `crate::corroborate` is for prices.
 // ---------------------------------------------------------------------------
 
@@ -592,5 +745,72 @@ mod tests {
     #[test]
     fn a_malformed_directory_is_an_error_rather_than_a_panic() {
         assert!(corroborate(&[], "not json").is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // The live Bedrock check. The judgement here is entirely in what counts as
+    // an answer, which is why the parse is split from the fetch.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn only_a_literal_none_confirms_the_zero_posture() {
+        // AWS's documented PUT response shape, with the mode that backs the pin.
+        assert_eq!(
+            check_live_mode(r#"{"mode":"none","updated_at":1733529600}"#),
+            LiveVerdict::Confirmed
+        );
+        // Casing is the wire's business, not a reason to fail a true answer.
+        assert_eq!(
+            check_live_mode(r#"{"mode":"NONE"}"#),
+            LiveVerdict::Confirmed
+        );
+    }
+
+    #[test]
+    fn every_other_mode_contradicts_the_published_label() {
+        // `inherit` is the one to get right, and it is the DEFAULT for a new
+        // account: it means "no opinion at this scope", not "retains nothing".
+        // Reading it as zero would let an account nobody ever configured
+        // publish a zero-retention claim to customers.
+        for mode in ["default", "provider_data_share", "inherit"] {
+            let verdict = check_live_mode(&format!(r#"{{"mode":"{mode}"}}"#));
+            assert_eq!(
+                verdict,
+                LiveVerdict::Contradicted {
+                    mode: mode.to_owned()
+                },
+                "{mode} must not read as zero retention"
+            );
+            assert!(verdict.is_actionable());
+        }
+    }
+
+    #[test]
+    fn a_response_that_states_no_mode_is_unverified_never_confirmed() {
+        // The failure direction that matters. A body this cannot read must
+        // never resolve to "zero" — the value decides whether a legal-adjacent
+        // claim keeps being published, so silence has to be an error.
+        for body in ["{}", r#"{"mode":null}"#, r#"{"mode":"  "}"#, "not json", ""] {
+            let verdict = check_live_mode(body);
+            assert!(
+                matches!(verdict, LiveVerdict::Unavailable { .. }),
+                "{body:?} must not resolve to a verdict about the account"
+            );
+            assert!(verdict.is_actionable());
+        }
+    }
+
+    #[test]
+    fn the_retention_url_is_the_mantle_plane_and_interpolates_its_region() {
+        // Two spellings exist and they are not interchangeable: the mantle
+        // plane serves `/v1/data_retention` with an underscore, the classic
+        // control plane `/data-retention` with a hyphen. ZeroRouter dispatches
+        // on mantle, so mantle is the plane whose setting governs its traffic.
+        let url = BEDROCK_RETENTION_URL_TEMPLATE.replace("{region}", "us-east-1");
+        assert_eq!(
+            url,
+            "https://bedrock-mantle.us-east-1.api.aws/v1/data_retention"
+        );
+        assert!(!url.contains("{region}"), "{url}");
     }
 }

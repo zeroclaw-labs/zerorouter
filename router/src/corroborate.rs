@@ -515,7 +515,17 @@ pub fn corroborate(findings: &[CandidateDrift], document: &str) -> Result<Report
     let mut entries = Vec::new();
     let mut exempt = 0;
     for found in findings {
-        if found.verdict == Verdict::Unreconcilable {
+        // Both primary exemptions carry across, for the reason the `exempt`
+        // field records: a candidate the PRIMARY source structurally cannot
+        // cover is not a candidate a second opinion has anything to add about,
+        // and a permanent "not listed" row is the forever-red noise this whole
+        // design refuses to print. `NotCoveredBySource` joins `Unreconcilable`
+        // here on that rule and on no weaker one — it is a declared, argued gap
+        // in the primary, not a lane anybody chose to stop looking at.
+        if matches!(
+            found.verdict,
+            Verdict::Unreconcilable | Verdict::NotCoveredBySource
+        ) {
             exempt += 1;
             continue;
         }
@@ -1142,7 +1152,7 @@ mod tests {
             retention: BTreeMap::new(),
             unavailable: BTreeMap::new(),
         };
-        let found = crate::drift::reconcile_with(&edge, PRIMARY, &|_| true);
+        let found = crate::drift::reconcile_with(&edge, PRIMARY, &|_| true, &|_| None);
         assert_eq!(found[0].verdict, Verdict::Unreconcilable);
 
         let report = corroborate(&found, SECOND).expect("a well-formed second source is readable");
