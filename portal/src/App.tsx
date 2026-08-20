@@ -210,7 +210,10 @@ function Landing({ reason }: { reason?: string }) {
     <div className="landing">
       <div className="landing-inner">
         <Wordmark large />
-        <p className="landing-tag">The LLM router with Zero Data Retention — always.</p>
+        <p className="landing-tag">
+          Doesn&apos;t store your prompts. Doesn&apos;t train on them. Labels every provider that
+          does.
+        </p>
         <p className="landing-sub">
           ZeroRouter is structurally incapable of reading, logging, or training on your prompts and
           completions — content-free by design, and open source so anyone can verify it. Prepaid
