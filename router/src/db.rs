@@ -1033,6 +1033,13 @@ pub async fn migrate(pool: &PgPool) -> Result<()> {
                 Cow::Borrowed(include_str!("../migrations/0024_autopay_tax_lifecycle.sql")),
                 false,
             ),
+            Migration::new(
+                25,
+                Cow::Borrowed("redemption tax"),
+                MigrationType::Simple,
+                Cow::Borrowed(include_str!("../migrations/0025_redemption_tax.sql")),
+                false,
+            ),
         ]),
         ignore_missing: false,
         locking: true,

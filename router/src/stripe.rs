@@ -143,12 +143,17 @@
 //!
 //! *When is tax due?* Not answered, by anyone. The sale-versus-redemption
 //! question above is unresolved, and a product tax code cannot express timing,
-//! so no selection here settles it. What the architecture settles is narrower:
-//! redemption is a metered balance debit in [`crate::billing`] with no Stripe
-//! object and no tax computation, so a stored-value code (`txcd_10502000`, which
-//! Stripe calls multi-purpose) defers tax to a point that will never collect it
-//! — in practice a choice to collect nothing anywhere. Avoid `txcd_00000000`
-//! (Nontaxable) for a different reason: it makes Stripe's
+//! so no selection here settles it. What the architecture now provides is the
+//! ABILITY to choose either answer: redemption is a metered balance debit in
+//! [`crate::billing`] with no Stripe object and no inline tax computation,
+//! but [`crate::redemption_tax`] (dormant, `ZEROROUTER_REDEMPTION_TAX`) can
+//! aggregate that usage into periods and tax it at redemption time. So a
+//! stored-value code (`txcd_10502000`, which Stripe calls multi-purpose) — the
+//! code the stored-value determination would call for — is only coherent
+//! TOGETHER with enabling that mechanism; selected alone it defers tax to a
+//! point where nothing collects it. The flip procedure lives in DEPLOY.md and
+//! is a deliberate paired change, never a dashboard edit alone. Avoid
+//! `txcd_00000000` (Nontaxable) for a different reason: it makes Stripe's
 //! `taxability_reason=not_collecting` indistinguishable from a missing
 //! registration, hiding real misconfiguration. Massachusetts DOR issues letter
 //! rulings for exactly this situation (830 CMR 62C.3.1(6)).
@@ -398,7 +403,7 @@ const CHECKOUT_RETURN_PATH: &str = "/credits/return?session_id={CHECKOUT_SESSION
 /// the webhook's `currency` — an amount match alone is not proof of the price,
 /// because the smallest unit of a zero-decimal currency (1000 JPY, roughly $6)
 /// numerically equals a cents amount ($10.00).
-const CHECKOUT_CURRENCY: &str = "usd";
+pub(crate) const CHECKOUT_CURRENCY: &str = "usd";
 /// SQLSTATE for a foreign-key violation: the metadata user does not exist.
 const PG_FOREIGN_KEY_VIOLATION: &str = "23503";
 
@@ -556,7 +561,7 @@ pub fn router() -> Router<WebCtx> {
 }
 
 #[derive(Debug)]
-enum StripeHttpError {
+pub(crate) enum StripeHttpError {
     BillingUnavailable,
     InvalidAmount,
     CheckoutFailed,
@@ -1799,6 +1804,21 @@ async fn stripe_webhook(
                     "stripe purchase credited but its pending record could not be marked settled"
                 );
             }
+            // Keep the buyer's billing address (migration 0025): checkout
+            // collects it (`billing_address_collection=required`) but nothing
+            // durable held it, and the redemption-tax surface can only rate a
+            // buyer it can locate. Best-effort AFTER the credit — a lost
+            // address costs one future period a fallback, never the money —
+            // and always on, so the addresses exist before the operator ever
+            // flips redemption-time taxation on.
+            crate::redemption_tax::store_buyer_address(
+                &ctx.pool,
+                user_id,
+                object
+                    .get("customer_details")
+                    .and_then(|d| d.get("address")),
+            )
+            .await;
             Ok(received())
         }
         Err(error) if is_foreign_key_violation(&error) => {
@@ -2994,7 +3014,7 @@ async fn ensure_stripe_customer(
     Ok(stored.unwrap_or_else(|| customer_id.to_owned()))
 }
 
-fn stripe_client() -> Result<reqwest::Client, StripeHttpError> {
+pub(crate) fn stripe_client() -> Result<reqwest::Client, StripeHttpError> {
     reqwest::Client::builder()
         .timeout(STRIPE_HTTP_TIMEOUT)
         .build()
@@ -3016,11 +3036,13 @@ const TAX_FALLBACK_FIELD: &str = "autopay_tax_fallback";
 /// — the customer's inference stops — so nothing in the tax path is allowed to
 /// fail the charge.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TaxFallback {
+pub(crate) enum TaxFallback {
     /// The saved card carries no billing address at all. Stripe collects
     /// billing details on the setup Checkout Session only if the account's
     /// settings ask for them, so this is the expected state for cards saved
-    /// before that was configured.
+    /// before that was configured. (For the redemption surface, which reads
+    /// the address [`crate::redemption_tax`] stored from checkout, this means
+    /// the user has never completed a checkout since migration 0025.)
     NoBillingAddress,
     /// An address is present but cannot locate a buyer for tax: no country, or
     /// a US address with no postal code (Stripe cannot rate a US buyer from a
@@ -3040,7 +3062,7 @@ enum TaxFallback {
 impl TaxFallback {
     /// Stable log values. These are grepped and alerted on; do not rename one
     /// without meaning to break whatever is watching it.
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             TaxFallback::NoBillingAddress => "no_billing_address",
             TaxFallback::IncompleteAddress => "incomplete_address",
@@ -3050,14 +3072,54 @@ impl TaxFallback {
     }
 }
 
-/// A buyer location good enough for Stripe Tax, lifted from the saved card.
+/// A buyer location good enough for Stripe Tax.
+///
+/// Autopay lifts one off the saved card's `billing_details`
+/// ([`autopay_tax_address`]); the redemption surface reads the one the
+/// checkout webhook stored on `users` (migration 0025). Both go through
+/// [`TaxAddress::from_parts`], so the completeness rules live in exactly one
+/// place.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct TaxAddress {
-    country: String,
-    postal_code: Option<String>,
-    state: Option<String>,
-    city: Option<String>,
-    line1: Option<String>,
+pub(crate) struct TaxAddress {
+    pub(crate) country: String,
+    pub(crate) postal_code: Option<String>,
+    pub(crate) state: Option<String>,
+    pub(crate) city: Option<String>,
+    pub(crate) line1: Option<String>,
+}
+
+impl TaxAddress {
+    /// The completeness rules, in one place for every surface that hands
+    /// Stripe Tax an address: a whitespace-only component is absent (a blank
+    /// form field cannot masquerade as a location), `country` is required by
+    /// the API, and a US buyer cannot be rated without a postal code — Stripe
+    /// cannot calculate US tax from a country code alone, nor from country
+    /// plus state, so checking locally turns a guaranteed round trip and
+    /// error into an immediate, cheaper fallback.
+    pub(crate) fn from_parts(
+        country: Option<&str>,
+        postal_code: Option<&str>,
+        state: Option<&str>,
+        city: Option<&str>,
+        line1: Option<&str>,
+    ) -> Result<TaxAddress, TaxFallback> {
+        fn present(value: Option<&str>) -> Option<String> {
+            let value = value?.trim();
+            (!value.is_empty()).then(|| value.to_owned())
+        }
+        let country = present(country).ok_or(TaxFallback::IncompleteAddress)?;
+        let postal_code = present(postal_code);
+        if country.eq_ignore_ascii_case("US") && postal_code.is_none() {
+            return Err(TaxFallback::IncompleteAddress);
+        }
+        Ok(TaxAddress {
+            country,
+            postal_code,
+            state: present(state),
+            city: present(city),
+            line1: present(line1),
+        })
+    }
 }
 
 /// Read a usable tax location off a PaymentMethod object.
@@ -3109,12 +3171,10 @@ struct TaxAddress {
 /// remote `customer_tax_location_invalid` case is still handled, because an
 /// address can pass these checks and still not resolve.
 fn autopay_tax_address(payment_method: &Value) -> Result<TaxAddress, TaxFallback> {
-    /// Stripe renders unset address components as JSON null; treat a
-    /// whitespace-only string the same as absent so a blank form field cannot
-    /// masquerade as a location.
-    fn field(address: &Value, key: &str) -> Option<String> {
-        let value = address.get(key)?.as_str()?.trim();
-        (!value.is_empty()).then(|| value.to_owned())
+    // Stripe renders unset address components as JSON null; `from_parts`
+    // treats a whitespace-only string the same as absent.
+    fn field<'a>(address: &'a Value, key: &str) -> Option<&'a str> {
+        address.get(key)?.as_str()
     }
 
     let address = payment_method
@@ -3123,18 +3183,13 @@ fn autopay_tax_address(payment_method: &Value) -> Result<TaxAddress, TaxFallback
         .filter(|address| address.is_object())
         .ok_or(TaxFallback::NoBillingAddress)?;
 
-    let country = field(address, "country").ok_or(TaxFallback::IncompleteAddress)?;
-    let postal_code = field(address, "postal_code");
-    if country.eq_ignore_ascii_case("US") && postal_code.is_none() {
-        return Err(TaxFallback::IncompleteAddress);
-    }
-    Ok(TaxAddress {
-        country,
-        postal_code,
-        state: field(address, "state"),
-        city: field(address, "city"),
-        line1: field(address, "line1"),
-    })
+    TaxAddress::from_parts(
+        field(address, "country"),
+        field(address, "postal_code"),
+        field(address, "state"),
+        field(address, "city"),
+        field(address, "line1"),
+    )
 }
 
 /// A priced tax: what to add to the charge, and the calculation that says so.

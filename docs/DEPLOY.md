@@ -444,6 +444,51 @@ for days, so it credits once the rollout completes. With no registrations the
 tax is zero and the two shapes are numerically identical, so this is a
 non-event today; it matters only if a registration is added mid-deploy.
 
+### Redemption-time tax exists, and is OFF (migration 0025)
+
+If the accountant or a Massachusetts DOR letter ruling decides prepaid
+credits are stored value — excluded at sale, taxable when SPENT — the
+mechanism for that answer is built and dormant: `ZEROROUTER_REDEMPTION_TAX`
+(default `off`). It tiles each user's usage ledger into periods, prices each
+period with one Tax Calculation against the billing address checkout now
+stores on the user, debits the collected figure from the balance as a `tax`
+ledger entry (clamped — a drained balance is absorbed, never overdrawn), and
+records the FULL figure as a tax transaction. Design and policies are in
+`router/src/redemption_tax.rs`; nothing below runs while the variable is
+unset, and address capture from checkout runs regardless so the data exists
+before any flip.
+
+**The flip is one paired change, in this order, or the same dollar is taxed
+twice:**
+
+1. Confirm the determination in writing (this code does not settle the law).
+2. Dashboard → Tax → Settings: change the preset product tax code to the
+   multi-purpose stored-value code (`txcd_10502000`). Purchases — checkout
+   AND autopay, which share the preset — start pricing zero tax.
+3. Set `ZEROROUTER_REDEMPTION_TAX=collect` and deploy. Redemptions start
+   being taxed. (`dry_run` first is cheaper courage: periods are built and
+   priced, nothing is debited, nothing reaches filing reports.)
+4. Never run step 2 without step 3 (defers tax to a point that collects
+   nothing) or step 3 without step 2 (taxes purchase and redemption both).
+
+What to know when it is on:
+
+- **Pre-flip balances are exempt.** Each user's balance at enrollment was
+  bought tax-paid; periods consume that exemption before anything is
+  taxable. Users created after the flip get zero exemption. Promo credit at
+  enrollment sits inside the exemption — an accountant question the code
+  answers toward not collecting.
+- **A user with no stored address cannot be priced.** Their periods wait,
+  logging `redemption_tax_fallback` on every pass, and are priced correctly
+  once their next checkout stores an address. Nothing is frozen wrong to
+  quiet a log.
+- **Shortfalls are absorbed and filed.** The debit is clamped to the
+  balance; the vendor's liability is not. Watch for the clamped-debit WARN —
+  it is money ZeroRouter is paying a jurisdiction out of margin.
+- **Dry-run calculations still cost Stripe Tax API calls** once
+  registrations exist; the hourly sweep prices at most one calculation per
+  user per pass.
+
 ## Credit enforcement is on by default
 
 `ZEROROUTER_REQUIRE_CREDITS` **defaults to `true`**. It previously defaulted

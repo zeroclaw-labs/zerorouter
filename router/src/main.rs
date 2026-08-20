@@ -7,7 +7,7 @@ use zerorouter::{
     admin::{self, AdminArgs},
     app,
     db::{database_pool_from_env, migrate},
-    device, logging, oidc, portal, providers, stripe,
+    device, logging, oidc, portal, providers, redemption_tax, stripe,
     user::{self, UserArgs},
     web::{WebConfig, WebCtx, credits_required_from_env},
 };
@@ -102,6 +102,20 @@ async fn serve() -> Result<()> {
     // configured right now.
     state.spawn_checkout_intent_cleanup();
     if let Some(stripe) = web_config.as_ref().and_then(|config| config.stripe.clone()) {
+        // Parsed unconditionally so a typo in the mode refuses startup even
+        // on a deployment that meant to leave it off; spawned only when the
+        // operator has explicitly turned the mechanism on (see
+        // `redemption_tax` — the flip is a deliberate, documented procedure,
+        // never a side effect of configuring Stripe).
+        let redemption_tax_mode =
+            redemption_tax::mode_from_env().map_err(|message| anyhow::anyhow!(message))?;
+        if redemption_tax_mode != redemption_tax::RedemptionTaxMode::Off {
+            tracing::warn!(
+                ?redemption_tax_mode,
+                "redemption-time tax is ON; the Tax Settings preset must be the stored-value code or the same dollar is taxed twice (see DEPLOY.md)"
+            );
+            state.spawn_redemption_tax_sweep(stripe.clone(), redemption_tax_mode);
+        }
         state.spawn_autopay_sweep(stripe);
     }
     let mut router = app(state.clone());

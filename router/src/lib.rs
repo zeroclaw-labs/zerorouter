@@ -17,6 +17,7 @@ pub mod portal;
 pub mod priority;
 pub mod provider;
 pub mod providers;
+pub mod redemption_tax;
 pub mod retention;
 pub mod retry;
 pub mod session;

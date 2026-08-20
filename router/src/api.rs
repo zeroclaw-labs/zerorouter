@@ -840,6 +840,34 @@ impl RouterState {
         });
     }
 
+    /// Start the redemption-tax sweep: hourly, tile new usage into periods,
+    /// price them, and — in `collect` mode — debit and record them. Same
+    /// opt-in serve-only contract as the other background loops; tests drive
+    /// `redemption_tax::run_redemption_tax_sweep_once` directly. The caller
+    /// only spawns this when the mode is not `Off`, which keeps the default
+    /// deployment free of even the idle loop.
+    pub fn spawn_redemption_tax_sweep(
+        &self,
+        settings: crate::web::StripeSettings,
+        mode: crate::redemption_tax::RedemptionTaxMode,
+    ) {
+        let Some(services) = &self.services else {
+            return;
+        };
+        let pool = services.pool.clone();
+        let shutdown = services.runtime.shutdown.clone();
+        services.runtime.tasks.spawn(async move {
+            loop {
+                tokio::select! {
+                    biased;
+                    () = shutdown.cancelled() => return,
+                    () = tokio::time::sleep(Duration::from_secs(3600)) => {}
+                }
+                crate::redemption_tax::run_redemption_tax_sweep_once(&pool, &settings, mode).await;
+            }
+        });
+    }
+
     pub fn begin_shutdown(&self) {
         if let Some(services) = &self.services {
             services.runtime.shutdown.cancel();
