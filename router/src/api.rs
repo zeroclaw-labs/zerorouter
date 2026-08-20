@@ -3415,6 +3415,7 @@ async fn admit_usage(
         UsageAdmission::Allowed(session) => Ok(session),
         UsageAdmission::Unauthorized => Err(ApiError::Unauthorized),
         UsageAdmission::SpendExceeded => Err(ApiError::SpendCapExceeded),
+        UsageAdmission::KeyCreditLimitExceeded => Err(ApiError::KeyCreditLimitExceeded),
         UsageAdmission::VelocityExceeded => Err(ApiError::VelocityCapExceeded),
         UsageAdmission::InsufficientCredits => Err(ApiError::InsufficientCredits),
         UsageAdmission::AccountFrozen => Err(ApiError::AccountFrozen),

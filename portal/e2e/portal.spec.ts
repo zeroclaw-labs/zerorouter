@@ -34,6 +34,42 @@ test('keys page lists, creates, and reveals a key exactly once', async ({ page }
   await expect(page.getByText(keyName)).toBeVisible()
 })
 
+test('a key can be minted with an expiry and a credit limit', async ({ page }) => {
+  await signIn(page)
+  await page.getByRole('link', { name: /keys/i }).click()
+
+  // Defaults first: the form opens on the same key it has always minted —
+  // never expires, no limit — so the added fields cost an existing user
+  // nothing.
+  await expect(page.getByText(/this key will not expire/i)).toBeVisible()
+
+  // Choosing a preset resolves it to a concrete date in the dialog, which is
+  // the whole reason the presets live client-side.
+  await page.getByLabel(/expiration/i).selectOption({ label: '1 week' })
+  await expect(page.getByText(/expires \w+ \d+, \d{2}:\d{2}/i)).toBeVisible()
+
+  const keyName = `e2e-limited-${Date.now()}`
+  await page.getByPlaceholder(/key name/i).fill(keyName)
+  await page.getByLabel(/credit limit in dollars/i).fill('25')
+  await page.getByLabel(/reset limit every/i).selectOption({ label: 'Weekly' })
+  await page.getByRole('button', { name: /create key/i }).click()
+  await expect(page.getByText(/zcr_[a-f0-9]{16}/)).toBeVisible()
+  await page.getByRole('button', { name: /stored it/i }).click()
+
+  // The row carries both, and the usage half starts at zero.
+  const row = page.getByRole('row', { name: new RegExp(keyName) })
+  await expect(row).toContainText('$0.00 of $25.00/we')
+  await expect(row).toContainText('active')
+
+  // A reset cadence with no limit would mint an UNLIMITED key from a request
+  // that plainly asked for a budget, so the form refuses to send it.
+  await page.getByPlaceholder(/key name/i).fill(`e2e-bad-${Date.now()}`)
+  await page.getByLabel(/credit limit in dollars/i).fill('')
+  await page.getByLabel(/reset limit every/i).selectOption({ label: 'Daily' })
+  await page.getByRole('button', { name: /create key/i }).click()
+  await expect(page.getByText(/set a credit limit/i)).toBeVisible()
+})
+
 test('credits page renders balance, promo ledger, and the autopay panel', async ({ page }) => {
   await signIn(page)
   // Fund through the same admin path production uses; the user exists
@@ -115,11 +151,20 @@ test('the api surface the SPA consumes returns the documented shapes', async ({ 
   // drift on endpoints whose pages might not render them immediately.
   const shapes = await page.evaluate(async () => {
     const keys = await (await fetch('/api/keys')).json()
+    // The 0023 fields are ADDITIVE: present on every row, null where unset.
+    // A missing key here means the SPA's limit column would render undefined.
+    const firstKey = keys.keys[0] ?? {}
+    const keyHasLimitFields =
+      'expires_at' in firstKey &&
+      'credit_limit_usd' in firstKey &&
+      'credit_limit_window' in firstKey &&
+      'credit_limit_used_usd' in firstKey
     const ledger = await (await fetch('/api/billing/ledger?limit=5')).json()
     const me = await (await fetch('/api/me')).json()
     const usage = await (await fetch('/api/usage?days=7')).json()
     return {
       keysIsEnvelope: Array.isArray(keys.keys),
+      keyHasLimitFields,
       ledgerIsEnvelope: Array.isArray(ledger.entries),
       meHasEmail: typeof me.email === 'string',
       usageHasTotals: typeof usage.totals === 'object' && Array.isArray(usage.daily),
@@ -127,6 +172,7 @@ test('the api surface the SPA consumes returns the documented shapes', async ({ 
   })
   expect(shapes).toEqual({
     keysIsEnvelope: true,
+    keyHasLimitFields: true,
     ledgerIsEnvelope: true,
     meHasEmail: true,
     usageHasTotals: true,

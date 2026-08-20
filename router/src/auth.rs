@@ -1,5 +1,6 @@
 use std::{collections::HashMap, time::Duration};
 
+use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
 use tokio::{sync::RwLock, time::Instant};
 use uuid::Uuid;
@@ -74,9 +75,19 @@ impl KeyAuthenticator {
             return Ok(key);
         }
 
-        let row = sqlx::query_as::<_, (Uuid, Uuid, String, bool, Option<String>)>(
+        let row = sqlx::query_as::<
+            _,
+            (
+                Uuid,
+                Uuid,
+                String,
+                bool,
+                Option<String>,
+                Option<DateTime<Utc>>,
+            ),
+        >(
             r#"
-            SELECT id, user_id, key_hash, disabled, default_priority
+            SELECT id, user_id, key_hash, disabled, default_priority, expires_at
             FROM api_keys
             WHERE key_hash = $1
             "#,
@@ -88,8 +99,17 @@ impl KeyAuthenticator {
 
         let stored_hash = row.as_ref().map_or(DUMMY_HASH, |record| record.2.as_str());
         let hashes_match = constant_time_eq(stored_hash, &hash);
-        let Some((id, user_id, _, _, default_priority)) =
-            row.filter(|row| syntactically_valid && hashes_match && !row.3)
+        // `expires_at` (migration 0023) joins `disabled` in the SAME filter, so
+        // a lapsed key is refused with the same `Invalid` a revoked or unknown
+        // one gets and never enters the cache. Admission enforces expiry
+        // independently and authoritatively in its own row-locked predicate;
+        // this arm is what keeps the 30-second cache from being a way to hold
+        // a lapsed key open, not the enforcement point itself.
+        let expired = |expires_at: Option<DateTime<Utc>>| {
+            expires_at.is_some_and(|deadline| deadline <= Utc::now())
+        };
+        let Some((id, user_id, _, _, default_priority, expires_at)) =
+            row.filter(|row| syntactically_valid && hashes_match && !row.3 && !expired(row.5))
         else {
             return Err(AuthenticationError::Invalid);
         };
@@ -101,13 +121,26 @@ impl KeyAuthenticator {
             // `None` here is a genuine NULL — balanced — not a parse loss.
             default_priority: default_priority.as_deref().and_then(Priority::from_keyword),
         };
+        // A cached entry may not outlive the key it caches. Without this clamp
+        // a key that expires one second from now would still be served from
+        // cache for the remaining CACHE_TTL — admission would refuse it, so no
+        // inference would be dispatched, but every other reader of an
+        // `AuthenticatedKey` would be looking at a key that had lapsed. Taking
+        // the minimum makes "cached" strictly narrower than "live", which is
+        // the same direction the disablement contract already runs in.
+        let ttl = match expires_at {
+            None => CACHE_TTL,
+            Some(deadline) => (deadline - Utc::now())
+                .to_std()
+                .map_or(Duration::ZERO, |remaining| remaining.min(CACHE_TTL)),
+        };
         let mut cache = self.cache.write().await;
         cache.retain(|_, entry| entry.expires_at > now);
         cache.insert(
             hash,
             CacheEntry {
                 key: key.clone(),
-                expires_at: now + CACHE_TTL,
+                expires_at: now + ttl,
             },
         );
         Ok(key)

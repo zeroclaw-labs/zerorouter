@@ -30,14 +30,40 @@ export interface Me {
   stripe_publishable_key: string | null
 }
 
+/** The reset cadences a key's credit limit can use; `null` never resets. */
+export type CreditLimitWindow = 'daily' | 'weekly' | 'monthly'
+
 export interface ApiKey {
   id: string
   name: string
   disabled: boolean
   spend_cap_usd: string | null
   velocity_cap_tokens_per_min: number | null
+  /** When the key stops working; null never expires. */
+  expires_at: string | null
+  /** The limit set on this key; null is unlimited. */
+  credit_limit_usd: string | null
+  /** How often the limit resets; null means it never does. */
+  credit_limit_window: CreditLimitWindow | null
+  /** Spend counted against the limit in the CURRENT window; null when there
+   * is no limit. Server-computed from the same counters that enforce it, so
+   * this page never shows a number that disagrees with the gate. */
+  credit_limit_used_usd: string | null
   created_at: string
   last_used_at: string | null
+}
+
+/** What the create-key dialog sends. Everything but the name is optional, and
+ * omitting all of it mints exactly the key this portal minted before limits
+ * existed: no expiry, no cap. */
+export interface NewKey {
+  name: string
+  /** An absolute instant, not a preset — the dialog resolves its presets
+   * against the clock and sends the result, so what the customer was shown is
+   * what the server records. */
+  expires_at?: string
+  credit_limit_usd?: string
+  credit_limit_window?: CreditLimitWindow
 }
 
 export interface CreatedKey extends ApiKey {
@@ -211,7 +237,7 @@ export const api = {
   // consume bare arrays (first caught live: the SPA's data pages were
   // untestable in a browser until OIDC existed).
   keys: () => request<{ keys: ApiKey[] }>('GET', '/api/keys').then((r) => r.keys),
-  createKey: (name: string) => request<CreatedKey>('POST', '/api/keys', { name }),
+  createKey: (key: NewKey) => request<CreatedKey>('POST', '/api/keys', key),
   deleteKey: (id: string) => request<void>('DELETE', `/api/keys/${encodeURIComponent(id)}`),
   // The public catalog — same endpoint any OpenAI-compatible client reads, so
   // the storefront shows exactly what callers get. No auth: a prospective

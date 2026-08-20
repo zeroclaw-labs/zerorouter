@@ -125,6 +125,39 @@ pub struct MintKeyArgs {
     /// omitted means NULL, which reads as balanced.
     #[arg(long, value_parser = parse_priority)]
     pub default_priority: Option<Priority>,
+    /// When the key should stop authenticating, as an RFC 3339 instant
+    /// (e.g. `2026-09-01T00:00:00Z`). Omitted means it never expires.
+    ///
+    /// Expiry is on this CLI and the customer's credit limit is not, and the
+    /// split is deliberate. A self-expiring key is an OPERATOR story with no
+    /// other answer here: a key minted for a trial, a demo, a contractor, or an
+    /// incident bridge should die on its own, and `revoke-key` requires someone
+    /// to remember. The credit limit is the CUSTOMER's own budget on their own
+    /// key — an operator setting it is impersonation, not administration, and
+    /// the operator already has `--spend-cap-usd`, which is the ceiling
+    /// admission enforces on their behalf. Offering both here would invite
+    /// setting the wrong one and believing the account was capped when in fact
+    /// only a knob the customer can raise from the portal had moved.
+    /// `list-keys` still REPORTS the credit limit, so a refusal can be
+    /// diagnosed without being able to cause one.
+    #[arg(long, value_parser = parse_expires_at)]
+    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Parse `--expires-at` as RFC 3339 and refuse an instant already past.
+///
+/// A key minted already expired authenticates nothing, so it is always a
+/// mistake — a wrong year, a local time typed as UTC — and failing at the
+/// command line is far cheaper than handing over a key that is refused on
+/// first use.
+fn parse_expires_at(value: &str) -> Result<chrono::DateTime<chrono::Utc>, String> {
+    let parsed = chrono::DateTime::parse_from_rfc3339(value.trim())
+        .map_err(|error| format!("expires-at must be an RFC 3339 instant: {error}"))?
+        .with_timezone(&chrono::Utc);
+    if parsed <= chrono::Utc::now() {
+        return Err(format!("expires-at {parsed:?} is already in the past"));
+    }
+    Ok(parsed)
 }
 
 #[derive(Debug, Args)]
@@ -293,6 +326,16 @@ struct KeyMetadata {
     spend_cap_usd: Decimal,
     velocity_cap_tokens_per_min: i32,
     default_priority: Option<String>,
+    /// When the key stops authenticating; `null` never expires (migration
+    /// 0023). Settable at mint by `--expires-at`.
+    expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// The CUSTOMER's own budget for this key and the cadence it resets on
+    /// (migration 0023). Reported here but deliberately NOT settable from this
+    /// CLI — see [`MintKeyArgs::expires_at`] for why the two 0023 fields are
+    /// split. Present because an operator debugging a `key_credit_limit_exceeded`
+    /// refusal needs to see the number that caused it.
+    credit_limit_usd: Option<Decimal>,
+    credit_limit_window: Option<String>,
     disabled: bool,
     created_at: chrono::DateTime<chrono::Utc>,
     last_used_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -842,15 +885,19 @@ async fn mint_key(pool: &PgPool, args: MintKeyArgs) -> Result<()> {
             id,
             user_id,
             key_hash,
-            name
+            name,
+            expires_at
         )
-        VALUES ($1, $2, $3, $4)
+        VALUES ($1, $2, $3, $4, $5)
         "#,
     )
     .bind(key_id)
     .bind(user_id)
     .bind(hash_api_key(&api_key))
     .bind(name)
+    // NULL is "never expires" and is the value every mint had before 0023, so
+    // an invocation that omits the flag produces exactly the row it used to.
+    .bind(args.expires_at)
     .execute(&mut *transaction)
     .await
     .context("failed to store API key digest")?;
@@ -923,6 +970,9 @@ async fn list_key_metadata(pool: &PgPool, email: Option<String>) -> Result<Vec<K
             Decimal,
             i32,
             Option<String>,
+            Option<chrono::DateTime<chrono::Utc>>,
+            Option<Decimal>,
+            Option<String>,
             bool,
             chrono::DateTime<chrono::Utc>,
             Option<chrono::DateTime<chrono::Utc>>,
@@ -936,6 +986,9 @@ async fn list_key_metadata(pool: &PgPool, email: Option<String>) -> Result<Vec<K
             api_keys.spend_cap_usd,
             api_keys.velocity_cap_tokens_per_min,
             api_keys.default_priority,
+            api_keys.expires_at,
+            api_keys.credit_limit_usd,
+            api_keys.credit_limit_window,
             api_keys.disabled,
             api_keys.created_at,
             api_keys.last_used_at
@@ -958,6 +1011,9 @@ async fn list_key_metadata(pool: &PgPool, email: Option<String>) -> Result<Vec<K
             spend_cap_usd,
             velocity_cap_tokens_per_min,
             default_priority,
+            expires_at,
+            credit_limit_usd,
+            credit_limit_window,
             disabled,
             created_at,
             last_used_at,
@@ -968,6 +1024,9 @@ async fn list_key_metadata(pool: &PgPool, email: Option<String>) -> Result<Vec<K
             spend_cap_usd,
             velocity_cap_tokens_per_min,
             default_priority,
+            expires_at,
+            credit_limit_usd,
+            credit_limit_window,
             disabled,
             created_at,
             last_used_at,

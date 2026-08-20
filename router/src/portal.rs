@@ -30,12 +30,55 @@ use uuid::Uuid;
 use crate::{
     auth::{generate_api_key, hash_api_key},
     billing::{self, LedgerEntry},
-    db::{KeyMintAdmission, admit_key_mint},
+    db::{CreditLimitWindow, KeyMintAdmission, admit_key_mint},
     priority::Priority,
     session::PortalUser,
     sqlx,
     web::WebCtx,
 };
+
+/// Spend counted against a key's `credit_limit_usd` in its CURRENT window, as
+/// a SELECT-list expression over an `api_keys` row (migration 0023).
+///
+/// One definition shared by `list_keys` and `update_key` rather than two
+/// copies: both answer the same question about the same row, and the failure
+/// mode of letting them drift is a portal that shows one number on the list and
+/// another after an edit.
+///
+/// It reads the SAME derived counters `begin_usage_session` reads, with the
+/// same cadence-to-counter mapping and the same UTC window starts. Recomputing
+/// it from `usage_events` would be a second definition of "spent this window",
+/// and the portal would eventually show a customer a figure that disagreed with
+/// the one refusing their requests. Admission's copy is an arm of a hot-path
+/// statement built for a single key and cannot share this string; the two are
+/// pinned to each other by test instead.
+const CREDIT_LIMIT_USED_SQL: &str = r#"
+    CASE
+        -- No limit, so no window, so nothing has been used OF it. NULL rather
+        -- than 0: the key is unlimited, not unspent.
+        WHEN api_keys.credit_limit_usd IS NULL THEN NULL
+        WHEN api_keys.credit_limit_window IS NULL THEN COALESCE((
+            SELECT usage_key_total_spend.spend_usd
+            FROM usage_key_total_spend
+            WHERE usage_key_total_spend.api_key_id = api_keys.id
+        ), 0)
+        WHEN api_keys.credit_limit_window = 'monthly' THEN COALESCE((
+            SELECT SUM(usage_key_month_spend.spend_usd)
+            FROM usage_key_month_spend
+            WHERE usage_key_month_spend.api_key_id = api_keys.id
+              AND usage_key_month_spend.month >= usage_event_utc_month(NOW())
+        ), 0)
+        ELSE COALESCE((
+            SELECT SUM(usage_key_day_spend.spend_usd)
+            FROM usage_key_day_spend
+            WHERE usage_key_day_spend.api_key_id = api_keys.id
+              AND usage_key_day_spend.day >= CASE api_keys.credit_limit_window
+                      WHEN 'daily' THEN usage_event_utc_day(NOW())
+                      ELSE (date_trunc('week', NOW() AT TIME ZONE 'UTC'))::DATE
+                  END
+        ), 0)
+    END
+"#;
 
 const MAX_KEY_NAME_CHARS: usize = 100;
 const MAX_SPEND_CAP_USD: u32 = 10_000;
@@ -209,6 +252,22 @@ struct KeySummary {
     /// (migration 0004). Additive, so pre-knob portal clients are
     /// undisturbed.
     default_priority: Option<Priority>,
+    /// When the key stops authenticating; `null` never expires (migration
+    /// 0023). Additive, like every field below it.
+    expires_at: Option<DateTime<Utc>>,
+    /// The customer's own spend cap on this key; `null` is unlimited.
+    credit_limit_usd: Option<Decimal>,
+    /// The cadence `credit_limit_usd` resets on; `null` never resets.
+    credit_limit_window: Option<CreditLimitWindow>,
+    /// Spend already counted against `credit_limit_usd` in the CURRENT window
+    /// — what the portal shows as "used of limit", and the same number
+    /// admission compares. `null` when the key has no limit, because there is
+    /// then no window to have used any of.
+    ///
+    /// Read from the same derived counters admission reads (migration 0023),
+    /// not recomputed from the ledger, so the portal cannot display a figure
+    /// that disagrees with the one enforcing the limit.
+    credit_limit_used_usd: Option<Decimal>,
     created_at: DateTime<Utc>,
     last_used_at: Option<DateTime<Utc>>,
 }
@@ -231,18 +290,24 @@ async fn list_keys(
             Decimal,
             i32,
             Option<String>,
+            Option<DateTime<Utc>>,
+            Option<Decimal>,
+            Option<String>,
+            Option<Decimal>,
             DateTime<Utc>,
             Option<DateTime<Utc>>,
         ),
-    >(
+    >(&format!(
         r#"
         SELECT id, name, disabled, spend_cap_usd, velocity_cap_tokens_per_min,
-               default_priority, created_at, last_used_at
+               default_priority, expires_at, credit_limit_usd, credit_limit_window,
+               {CREDIT_LIMIT_USED_SQL} AS credit_limit_used_usd,
+               created_at, last_used_at
         FROM api_keys
         WHERE user_id = $1
         ORDER BY created_at DESC, id DESC
-        "#,
-    )
+        "#
+    ))
     .bind(user.user_id)
     .fetch_all(&ctx.pool)
     .await?
@@ -255,6 +320,10 @@ async fn list_keys(
             spend_cap_usd,
             velocity_cap_tokens_per_min,
             default_priority,
+            expires_at,
+            credit_limit_usd,
+            credit_limit_window,
+            credit_limit_used_usd,
             created_at,
             last_used_at,
         )| {
@@ -265,6 +334,12 @@ async fn list_keys(
                 spend_cap_usd,
                 velocity_cap_tokens_per_min,
                 default_priority: default_priority.as_deref().and_then(Priority::from_keyword),
+                expires_at,
+                credit_limit_usd,
+                credit_limit_window: credit_limit_window
+                    .as_deref()
+                    .and_then(CreditLimitWindow::from_keyword),
+                credit_limit_used_usd,
                 created_at,
                 last_used_at,
             }
@@ -274,7 +349,11 @@ async fn list_keys(
     Ok(Json(KeysResponse { keys }))
 }
 
-#[derive(Deserialize)]
+// `Default` is for the unit tests below, which construct this by field and
+// would otherwise have to be edited in seven places every time the mint wire
+// gains an optional field. It changes no deserialization behavior: serde still
+// requires `name` and still refuses an unknown VALUE in any typed field.
+#[derive(Default, Deserialize)]
 struct CreateKeyRequest {
     name: String,
     spend_cap_usd: Option<Decimal>,
@@ -283,6 +362,23 @@ struct CreateKeyRequest {
     // wire-backward-compatible: a pre-knob portal build simply never sends
     // it. An unknown VALUE is still refused — `Priority` parses strictly.
     default_priority: Option<Priority>,
+    /// An absolute RFC 3339 instant, not a preset like "1 week".
+    ///
+    /// The presets belong to the dialog, which is where OpenRouter keeps them
+    /// too: the portal offers 1 hour / 1 day / 1 week / 1 month / never,
+    /// computes the instant, and shows the customer the concrete date it is
+    /// about to send. The API takes the instant because it is the only shape
+    /// that means the same thing twice — "1 week" resolves against whenever
+    /// the request happened to arrive, so a retried, queued, or replayed mint
+    /// would silently produce a different expiry than the one the customer was
+    /// shown. It is also the shape the column stores, so nothing between the
+    /// dialog and the row reinterprets it.
+    expires_at: Option<DateTime<Utc>>,
+    /// The customer's own spend cap for this key; absent is unlimited.
+    credit_limit_usd: Option<Decimal>,
+    /// Absent means the limit never resets (a lifetime cap on the key), which
+    /// is OpenRouter's "N/A" and this API's only spelling of it.
+    credit_limit_window: Option<CreditLimitWindow>,
 }
 
 struct ValidatedNewKey {
@@ -290,6 +386,9 @@ struct ValidatedNewKey {
     spend_cap_usd: Option<Decimal>,
     velocity_cap_tokens_per_min: Option<i32>,
     default_priority: Option<Priority>,
+    expires_at: Option<DateTime<Utc>>,
+    credit_limit_usd: Option<Decimal>,
+    credit_limit_window: Option<CreditLimitWindow>,
 }
 
 fn validate_new_key(request: &CreateKeyRequest) -> Result<ValidatedNewKey, PortalError> {
@@ -326,11 +425,57 @@ fn validate_new_key(request: &CreateKeyRequest) -> Result<ValidatedNewKey, Porta
             ));
         }
     }
+    // A key that has already expired authenticates nothing, so minting one is
+    // never what the caller meant — it is a clock skew, a timezone mistake, or
+    // a preset computed against the wrong `now`. Refusing beats handing back a
+    // 201 for a key that cannot be used.
+    //
+    // Compared against the router's clock here and against the DATABASE's in
+    // admission. That is a real (if tiny) seam: a router running behind the
+    // database could accept an expiry the database already considers past, and
+    // mint a key that is instantly refused. It fails CLOSED and it is loud —
+    // the customer sees the key refused immediately rather than silently
+    // getting more time than they asked for — so it is left as a validation
+    // nicety rather than made authoritative.
+    if request.expires_at.is_some_and(|at| at <= Utc::now()) {
+        return Err(PortalError::InvalidRequest(
+            "expires_at must be in the future",
+        ));
+    }
+    if let Some(limit) = request.credit_limit_usd {
+        // Zero is refused rather than treated as "block everything" — migration
+        // 0023 has the same CHECK, and revocation already says that, in one
+        // place, reversibly.
+        if limit <= Decimal::ZERO {
+            return Err(PortalError::InvalidRequest(
+                "credit_limit_usd must be positive",
+            ));
+        }
+        if limit > Decimal::from(MAX_SPEND_CAP_USD) {
+            return Err(PortalError::InvalidRequest(
+                "credit_limit_usd cannot exceed 10000",
+            ));
+        }
+    }
+    // A cadence with no limit to reset is refused rather than dropped. Dropping
+    // it would let a request that asked for "$0 every day, resetting" — a
+    // window with no limit — come back 201 with an UNLIMITED key, which is the
+    // one failure mode a budget feature must not have. Migration 0023 makes the
+    // state unrepresentable in the row; this makes the mistake visible to the
+    // caller instead of silently widening it.
+    if request.credit_limit_window.is_some() && request.credit_limit_usd.is_none() {
+        return Err(PortalError::InvalidRequest(
+            "credit_limit_window requires credit_limit_usd",
+        ));
+    }
     Ok(ValidatedNewKey {
         name: name.to_owned(),
         spend_cap_usd: request.spend_cap_usd,
         velocity_cap_tokens_per_min: request.velocity_cap_tokens_per_min,
         default_priority: request.default_priority,
+        expires_at: request.expires_at,
+        credit_limit_usd: request.credit_limit_usd,
+        credit_limit_window: request.credit_limit_window,
     })
 }
 
@@ -344,6 +489,16 @@ struct CreatedKeyResponse {
     spend_cap_usd: Decimal,
     velocity_cap_tokens_per_min: i32,
     default_priority: Option<Priority>,
+    /// The 0023 fields echoed back exactly as stored, so the dialog can show
+    /// the customer the expiry the server actually recorded rather than the one
+    /// the browser computed.
+    expires_at: Option<DateTime<Utc>>,
+    credit_limit_usd: Option<Decimal>,
+    credit_limit_window: Option<CreditLimitWindow>,
+    /// Always `0` for a key with a limit and `null` for one without: a key that
+    /// has just been minted has spent nothing. Present so a freshly created key
+    /// has the same shape as a listed one and the SPA needs no second branch.
+    credit_limit_used_usd: Option<Decimal>,
     created_at: DateTime<Utc>,
     last_used_at: Option<DateTime<Utc>>,
 }
@@ -377,16 +532,28 @@ async fn create_key(
 
     let api_key = generate_api_key();
     let key_id = Uuid::new_v4();
+    // The 0023 columns go in the INSERT rather than the COALESCE update below,
+    // because for them NULL is a VALUE — "never expires", "unlimited" — not an
+    // absent override to be defaulted away. `COALESCE($n, expires_at)` would
+    // read the column's own NULL and happen to produce the right answer here,
+    // but only by coincidence of this being an insert; stating them directly
+    // means the two groups of columns cannot be confused for each other later.
     sqlx::query(
         r#"
-        INSERT INTO api_keys (id, user_id, key_hash, name)
-        VALUES ($1, $2, $3, $4)
+        INSERT INTO api_keys (
+            id, user_id, key_hash, name,
+            expires_at, credit_limit_usd, credit_limit_window
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
         "#,
     )
     .bind(key_id)
     .bind(user.user_id)
     .bind(hash_api_key(&api_key))
     .bind(&validated.name)
+    .bind(validated.expires_at)
+    .bind(validated.credit_limit_usd)
+    .bind(validated.credit_limit_window.map(CreditLimitWindow::as_str))
     .execute(&mut *transaction)
     .await?;
     if validated.spend_cap_usd.is_some()
@@ -433,6 +600,10 @@ async fn create_key(
             spend_cap_usd,
             velocity_cap_tokens_per_min,
             default_priority: validated.default_priority,
+            expires_at: validated.expires_at,
+            credit_limit_usd: validated.credit_limit_usd,
+            credit_limit_window: validated.credit_limit_window,
+            credit_limit_used_usd: validated.credit_limit_usd.map(|_| Decimal::ZERO),
             created_at,
             last_used_at: None,
         }),
@@ -534,17 +705,23 @@ async fn update_key(
             Decimal,
             i32,
             Option<String>,
+            Option<DateTime<Utc>>,
+            Option<Decimal>,
+            Option<String>,
+            Option<Decimal>,
             DateTime<Utc>,
             Option<DateTime<Utc>>,
         ),
-    >(
+    >(&format!(
         r#"
         SELECT name, disabled, spend_cap_usd, velocity_cap_tokens_per_min,
-               default_priority, created_at, last_used_at
+               default_priority, expires_at, credit_limit_usd, credit_limit_window,
+               {CREDIT_LIMIT_USED_SQL} AS credit_limit_used_usd,
+               created_at, last_used_at
         FROM api_keys
         WHERE id = $1 AND user_id = $2
-        "#,
-    )
+        "#
+    ))
     .bind(key_id)
     .bind(user.user_id)
     .fetch_optional(&ctx.pool)
@@ -556,6 +733,10 @@ async fn update_key(
         spend_cap_usd,
         velocity_cap_tokens_per_min,
         default_priority,
+        expires_at,
+        credit_limit_usd,
+        credit_limit_window,
+        credit_limit_used_usd,
         created_at,
         last_used_at,
     ) = row;
@@ -566,6 +747,12 @@ async fn update_key(
         spend_cap_usd,
         velocity_cap_tokens_per_min,
         default_priority: default_priority.as_deref().and_then(Priority::from_keyword),
+        expires_at,
+        credit_limit_usd,
+        credit_limit_window: credit_limit_window
+            .as_deref()
+            .and_then(CreditLimitWindow::from_keyword),
+        credit_limit_used_usd,
         created_at,
         last_used_at,
     }))
@@ -839,6 +1026,7 @@ mod tests {
             spend_cap_usd: Some(Decimal::from(5)),
             velocity_cap_tokens_per_min: Some(1_000),
             default_priority: Some(Priority::Cost),
+            ..CreateKeyRequest::default()
         })
         .expect("a well-formed key request should validate");
         assert_eq!(valid.name, "ci key");
@@ -849,39 +1037,31 @@ mod tests {
         let rejects = [
             CreateKeyRequest {
                 name: "   ".to_owned(),
-                spend_cap_usd: None,
-                velocity_cap_tokens_per_min: None,
-                default_priority: None,
+                ..CreateKeyRequest::default()
             },
             CreateKeyRequest {
                 name: "n".repeat(MAX_KEY_NAME_CHARS + 1),
-                spend_cap_usd: None,
-                velocity_cap_tokens_per_min: None,
-                default_priority: None,
+                ..CreateKeyRequest::default()
             },
             CreateKeyRequest {
                 name: "ok".to_owned(),
                 spend_cap_usd: Some(Decimal::ZERO),
-                velocity_cap_tokens_per_min: None,
-                default_priority: None,
+                ..CreateKeyRequest::default()
             },
             CreateKeyRequest {
                 name: "ok".to_owned(),
                 spend_cap_usd: Some(Decimal::from(MAX_SPEND_CAP_USD) + Decimal::ONE),
-                velocity_cap_tokens_per_min: None,
-                default_priority: None,
+                ..CreateKeyRequest::default()
             },
             CreateKeyRequest {
                 name: "ok".to_owned(),
-                spend_cap_usd: None,
                 velocity_cap_tokens_per_min: Some(0),
-                default_priority: None,
+                ..CreateKeyRequest::default()
             },
             CreateKeyRequest {
                 name: "ok".to_owned(),
-                spend_cap_usd: None,
                 velocity_cap_tokens_per_min: Some(MAX_VELOCITY_CAP_TOKENS_PER_MIN + 1),
-                default_priority: None,
+                ..CreateKeyRequest::default()
             },
         ];
         for request in &rejects {
@@ -889,6 +1069,87 @@ mod tests {
                 validate_new_key(request),
                 Err(PortalError::InvalidRequest(_))
             ));
+        }
+    }
+
+    /// The 0023 mint fields, at the boundaries that decide whether a key can be
+    /// used at all or can spend without limit.
+    #[test]
+    fn new_key_validation_enforces_expiry_and_credit_limit() {
+        let valid = validate_new_key(&CreateKeyRequest {
+            name: "contractor".to_owned(),
+            expires_at: Some(Utc::now() + chrono::Duration::days(7)),
+            credit_limit_usd: Some(Decimal::from(25)),
+            credit_limit_window: Some(CreditLimitWindow::Weekly),
+            ..CreateKeyRequest::default()
+        })
+        .expect("a well-formed limited key should validate");
+        assert!(valid.expires_at.is_some());
+        assert_eq!(valid.credit_limit_usd, Some(Decimal::from(25)));
+        assert_eq!(valid.credit_limit_window, Some(CreditLimitWindow::Weekly));
+
+        // Absent everywhere is the unlimited, never-expiring key every caller
+        // minted before 0023, and it must stay valid.
+        let unlimited = validate_new_key(&CreateKeyRequest {
+            name: "plain".to_owned(),
+            ..CreateKeyRequest::default()
+        })
+        .expect("a key with no expiry and no limit should validate");
+        assert_eq!(unlimited.expires_at, None);
+        assert_eq!(unlimited.credit_limit_usd, None);
+        assert_eq!(unlimited.credit_limit_window, None);
+
+        // A limit with no cadence is the lifetime cap, not an error.
+        let lifetime = validate_new_key(&CreateKeyRequest {
+            name: "lifetime".to_owned(),
+            credit_limit_usd: Some(Decimal::ONE),
+            ..CreateKeyRequest::default()
+        })
+        .expect("a limit with no window is the lifetime cap");
+        assert_eq!(lifetime.credit_limit_usd, Some(Decimal::ONE));
+        assert_eq!(lifetime.credit_limit_window, None);
+
+        let rejects = [
+            // Already lapsed: the key would authenticate nothing.
+            CreateKeyRequest {
+                name: "ok".to_owned(),
+                expires_at: Some(Utc::now() - chrono::Duration::seconds(1)),
+                ..CreateKeyRequest::default()
+            },
+            // Zero is a revocation wearing a budget's clothes.
+            CreateKeyRequest {
+                name: "ok".to_owned(),
+                credit_limit_usd: Some(Decimal::ZERO),
+                ..CreateKeyRequest::default()
+            },
+            CreateKeyRequest {
+                name: "ok".to_owned(),
+                credit_limit_usd: Some(-Decimal::ONE),
+                ..CreateKeyRequest::default()
+            },
+            CreateKeyRequest {
+                name: "ok".to_owned(),
+                credit_limit_usd: Some(Decimal::from(MAX_SPEND_CAP_USD) + Decimal::ONE),
+                ..CreateKeyRequest::default()
+            },
+            // The one that must never be silently dropped: a cadence with no
+            // limit would otherwise mint an UNLIMITED key from a request that
+            // plainly asked for a budget.
+            CreateKeyRequest {
+                name: "ok".to_owned(),
+                credit_limit_window: Some(CreditLimitWindow::Daily),
+                ..CreateKeyRequest::default()
+            },
+        ];
+        for request in &rejects {
+            assert!(
+                matches!(
+                    validate_new_key(request),
+                    Err(PortalError::InvalidRequest(_))
+                ),
+                "request for {:?} should have been refused",
+                request.name
+            );
         }
     }
 }

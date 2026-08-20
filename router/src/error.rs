@@ -26,6 +26,15 @@ pub enum ApiError {
     UnsupportedRequestFields,
     Unauthorized,
     SpendCapExceeded,
+    /// The presenting key has spent the credit limit its owner set on it
+    /// (migration 0023), for the current reset window.
+    ///
+    /// Its own code rather than a reuse of [`Self::SpendCapExceeded`] or
+    /// [`Self::InsufficientCredits`], because the remedy differs and a caller
+    /// acts on the code: this one clears when the key's own window resets, not
+    /// by buying credit (the balance is untouched) and not by asking the
+    /// operator to raise a ceiling (this limit is the customer's own).
+    KeyCreditLimitExceeded,
     InsufficientCredits,
     /// The account is frozen (migration 0009): a Stripe chargeback, or an
     /// operator's hold. Deliberately its own code rather than a reuse of
@@ -144,6 +153,17 @@ impl ApiError {
                 "billing_error",
                 None,
                 "spend_cap_exceeded",
+            ),
+            Self::KeyCreditLimitExceeded => (
+                StatusCode::PAYMENT_REQUIRED,
+                Cow::Borrowed(
+                    "This API key has reached the credit limit set on it. \
+                     The account balance is unaffected; the limit resets on \
+                     the key's own schedule.",
+                ),
+                "billing_error",
+                None,
+                "key_credit_limit_exceeded",
             ),
             Self::InsufficientCredits => (
                 StatusCode::PAYMENT_REQUIRED,

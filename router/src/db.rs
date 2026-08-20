@@ -580,6 +580,67 @@ pub enum UsageAdmission {
     /// [`Self::InsufficientCredits`] on purpose: a frozen account is refused
     /// however much credit it holds, and topping up does not clear it.
     AccountFrozen,
+    /// The presenting key has spent its own `credit_limit_usd` for the current
+    /// [`CreditLimitWindow`] (migration 0023).
+    ///
+    /// Distinct from all three of its neighbours, and each distinction is
+    /// load-bearing for a caller deciding what to do next:
+    ///
+    /// * not [`Self::SpendExceeded`] — that is the operator's ceiling, which
+    ///   the customer cannot raise. This one they set themselves and can raise
+    ///   from the portal.
+    /// * not [`Self::InsufficientCredits`] — the account may hold plenty of
+    ///   credit. Buying more does not clear this, and a client told
+    ///   "insufficient credits" would reasonably try.
+    /// * not [`Self::Unauthorized`] — the key is live and valid. It has a
+    ///   budget and has spent it.
+    KeyCreditLimitExceeded,
+}
+
+/// The calendar cadence at which a key's `credit_limit_usd` allowance resets
+/// (migration 0023).
+///
+/// `None` at every carrier — the column, the wire, and admission's own
+/// `Option<CreditLimitWindow>` — means the limit never resets: a lifetime cap
+/// on the key. That is why this enum has three variants rather than a fourth
+/// `Never`: the absence of a cadence IS the lifetime case, and giving it a
+/// second spelling would let a row say "never" two ways.
+///
+/// Windows are CALENDAR windows in UTC, never rolling ones. A rolling window
+/// cannot be answered from a bucket at all — it is the same property that keeps
+/// the velocity ceiling out of a rollup — and "$20 a day" means the day.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CreditLimitWindow {
+    Daily,
+    Weekly,
+    Monthly,
+}
+
+impl CreditLimitWindow {
+    /// Parse the text a nullable database column carries. The words are exactly
+    /// the enum's serde names and exactly migration 0023's CHECK constraint, so
+    /// a window read from a row and one deserialized from the portal's request
+    /// body can never disagree.
+    #[must_use]
+    pub fn from_keyword(keyword: &str) -> Option<Self> {
+        match keyword {
+            "daily" => Some(Self::Daily),
+            "weekly" => Some(Self::Weekly),
+            "monthly" => Some(Self::Monthly),
+            _ => None,
+        }
+    }
+
+    /// The keyword this window writes wherever it is stored or echoed.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Daily => "daily",
+            Self::Weekly => "weekly",
+            Self::Monthly => "monthly",
+        }
+    }
 }
 
 pub struct UsageSession {
@@ -956,6 +1017,15 @@ pub async fn migrate(pool: &PgPool) -> Result<()> {
                 )),
                 false,
             ),
+            Migration::new(
+                23,
+                Cow::Borrowed("key expiry and credit limits"),
+                MigrationType::Simple,
+                Cow::Borrowed(include_str!(
+                    "../migrations/0023_key_expiry_and_credit_limits.sql"
+                )),
+                false,
+            ),
         ]),
         ignore_missing: false,
         locking: true,
@@ -1117,13 +1187,38 @@ pub async fn begin_usage_session(
     // on makes the lock's scope and the statement's scope provably the same set
     // of rows; a stale [`AuthenticatedKey`] whose cached owner disagrees with
     // the row matches nothing and is rejected.
-    let key_state = sqlx::query_as::<_, (Decimal, i32, Decimal, i32)>(
-        r#"
+    //
+    // # Expiry (migration 0023) is a predicate here, not a check below
+    //
+    // `expires_at` joins `NOT disabled` in the WHERE clause rather than riding
+    // out in RETURNING to be compared in Rust, and that placement is the whole
+    // design:
+    //
+    // - It costs NOTHING. No extra statement, no extra round trip, no extra
+    //   column fetched — one more term in a predicate this statement was
+    //   already evaluating against a row it was already locking. This is the
+    //   hot path; every inference request pays for whatever is added here.
+    // - An expired key falls out of `fetch_optional` as `None`, which is the
+    //   same `None` an absent, someone-else's, or revoked key produces, and
+    //   the arm below answers all four with `Unauthorized`. A caller cannot
+    //   learn from the refusal whether the key never existed, was revoked, or
+    //   merely lapsed — the refusal is not an oracle, and expiry does not make
+    //   it one.
+    // - `NOW()` is transaction-stable, so expiry is evaluated against the same
+    //   instant as every other gate in this transaction rather than against a
+    //   clock that could tick between them.
+    //
+    // `expires_at IS NULL` is "never expires" and is what every key predating
+    // 0023 carries, so the added term is a tautology for all of them.
+    let key_state =
+        sqlx::query_as::<_, (Decimal, i32, Decimal, i32, Option<Decimal>, Option<String>)>(
+            r#"
         UPDATE api_keys AS presenting
         SET last_used_at = NOW()
         WHERE presenting.id = $1
           AND presenting.user_id = $2
           AND NOT presenting.disabled
+          AND (presenting.expires_at IS NULL OR presenting.expires_at > NOW())
         RETURNING
             presenting.spend_cap_usd,
             presenting.velocity_cap_tokens_per_min,
@@ -1136,24 +1231,47 @@ pub async fn begin_usage_session(
                 SELECT MAX(sibling.velocity_cap_tokens_per_min)
                 FROM api_keys AS sibling
                 WHERE sibling.user_id = $2 AND NOT sibling.disabled
-            ), presenting.velocity_cap_tokens_per_min) AS user_velocity_cap
+            ), presenting.velocity_cap_tokens_per_min) AS user_velocity_cap,
+            presenting.credit_limit_usd,
+            presenting.credit_limit_window
         "#,
-    )
-    .bind(key.id)
-    .bind(key.user_id)
-    .fetch_optional(&mut *transaction)
-    .await?;
-    // Absent, owned by someone else, or revoked: one answer for all three, so
-    // admission never becomes an oracle over another user's key ids.
+        )
+        .bind(key.id)
+        .bind(key.user_id)
+        .fetch_optional(&mut *transaction)
+        .await?;
+    // Absent, owned by someone else, revoked, or expired: one answer for all
+    // four, so admission never becomes an oracle over another user's key ids.
     let Some((
         spend_cap_usd,
         velocity_cap_tokens_per_min,
         user_spend_cap_usd,
         user_velocity_cap_tokens_per_min,
+        credit_limit_usd,
+        credit_limit_window,
     )) = key_state
     else {
         transaction.rollback().await?;
         return Ok(UsageAdmission::Unauthorized);
+    };
+    // The column is CHECK-constrained to the three keywords and to being NULL
+    // whenever `credit_limit_usd` is (migration 0023), so an unparseable word
+    // is unreachable through any writer the schema permits. Refuse rather than
+    // silently widen if one appears anyway: a key whose cadence cannot be read
+    // has a limit that cannot be enforced, and admitting it would enforce
+    // nothing at all.
+    let credit_limit_window = match credit_limit_window.as_deref() {
+        None => None,
+        Some(keyword) => match CreditLimitWindow::from_keyword(keyword) {
+            Some(window) => Some(window),
+            None => {
+                transaction.rollback().await?;
+                return Err(sqlx::Error::Protocol(format!(
+                    "api key {} carries an unknown credit_limit_window {keyword:?}",
+                    key.id
+                )));
+            }
+        },
     };
 
     // The freeze gate (migration 0009). It sits HERE — inside the admission
@@ -1335,14 +1453,59 @@ pub async fn begin_usage_session(
     // boundary), so dropping it would have narrowed what the cap enforces.
     // Migration 0019 carries the proof that the two select the same set of
     // events for every possible `ts`.
-    let (user_monthly_spend, user_recent_tokens, monthly_spend, recent_tokens) =
-        sqlx::query_as::<_, (Decimal, i64, Decimal, i64)>(
-            r#"
+    //
+    // # The per-key credit-limit window (migration 0023) reads from here too
+    //
+    // Two more scalar subqueries on the same cross join, so the key's
+    // window-to-date spend arrives in the SAME round trip as everything above
+    // and admission still makes exactly the number of database calls it made
+    // before 0023. Which counter answers depends on the key's cadence:
+    //
+    //   monthly  -> `monthly_spend`, ALREADY SELECTED above for the
+    //               `spend_cap_usd` gate. Free; no subquery reads for it, and
+    //               `$3` is never 'monthly' below.
+    //   daily    -> one PK row of `usage_key_day_spend`.
+    //   weekly   -> at most seven PK rows of the same table.
+    //   none     -> one PK row of `usage_key_total_spend` (the lifetime cap).
+    //
+    // `$3` is NULL whenever the key has no `credit_limit_usd` at all, which is
+    // every key that predates 0023 and every key whose owner never set a
+    // budget. Both subqueries then match nothing — `day >= NULL` and
+    // `NULL = 'lifetime'` are both NULL, hence not true — and cost a probe
+    // apiece against a narrow table rather than a scan.
+    //
+    // # Why `day >=` selects exactly the window
+    //
+    // Buckets are whole UTC days (`usage_event_utc_day` returns DATE, so a
+    // bucket has no sub-day component to straddle a boundary with), and every
+    // window start below is a UTC midnight: today's date for daily, Monday's
+    // date for weekly (`date_trunc('week', ...)` truncates to Monday). So
+    // `day >= <start>` and `ts >= <start>` select the same events, exactly —
+    // there is no partial bucket at either end, and no event settled before a
+    // reset can be counted after it. That is the property 0019 had to prove
+    // about month truncation and that DATE grain makes true by construction.
+    //
+    // The window start is computed from `NOW()` in SQL rather than from the
+    // router's own clock, so it is the same transaction-stable instant every
+    // other gate here is evaluated against; a router whose clock has drifted
+    // cannot shift a customer's window relative to the buckets the trigger
+    // wrote.
+    let (
+        user_monthly_spend,
+        user_recent_tokens,
+        monthly_spend,
+        recent_tokens,
+        window_day_spend,
+        window_total_spend,
+    ) = sqlx::query_as::<_, (Decimal, i64, Decimal, i64, Decimal, Decimal)>(
+        r#"
         SELECT
             COALESCE(spend.user_monthly_spend, 0) AS user_monthly_spend,
             COALESCE(velocity.user_recent_tokens, 0)::BIGINT AS user_recent_tokens,
             COALESCE(spend.monthly_spend, 0) AS monthly_spend,
-            COALESCE(velocity.recent_tokens, 0)::BIGINT AS recent_tokens
+            COALESCE(velocity.recent_tokens, 0)::BIGINT AS recent_tokens,
+            COALESCE(window_day.day_spend, 0) AS window_day_spend,
+            COALESCE(window_total.total_spend, 0) AS window_total_spend
         FROM
             (
                 SELECT
@@ -1382,13 +1545,39 @@ pub async fn begin_usage_session(
                 INNER JOIN api_keys ON api_keys.id = usage_events.api_key_id
                 WHERE api_keys.user_id = $1
                   AND usage_events.ts >= NOW() - INTERVAL '1 minute'
-            ) AS velocity
+            ) AS velocity,
+            (
+                SELECT COALESCE(SUM(usage_key_day_spend.spend_usd), 0) AS day_spend
+                FROM usage_key_day_spend
+                WHERE usage_key_day_spend.api_key_id = $2
+                  AND usage_key_day_spend.day >= CASE $3::TEXT
+                          WHEN 'daily' THEN usage_event_utc_day(NOW())
+                          WHEN 'weekly'
+                              THEN (date_trunc('week', NOW() AT TIME ZONE 'UTC'))::DATE
+                          ELSE NULL
+                      END
+            ) AS window_day,
+            (
+                SELECT COALESCE(SUM(usage_key_total_spend.spend_usd), 0) AS total_spend
+                FROM usage_key_total_spend
+                WHERE usage_key_total_spend.api_key_id = $2
+                  AND $3::TEXT = 'lifetime'
+            ) AS window_total
         "#,
-        )
-        .bind(key.user_id)
-        .bind(key.id)
-        .fetch_one(&mut *transaction)
-        .await?;
+    )
+    .bind(key.user_id)
+    .bind(key.id)
+    .bind(credit_limit_usd.map(|_| match credit_limit_window {
+        None => "lifetime",
+        Some(CreditLimitWindow::Daily) => "daily",
+        Some(CreditLimitWindow::Weekly) => "weekly",
+        // Answered by `monthly_spend`, which this statement already selects
+        // for the operator ceiling. Naming a bucket neither subquery reads
+        // keeps both of them matching nothing.
+        Some(CreditLimitWindow::Monthly) => "monthly",
+    }))
+    .fetch_one(&mut *transaction)
+    .await?;
     // In-flight reservations, same two scopes. Expired rows were deleted above,
     // and the `expires_at > NOW()` predicate is kept so a row that expires
     // between the two statements is not counted.
@@ -1518,6 +1707,63 @@ pub async fn begin_usage_session(
     ) {
         transaction.rollback().await?;
         return Ok(UsageAdmission::SpendExceeded);
+    }
+
+    // The customer's own budget for this key (migration 0023). `None` is
+    // unlimited and is what every key predating 0023 carries, so this whole
+    // gate is skipped for them and their admission is bit-for-bit the pre-0023
+    // one.
+    //
+    // # Why it is checked HERE and not earlier
+    //
+    // After the operator ceilings, deliberately. When both bind, the more
+    // useful answer is the one the customer CANNOT fix: raising their own limit
+    // will not get them past `spend_cap_usd`, so reporting the operator ceiling
+    // first sends them somewhere that helps. It also means the existing gates
+    // keep their exact precedence and no pre-0023 refusal changes its code.
+    //
+    // # The same arithmetic as every other ceiling
+    //
+    // [`spend_within_cap`] with the key's own in-flight encumbrance
+    // (`active_reserved_cost`) on the committed side and the worst-case reserve
+    // for THIS request as the projection — the identical semantics the
+    // `spend_cap_usd` gate above uses, and for the identical reason: what a
+    // request may cost is what it must fit under, because settlement can bill
+    // up to the reservation.
+    //
+    // Two honest consequences, both inherited rather than introduced:
+    //
+    // * A burst can overshoot the limit by the requests already in flight. The
+    //   per-user advisory lock bounds it — request N+1 reads N's reservation on
+    //   the committed side, so the overshoot is the reserved amount rather than
+    //   unbounded — and OpenRouter's own per-key limit behaves the same way.
+    //   The FREE lane takes no lock and creates no reservation, but a free-lane
+    //   request settles at exactly zero by construction, so it moves no counter
+    //   and can overshoot nothing.
+    // * A reservation opened just before a window boundary and still live after
+    //   it is counted against the NEW window even though it will settle into
+    //   the old one. That is the conservative direction — it refuses slightly
+    //   early, never admits past the limit — and correcting it would mean
+    //   holding a reservation's own window start, which the settle path would
+    //   then have to keep true.
+    if let Some(credit_limit_usd) = credit_limit_usd {
+        // Which counter answers is decided here, from the same cadence the
+        // statement above selected the buckets with, so the range read and the
+        // value compared can never come from different windows.
+        let window_spend = match credit_limit_window {
+            None => window_total_spend,
+            Some(CreditLimitWindow::Daily | CreditLimitWindow::Weekly) => window_day_spend,
+            Some(CreditLimitWindow::Monthly) => monthly_spend,
+        };
+        if !spend_within_cap(
+            window_spend,
+            active_reserved_cost,
+            reserved_cost_usd,
+            credit_limit_usd,
+        ) {
+            transaction.rollback().await?;
+            return Ok(UsageAdmission::KeyCreditLimitExceeded);
+        }
     }
 
     if !velocity_within_cap(
