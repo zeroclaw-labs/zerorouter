@@ -8,6 +8,7 @@ use zerorouter::{
     app,
     db::{database_pool_from_env, migrate},
     device, logging, oidc, portal, providers, stripe,
+    user::{self, UserArgs},
     web::{WebConfig, WebCtx, credits_required_from_env},
 };
 
@@ -25,6 +26,8 @@ struct Cli {
 enum Command {
     /// Run database-backed API-key administration commands.
     Admin(AdminArgs),
+    /// Log in and inspect this machine's ZeroRouter account credential.
+    User(UserArgs),
     /// Start the HTTP inference router (the default command).
     Serve,
 }
@@ -42,6 +45,11 @@ async fn main() -> Result<()> {
 
     match Cli::parse().command {
         Some(Command::Admin(args)) => admin::run(args).await,
+        // The user CLI owns its own exit statuses — an agent driving it branches
+        // on whether the failure was "not logged in", an HTTP error, or a
+        // refused device grant, which a single anyhow bail cannot express. It
+        // has already written its own diagnostics, so exit directly.
+        Some(Command::User(args)) => std::process::exit(user::run(args).await),
         Some(Command::Serve) | None => serve().await,
     }
 }

@@ -106,6 +106,21 @@ To use the hosted deployment instead of running your own: sign in at
 any OpenAI-compatible client at `https://zerorouter.ai/v1`. Step by step:
 [`docs/getting-started-hosted.md`](docs/getting-started-hosted.md).
 
+Or get a key without leaving the terminal, using the device-authorization flow:
+
+```bash
+zerorouter user login          # prints a URL and a code; approve in the browser
+zerorouter user whoami
+zerorouter user models
+```
+
+Every command takes `--json` and returns meaningful exit codes, so an agent can
+drive it as well as a person. The credential lands in
+`~/.config/zerorouter/credentials` (mode 600). What that credential can and
+cannot authorize — it is an inference key, not a portal session, so key and
+billing management stay in the portal for now — is spelled out in
+[`docs/USER-CLI.md`](docs/USER-CLI.md).
+
 ### Local models (edge mode)
 
 A self-hosted router can route to models on your own hardware — llama.cpp,
@@ -301,11 +316,11 @@ pnpm dev          # proxies /api, /auth, /webhooks to localhost:8080
 ## Repository layout
 
 ```
-router/            Rust crate: inference plane, web plane, admin CLI, migrations
+router/            Rust crate: inference plane, web plane, admin + user CLI, migrations
   config/tiers.toml  canonical tier catalog + sell rates
 portal/            Vite + React portal SPA
 examples/edge/     docker compose stack for edge mode (docs/edge-quickstart.md)
-docs/              ARCHITECTURE · SECURITY · DEPLOY · ZEROCLAW-INTEGRATION · ROADMAP
+docs/              ARCHITECTURE · SECURITY · DEPLOY · USER-CLI · ZEROCLAW-INTEGRATION · ROADMAP
 Dockerfile         ARM64 image: router binary + built portal SPA
 .github/workflows  ci.yml (fmt/clippy/test with Postgres) · deploy.yml (ECS)
 ```
