@@ -270,9 +270,12 @@ async fn models_are_materialized_from_tiers_toml() {
     // One row per model PIN, keyed by its OpenRouter-standard {vendor}/{model}
     // id. The pre-rename catalog published a `zero/*` alias row AND a concrete
     // candidate row per model (14 rows); each pin now equals its candidate, so
-    // it contributes exactly one row — twelve models, twelve rows (the two
-    // Bedrock zero-retention lanes joined on 2026-08-20).
-    assert_eq!(data.len(), 12);
+    // it contributes exactly one row — fourteen models, fourteen rows (the
+    // four Bedrock classic-runtime zero-retention lanes joined on 2026-08-20;
+    // the two mantle lanes added the same day are commented out in
+    // `tiers.toml` because AWS's per-account Sales gate refuses this account
+    // 5-generation Claude, so they could be listed but never served).
+    assert_eq!(data.len(), 14);
     assert!(data.iter().all(|model| model["object"] == "model"));
 
     let ids = data
@@ -290,8 +293,10 @@ async fn models_are_materialized_from_tiers_toml() {
             "anthropic/claude-haiku-4-5",
             "anthropic/claude-opus-5",
             "anthropic/claude-sonnet-5",
-            "bedrock/claude-opus-5",
-            "bedrock/claude-sonnet-5",
+            "bedrock/claude-haiku-4-5",
+            "bedrock/claude-opus-4-5",
+            "bedrock/claude-opus-4-6",
+            "bedrock/claude-sonnet-4-5",
             "google/gemini-3.1-pro-preview",
             "google/gemini-3.5-flash-lite",
             "google/gemini-3.7-flash",
@@ -624,7 +629,12 @@ async fn every_shipped_lane_publishes_a_retention_posture() {
         .collect();
     assert_eq!(
         zero,
-        ["bedrock/claude-opus-5", "bedrock/claude-sonnet-5"],
+        [
+            "bedrock/claude-haiku-4-5",
+            "bedrock/claude-opus-4-5",
+            "bedrock/claude-opus-4-6",
+            "bedrock/claude-sonnet-4-5"
+        ],
         "no lane may claim zero retention without a confirmed arrangement or an \
          enforced account configuration behind it"
     );
@@ -688,9 +698,9 @@ async fn a_lane_whose_credential_is_absent_is_not_advertised() {
         "an uncredentialed lane must not appear in /v1/models: {ids:?}"
     );
     // And the rest of the catalog is untouched — a missing key removes its own
-    // lanes and nothing else. The count is the shipped twelve minus Bedrock's
-    // two; asserting the survivors by name would just restate the catalog, but
-    // asserting that the ONLY difference is the Bedrock pair is the claim.
+    // lanes and nothing else. The count is the shipped fourteen minus Bedrock's
+    // four; asserting the survivors by name would just restate the catalog,
+    // but asserting that the ONLY difference is the Bedrock lanes is the claim.
     assert_eq!(ids.len(), 10, "{ids:?}");
     assert!(ids.iter().any(|id| id == "anthropic/claude-sonnet-5"));
 }
@@ -749,8 +759,10 @@ async fn bundled_tier_catalog_has_expected_virtual_models() {
             "anthropic/claude-haiku-4-5",
             "anthropic/claude-opus-5",
             "anthropic/claude-sonnet-5",
-            "bedrock/claude-opus-5",
-            "bedrock/claude-sonnet-5",
+            "bedrock/claude-haiku-4-5",
+            "bedrock/claude-opus-4-5",
+            "bedrock/claude-opus-4-6",
+            "bedrock/claude-sonnet-4-5",
             "google/gemini-3.1-pro-preview",
             "google/gemini-3.5-flash-lite",
             "google/gemini-3.7-flash",
@@ -758,14 +770,27 @@ async fn bundled_tier_catalog_has_expected_virtual_models() {
             "openai/gpt-5.6-sol",
             "openai/gpt-5.6-terra",
         ],
-        "the twelve vendor-named model pins (Gemini flash + flash-lite added \
+        "the fourteen vendor-named model pins (Gemini flash + flash-lite added \
          2026-08-18; Gemini Pro joined them once conditional rates could \
-         express the 200,000-token boundary Google prices it at; the two \
-         Bedrock zero-retention lanes on 2026-08-20). Note there is NO \
-         `bedrock/claude-fable-5`: Bedrock publishes `allowed_modes` per model \
-         and fable-class allows only `provider_data_share`, so under this \
-         account's `none` mode AWS reports it unavailable and blocks requests \
-         to it — a lane that could not serve"
+         express the 200,000-token boundary Google prices it at; the four \
+         Bedrock classic-runtime zero-retention lanes on 2026-08-20). \
+         \
+         THE BEDROCK LANES ARE 4.5-GENERATION AND THAT IS NOT A TYPO. The two \
+         5-generation `bedrock/claude-{{opus,sonnet}}-5` tiers were added the \
+         same day against Bedrock's MANTLE plane and are commented out in \
+         `tiers.toml`: AWS gates 5-generation Claude per account behind Sales \
+         and refuses this one, so every call 403s with `not available for this \
+         account`. Credential-presence filtering cannot see an entitlement, so \
+         the catalog file is the only honest place to record it. These four \
+         ride the CLASSIC RUNTIME plane, which hosts 4.5- and 4.6-generation \
+         Claude and nothing else — so when the account is ungated the catalog gains the \
+         5-generation pair ALONGSIDE these rather than replacing them. \
+         \
+         Note there is also NO `bedrock/claude-fable-5`: Bedrock publishes \
+         `allowed_modes` per model and fable-class allows only \
+         `provider_data_share`, so under this account's `none` mode AWS \
+         reports it unavailable and blocks requests to it — a lane that could \
+         not serve"
     );
 
     // One upstream each, and only from the providers ZeroRouter integrates
@@ -781,6 +806,133 @@ async fn bundled_tier_catalog_has_expected_virtual_models() {
         assert!(
             matches!(provider, "openai" | "anthropic" | "google" | "bedrock"),
             "{tier_id} routes to {provider}, which is not in the shipped inventory"
+        );
+    }
+}
+
+/// The shipped Bedrock lanes dispatch on the CLASSIC RUNTIME plane, with the
+/// geographic inference-profile ids that plane requires.
+///
+/// Three claims in one test because they only work together, and each fails as
+/// an opaque AWS error rather than as anything a reader would recognise:
+///
+/// - `surface = "classic_runtime"` selects the InvokeModel wire. Drop it and
+///   these dispatch on the mantle plane's Messages wire instead — which, for
+///   this account, is the plane that 403s.
+/// - The model ids carry a `us.` prefix. They are geographic inference profiles;
+///   the bare and dated forms are documented In-Region N/A on this plane and are
+///   refused. Strip the prefix and every request fails.
+/// - The ids are 4.5-generation. The classic runtime plane is the only plane
+///   that hosts them, and it does not host the 5-generation models — so these
+///   are not a downgrade waiting to be "fixed" upward, they are the models this
+///   plane serves.
+#[tokio::test]
+async fn the_bedrock_lanes_dispatch_the_runtime_plane_with_geographic_profiles() {
+    let catalog = load_tier_catalog(&tier_config_path())
+        .await
+        .expect("bundled tier catalog should load");
+
+    let bedrock: Vec<(&str, &str, Option<&str>)> = catalog
+        .tiers
+        .values()
+        .flat_map(|tier| &tier.candidates)
+        .filter(|candidate| candidate.provider == "bedrock")
+        .map(|candidate| {
+            (
+                candidate.id.as_str(),
+                candidate.model.as_str(),
+                candidate.surface.as_deref(),
+            )
+        })
+        .collect();
+
+    assert_eq!(
+        bedrock,
+        [
+            (
+                "bedrock/claude-haiku-4-5",
+                "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+                Some("classic_runtime")
+            ),
+            (
+                "bedrock/claude-opus-4-5",
+                "us.anthropic.claude-opus-4-5-20251101-v1:0",
+                Some("classic_runtime")
+            ),
+            // The one undated profile id, and deliberately so — see the note
+            // in `tiers.toml`. AWS publishes no dated `us.` profile for opus
+            // 4.6, so the shape genuinely differs from its siblings and must
+            // not be "regularised" into a dated one.
+            (
+                "bedrock/claude-opus-4-6",
+                "us.anthropic.claude-opus-4-6-v1",
+                Some("classic_runtime")
+            ),
+            (
+                "bedrock/claude-sonnet-4-5",
+                "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+                Some("classic_runtime")
+            ),
+        ],
+        "every shipped Bedrock candidate must ride the classic runtime plane with a \
+         `us.`-prefixed geographic inference profile id"
+    );
+}
+
+/// The Bedrock lanes' prices are exactly 1.10x their first-party twins.
+///
+/// The cheapest available check on the one number in this catalog with no
+/// automated source. AWS's cross-region-inference doc prices geographic profiles
+/// at the standard class and global at "approximately 10% savings"; Anthropic's
+/// Bedrock page states the same premium from the other side. So every rate on
+/// these lanes should be exactly 1.10x Anthropic's first-party rate for the same
+/// weights — and it is, on all six dimensions of the two models this catalog
+/// also pins first-party.
+///
+/// This is a consistency check, not a source: it would not catch AWS repricing
+/// both classes together. What it does catch is the likely edit — someone
+/// "correcting" a Bedrock rate down to its first-party figure, which would sell
+/// the lane below cost on every token, and which `catalog-drift` cannot see
+/// because Bedrock is exempted from reconciliation.
+#[tokio::test]
+async fn every_bedrock_rate_is_exactly_the_documented_premium_over_first_party() {
+    let catalog = load_tier_catalog(&tier_config_path())
+        .await
+        .expect("bundled tier catalog should load");
+
+    // Only haiku 4.5 has a first-party twin in this catalog today; opus 4.5 and
+    // sonnet 4.5 are Bedrock-only here, so their premium is checked against the
+    // published first-party list rates instead, transcribed from models.dev on
+    // 2026-08-20 alongside the Price List read.
+    let first_party: [(&str, f64, f64, f64); 4] = [
+        ("bedrock/claude-opus-4-6", 5.00, 0.50, 25.00),
+        ("bedrock/claude-opus-4-5", 5.00, 0.50, 25.00),
+        ("bedrock/claude-sonnet-4-5", 3.00, 0.30, 15.00),
+        ("bedrock/claude-haiku-4-5", 1.00, 0.10, 5.00),
+    ];
+
+    for (tier_id, input, cached, output) in first_party {
+        let rates = catalog.tiers[tier_id].rates.base();
+        for (dimension, published, actual) in [
+            ("input", input, rates.input_per_mtok),
+            ("cached input", cached, rates.cached_input_per_mtok),
+            ("output", output, rates.output_per_mtok),
+        ] {
+            let actual = actual.unwrap_or_else(|| panic!("{tier_id} prices {dimension}"));
+            let expected = published * 1.10;
+            assert!(
+                (actual - expected).abs() < 1e-9,
+                "{tier_id} {dimension} is {actual}, but a geographic inference profile bills the \
+                 standard class — 1.10x the first-party {published}, i.e. {expected}. If AWS \
+                 genuinely moved this rate, re-read the Price List SKU table before changing it; \
+                 a figure that is no longer 1.10x its twin usually means the GLOBAL SKU was read \
+                 by mistake, which sells this lane below cost."
+            );
+        }
+        // Basis == sell on every dimension, which is what makes it pass-through.
+        assert_eq!(
+            catalog.tiers[tier_id].candidates[0].rates, catalog.tiers[tier_id].rates,
+            "{tier_id} must sell at cost"
         );
     }
 }
@@ -1080,8 +1232,10 @@ async fn a_basis_hike_above_sell_withholds_that_tier_and_nothing_else() {
             "anthropic/claude-opus-5",
             // The Bedrock lanes are untouched by a first-party Anthropic
             // repricing: different account, different rate card, own pins.
-            "bedrock/claude-opus-5",
-            "bedrock/claude-sonnet-5",
+            "bedrock/claude-haiku-4-5",
+            "bedrock/claude-opus-4-5",
+            "bedrock/claude-opus-4-6",
+            "bedrock/claude-sonnet-4-5",
             "google/gemini-3.1-pro-preview",
             "google/gemini-3.5-flash-lite",
             "google/gemini-3.7-flash",
@@ -1127,14 +1281,14 @@ async fn a_basis_hike_above_sell_withholds_that_tier_and_nothing_else() {
     assert_eq!(sell.input_per_mtok, Some(2.00));
     assert_eq!(sell.output_per_mtok, Some(10.00));
 
-    // And the public catalog stops advertising what it cannot serve: the eleven
-    // surviving pins, one row each. `bedrock/claude-sonnet-5` is among the
-    // survivors and that is the point of naming it — the two lanes serve the
-    // same weights on different accounts, so a repricing of the first-party
-    // one withholds only the first-party one.
+    // And the public catalog stops advertising what it cannot serve: the twelve
+    // surviving pins, one row each. A Bedrock lane is among the survivors and
+    // that is the point of naming one — Bedrock lanes are a different account
+    // with their own rate card, so a repricing of a first-party Anthropic lane
+    // withholds only that first-party lane.
     let listed = listed_model_ids(RouterState::fully_credentialed(path)).await;
-    assert_eq!(listed.len(), 11);
-    assert!(listed.iter().any(|id| id == "bedrock/claude-sonnet-5"));
+    assert_eq!(listed.len(), 13);
+    assert!(listed.iter().any(|id| id == "bedrock/claude-sonnet-4-5"));
     assert!(listed.iter().any(|id| id == "openai/gpt-5.6-luna"));
     assert!(listed.iter().any(|id| id == "anthropic/claude-haiku-4-5"));
 
@@ -1159,7 +1313,7 @@ async fn the_shipped_catalog_withholds_no_tier_today() {
         "the shipped catalog withholds {:?}",
         catalog.unavailable.keys().collect::<Vec<_>>()
     );
-    assert_eq!(catalog.tiers.len(), 12);
+    assert_eq!(catalog.tiers.len(), 14);
 }
 
 /// Every conditional rate the shipped catalog declares, transcribed from
@@ -1241,7 +1395,7 @@ async fn every_shipped_conditional_rate_is_the_one_the_vendor_publishes() {
 // rungs across >=2 providers). Every tier is pass-through until a second
 // provider serves a model class again.
 const ROUTED_TIERS: [&str; 0] = [];
-const PASS_THROUGH_TIERS: [&str; 12] = [
+const PASS_THROUGH_TIERS: [&str; 14] = [
     // Model pins, keyed by their OpenRouter-standard {vendor}/{model} ids.
     "openai/gpt-5.6-luna",
     "anthropic/claude-haiku-4-5",
@@ -1253,16 +1407,19 @@ const PASS_THROUGH_TIERS: [&str; 12] = [
     "google/gemini-3.7-flash",
     "google/gemini-3.5-flash-lite",
     "google/gemini-3.1-pro-preview",
-    // The Bedrock zero-retention lanes (2026-08-20). Pass-through like every
-    // other pin, and note what that means here: they cost 10% MORE than the
-    // `anthropic/*` lanes serving the same weights, because the mantle
-    // endpoint is in-region only and AWS meters in-region traffic at a 10%
-    // premium over the global inference profile. Selling that through at cost
+    // The Bedrock classic-runtime zero-retention lanes (2026-08-20).
+    // Pass-through like every other pin, and note what that means here: each
+    // costs exactly 10% MORE than the first-party Anthropic rate for the same
+    // weights, because these dispatch `us.`-prefixed GEOGRAPHIC inference
+    // profiles and AWS prices geographic cross-region inference at the standard
+    // class while the global class takes ~10% off. Selling that through at cost
     // is the promise; the assertion below (candidate rates == tier rates) is
     // what holds it, and it would equally catch someone "fixing" these down to
-    // 2.00/10.00 on the sell side only.
-    "bedrock/claude-sonnet-5",
-    "bedrock/claude-opus-5",
+    // the first-party figures on the sell side only.
+    "bedrock/claude-opus-4-6",
+    "bedrock/claude-opus-4-5",
+    "bedrock/claude-sonnet-4-5",
+    "bedrock/claude-haiku-4-5",
 ];
 
 #[tokio::test]

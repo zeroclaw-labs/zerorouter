@@ -44,22 +44,25 @@ defines it:
   key is absent is simply not a candidate — set only what the catalog actually
   routes to.
 - **`BEDROCK_REGION`** — plain env, not a secret; a region is not a credential.
-  It is **required whenever `BEDROCK_API_KEY` is set**, because the Bedrock
-  endpoint carries the region in its hostname
-  (`bedrock-mantle.{region}.api.aws`). Unset, the Bedrock rungs drop out of
-  every route exactly as a missing key would, and the rest of the catalog keeps
-  serving; `/v1/models` still lists them, as it does for any credential-less
-  lane. No region is defaulted on purpose: `us-east-1` is the plausible guess
-  that would silently route an eu-west-1 deployment's prompts to Virginia.
+  It is **required whenever `BEDROCK_API_KEY` is set**, because BOTH Bedrock
+  endpoints carry the region in their hostname
+  (`bedrock-mantle.{region}.api.aws` and
+  `bedrock-runtime.{region}.amazonaws.com`). Unset, the Bedrock rungs drop out
+  of every route exactly as a missing key would, they disappear from
+  `/v1/models` by the same filter, and the rest of the catalog keeps serving.
+  No region is defaulted on purpose: `us-east-1` is the plausible guess that
+  would silently route an eu-west-1 deployment's prompts to Virginia.
 
-  **Not every region serves every model.** The mantle endpoint exists in a
-  subset of regions, and in-region Claude availability is narrower still —
-  `anthropic.claude-sonnet-5` in-region is us-east-1, eu-west-1, and
-  eu-north-1 (plus us-gov-west-1, priced 1.2x rather than 1.1x). Pointing
-  `BEDROCK_REGION` at a mantle region that does not serve the model — us-west-2,
-  say — produces failing calls rather than a fallback, because mantle is
-  in-region only and cannot reach a cross-region inference profile. Beta runs
-  us-east-1.
+  **Not every region serves every model, and the two planes differ.** The
+  mantle endpoint exists in a subset of regions and is in-region only, so it
+  cannot reach a cross-region inference profile: `anthropic.claude-sonnet-5`
+  in-region is us-east-1, eu-west-1, and eu-north-1 (plus us-gov-west-1, priced
+  1.2x rather than 1.1x). The classic runtime plane the shipped lanes actually
+  dispatch on is broader, because those lanes name `us.`-prefixed GEOGRAPHIC
+  inference profiles, which route within the US geography rather than pinning
+  one region — but `BEDROCK_REGION` still selects the source region the call is
+  made from and priced in, so it must be a US region for a `us.` profile. Beta
+  runs us-east-1.
 - **Platform**: ARM64 on Fargate; the workflow builds `linux/arm64` only.
 
 The deploy workflow re-registers the task-definition family's latest ACTIVE
@@ -458,11 +461,16 @@ The labels are pinned in `router/config/tiers.toml` under `[retention.<provider>
 and are never written by any tool — the same rule prices follow, for a sharper
 reason: a retention label is a claim to a customer about their own data.
 
-**Today two lanes are `zero` and the rest are `standard`.** `anthropic`,
-`openai`, and `google` are ordinary API accounts. `bedrock` — the two
+**Today four lanes are `zero` and the rest are `standard`.** `anthropic`,
+`openai`, and `google` are ordinary API accounts. `bedrock` — the four
 `bedrock/claude-*` lanes, added 2026-08-20 — is the first zero-retention
 upstream, and it got there by configuration rather than by contract. The section
 below on enforced configuration is why that counts.
+
+The posture is pinned per PROVIDER, and that is what lets one `[retention.bedrock]`
+block cover both of Bedrock's API planes (see the next section):
+`data_retention_mode` is a property of the AWS account, not of a model or an
+endpoint, so one setting governs every request made on that key.
 
 ### The rule for `posture = "zero"`
 
@@ -622,29 +630,130 @@ Raise `standard` first. A lane labelled `standard` that is really zero costs
 nothing but a missed selling point; a lane labelled `zero` that is really
 standard is the failure this whole mechanism exists to prevent.
 
+## Bedrock has two API planes, and only one of them currently answers
+
+The `bedrock` provider entry in `router/config/providers.json` declares two
+endpoints for one AWS account, because AWS exposes Claude on two unrelated APIs
+and they host **different model generations**:
+
+| Plane | Endpoint | API | Hosts | Status on this account |
+| --- | --- | --- | --- | --- |
+| Mantle | `bedrock-mantle.{region}.api.aws/anthropic/v1/messages` | Anthropic Messages, verbatim | 5-generation Claude | **Refused.** Every model 403s `not available for this account` |
+| Classic runtime (`surfaces.classic_runtime`) | `bedrock-runtime.{region}.amazonaws.com` | AWS `InvokeModel` | 4.5- and 4.6-generation Claude | **Live.** Serves all four shipped lanes |
+
+### Where the account gate actually cuts
+
+The gate is **not** "the mantle plane" and **not** "the new API" — it is a
+per-model-generation entitlement on the AWS account, and on this account it cuts
+between 4.6 and 4.7. Probed model by model on 2026-08-20, on the classic runtime
+plane, with the same bearer credential:
+
+| Model | Result |
+| --- | --- |
+| `us.anthropic.claude-opus-4-5-20251101-v1:0` | 200 |
+| `us.anthropic.claude-sonnet-4-5-20250929-v1:0` | 200 |
+| `us.anthropic.claude-haiku-4-5-20251001-v1:0` | 200 |
+| `us.anthropic.claude-opus-4-6-v1` | 200 |
+| opus 4.7, opus 4.8 | 403 `not available for this account` |
+| every 5-generation model | 403 `not available for this account` |
+
+The 403 arrives before IAM, region, or retention mode matter — a valid key on a
+correctly configured account still gets it. **Do not add a lane above that line
+without probing it first**: the id shapes are guessable, so a plausible-looking
+`us.anthropic.claude-opus-4-7-v1` will pass every check this repo has and 403 on
+every customer request. When Sales grants the account more generations, re-probe
+and move the line.
+
+Note also that the profile id shapes are not uniform: the 4.5-generation
+profiles carry a date and a `-v1:0` suffix, while opus 4.6 is plain
+`us.anthropic.claude-opus-4-6-v1`. Both are what AWS publishes; neither should
+be "regularised" into the other.
+
+Both planes read the same `BEDROCK_API_KEY` and the same `BEDROCK_REGION`, so a
+deployment either reaches both or neither — which is why `/v1/models` and route
+construction still share one dispatchability answer (see `ProviderMetadata::dispatchable`).
+
+**The mantle lanes are commented out in `router/config/tiers.toml`, not
+deleted.** AWS gates 5-generation Claude per account behind a Sales conversation,
+entirely separately from IAM: the credential is valid, the region is right,
+`data_retention_mode` reads `none`, IAM grants invoke — and the request is still
+refused. Nothing in the environment records an entitlement, so the credential
+filter that keeps unservable lanes off the storefront (#89) cannot see it, and
+would happily publish two flagship lanes that 403 on every call. The catalog file
+is the only honest place to encode it.
+
+**To re-enable them:** AWS Sales grants account `161457899654` access to
+5-generation Claude on Bedrock; verify with a real invocation rather than a
+console page; then uncomment the block in `tiers.toml` and re-check its prices.
+Nothing else needs changing — the retention pin, the provider entry, and the
+reconciliation exemption all stay in place while the lanes are dark.
+
+**The runtime lanes are NOT temporary and do not retire when that happens.**
+They were reached for because the mantle plane was gated, but they are not a
+stand-in for it: the mantle plane does not host 4.5- or 4.6-generation Claude at
+all. So ungating the account gives the catalog six Bedrock lanes rather than
+replacing four with two, and a customer picks a model generation rather than an
+API plane. Deleting the runtime lanes later would remove four models nothing else
+serves.
+
+One honest gap in the retention verification while this is the shape:
+`admin retention-drift --bedrock-live` reads the **mantle** control plane's
+`/v1/data_retention`, while traffic goes to the **runtime** plane. That is still
+a valid check — `data_retention_mode` is an account-level setting, so the value
+that endpoint reports is the value governing every request on the key — but the
+check and the traffic do go through different hosts, and it is worth knowing that
+if the mantle plane ever becomes unreachable for reasons beyond the model gate.
+The classic control plane exposes the same setting at
+`bedrock.{region}.amazonaws.com/data-retention` (hyphen, not underscore) as a
+fallback read.
+
 ## Bedrock: confirm the billing SKU after the first real request
 
-The two `bedrock/claude-*` lanes are pinned at AWS's **in-region** rates —
-Sonnet 5 at 2.20/0.22/11.00 and Opus 5 at 5.50/0.55/27.50 per MTok, 10% above
-the `anthropic/*` lanes serving the same weights. That premium is correct and
-priced straight through: the mantle endpoint is in-region only, and AWS charges
-in-region traffic 10% more than a global cross-region inference profile. Do not
-"correct" it downward — that sells the lane below what AWS invoices, on every
-token.
+The four `bedrock/claude-*` lanes are pinned at AWS's **regional** rates —
+Opus 4.6 and Opus 4.5 both at 5.50/0.55/27.50, Sonnet 4.5 at 3.30/0.33/16.50, and
+Haiku 4.5 at 1.10/0.11/5.50 per MTok. Each is exactly 10% above Anthropic's
+first-party rate
+for the same weights. That premium is correct and priced straight through: these
+lanes dispatch `us.`-prefixed **geographic** inference profiles, and AWS prices
+geographic cross-region inference at the standard class while the global class
+takes ~10% off ("Cost: Standard pricing" versus "approximately 10% savings", in
+AWS's own cross-region-inference comparison). Do not "correct" them downward —
+that sells the lane below what AWS invoices, on every token. Reaching the cheaper
+class would mean dispatching `global.`-prefixed ids, which is a different routing
+and data-residency decision, not a price fix.
+
+Read the rates from the AWS Price List API, offer `AmazonBedrockFoundationModels`
+(the older `AmazonBedrock` offer carries no Claude models at all). **The usagetype
+naming differs by model generation and neither form is guessable from the other:**
+
+| Generation | Regional (what we bill at) | Global |
+| --- | --- | --- |
+| 4.5 | `USE1-MP:USE1_InputTokenCount-Units` | `USE1-MP:USE1_InputTokenCount_Global-Units` |
+| 5 | `USE1_input_tokens_standard-Units` | `USE1_input_tokens_global_standard-Units` |
+
+On 4.5-generation SKUs the priceDimension descriptions end "Regional" and
+"Global" respectively; take the non-global member of the pair in both schemes.
 
 **One step of that reasoning is an inference and should be closed empirically.**
-AWS publishes exactly two on-demand SKU classes per model — `_standard` and
-`_global_standard` — but no sentence states which one a mantle call meters
-against. It is forced by elimination (mantle cannot use a global inference
-profile), and the invoice is what settles it. After the first real Bedrock
-request, open the Cost and Usage Report and read the line item:
+AWS documents the price *level* of each profile kind but never maps a profile
+prefix to a Price List `usagetype`, and its Cost and Usage Report page uses a
+third naming scheme again with no distinct geographic entry. "A `us.` call bills
+the unqualified SKU" is forced by elimination, and the invoice settles it. After
+the first real Bedrock request, open the Cost and Usage Report and read the line
+item's routing column:
 
-- `usagetype` ending `_input_tokens_standard-Units` — as pinned, nothing to do.
-- `usagetype` ending `_input_tokens_global_standard-Units` — the pins are 10%
-  **high**, and the lane is selling above cost. Correct both basis and sell.
+- **In-region** — as pinned, nothing to do.
+- **Cross-region-global** — the pins are 10% **high** and the lane is selling
+  above cost. Correct both basis and sell.
 
-These two tiers are also the only ones `admin catalog-drift` does not reconcile,
-so nothing in CI will catch an AWS price move on them. The exemption, its
+A cheap desk check in the meantime: every pinned rate should be exactly 1.10x
+Anthropic's first-party rate for the same model.
+`every_bedrock_rate_is_exactly_the_documented_premium_over_first_party` in
+`router/tests/http.rs` asserts that, so an accidental edit toward the global
+figures fails `cargo test` rather than surfacing on an invoice.
+
+These tiers are also the only ones `admin catalog-drift` does not reconcile, so
+nothing in CI will catch an AWS price move on them. The exemption, its
 reasoning, and the re-verification command are declared in
 `router/config/providers.json` under `unreconcilable_reason`, and printed on
 every drift run. Re-read it by hand when AWS changes anything:

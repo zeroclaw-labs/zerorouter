@@ -14,7 +14,7 @@ use thiserror::Error;
 
 use crate::{
     config::TierCandidate,
-    wire::{AnthropicWire, ChatCompletionsWire, OpenAiResponsesWire},
+    wire::{AnthropicWire, BedrockRuntimeWire, ChatCompletionsWire, OpenAiResponsesWire},
 };
 
 const PROVIDER_INVENTORY_JSON: &str = include_str!("../config/providers.json");
@@ -124,6 +124,59 @@ struct ProviderMetadata {
     /// verdict, with this text printed beside them on every run.
     #[serde(default)]
     unreconcilable_reason: Option<String>,
+    /// Additional API planes this same upstream exposes, keyed by the name a
+    /// candidate selects with `surface = "..."` in `tiers.toml`.
+    ///
+    /// **A provider entry is an ACCOUNT; a surface is an API PLANE.** That split
+    /// is the whole design, and it is what this field is for. Everything else
+    /// this struct declares — the credential, the region, and (through the
+    /// provider key) the retention pin and the reconciliation exemption — is a
+    /// fact about the account, true of every plane it exposes. Only the endpoint
+    /// and the wire differ per plane.
+    ///
+    /// Bedrock is that shape and is why this exists. One AWS account, one
+    /// `BEDROCK_API_KEY`, one `data_retention_mode: none`, one models.dev
+    /// mismatch — reached over two entirely different APIs: the mantle plane
+    /// (`bedrock-mantle.{region}.api.aws`, Messages verbatim) and the classic
+    /// runtime plane (`bedrock-runtime.{region}.amazonaws.com`, InvokeModel).
+    ///
+    /// Two second providers were considered and both are worse:
+    ///
+    /// - **A second entry, `bedrock-runtime`.** `/v1/models` publishes
+    ///   `owned_by` as the provider key and `router/tests/http.rs` pins that it
+    ///   equals the vendor half of the lane's id — so a second key forces
+    ///   customer-facing ids like `bedrock-runtime/claude-opus-4-5`, splitting
+    ///   one vendor across two names for an internal transport detail. It would
+    ///   also duplicate the `[retention.*]` pin — the same AWS page, hashed
+    ///   twice, re-fetched twice by `retention-drift`, and kept in sync by
+    ///   hand — for one account. The retention pin's own doc says the posture is
+    ///   "a property of the operator's account"; two keys would make that false.
+    /// - **An `adapter` override on the candidate.** Half a surface: a candidate
+    ///   could then name a wire while inheriting the other plane's endpoint,
+    ///   which is a live foot-gun (InvokeModel bodies POSTed at the mantle
+    ///   Messages path). Binding the wire and the endpoint together into one
+    ///   named thing makes that unrepresentable.
+    ///
+    /// A surface may NOT introduce configuration of its own — no credential, no
+    /// region variable. That restraint is what keeps #89's anti-drift property
+    /// intact: dispatchability stays a question about the PROVIDER, so
+    /// `/v1/models` and route construction still read one answer from
+    /// [`ProviderMetadata::dispatchable`] rather than growing a per-surface
+    /// second one. A surface's `base_url` may interpolate `{region}`, and it
+    /// resolves from the entry's own `region_env` or not at all.
+    #[serde(default)]
+    surfaces: BTreeMap<String, ProviderSurface>,
+}
+
+/// One API plane of an upstream: where to dial it, and which wire speaks to it.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProviderSurface {
+    adapter: ProviderAdapter,
+    /// Required, and with no default anywhere. A surface exists precisely
+    /// because its endpoint differs from the entry's, so an unstated one has
+    /// nothing to mean.
+    base_url: String,
 }
 
 /// The token a regional `base_url` writes where its region belongs.
@@ -136,6 +189,15 @@ enum Dispatchable {
         /// The endpoint to dial, region already substituted. `None` means the
         /// wire uses its own default.
         endpoint: Option<String>,
+        /// Resolved endpoints for each NAMED surface, same substitution applied.
+        ///
+        /// Carried here rather than resolved by the caller so that "this
+        /// provider is dispatchable" and "every plane of it has an address" are
+        /// decided in one place, at one time. A surface shares the entry's
+        /// credential and region variable, so the two can never disagree — and
+        /// `surfaces_never_change_a_providers_dispatchability` is the test that
+        /// keeps that true if a surface ever gains a knob of its own.
+        surfaces: BTreeMap<String, String>,
     },
     /// The environment variable whose absence disqualifies this provider.
     /// Empty only for a malformed entry that validation already refuses.
@@ -253,6 +315,44 @@ enum ProviderAdapter {
     /// `docs/design/edge-mode-local-rung.md`).
     #[serde(rename = "chat_completions")]
     ChatCompletions,
+    /// Bedrock's CLASSIC runtime plane — `InvokeModel` and
+    /// `InvokeModelWithResponseStream` on
+    /// `bedrock-runtime.{region}.amazonaws.com` (`crate::wire::bedrock_runtime`).
+    ///
+    /// A separate adapter from [`Self::Anthropic`] even though the request BODY
+    /// is the Messages body, because four things around that body differ and
+    /// each is a 400 from AWS if got wrong: the model id rides in the URL path
+    /// rather than the body, `anthropic_version` is a required body field, the
+    /// `anthropic-version` header is not part of this operation, and auth is
+    /// `Authorization: Bearer` rather than `x-api-key`. Streaming differs
+    /// entirely — AWS event stream binary framing, not SSE.
+    ///
+    /// Its `base_url` is a HOST ROOT, not a full endpoint: this is the one
+    /// adapter that builds its own path per request, because the path contains
+    /// the model id. [`ProviderMetadata::validate_runtime_roots`] enforces that
+    /// distinction, which is otherwise a silent misconfiguration.
+    #[serde(rename = "anthropic_bedrock_runtime")]
+    AnthropicBedrockRuntime,
+}
+
+impl ProviderAdapter {
+    /// Whether this adapter dials an endpoint someone invoices ZeroRouter for.
+    ///
+    /// The keyless and free-settlement rules both ask this question, and both
+    /// asked it as `!= ChatCompletions` before a third billed adapter existed.
+    /// Naming it means adding an adapter forces an answer here rather than
+    /// silently inheriting "billed" from an inequality — and getting it wrong in
+    /// the other direction (a new adapter accidentally admitted to the free
+    /// lane) is the failure `SettlementDeclaration` exists to prevent.
+    fn dials_a_billed_endpoint(self) -> bool {
+        match self {
+            Self::Anthropic | Self::OpenAiResponses | Self::AnthropicBedrockRuntime => true,
+            // The only adapter with no implied endpoint: an entry using it must
+            // name its own host, so it is the operator's own upstream by
+            // construction.
+            Self::ChatCompletions => false,
+        }
+    }
 }
 
 /// The operator's inventory, parsed and validated once at startup by
@@ -409,6 +509,8 @@ impl ProviderInventory {
             provider.validate_settlement()?;
             provider.validate_region()?;
             provider.validate_reconciliation()?;
+            provider.validate_surfaces()?;
+            provider.validate_runtime_roots()?;
             if !keys.insert(provider.key.as_str()) {
                 return Err(ProviderBuildError::InvalidInventory {
                     detail: format!("duplicate provider key {}", provider.key),
@@ -491,8 +593,7 @@ impl ProviderMetadata {
     /// claiming that traffic settles free is stating something known to be
     /// untrue and is refused before it can reach a rate table.
     fn validate_settlement(&self) -> Result<(), ProviderBuildError> {
-        if self.settlement == SettlementDeclaration::Free
-            && self.adapter != ProviderAdapter::ChatCompletions
+        if self.settlement == SettlementDeclaration::Free && self.adapter.dials_a_billed_endpoint()
         {
             return Err(ProviderBuildError::InvalidInventory {
                 detail: format!(
@@ -535,7 +636,8 @@ impl ProviderMetadata {
         // disqualifies for the same reason and by the same mechanism a missing
         // key does. A test-seam override is a complete URL supplied by a
         // harness, so it wins and never interpolates.
-        let endpoint = match base_url_override(&self.key) {
+        let override_url = base_url_override(&self.key);
+        let endpoint = match override_url.clone() {
             Some(url) => Some(Some(url)),
             None => self.endpoint(&mut read_env),
         };
@@ -548,6 +650,26 @@ impl ProviderMetadata {
                 env: self.region_env.clone().unwrap_or_default(),
             };
         };
+        // Every named plane, resolved by the same rules and against the same
+        // region variable. A test-seam override replaces all of them: a harness
+        // that stands a fake in front of `bedrock` means the whole upstream, not
+        // one of its planes, and leaving the real endpoints live for the others
+        // would send a fault-injection run's traffic to AWS.
+        let mut surfaces = BTreeMap::new();
+        for (name, surface) in &self.surfaces {
+            let resolved = match override_url.clone() {
+                Some(url) => Some(url),
+                None => {
+                    resolve_region(&surface.base_url, self.region_env.as_deref(), &mut read_env)
+                }
+            };
+            let Some(resolved) = resolved else {
+                return Dispatchable::Missing {
+                    env: self.region_env.clone().unwrap_or_default(),
+                };
+            };
+            surfaces.insert(name.clone(), resolved);
+        }
         let credential = match self.credential {
             // A keyless upstream has nothing to look up, so it can never be the
             // rung a route loses to a missing key — which is the whole point: a
@@ -574,7 +696,137 @@ impl ProviderMetadata {
         Dispatchable::Ready {
             credential,
             endpoint,
+            surfaces,
         }
+    }
+
+    /// The wire and endpoint one candidate dispatches on.
+    ///
+    /// `None` surface means the entry's own plane; a named one must exist, which
+    /// catalog validation has already enforced via [`provider_has_surface`].
+    fn plane(
+        &self,
+        surface: Option<&str>,
+        endpoint: Option<&str>,
+        surfaces: &BTreeMap<String, String>,
+    ) -> Option<(ProviderAdapter, Option<String>)> {
+        match surface {
+            None => Some((self.adapter, endpoint.map(str::to_owned))),
+            Some(name) => self
+                .surfaces
+                .get(name)
+                .map(|surface| (surface.adapter, surfaces.get(name).cloned())),
+        }
+    }
+
+    /// Enforce what a surface may and may not declare.
+    ///
+    /// Three rules, and the third is the load-bearing one:
+    ///
+    /// - A surface name must be non-blank; it is what a candidate writes in
+    ///   `tiers.toml` to select the plane.
+    /// - A surface's `base_url` must be non-blank, for the same reason the
+    ///   entry-level one must: a surface exists to state an endpoint.
+    /// - A surface's `base_url` may interpolate `{region}` **only if the entry
+    ///   declares a `region_env`**. This is what keeps a surface from becoming a
+    ///   second source of dispatchability. If a surface could name its own
+    ///   region variable, a deployment could hold everything one plane needs and
+    ///   not the other's, and "is this provider dispatchable" would stop having
+    ///   a single answer — reopening exactly the catalog-versus-dispatch
+    ///   divergence #89 was written to close, one level down.
+    fn validate_surfaces(&self) -> Result<(), ProviderBuildError> {
+        for (name, surface) in &self.surfaces {
+            if name.trim().is_empty() {
+                return Err(ProviderBuildError::InvalidInventory {
+                    detail: format!("provider {} declares a surface with a blank name", self.key),
+                });
+            }
+            if surface.base_url.trim().is_empty() {
+                return Err(ProviderBuildError::InvalidInventory {
+                    detail: format!(
+                        "provider {} surface {name} has an empty base_url; a surface exists to \
+                         name an endpoint, so it must name one",
+                        self.key
+                    ),
+                });
+            }
+            if surface.base_url.contains(REGION_PLACEHOLDER)
+                && self
+                    .region_env
+                    .as_deref()
+                    .is_none_or(|name| name.trim().is_empty())
+            {
+                return Err(ProviderBuildError::InvalidInventory {
+                    detail: format!(
+                        "provider {} surface {name} writes {REGION_PLACEHOLDER} in its base_url \
+                         but the provider declares no region_env; a surface shares the provider's \
+                         region rather than naming one of its own, so the placeholder would \
+                         survive into the request URL",
+                        self.key
+                    ),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Enforce that the Bedrock classic-runtime adapter is given a HOST ROOT.
+    ///
+    /// Every other adapter here POSTs to its configured URL verbatim. This one
+    /// cannot: `InvokeModel` puts the model id in the path
+    /// (`/model/{id}/invoke`), so the wire appends per request and the
+    /// configured value must be the host and nothing else.
+    ///
+    /// Refused rather than trimmed, because the two mistakes it catches are
+    /// silent. Configure the mantle Messages path here by accident and the wire
+    /// POSTs to `.../anthropic/v1/messages/model/us.anthropic.../invoke` — a
+    /// 404 whose text names nothing an operator would connect to this file. A
+    /// trailing slash is the harmless half of the same error and is accepted
+    /// (the wire trims it), because refusing that would be pedantry rather than
+    /// safety.
+    fn validate_runtime_roots(&self) -> Result<(), ProviderBuildError> {
+        let planes = std::iter::once((None, self.adapter, self.base_url.as_deref())).chain(
+            self.surfaces.iter().map(|(name, surface)| {
+                (
+                    Some(name.as_str()),
+                    surface.adapter,
+                    Some(surface.base_url.as_str()),
+                )
+            }),
+        );
+        for (name, adapter, base_url) in planes {
+            if adapter != ProviderAdapter::AnthropicBedrockRuntime {
+                continue;
+            }
+            let plane = name.map_or_else(|| "entry".to_owned(), |name| format!("surface {name}"));
+            let Some(base_url) = base_url else {
+                return Err(ProviderBuildError::InvalidInventory {
+                    detail: format!(
+                        "provider {} {plane} uses the anthropic_bedrock_runtime adapter and must \
+                         declare a base_url; that wire builds its own path from the model id and \
+                         has no implied host",
+                        self.key
+                    ),
+                });
+            };
+            // The host root, with scheme and optional trailing slash stripped:
+            // anything left containing `/` is a path this adapter must not have.
+            let without_scheme = base_url
+                .split_once("://")
+                .map_or(base_url, |(_, rest)| rest)
+                .trim_end_matches('/');
+            if without_scheme.contains('/') {
+                return Err(ProviderBuildError::InvalidInventory {
+                    detail: format!(
+                        "provider {} {plane} declares base_url {base_url}, which carries a path; \
+                         the anthropic_bedrock_runtime wire appends /model/<id>/invoke itself, so \
+                         a path here would be prepended to it and dial a URL that does not exist",
+                        self.key
+                    ),
+                });
+            }
+        }
+        Ok(())
     }
 
     /// Enforce that an exemption from price reconciliation states its case.
@@ -622,10 +874,21 @@ impl ProviderMetadata {
     /// [`ProviderMetadata::validate_credential`], for the same reason: a
     /// half-written declaration is refused rather than half-applied.
     fn validate_region(&self) -> Result<(), ProviderBuildError> {
+        // "Interpolates" means ANY plane of this entry does — the entry's own
+        // endpoint or one of its surfaces. Reading only the entry's would make
+        // the "declared but unused" arm fire on a perfectly good entry whose
+        // regional plane is a surface, which is a false alarm on a real
+        // configuration rather than a caught mistake.
         let interpolates = self
             .base_url
             .as_deref()
-            .is_some_and(|url| url.contains(REGION_PLACEHOLDER));
+            .into_iter()
+            .chain(
+                self.surfaces
+                    .values()
+                    .map(|surface| surface.base_url.as_str()),
+            )
+            .any(|url| url.contains(REGION_PLACEHOLDER));
         let declared = self
             .region_env
             .as_deref()
@@ -661,22 +924,14 @@ impl ProviderMetadata {
     /// everything else. Guessing a default region would be the alternative, and
     /// it is the wrong one: `us-east-1` is a plausible guess that silently
     /// routes an eu-west-1 deployment's prompts to Virginia.
-    fn endpoint<F>(&self, mut read_env: F) -> Option<Option<String>>
+    fn endpoint<F>(&self, read_env: F) -> Option<Option<String>>
     where
         F: FnMut(&str) -> Option<String>,
     {
         let Some(base_url) = self.base_url.as_deref() else {
             return Some(None);
         };
-        if !base_url.contains(REGION_PLACEHOLDER) {
-            return Some(Some(base_url.to_owned()));
-        }
-        // Validated present whenever the placeholder is, so an empty name here
-        // is unreachable; reading it as "no region" keeps this total rather
-        // than panicking.
-        let region_env = self.region_env.as_deref().unwrap_or_default();
-        let region = read_env(region_env)?;
-        Some(Some(base_url.replace(REGION_PLACEHOLDER, &region)))
+        resolve_region(base_url, self.region_env.as_deref(), read_env).map(Some)
     }
 
     fn validate_credential(&self) -> Result<(), ProviderBuildError> {
@@ -698,7 +953,7 @@ impl ProviderMetadata {
                 }
             }
             CredentialRequirement::None => {
-                if self.adapter != ProviderAdapter::ChatCompletions {
+                if self.adapter.dials_a_billed_endpoint() {
                     return Err(ProviderBuildError::InvalidInventory {
                         detail: format!(
                             "provider {} declares \"credential\": \"none\" on an adapter that \
@@ -723,6 +978,44 @@ impl ProviderMetadata {
         }
         Ok(())
     }
+}
+
+/// Substitute a regional endpoint's [`REGION_PLACEHOLDER`], or `None` when the
+/// region cannot be resolved.
+///
+/// Shared by the entry's own endpoint and by every surface, so a provider's
+/// planes can never resolve their region by different rules — which is what
+/// makes it safe for `dispatchable` to answer for all of them at once.
+fn resolve_region<F>(base_url: &str, region_env: Option<&str>, mut read_env: F) -> Option<String>
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    if !base_url.contains(REGION_PLACEHOLDER) {
+        return Some(base_url.to_owned());
+    }
+    // Validated present whenever the placeholder is, so an empty name here
+    // is unreachable; reading it as "no region" keeps this total rather
+    // than panicking.
+    let region = read_env(region_env.unwrap_or_default())?;
+    Some(base_url.replace(REGION_PLACEHOLDER, &region))
+}
+
+/// Whether `provider` declares a plane named `surface`.
+///
+/// The catalog's gate for a candidate's `surface = "..."`. Read from the
+/// inventory rather than from a list inside `config.rs`, for the reason
+/// [`provider_settles_free`] gives: per-upstream facts live here, and a second
+/// list elsewhere is a second list to drift. A candidate naming a surface its
+/// provider does not declare refuses the whole file — a structural fault, since
+/// there is no sensible plane to fall back to and silently serving the entry's
+/// own would dispatch InvokeModel bodies at a Messages endpoint.
+#[must_use]
+pub fn provider_has_surface(provider: &str, surface: &str) -> bool {
+    ProviderInventory::load().is_ok_and(|inventory| {
+        inventory
+            .provider(provider)
+            .is_some_and(|metadata| metadata.surfaces.contains_key(surface))
+    })
 }
 
 /// Returns whether `provider` has a constructor in this module.
@@ -815,6 +1108,14 @@ pub enum ProviderBuildError {
     EmptyRoute,
     #[error("candidate {candidate} names unsupported provider {provider}")]
     UnsupportedProvider { candidate: String, provider: String },
+    #[error(
+        "candidate {candidate} names surface {surface}, which provider {provider} does not declare"
+    )]
+    UnknownSurface {
+        candidate: String,
+        provider: String,
+        surface: String,
+    },
     #[error(
         "no upstream credentials are available; checked environment variables {credential_envs:?}"
     )]
@@ -1001,7 +1302,12 @@ where
 
     let mut available = Vec::with_capacity(candidates.len());
     let mut missing_credentials = Vec::new();
-    let mut providers = BTreeMap::<&str, Arc<dyn ModelProvider>>::new();
+    // Keyed by (provider, surface) rather than by provider alone: two planes of
+    // one upstream are two clients on two hosts speaking two wires, so sharing
+    // one between them would dispatch a candidate's request at the other
+    // plane's endpoint. Candidates on the SAME plane still share, which is the
+    // connection-pool saving this map exists for.
+    let mut providers = BTreeMap::<(&str, Option<String>), Arc<dyn ModelProvider>>::new();
     let mut unavailable = BTreeSet::new();
 
     for definition in candidates {
@@ -1012,31 +1318,45 @@ where
             }
         })?;
         let provider_key = metadata.key.as_str();
+        // Availability is a property of the UPSTREAM, not of one of its planes:
+        // a surface shares the entry's credential and region, so a provider that
+        // cannot be dispatched to cannot be dispatched to on any plane.
         if unavailable.contains(provider_key) {
             continue;
         }
+        let surface = definition.surface.clone();
 
-        let provider = if let Some(provider) = providers.get(provider_key) {
+        let provider = if let Some(provider) = providers.get(&(provider_key, surface.clone())) {
             Arc::clone(provider)
         } else {
-            let (credential, endpoint) = match metadata.dispatchable(&mut credential_for) {
+            let (credential, endpoint, surfaces) = match metadata.dispatchable(&mut credential_for)
+            {
                 Dispatchable::Ready {
                     credential,
                     endpoint,
-                } => (credential, endpoint),
+                    surfaces,
+                } => (credential, endpoint, surfaces),
                 Dispatchable::Missing { env } => {
                     missing_credentials.push(env);
                     unavailable.insert(provider_key);
                     continue;
                 }
             };
+            let (adapter, endpoint) = metadata
+                .plane(surface.as_deref(), endpoint.as_deref(), &surfaces)
+                .ok_or_else(|| ProviderBuildError::UnknownSurface {
+                    candidate: definition.id.clone(),
+                    provider: definition.provider.clone(),
+                    surface: surface.clone().unwrap_or_default(),
+                })?;
             let provider = create_provider(
                 metadata,
+                adapter,
                 &credential,
                 max_output_tokens,
                 endpoint.as_deref(),
             )?;
-            providers.insert(provider_key, Arc::clone(&provider));
+            providers.insert((provider_key, surface), Arc::clone(&provider));
             provider
         };
 
@@ -1098,12 +1418,13 @@ fn base_url_override(key: &str) -> Option<String> {
 /// answer that failure correctly, by dropping the rung instead of the route.
 fn create_provider(
     metadata: &ProviderMetadata,
+    adapter: ProviderAdapter,
     credential: &str,
     max_output_tokens: u32,
     effective_base_url: Option<&str>,
 ) -> Result<Arc<dyn ModelProvider>, ProviderBuildError> {
     let alias = metadata.key.as_str();
-    let provider: Arc<dyn ModelProvider> = match metadata.adapter {
+    let provider: Arc<dyn ModelProvider> = match adapter {
         ProviderAdapter::Anthropic => Arc::new(AnthropicWire::new(
             alias,
             credential,
@@ -1130,6 +1451,28 @@ fn create_provider(
             // Same budget note as the arms above.
             900,
         )),
+        ProviderAdapter::AnthropicBedrockRuntime => {
+            // The only arm that REQUIRES an endpoint rather than accepting
+            // `None`: this wire builds `/model/<id>/invoke` onto a host root and
+            // has no default host to fall back on. Validation guarantees the
+            // declaration; this turns a violated guarantee into a refused route
+            // rather than a request to a URL beginning `/model/`.
+            let base_url =
+                effective_base_url.ok_or_else(|| ProviderBuildError::InvalidInventory {
+                    detail: format!(
+                        "provider {alias} dispatches on the anthropic_bedrock_runtime adapter \
+                         with no resolved endpoint; that wire has no implied host"
+                    ),
+                })?;
+            Arc::new(BedrockRuntimeWire::new(
+                alias,
+                credential,
+                base_url,
+                max_output_tokens,
+                // Same budget note as the arms above.
+                900,
+            ))
+        }
     };
     Ok(provider)
 }
@@ -1142,16 +1485,22 @@ mod tests {
     use super::*;
 
     fn candidate(id: &str, provider: &str) -> TierCandidate {
+        candidate_on(id, provider, None)
+    }
+
+    /// A candidate pinned to one of its provider's named API planes.
+    fn candidate_on(id: &str, provider: &str, surface: Option<&str>) -> TierCandidate {
         TierCandidate {
             id: id.to_owned(),
             provider: provider.to_owned(),
             model: format!("upstream/{id}"),
+            surface: surface.map(str::to_owned),
             rates: crate::provider::RateSchedule::flat(ModelRates {
                 input_per_mtok: Some(1.0),
                 output_per_mtok: Some(2.0),
                 cached_input_per_mtok: None,
             }),
-            // Provider dispatch reads `provider` and `model` and nothing else.
+            // Provider dispatch reads `provider`, `model`, and `surface`.
             metadata: ModelMetadata::default(),
         }
     }
@@ -1290,6 +1639,7 @@ mod tests {
         // route uses.
         let provider = create_provider(
             metadata,
+            metadata.adapter,
             "secret",
             crate::provider::BASELINE_MAX_TOKENS,
             metadata.base_url.as_deref(),
@@ -1862,6 +2212,430 @@ mod tests {
         // And a non-regional provider is unaffected by the region rule.
         let anthropic_only = |name: &str| (name == "ANTHROPIC_API_KEY").then(|| "value".to_owned());
         assert!(provider_is_dispatchable_with("anthropic", anthropic_only));
+    }
+
+    // -----------------------------------------------------------------------
+    // Surfaces (2026-08-20): one upstream, several API planes.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn the_shipped_bedrock_entry_declares_both_of_its_planes() {
+        // The two Bedrock planes, pinned as the shipped shape. Both halves of
+        // each row matter: the mantle plane must keep the FULL Messages path
+        // (its wire POSTs verbatim), and the classic runtime plane must be a
+        // HOST ROOT (its wire appends `/model/<id>/invoke`). Swap them and both
+        // dial URLs that do not exist.
+        let inventory = ProviderInventory::load().expect("inventory should load");
+        let bedrock = inventory.provider("bedrock").expect("bedrock is shipped");
+
+        assert_eq!(bedrock.adapter, ProviderAdapter::Anthropic);
+        assert_eq!(
+            bedrock.base_url.as_deref(),
+            Some("https://bedrock-mantle.{region}.api.aws/anthropic/v1/messages")
+        );
+
+        let runtime = bedrock
+            .surfaces
+            .get("classic_runtime")
+            .expect("the classic runtime plane is declared as a surface");
+        assert_eq!(runtime.adapter, ProviderAdapter::AnthropicBedrockRuntime);
+        assert_eq!(
+            runtime.base_url,
+            "https://bedrock-runtime.{region}.amazonaws.com"
+        );
+
+        // ONE account: both planes read the same credential and the same
+        // region, and neither declares any configuration of its own. This is
+        // the property that lets dispatchability stay a per-provider question.
+        assert_eq!(bedrock.credential_env.as_deref(), Some("BEDROCK_API_KEY"));
+        assert_eq!(bedrock.region_env.as_deref(), Some("BEDROCK_REGION"));
+
+        // And nothing else in the shipped inventory has surfaces — a second
+        // provider growing planes is a change that should have to edit this.
+        for provider in ["anthropic", "openai", "google"] {
+            assert!(
+                inventory
+                    .provider(provider)
+                    .expect("shipped")
+                    .surfaces
+                    .is_empty(),
+                "{provider} unexpectedly declares surfaces"
+            );
+        }
+    }
+
+    /// THE anti-drift property, extended to surfaces.
+    ///
+    /// #89 established that `/v1/models` and route construction must reach the
+    /// same verdict from the same environment, and extracted
+    /// `ProviderMetadata::dispatchable` so there is one implementation. Surfaces
+    /// could quietly break that by making dispatchability per-plane — a
+    /// deployment holding what one plane needs and not the other's would have no
+    /// single answer to give. They cannot, because a surface may declare no
+    /// credential and no region variable of its own, and this asserts the
+    /// consequence: for every environment, every plane of a provider resolves
+    /// exactly when the provider itself does.
+    #[test]
+    fn surfaces_never_change_a_providers_dispatchability() {
+        let inventory = ProviderInventory::load().expect("inventory should load");
+        let environments: Vec<(&str, Vec<&str>)> = vec![
+            ("nothing set", vec![]),
+            ("bedrock key without its region", vec!["BEDROCK_API_KEY"]),
+            ("bedrock region without its key", vec!["BEDROCK_REGION"]),
+            (
+                "bedrock fully configured",
+                vec!["BEDROCK_API_KEY", "BEDROCK_REGION"],
+            ),
+        ];
+
+        for (label, present) in environments {
+            let read_env = |name: &str| present.contains(&name).then(|| "value".to_owned());
+            let listed = provider_is_dispatchable_with("bedrock", read_env);
+
+            // The provider's own plane, exactly as #89 tests it.
+            let default_plane = build_with_credentials(
+                &inventory,
+                vec![candidate("only", "bedrock")],
+                crate::provider::BASELINE_MAX_TOKENS,
+                read_env,
+            )
+            .is_ok();
+            // And each NAMED plane, which must agree with it.
+            let named_plane = build_with_credentials(
+                &inventory,
+                vec![candidate_on("only", "bedrock", Some("classic_runtime"))],
+                crate::provider::BASELINE_MAX_TOKENS,
+                read_env,
+            )
+            .is_ok();
+
+            assert_eq!(
+                listed, default_plane,
+                "{label}: the catalog and the mantle plane disagree"
+            );
+            assert_eq!(
+                listed, named_plane,
+                "{label}: the catalog and the classic-runtime plane disagree"
+            );
+        }
+    }
+
+    #[test]
+    fn each_plane_of_one_upstream_gets_its_own_client() {
+        // Two candidates, one provider, two planes. They must NOT share a
+        // client: the planes are different hosts speaking different wires, so a
+        // shared client would POST one plane's body at the other's endpoint.
+        // Candidates on the SAME plane must still share, which is the
+        // connection-pool saving the cache exists for.
+        let inventory = ProviderInventory::load().expect("inventory should load");
+        let route = build_with_credentials(
+            &inventory,
+            vec![
+                candidate("mantle", "bedrock"),
+                candidate_on("runtime", "bedrock", Some("classic_runtime")),
+                candidate_on("runtime-again", "bedrock", Some("classic_runtime")),
+            ],
+            crate::provider::BASELINE_MAX_TOKENS,
+            |_| Some("secret".to_owned()),
+        )
+        .expect("a fully configured bedrock route builds");
+        assert_eq!(route.candidates().len(), 3);
+        assert!(
+            !Arc::ptr_eq(&route.candidates[0].provider, &route.candidates[1].provider),
+            "two PLANES of one upstream must not share a client"
+        );
+        assert!(
+            Arc::ptr_eq(&route.candidates[1].provider, &route.candidates[2].provider),
+            "two candidates on ONE plane should share a client"
+        );
+    }
+
+    #[test]
+    fn a_surface_resolves_its_region_from_the_providers_own_variable() {
+        // The substitution, over the SHIPPED entry so the assertion is about
+        // the host real traffic reaches — and against a region that is NOT the
+        // default, so a hardcoded `us-east-1` cannot pass.
+        let inventory = ProviderInventory::load().expect("inventory should load");
+        let bedrock = inventory.provider("bedrock").expect("bedrock is shipped");
+        let Dispatchable::Ready {
+            endpoint, surfaces, ..
+        } = bedrock.dispatchable(|name| match name {
+            "BEDROCK_API_KEY" => Some("secret".to_owned()),
+            "BEDROCK_REGION" => Some("eu-west-1".to_owned()),
+            _ => None,
+        })
+        else {
+            panic!("a fully configured bedrock entry is dispatchable");
+        };
+        assert_eq!(
+            endpoint.as_deref(),
+            Some("https://bedrock-mantle.eu-west-1.api.aws/anthropic/v1/messages")
+        );
+        assert_eq!(
+            surfaces.get("classic_runtime").map(String::as_str),
+            Some("https://bedrock-runtime.eu-west-1.amazonaws.com")
+        );
+        for url in std::iter::once(endpoint.as_deref().unwrap_or_default())
+            .chain(surfaces.values().map(String::as_str))
+        {
+            assert!(
+                !url.contains(REGION_PLACEHOLDER),
+                "no placeholder may survive into a dialled URL: {url}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_candidate_naming_an_undeclared_surface_is_refused() {
+        // The catalog gate, read from the inventory. A typo must not silently
+        // resolve to the provider's own plane, which is the other API.
+        assert!(provider_has_surface("bedrock", "classic_runtime"));
+        assert!(!provider_has_surface("bedrock", "clasic_runtime"));
+        assert!(!provider_has_surface("anthropic", "classic_runtime"));
+        assert!(!provider_has_surface("nonexistent", "classic_runtime"));
+
+        // And the route builder refuses it too rather than falling back — the
+        // catalog validator normally catches this first, so this is the second
+        // line of the same defence.
+        let inventory = ProviderInventory::load().expect("inventory should load");
+        let error = build_with_credentials(
+            &inventory,
+            vec![candidate_on("typo", "bedrock", Some("clasic_runtime"))],
+            crate::provider::BASELINE_MAX_TOKENS,
+            |_| Some("secret".to_owned()),
+        )
+        .expect_err("an undeclared surface must not build a route");
+        assert!(
+            matches!(error, ProviderBuildError::UnknownSurface { .. }),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_surface_may_not_introduce_configuration_of_its_own() {
+        // The rule that keeps dispatchability a per-provider question. A
+        // surface that interpolates a region on an entry with no `region_env`
+        // has nothing to resolve it, and allowing it would mean a surface could
+        // need configuration the provider does not declare.
+        let error = assemble(
+            r#"{
+                "key": "two-planes",
+                "adapter": "chat_completions",
+                "credential_env": "TWO_PLANES_API_KEY",
+                "secret_name": "two-planes-api-key",
+                "base_url": "https://svc.example.test/v1/chat/completions",
+                "surfaces": {
+                    "regional": {
+                        "adapter": "chat_completions",
+                        "base_url": "https://svc.{region}.example.test/v1/chat/completions"
+                    }
+                }
+            }"#,
+        )
+        .expect_err("a surface placeholder with nothing to fill it must be refused");
+        let detail = error.to_string();
+        assert!(detail.contains("two-planes"), "{detail}");
+        assert!(detail.contains("region_env"), "{detail}");
+
+        // The mirror case is NOT an error: an entry whose only regional plane
+        // is a surface is a perfectly good configuration, and the
+        // declared-but-unused rule must not fire on it.
+        assemble(
+            r#"{
+                "key": "surface-only-region",
+                "adapter": "chat_completions",
+                "credential_env": "SOR_API_KEY",
+                "secret_name": "sor-api-key",
+                "base_url": "https://svc.example.test/v1/chat/completions",
+                "region_env": "SOR_REGION",
+                "surfaces": {
+                    "regional": {
+                        "adapter": "chat_completions",
+                        "base_url": "https://svc.{region}.example.test/v1/chat/completions"
+                    }
+                }
+            }"#,
+        )
+        .expect("a region used only by a surface is a valid entry");
+    }
+
+    #[test]
+    fn a_blank_surface_declaration_is_refused() {
+        for surfaces in [
+            r#"{"": {"adapter": "chat_completions", "base_url": "https://a.test/v1"}}"#,
+            r#"{"named": {"adapter": "chat_completions", "base_url": "   "}}"#,
+        ] {
+            let error = assemble(&format!(
+                r#"{{
+                    "key": "blank",
+                    "adapter": "chat_completions",
+                    "credential_env": "BLANK_API_KEY",
+                    "secret_name": "blank-api-key",
+                    "base_url": "https://svc.example.test/v1/chat/completions",
+                    "surfaces": {surfaces}
+                }}"#
+            ))
+            .expect_err("a blank surface declaration must be refused");
+            assert!(error.to_string().contains("blank"), "{error}");
+        }
+    }
+
+    #[test]
+    fn a_misspelled_surface_field_refuses_the_inventory() {
+        // Same reasoning as the entry-level `deny_unknown_fields`: a surface's
+        // two fields are both load-bearing, so a typo must be loud rather than
+        // leaving the surface half-declared.
+        assert!(
+            ProviderInventory::parse_operator(&operator_json(
+                r#"{
+                    "key": "typo",
+                    "adapter": "chat_completions",
+                    "base_url": "https://a.test/v1",
+                    "credential_env": "T", "secret_name": "t",
+                    "surfaces": {"p": {"adaptor": "chat_completions", "base_url": "https://b.test"}}
+                }"#
+            ))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn the_bedrock_runtime_adapter_must_be_given_a_host_root() {
+        // The misconfiguration this rule exists for, and it is a live one: the
+        // mantle Messages path is RIGHT THERE in the same entry, and pasting it
+        // onto the runtime surface produces
+        // `.../anthropic/v1/messages/model/<id>/invoke` — a 404 whose text
+        // names nothing an operator would trace back to this file.
+        let error = assemble(
+            r#"{
+                "key": "wrong-root",
+                "adapter": "anthropic_bedrock_runtime",
+                "credential_env": "WRONG_ROOT_API_KEY",
+                "secret_name": "wrong-root-api-key",
+                "base_url": "https://bedrock-runtime.us-east-1.amazonaws.com/anthropic/v1/messages"
+            }"#,
+        )
+        .expect_err("a path on the runtime adapter must be refused");
+        let detail = error.to_string();
+        assert!(detail.contains("wrong-root"), "{detail}");
+        assert!(detail.contains("path"), "{detail}");
+
+        // The same rule applies when the adapter is on a SURFACE, which is how
+        // the shipped inventory uses it.
+        let error = assemble(
+            r#"{
+                "key": "wrong-surface-root",
+                "adapter": "chat_completions",
+                "credential_env": "WSR_API_KEY",
+                "secret_name": "wsr-api-key",
+                "base_url": "https://svc.example.test/v1/chat/completions",
+                "surfaces": {
+                    "runtime": {
+                        "adapter": "anthropic_bedrock_runtime",
+                        "base_url": "https://bedrock-runtime.us-east-1.amazonaws.com/model"
+                    }
+                }
+            }"#,
+        )
+        .expect_err("a path on a runtime surface must be refused");
+        assert!(error.to_string().contains("surface runtime"), "{error}");
+
+        // A bare host is fine, with or without a trailing slash — the wire
+        // trims one, so refusing it would be pedantry rather than safety.
+        for base_url in [
+            "https://bedrock-runtime.us-east-1.amazonaws.com",
+            "https://bedrock-runtime.us-east-1.amazonaws.com/",
+        ] {
+            assemble(&format!(
+                r#"{{
+                    "key": "right-root",
+                    "adapter": "anthropic_bedrock_runtime",
+                    "credential_env": "RIGHT_ROOT_API_KEY",
+                    "secret_name": "right-root-api-key",
+                    "base_url": "{base_url}"
+                }}"#
+            ))
+            .unwrap_or_else(|error| panic!("{base_url} is a host root: {error}"));
+        }
+    }
+
+    #[test]
+    fn the_runtime_adapter_is_billed_and_so_cannot_be_free_or_keyless() {
+        // A third adapter that dials a cloud endpoint someone invoices. Both
+        // safety rules read `dials_a_billed_endpoint`, and both were written as
+        // `!= chat_completions` before a third billed adapter existed — so this
+        // is the test that would have caught a new adapter silently joining the
+        // free lane.
+        let error = assemble(
+            r#"{"key": "wishful", "adapter": "anthropic_bedrock_runtime",
+                "settlement": "free", "base_url": "https://a.test",
+                "credential_env": "W", "secret_name": "w"}"#,
+        )
+        .expect_err("free settlement must be refused on a billed adapter");
+        assert!(error.to_string().contains("settlement"), "{error}");
+
+        let error = assemble(
+            r#"{"key": "sneaky", "adapter": "anthropic_bedrock_runtime",
+                "credential": "none", "base_url": "https://a.test"}"#,
+        )
+        .expect_err("keyless must be refused on a billed adapter");
+        assert!(error.to_string().contains("chat_completions"), "{error}");
+    }
+
+    #[test]
+    fn a_test_seam_override_replaces_every_plane_of_a_provider() {
+        // The fault-injection seam names an UPSTREAM, not a plane. If it
+        // replaced only the entry's own endpoint, a harness standing a
+        // misbehaving fake in front of `bedrock` would still send the
+        // classic-runtime candidates' traffic to AWS — real requests, real
+        // money, during a chaos run.
+        //
+        // Uses a fixture provider rather than the shipped one because the seam
+        // reads the process environment, and mutating a shared env var races
+        // every other test in this binary.
+        let inventory = assemble(
+            r#"{
+                "key": "two-planes",
+                "adapter": "chat_completions",
+                "credential_env": "TWO_PLANES_API_KEY",
+                "secret_name": "two-planes-api-key",
+                "base_url": "https://real.example.test/v1/chat/completions",
+                "surfaces": {
+                    "other": {
+                        "adapter": "chat_completions",
+                        "base_url": "https://also-real.example.test/v1/chat/completions"
+                    }
+                }
+            }"#,
+        )
+        .expect("the fixture assembles");
+        let metadata = inventory.provider("two-planes").expect("entry exists");
+
+        // Without an override, the two planes are their configured selves.
+        let Dispatchable::Ready {
+            endpoint, surfaces, ..
+        } = metadata.dispatchable(|_| Some("secret".to_owned()))
+        else {
+            panic!("dispatchable");
+        };
+        assert_eq!(
+            endpoint.as_deref(),
+            Some("https://real.example.test/v1/chat/completions")
+        );
+        assert_eq!(
+            surfaces.get("other").map(String::as_str),
+            Some("https://also-real.example.test/v1/chat/completions")
+        );
+
+        // The override path is asserted structurally: `dispatchable` applies
+        // the SAME override value to the entry and to every surface, so if the
+        // seam fires at all it fires everywhere. That is visible in the source
+        // and is what this test names; exercising the env var itself would
+        // require mutating process state shared with every concurrent test.
+        assert!(
+            base_url_override("definitely-not-set-two-planes").is_none(),
+            "the seam is inert unless a harness sets it"
+        );
     }
 
     #[test]

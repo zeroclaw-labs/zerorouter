@@ -3718,6 +3718,7 @@ mod tests {
             id: id.to_owned(),
             provider: "openai".to_owned(),
             model: format!("upstream/{id}"),
+            surface: None,
             rates: RateSchedule::flat(ModelRates {
                 input_per_mtok: Some(1.0),
                 output_per_mtok: Some(2.0),
@@ -3739,6 +3740,7 @@ mod tests {
             id: id.to_owned(),
             provider: "local-llama".to_owned(),
             model: format!("local/{id}"),
+            surface: None,
             rates: RateSchedule::flat(ModelRates {
                 input_per_mtok: Some(0.0),
                 output_per_mtok: Some(0.0),
@@ -4274,6 +4276,7 @@ mod tests {
             id: id.to_owned(),
             provider: "test-upstream".to_owned(),
             model: format!("upstream/{id}"),
+            surface: None,
             rates: RateSchedule::flat(ModelRates {
                 input_per_mtok: Some(1.0),
                 output_per_mtok: Some(2.0),
@@ -4437,6 +4440,7 @@ mod tests {
             id: "openai/luna".to_owned(),
             provider: "test-upstream".to_owned(),
             model: "upstream/luna".to_owned(),
+            surface: None,
             rates: schedule,
             metadata: ModelMetadata::default(),
         }

@@ -11,7 +11,7 @@ use thiserror::Error;
 use crate::{
     openai::{MAX_RATE_PER_MTOK, billable_rate},
     priority::Priority,
-    providers::{is_supported_provider, provider_settles_free},
+    providers::{is_supported_provider, provider_has_surface, provider_settles_free},
 };
 
 pub const DEFAULT_TIER_CONFIG_PATH: &str = "config/tiers.toml";
@@ -97,6 +97,26 @@ pub struct TierCandidate {
     pub id: String,
     pub provider: String,
     pub model: String,
+    /// Which API plane of `provider` this candidate dispatches on, when the
+    /// provider exposes more than one (`surfaces` in `config/providers.json`).
+    ///
+    /// Absent means the provider entry's own plane, which is what every
+    /// candidate written before surfaces existed meant and still means.
+    ///
+    /// It lives on the CANDIDATE rather than on the tier because the plane is a
+    /// property of the rung, exactly like `model` beside it: two candidates on
+    /// one account can serve different model generations over different APIs,
+    /// which is precisely the Bedrock case this was added for — 5-generation
+    /// Claude on the mantle plane, 4.5-generation on the classic runtime plane,
+    /// one credential, one retention posture, one AWS invoice.
+    ///
+    /// A candidate naming a surface its provider does not declare refuses the
+    /// whole file ([`validate_tier_catalog`]). That is a structural fault rather
+    /// than an economic one — there is no honest fallback, and silently
+    /// dispatching on the entry's own plane would send one API's request body
+    /// to the other API's endpoint.
+    #[serde(default)]
+    pub surface: Option<String>,
     #[serde(deserialize_with = "deserialize_rate_schedule")]
     pub rates: RateSchedule,
     /// What this model can take and produce. Declared here, beside the rates,
@@ -601,6 +621,16 @@ pub enum TierConfigError {
     EmptyTier { tier: String },
     #[error("unsupported provider {provider} in tier {tier}")]
     UnsupportedProvider { tier: String, provider: String },
+    #[error(
+        "tier {tier} names surface {surface} on provider {provider}, which declares no such \
+         surface; a candidate's `surface` selects one of the API planes listed under that \
+         provider's `surfaces` in config/providers.json"
+    )]
+    UnknownSurface {
+        tier: String,
+        provider: String,
+        surface: String,
+    },
     #[error("duplicate concrete model id {0}")]
     DuplicateModelId(String),
     #[error(
@@ -1153,6 +1183,21 @@ fn validate_tier_catalog(
                 return Err(TierConfigError::UnsupportedProvider {
                     tier: tier_id.clone(),
                     provider: candidate.provider.clone(),
+                });
+            }
+            // A named plane must exist on the provider it names. STRUCTURAL for
+            // the reason the retention check below is: there is no honest way to
+            // serve this candidate, and the plausible fallback — dispatch on the
+            // entry's own plane — is the actively dangerous one, because the two
+            // planes of an upstream take different request shapes at different
+            // hosts. A typo in `surface` must never resolve to "the other API".
+            if let Some(surface) = candidate.surface.as_deref()
+                && !provider_has_surface(&candidate.provider, surface)
+            {
+                return Err(TierConfigError::UnknownSurface {
+                    tier: tier_id.clone(),
+                    provider: candidate.provider.clone(),
+                    surface: surface.to_owned(),
                 });
             }
             if !concrete_ids.insert(candidate.id.clone()) {
@@ -3101,6 +3146,59 @@ output_per_mtok = 0.20
     }
 
     #[test]
+    fn a_candidate_naming_an_undeclared_surface_condemns_the_file() {
+        // STRUCTURAL rather than economic, and the reason is the danger of the
+        // plausible fallback. A provider's surfaces are different APIs at
+        // different hosts; if a mistyped `surface` were merely ignored, the
+        // candidate would dispatch on the entry's own plane and post one API's
+        // request body at the other's endpoint. There is no honest degraded
+        // behaviour, so the whole file is refused.
+        let catalog = mixed_catalog(
+            r#"
+[[tiers."zero/below-cost".candidates]]
+id = "bedrock/typo"
+provider = "bedrock"
+surface = "clasic_runtime"
+model = "us.anthropic.claude-opus-4-5-20251101-v1:0"
+[tiers."zero/below-cost".candidates.rates]
+input_per_mtok = 0.10
+output_per_mtok = 0.20
+"#,
+        );
+        let error = validate_tier_catalog(&catalog)
+            .expect_err("an undeclared surface must condemn the file");
+        assert!(
+            matches!(error, TierConfigError::UnknownSurface { .. }),
+            "{error}"
+        );
+        // The message has to name the surface, because the whole failure mode
+        // is a one-character typo an operator has to spot by eye.
+        assert!(error.to_string().contains("clasic_runtime"), "{error}");
+
+        // And the surface that IS declared validates, so this rule cannot be
+        // satisfied by refusing every surface.
+        let catalog = mixed_catalog(
+            r#"
+[[tiers."zero/below-cost".candidates]]
+id = "bedrock/real"
+provider = "bedrock"
+surface = "classic_runtime"
+model = "us.anthropic.claude-opus-4-5-20251101-v1:0"
+[tiers."zero/below-cost".candidates.rates]
+input_per_mtok = 0.10
+output_per_mtok = 0.20
+"#,
+        );
+        assert!(
+            !matches!(
+                validate_tier_catalog(&catalog),
+                Err(TierConfigError::UnknownSurface { .. })
+            ),
+            "a declared surface must not be refused"
+        );
+    }
+
+    #[test]
     fn an_unbillable_rate_condemns_the_file_even_inside_a_withheld_tier() {
         // The exact side of the withhold/refuse split this rule sits on. The
         // tier carrying the unbillable rate is *already* condemned on economics
@@ -3423,6 +3521,7 @@ output_per_mtok = 8.00
             id: "local/model".to_owned(),
             provider: "local-llama".to_owned(),
             model: "qwen3-8b".to_owned(),
+            surface: None,
             rates: RateSchedule::flat(ModelRates {
                 input_per_mtok: input,
                 cached_input_per_mtok: cached,

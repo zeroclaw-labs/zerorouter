@@ -227,6 +227,7 @@ mod tests {
             id: format!("{provider}/{model}"),
             provider: provider.to_owned(),
             model: model.to_owned(),
+            surface: None,
             rates: crate::provider::RateSchedule::flat(ModelRates {
                 input_per_mtok: Some(1.0),
                 output_per_mtok: Some(2.0),
