@@ -41,6 +41,17 @@
 //! record, never from the event. A session created before migration 0005 has
 //! no record and is rejected — see [`stripe_webhook`].
 //!
+//! # Abandoned records are swept; credited ones are permanent
+//!
+//! Most Checkout Sessions are never paid, so most of those records are dead
+//! weight. [`run_checkout_intent_cleanup_once`] (migration 0022) removes the
+//! ones that were never credited and are older than
+//! [`CHECKOUT_INTENT_RETENTION_DAYS`]; a record behind a `credit_ledger` entry
+//! is never removable, and the database enforces that rather than trusting the
+//! sweeping query. The retention window sits far outside the longest delay
+//! Stripe can legitimately introduce (24h of session life plus three days of
+//! webhook retries), so the crediting path above is unaffected by it.
+//!
 //! # Events consumed
 //!
 //! | Event | Action |
@@ -666,7 +677,11 @@ async fn create_checkout(
     // "Change amount", and mounts it again on the next Continue — each mount
     // calls this endpoint. Without this, one indecisive customer buying $25
     // once produces several Checkout Sessions and several
-    // `stripe_checkout_intents` rows, none of which anything deletes.
+    // `stripe_checkout_intents` rows. The cleanup sweep (migration 0022) now
+    // removes those rows eventually, but only after
+    // [`CHECKOUT_INTENT_RETENTION_DAYS`] — this cache is what stops them being
+    // created in the first place, which is the half that also saves Stripe
+    // sessions.
     //
     // Safe because the key is `(user, gross_cents)`: the secret handed back
     // belongs to a session priced identically to the one this request would
@@ -781,10 +796,12 @@ const STATUS_CACHE_TTL: Duration = Duration::from_secs(8);
 /// for the same amount instead of creating a second one.
 ///
 /// Well under Stripe's 24h session expiry, so a reused session is always still
-/// mountable. The cap matters because nothing deletes
-/// `stripe_checkout_intents` rows: every abandoned mount used to leave one
-/// behind, and opening the modal, closing it, and reopening it three times
-/// created three sessions for one purchase.
+/// mountable. The cap matters because every abandoned mount leaves a
+/// `stripe_checkout_intents` row behind: opening the modal, closing it, and
+/// reopening it three times created three sessions for one purchase.
+/// [`run_checkout_intent_cleanup_once`] clears those rows a month later, which
+/// bounds the table but does nothing about the sessions minted at Stripe — so
+/// this cache remains the primary control and the sweep is the backstop.
 const SESSION_REUSE_TTL: Duration = Duration::from_secs(600);
 
 /// Stripe's prefix for Checkout Session ids. Anything else cannot be one, so
@@ -861,6 +878,32 @@ fn forget_session(user_id: Uuid, gross_cents: i64, session_id: &str) {
 /// as not-found, so this cannot be used to enumerate sessions or to observe
 /// another customer's purchase. Stripe is only consulted after that check
 /// passes.
+///
+/// # A swept session reads as not-found, on purpose
+///
+/// Since migration 0022 there is a third way to reach [`Self::SessionNotFound`]:
+/// the intent row existed and was removed by
+/// [`run_checkout_intent_cleanup_once`] as an abandoned checkout. That is a
+/// deliberate consequence of deleting rather than tombstoning, not an
+/// oversight, and it is bounded in three ways.
+///
+/// *When it can happen.* Only by returning to a checkout tab more than
+/// [`CHECKOUT_INTENT_RETENTION_DAYS`] after opening it. The session itself died
+/// at Stripe 24 hours in, so for 29 of those 30 days the honest answer was
+/// already "this is over".
+///
+/// *What it can never be.* A swept row was never credited — that is condition 2
+/// of the sweep predicate and the database enforces it — so this can never
+/// hide a purchase that succeeded. There is no state in which a customer's
+/// credits exist and this endpoint denies knowing about them.
+///
+/// *What the customer sees.* The portal treats a failed status read as
+/// `unknown` and renders "We could not confirm that payment just now. If it
+/// went through, the credits will still appear here — the ledger below is the
+/// record." That is accurate for a swept session and is the only banner of the
+/// four that asserts nothing about the outcome. The alternative — keeping every
+/// row forever so this could say "expired" — buys a more precise sentence on a
+/// month-old tab at the price of an unbounded table.
 async fn checkout_status(
     State(ctx): State<WebCtx>,
     user: PortalUser,
@@ -1505,13 +1548,33 @@ async fn stripe_webhook(
         // exposure is bounded — Checkout Sessions expire after 24h, so at most
         // one day of in-flight purchases — and each is reconcilable by hand
         // from the Stripe dashboard with an 'adjustment' ledger entry.
+        //
+        // POLICY — swept sessions (migration 0022): a row deleted by
+        // [`run_checkout_intent_cleanup_once`] would also land here, and is
+        // likewise rejected rather than credited. That arm is meant to be
+        // unreachable and the retention window is what makes it so: a session
+        // dies at Stripe 24h after creation and Stripe stops retrying its
+        // webhook three days after the payment, so the last legitimate delivery
+        // is ~4 days old against a [`CHECKOUT_INTENT_RETENTION_DAYS`] window of
+        // 30 (and a 7-day floor the database enforces). Reaching this arm from a
+        // sweep would mean Stripe delivered an event weeks outside its own
+        // documented retry horizon. Named in the message anyway, because the
+        // operator reading this line is deciding what to reconcile and needs the
+        // full list of ways a record can be absent.
+        //
+        // Deliberately distinct from a signature failure in both channels: this
+        // is ERROR (signature noise is WARN), it says what was refused and what
+        // it would have been worth, and it answers 400 `unknown_session` rather
+        // than `invalid_signature`, so Stripe's webhook dashboard separates
+        // "someone is sending us junk" from "a real payment was refused".
         tracing::error!(
             stripe_session_id = %session_id,
             metadata_user_id = %user_id,
             metadata_credit_usd = %credit_usd,
             amount_total_cents,
             "stripe webhook rejected: paid session has no pending purchase record; \
-             crediting nothing (reconcile by hand if this predates migration 0005)"
+             crediting nothing (reconcile by hand — the record was never written, \
+             predates migration 0005, or was swept as abandoned by migration 0022)"
         );
         return Err(StripeHttpError::UnknownSession);
     };
@@ -1651,6 +1714,91 @@ fn collected_ex_tax_cents(object: &Value, amount_total_cents: i64) -> Option<Col
         ex_tax_cents: amount_total_cents.checked_sub(tax_cents)?,
         tax_cents,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Abandoned checkout cleanup (migration 0022)
+// ---------------------------------------------------------------------------
+
+/// How long an unpaid `stripe_checkout_intents` row is kept before the sweep
+/// removes it.
+///
+/// A constant rather than an environment variable, following the house
+/// treatment of every other sweep knob ([`AUTOPAY_RECONCILE_AFTER_MINUTES`],
+/// `api::SETTLEMENT_RECOVERY_INTERVAL`): the number is a consequence of Stripe's
+/// documented windows, not a per-deployment preference, so an operator turning
+/// it down would be overriding a safety argument rather than tuning a workload.
+///
+/// **The floor is four days** and is not a matter of taste. A Checkout Session
+/// expires 24 hours after creation, so a payment can land as late as
+/// `created_at + 24h`; Stripe then retries the resulting webhook "for up to
+/// three days with an exponential back off in live mode". Delete inside
+/// `created_at + 4 days` and a customer who genuinely paid meets
+/// [`StripeHttpError::UnknownSession`] and is credited nothing.
+///
+/// Thirty days is that floor with 7.5x of margin, and it is chosen at the
+/// generous end deliberately: the cost of keeping a dead row a few extra weeks
+/// is a few hundred bytes, and the cost of deleting one too early is a customer
+/// who paid and did not get their credit. Migration 0022 refuses anything under
+/// seven days regardless of what this says, so lowering it cannot silently
+/// cross the floor — the sweep fails loudly instead.
+const CHECKOUT_INTENT_RETENTION_DAYS: i32 = 30;
+
+/// Rows one cleanup pass may remove. Bounded for the same reason
+/// `api::SETTLEMENT_RECOVERY_BATCH` is: a backlog (the first pass after this
+/// ships has one) is worked off over several passes rather than monopolising
+/// the pool in a single statement. At the hourly cadence this drains ~6k rows a
+/// day, orders of magnitude above the rate abandoned checkouts accumulate at.
+const CHECKOUT_INTENT_CLEANUP_BATCH: i64 = 256;
+
+/// One cleanup pass: delete checkout intents for sessions that were created,
+/// never paid, and are now beyond anything Stripe can still do with them.
+///
+/// Public and synchronous so tests drive the exact code production loops, the
+/// same contract as [`run_autopay_sweep_once`]. It takes no [`StripeSettings`]
+/// and makes no Stripe call: every input to the decision is already in
+/// ZeroRouter's own database, and asking Stripe about a month-old session would
+/// be a round trip per row for an answer the predicate already has.
+///
+/// # What this can and cannot delete
+///
+/// See [`billing::sweep_expired_checkout_intents`] for the predicate. The short
+/// version: a row that was ever credited is permanent, and the database
+/// enforces that independently of the query — so the worst a bug here can do is
+/// abort the pass, not erase corroboration for a dollar that moved.
+///
+/// # Failure is a warning, never a propagated error
+///
+/// Nothing downstream depends on a pass succeeding: no money moves, no request
+/// waits on it, and the next pass sees exactly the same rows. Matching the
+/// autopay sweep, every arm logs and returns.
+pub async fn run_checkout_intent_cleanup_once(pool: &crate::sqlx::PgPool) {
+    match billing::sweep_expired_checkout_intents(
+        pool,
+        CHECKOUT_INTENT_RETENTION_DAYS,
+        CHECKOUT_INTENT_CLEANUP_BATCH,
+    )
+    .await
+    {
+        // Silence is the healthy steady state — the same convention the
+        // settlement-recovery sweep uses for "nothing owed, nothing said".
+        Ok(Some(sweep)) if sweep.removed == 0 => {}
+        Ok(Some(sweep)) => tracing::info!(
+            removed = sweep.removed,
+            oldest = ?sweep.oldest,
+            quoted_credit_usd = %sweep.quoted_credit_usd,
+            retention_days = CHECKOUT_INTENT_RETENTION_DAYS,
+            "swept abandoned stripe checkout intents"
+        ),
+        // Another task holds the sweep lock. Expected on a multi-replica
+        // deployment and not worth a line per hour per replica.
+        Ok(None) => {}
+        // Includes the one interesting failure: a candidate credited between
+        // the scan and the delete would abort the statement on migration 0022's
+        // trigger. Self-healing — the next pass reads the committed ledger row
+        // and excludes it — so one warning and no retry is the right response.
+        Err(error) => tracing::warn!(%error, "checkout intent cleanup pass failed"),
+    }
 }
 
 // ---------------------------------------------------------------------------

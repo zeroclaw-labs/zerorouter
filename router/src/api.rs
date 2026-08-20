@@ -471,6 +471,15 @@ const SETTLEMENT_RECOVERY_INTERVAL: Duration = Duration::from_secs(60);
 /// over several passes instead of monopolising the pool in one.
 const SETTLEMENT_RECOVERY_BATCH: i64 = 64;
 
+/// Cadence of the abandoned-checkout-intent cleanup sweep.
+///
+/// Hourly rather than the minute the money sweeps run at, because this one is
+/// maintenance: its rows have already sat untouched for
+/// `stripe::CHECKOUT_INTENT_RETENTION_DAYS`, so nothing is improved by noticing
+/// them sooner, and the interval only has to keep up with the rate abandoned
+/// checkouts accumulate — which it does by three orders of magnitude.
+const CHECKOUT_INTENT_CLEANUP_INTERVAL: Duration = Duration::from_secs(60 * 60);
+
 const SSE_CHANNEL_CAPACITY: usize = 32;
 const SSE_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 const SSE_SEND_TIMEOUT: Duration = Duration::from_secs(5);
@@ -730,6 +739,37 @@ impl RouterState {
                     () = tokio::time::sleep(Duration::from_secs(60)) => {}
                 }
                 crate::stripe::run_autopay_sweep_once(&pool, &settings).await;
+            }
+        });
+    }
+
+    /// Start the abandoned-checkout cleanup sweep: hourly, delete
+    /// `stripe_checkout_intents` rows for sessions that were created, never
+    /// paid, and are now past anything Stripe can still do with them. Same
+    /// opt-in serve-only contract as the other background loops; tests drive
+    /// `stripe::run_checkout_intent_cleanup_once` directly.
+    ///
+    /// Unlike [`RouterState::spawn_autopay_sweep`] this takes no
+    /// [`crate::web::StripeSettings`] and is started even when Stripe is not
+    /// configured. The rows are ZeroRouter's own and outlive the integration
+    /// that wrote them: an operator who turns Stripe off would otherwise keep
+    /// the accumulated backlog forever, and the cost of the loop on a
+    /// deployment that never had checkout is one indexed query an hour that
+    /// matches nothing.
+    pub fn spawn_checkout_intent_cleanup(&self) {
+        let Some(services) = &self.services else {
+            return;
+        };
+        let pool = services.pool.clone();
+        let shutdown = services.runtime.shutdown.clone();
+        services.runtime.tasks.spawn(async move {
+            loop {
+                tokio::select! {
+                    biased;
+                    () = shutdown.cancelled() => return,
+                    () = tokio::time::sleep(CHECKOUT_INTENT_CLEANUP_INTERVAL) => {}
+                }
+                crate::stripe::run_checkout_intent_cleanup_once(&pool).await;
             }
         });
     }

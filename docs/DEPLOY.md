@@ -192,6 +192,43 @@ needs from the environment:
 The sweep itself (charge candidates, reconcile stale intents, three-strikes
 disable) starts with serve mode and needs no configuration.
 
+## Abandoned checkout intents are deleted after 30 days (migration 0022)
+
+A second, unrelated sweep starts with serve mode and also needs no
+configuration: hourly, it deletes `stripe_checkout_intents` rows for Checkout
+Sessions that were created, never paid, and are more than 30 days old. Most
+Checkout Sessions are never paid — a customer who opens the payment modal,
+closes it, and reopens it leaves a row behind each time — so without this the
+table only grows.
+
+**This is a data-retention change, so it is stated rather than left to be
+discovered.** What it can never delete is the half that matters: a row whose
+session was credited is corroboration for a `credit_ledger` purchase entry and
+is permanent, and that is enforced by the database (the migration narrows
+0005's DELETE prohibition rather than lifting it — a settled row, a
+ledger-referenced row, and any row less than seven days old are all refused by
+a trigger, independently of the sweeping query).
+
+Two consequences worth knowing before it runs:
+
+- **A customer returning to a checkout tab more than 30 days later** sees "We
+  could not confirm that payment just now" instead of "that checkout expired",
+  because the row the status endpoint looks them up in is gone. Safe by
+  construction — a deleted row was never credited, so this can never hide a
+  purchase that landed — but it is a deliberate trade of a precise sentence for
+  a bounded table.
+- **Reconciling a payment that was collected at Stripe but never credited**
+  loses its local handle after 30 days. Stripe keeps the record: the session,
+  its `metadata[user_id]` and `metadata[credit_usd]`, and the failed webhook
+  delivery are all in the dashboard, which is where that reconciliation
+  already starts. The retention window is far outside anything Stripe can do
+  on its own (24h of session life plus three days of webhook retries), so a
+  row reaching 30 days unpaid and uncredited has already exhausted every
+  automatic path.
+
+The sweep is bounded to 256 rows per pass and takes an advisory lock, so
+scaling out does not multiply the work.
+
 ## Stripe Tax must be configured BEFORE this deploys
 
 Checkout Sessions are created with `automatic_tax[enabled]=true` and

@@ -807,6 +807,7 @@ async fn migration_chain_applies_on_a_fresh_database() {
         bool,
         bool,
         bool,
+        bool,
         i64,
     )> = async {
         let pool = PgPoolOptions::new()
@@ -966,6 +967,23 @@ async fn migration_chain_applies_on_a_fresh_database() {
         )
         .fetch_one(&pool)
         .await?;
+        // 0022 replaces the body of 0005's guard rather than adding a table or
+        // a column, so the probe reads the installed function source. All three
+        // refusals must be present: a settled row, a ledger-corroborated row,
+        // and a row Stripe could still complete. If any one of them stopped
+        // being emitted, the sweep's WHERE clause would become the only thing
+        // standing between a bug and a deleted purchase record.
+        let checkout_intent_delete_is_guarded = query_scalar::<_, bool>(
+            r#"
+            SELECT prosrc LIKE '%rows that settled are never removed%'
+               AND prosrc LIKE '%corroborating a credit ledger entry are never removed%'
+               AND prosrc LIKE '%until stripe can no longer complete them%'
+            FROM pg_proc
+            WHERE proname = 'reject_stripe_checkout_intent_mutation'
+            "#,
+        )
+        .fetch_one(&pool)
+        .await?;
         let version = query_scalar::<_, i64>("SELECT MAX(version) FROM _sqlx_migrations")
             .fetch_one(&pool)
             .await?;
@@ -987,6 +1005,7 @@ async fn migration_chain_applies_on_a_fresh_database() {
             usage_events_has_source,
             attempts_have_source,
             attempts_have_reason,
+            checkout_intent_delete_is_guarded,
             version,
         ))
     }
@@ -997,7 +1016,7 @@ async fn migration_chain_applies_on_a_fresh_database() {
         .execute(&admin)
         .await;
 
-    let outcome = outcome.expect("the 0001->0020 chain must apply on a fresh database");
+    let outcome = outcome.expect("the 0001->0022 chain must apply on a fresh database");
     assert!(outcome.0, "request_attempts exists after the fresh chain");
     assert!(
         outcome.1,
@@ -1072,13 +1091,20 @@ async fn migration_chain_applies_on_a_fresh_database() {
         "request_attempts does carry finish_reason, which is exactly why the \
          missing source column matters"
     );
-    // 21, not 17: 0013 (dispute resolution), 0014 (dispatched reservations),
+    assert!(
+        outcome.16,
+        "the 0022 checkout-intent DELETE guard is installed after the chain: a \
+         settled row, a ledger-corroborated row, and a row Stripe can still \
+         complete are each refused by the database itself"
+    );
+    // 22, not 18: 0013 (dispute resolution), 0014 (dispatched reservations),
     // 0015 (released reservations), 0016 (deposit fee), 0017 (stripe observed
     // reversals), 0018 (autopay withheld state), 0019 (monthly spend rollup),
-    // 0020 (usage gap and real finish reason) and 0021 (autopay tax) are
-    // numbered with a gap so 0010-0012 stay available to branches in flight.
-    // The chain's head is the highest version applied, not a count of files.
-    assert_eq!(outcome.16, 21, "the chain reaches migration version 21");
+    // 0020 (usage gap and real finish reason), 0021 (autopay tax) and 0022
+    // (checkout intent cleanup) are numbered with a gap so 0010-0012 stay
+    // available to branches in flight. The chain's head is the highest version
+    // applied, not a count of files.
+    assert_eq!(outcome.17, 22, "the chain reaches migration version 22");
 }
 
 /// Rewrite the database name in a Postgres URL, keeping any query string

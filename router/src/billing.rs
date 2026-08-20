@@ -147,6 +147,148 @@ pub async fn settle_checkout_intent(
     Ok(settled > 0)
 }
 
+/// What one [`sweep_expired_checkout_intents`] pass removed.
+///
+/// Reported rather than merely counted so the sweep's log line is a usable
+/// forensic record: the rows themselves are gone, and this is what survives of
+/// them in the operator's logs.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CheckoutIntentSweep {
+    /// Rows deleted this pass. Equal to the batch limit means there is more to
+    /// do and the next pass will do it.
+    pub removed: u64,
+    /// `created_at` of the oldest row removed — how far the backlog reached.
+    pub oldest: Option<DateTime<Utc>>,
+    /// Summed `expected_credit_usd` of the removed rows: credit that was
+    /// quoted and never bought. Not money that moved (by construction none of
+    /// these rows was ever credited), so it is an abandonment figure, not a
+    /// ledger figure.
+    pub quoted_credit_usd: Decimal,
+}
+
+/// The advisory-lock key the cleanup sweep serializes on, and salt 2's only
+/// user.
+///
+/// Salts 0 and 1 are the per-user and per-PaymentIntent locks (see
+/// [`lock_payment_intent`] for how `hashtextextended`'s salt selects a hash
+/// function rather than a disjoint range, and why a cross-salt collision is
+/// harmless). This transaction takes ONLY this key — never a user or intent
+/// lock — so it cannot participate in a lock cycle with the money paths.
+const CHECKOUT_INTENT_CLEANUP_LOCK: &str = "stripe_checkout_intent_cleanup";
+
+/// Remove abandoned checkout intents: rows for Checkout Sessions that were
+/// created, never paid, and are now older than Stripe can possibly complete.
+///
+/// # The predicate is the safety argument
+///
+/// ```text
+/// settled_at IS NULL                      -- the webhook never delivered it
+/// AND created_at < NOW() - retention_days -- stripe can no longer complete it
+/// AND NOT EXISTS (credit_ledger row)      -- and it was never credited
+/// ```
+///
+/// The third condition is the one that protects money, and it is deliberately
+/// NOT expressed as `settled_at IS NULL`. That marker is stamped after the
+/// credit commits and is explicitly allowed to be lost (see
+/// [`settle_checkout_intent`]), so a row can be unsettled and yet credited. The
+/// `credit_ledger` row cannot be lost — it is the purchase's idempotence anchor
+/// and the ledger is append-only — so it is the authoritative answer to "did
+/// money move for this session?".
+///
+/// **The database enforces the same three conditions independently** (migration
+/// 0022 narrows `reject_stripe_checkout_intent_mutation` to permit DELETE only
+/// for rows meeting them, with a hard seven-day floor). This query is therefore
+/// the fast path, not the guarantee: a bug that widened it would abort against
+/// the trigger rather than delete a credited row.
+///
+/// # Shape
+///
+/// The inner `SELECT` rides `stripe_checkout_intents_unsettled_idx` — a partial
+/// index on `(created_at) WHERE settled_at IS NULL`, which matches this
+/// predicate and this ordering exactly — so the candidate scan is an ordered
+/// index read that stops at `limit`, never a table scan.
+///
+/// **The candidate scan carries the whole predicate, not just the cheap half,
+/// and that is not redundancy.** The rows a credit landed on but a
+/// [`settle_checkout_intent`] failed to stamp are permanent AND unsettled AND
+/// (in time) the oldest rows in the table, so a candidate scan filtered only on
+/// `settled_at` would hand the same undeletable rows to every pass forever,
+/// consuming the batch and deleting nothing. The sweep would report success and
+/// silently stop working. Selecting on the full predicate is what keeps a
+/// bounded batch a batch of *deletable* rows.
+///
+/// The predicate is then repeated on the DELETE itself, and that repetition IS
+/// the race guard: a candidate credited between the scan and the delete is
+/// dropped from the batch by the query rather than aborting the whole statement
+/// on migration 0022's trigger.
+///
+/// Returns `None` when another task already holds the sweep lock: cleanup is
+/// pure maintenance, so a skipped pass costs nothing and the next one picks up
+/// the same rows.
+pub async fn sweep_expired_checkout_intents(
+    pool: &PgPool,
+    retention_days: i32,
+    limit: i64,
+) -> Result<Option<CheckoutIntentSweep>, sqlx::Error> {
+    let mut transaction = pool.begin().await?;
+    sqlx::query("SET LOCAL lock_timeout = '5s'")
+        .execute(&mut *transaction)
+        .await?;
+    // `try`, not the blocking `pg_advisory_xact_lock` the money paths use: two
+    // sweeps doing the same maintenance is waste, not a fault, and waiting for
+    // the other one only to find it has already deleted the batch is more
+    // waste. Transaction-scoped so it is released by the commit or the rollback
+    // and can never be leaked onto a pooled connection.
+    let acquired = sqlx::query_scalar::<_, bool>(
+        "SELECT pg_try_advisory_xact_lock(hashtextextended($1::TEXT, 2))",
+    )
+    .bind(CHECKOUT_INTENT_CLEANUP_LOCK)
+    .fetch_one(&mut *transaction)
+    .await?;
+    if !acquired {
+        transaction.rollback().await?;
+        return Ok(None);
+    }
+    let removed = sqlx::query_as::<_, (DateTime<Utc>, Decimal)>(
+        r#"
+        DELETE FROM stripe_checkout_intents
+        WHERE stripe_session_id IN (
+            SELECT candidate.stripe_session_id
+            FROM stripe_checkout_intents candidate
+            WHERE candidate.settled_at IS NULL
+              AND candidate.created_at < NOW() - ($1 * INTERVAL '1 day')
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM credit_ledger
+                  WHERE credit_ledger.stripe_session_id
+                        = candidate.stripe_session_id
+              )
+            ORDER BY candidate.created_at
+            LIMIT $2
+        )
+          AND settled_at IS NULL
+          AND created_at < NOW() - ($1 * INTERVAL '1 day')
+          AND NOT EXISTS (
+              SELECT 1
+              FROM credit_ledger
+              WHERE credit_ledger.stripe_session_id
+                    = stripe_checkout_intents.stripe_session_id
+          )
+        RETURNING created_at, expected_credit_usd
+        "#,
+    )
+    .bind(retention_days)
+    .bind(limit)
+    .fetch_all(&mut *transaction)
+    .await?;
+    transaction.commit().await?;
+    Ok(Some(CheckoutIntentSweep {
+        removed: removed.len() as u64,
+        oldest: removed.iter().map(|(created_at, _)| *created_at).min(),
+        quoted_credit_usd: removed.iter().map(|(_, credit)| *credit).sum(),
+    }))
+}
+
 /// Apply a completed Stripe Checkout purchase to the user's balance.
 ///
 /// Idempotent by `stripe_session_id`: the first call credits the balance and
