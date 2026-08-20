@@ -19,9 +19,16 @@ runtime exists. Each item carries the reason it was deferred.
   schema.
 - **Shared entitlement evaluator for `/v1/models` and invocation** (the
   FrankenGate acceptance criterion: what the catalog advertises and what
-  invocation admits must come from one evaluator) — today `/v1/models` is
-  deliberately the stable full catalog while admission is credential- and
-  credit-gated; unifying them matters once per-plan entitlements exist.
+  invocation admits must come from one evaluator). **The CREDENTIAL dimension is
+  now unified** — both surfaces read
+  `providers::ProviderMetadata::dispatchable`, and a test asserts they agree for
+  every provider in every environment. That half stopped being deferrable when a
+  deploy without `BEDROCK_API_KEY` advertised two lanes it could not serve. What
+  remains is the per-USER dimension: admission is also credit- and cap-gated,
+  and the catalog is not, so a funded and an exhausted key still see the same
+  rows. That one genuinely waits for per-plan entitlements, and it is a much
+  weaker promise — a caller can discover their own balance, but they cannot
+  discover which secrets the operator provisioned.
 - **Cross-replica key-revocation invalidation SLO** — each replica's auth
   cache expires within 30 seconds; a revocation bus only matters above one
   replica, and the beta runs one.

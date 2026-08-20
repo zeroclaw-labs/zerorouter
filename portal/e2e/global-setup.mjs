@@ -50,6 +50,22 @@ export default async function globalSetup() {
       // page, so the gap was invisible until the catalog gained something
       // worth testing.
       ZEROROUTER_TIERS_PATH: path.resolve(repo, 'router', 'config', 'tiers.toml'),
+      // `/v1/models` publishes only lanes whose provider credential is present,
+      // so without these the storefront renders an EMPTY catalog — correctly,
+      // and the retention assertions below would have nothing to read. These
+      // stand for "the secret is provisioned"; the catalog route never dials an
+      // upstream, so no value here leaves the process. They are deliberately
+      // not plausible keys.
+      //
+      // This harness is therefore a FULLY credentialed deployment. The partial
+      // case — the one that caused the incident, region set and
+      // BEDROCK_API_KEY absent — is covered in `router/tests/http.rs`, where it
+      // can be asserted precisely and without a browser.
+      ANTHROPIC_API_KEY: 'not-a-real-key',
+      OPENAI_API_KEY: 'not-a-real-key',
+      GEMINI_API_KEY: 'not-a-real-key',
+      BEDROCK_API_KEY: 'not-a-real-key',
+      BEDROCK_REGION: 'us-east-1',
       OIDC_ISSUER_URL: `http://127.0.0.1:${IDP_PORT}`,
       OIDC_CLIENT_ID: 'e2e-portal',
       OIDC_CLIENT_SECRET: 'e2e-secret',

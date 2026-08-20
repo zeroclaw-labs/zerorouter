@@ -38,9 +38,20 @@ Do not commit these values or place them in Terraform variables. The list above
 is whatever `config/providers.json` entries name in `credential_env`; that file
 is the source of truth, and this list is a convenience copy of it.
 
-`/v1/models` deliberately remains the stable full catalog rather than changing
-with credential availability, so a lane whose key is absent is still advertised
-and fails at dispatch rather than vanishing from the storefront.
+**`/v1/models` publishes only the lanes this deployment can actually serve.** A
+provider whose `credential_env` is absent from the environment contributes no
+rows, and a request naming one of its models is refused as `model_unavailable`
+rather than admitted. A deployment with no provider secrets therefore publishes
+an empty catalog, which is the honest answer.
+
+This reverses an earlier rule — the catalog used to be "the stable full catalog
+rather than changing with credential availability" — and the reversal was paid
+for in production. A deploy without `BEDROCK_API_KEY` advertised both Bedrock
+zero-retention lanes, the ones the product leads with, while every call to them
+returned 503. Stability is not worth much when what is stable is untrue. If you
+need to see the catalog a fully-provisioned deployment would publish, read
+`config/tiers.toml`, which is the source of truth and is not filtered by
+anything.
 
 `BEDROCK_API_KEY` is an Amazon Bedrock API key (an IAM service-specific
 credential), not the AWS access-key ID and secret used for Terraform.

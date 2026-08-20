@@ -244,7 +244,7 @@ async fn completion_authentication_precedes_body_buffering() {
 
 #[tokio::test]
 async fn models_are_materialized_from_tiers_toml() {
-    let response = app(RouterState::new(tier_config_path()))
+    let response = app(RouterState::fully_credentialed(tier_config_path()))
         .oneshot(
             Request::builder()
                 .uri("/v1/models")
@@ -352,7 +352,7 @@ async fn model_pricing_matches_zeroclaws_model_pricing_wire_contract() {
     // ZeroClaw's `ModelPricing` declares no `deny_unknown_fields` and its
     // normalizer reads `prompt`, `completion`, `input_cache_read` by name, so
     // an existing client sees exactly what it saw before.
-    let data = listed_models(RouterState::new(tier_config_path())).await;
+    let data = listed_models(RouterState::fully_credentialed(tier_config_path())).await;
 
     let tier = data
         .iter()
@@ -457,7 +457,7 @@ async fn every_shipped_model_publishes_what_it_can_take_and_produce() {
     // exactly the long-context work someone reached for the big model to do.
     // A new tier has to come back and satisfy this test rather than discover
     // it in an agent transcript.
-    for model in listed_models(RouterState::new(tier_config_path())).await {
+    for model in listed_models(RouterState::fully_credentialed(tier_config_path())).await {
         let id = model["id"].as_str().expect("every model carries an id");
         // The shipped catalog's real floor is haiku's 200k. The assertion is a
         // sanity bound, not a spec: it catches a unit slip (200 for 200k) or a
@@ -509,7 +509,7 @@ async fn a_model_that_declares_no_metadata_omits_the_keys_rather_than_nulling_th
     // default would say something false. This fixture declares no metadata at
     // all, the shape of every tiers.toml written before the table existed.
     let path = catalog_fixture("models_no_metadata", &two_tier_source("1.00")).await;
-    let data = listed_models(RouterState::new(path)).await;
+    let data = listed_models(RouterState::fully_credentialed(path)).await;
 
     assert_eq!(data.len(), 4, "two tiers and their two pinned candidates");
     for model in &data {
@@ -555,7 +555,7 @@ async fn zero_retention_lanes_sort_before_standard_ones() {
     // The fixture is built so the two orderings disagree: by id alone the
     // answer would be anthropic, google, openai, openai — the zero lanes last.
     let path = catalog_fixture("models_retention_order", &retention_ordering_source()).await;
-    let ids = listed_model_ids(RouterState::new(path)).await;
+    let ids = listed_model_ids(RouterState::fully_credentialed(path)).await;
 
     assert_eq!(
         ids,
@@ -577,7 +577,7 @@ async fn every_shipped_lane_publishes_a_retention_posture() {
     // posture, and today every one of them is honest about retaining. If a
     // future lane is pinned zero, this test is where the count changes and
     // someone has to have meant it.
-    let data = listed_models(RouterState::new(tier_config_path())).await;
+    let data = listed_models(RouterState::fully_credentialed(tier_config_path())).await;
 
     for model in &data {
         let id = model["id"].as_str().expect("every model carries an id");
@@ -640,7 +640,7 @@ async fn every_shipped_lane_publishes_a_retention_posture() {
 /// sort in `ModelList::from_listing` — fails here against the real file.
 #[tokio::test]
 async fn the_shipped_catalog_lists_its_zero_retention_lanes_first() {
-    let data = listed_models(RouterState::new(tier_config_path())).await;
+    let data = listed_models(RouterState::fully_credentialed(tier_config_path())).await;
     let postures: Vec<&str> = data
         .iter()
         .map(|model| {
@@ -662,6 +662,76 @@ async fn the_shipped_catalog_lists_its_zero_retention_lanes_first() {
         last_zero < first_standard,
         "a retaining lane precedes a zero-retention one in the published order: {postures:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// The catalog publishes only what this deployment can serve.
+//
+// These pin the fix for a production incident: `/v1/models` was credential-blind
+// by design, so a deployment holding no `BEDROCK_API_KEY` advertised both
+// Bedrock lanes — the zero-retention lanes the whole product leads with — while
+// every request for them was refused. The catalog was "stable" and untrue.
+// ---------------------------------------------------------------------------
+
+/// THE INCIDENT, reproduced exactly: every other provider credentialed, Bedrock
+/// not. The lanes must be absent, and nothing else may move.
+#[tokio::test]
+async fn a_lane_whose_credential_is_absent_is_not_advertised() {
+    let ids = listed_model_ids(RouterState::credentialed_for(
+        tier_config_path(),
+        &["anthropic", "openai", "google"],
+    ))
+    .await;
+
+    assert!(
+        !ids.iter().any(|id| id.starts_with("bedrock/")),
+        "an uncredentialed lane must not appear in /v1/models: {ids:?}"
+    );
+    // And the rest of the catalog is untouched — a missing key removes its own
+    // lanes and nothing else. The count is the shipped twelve minus Bedrock's
+    // two; asserting the survivors by name would just restate the catalog, but
+    // asserting that the ONLY difference is the Bedrock pair is the claim.
+    assert_eq!(ids.len(), 10, "{ids:?}");
+    assert!(ids.iter().any(|id| id == "anthropic/claude-sonnet-5"));
+}
+
+/// The same rule for every other provider, because the bug was never
+/// Bedrock-specific — the catalog consulted no credential for ANY lane, and
+/// anthropic/openai/google only looked correct because their keys have always
+/// been present in production. Each is dropped in turn.
+#[tokio::test]
+async fn every_provider_hides_its_own_lanes_when_its_key_is_absent() {
+    const ALL: [&str; 4] = ["anthropic", "openai", "google", "bedrock"];
+    for missing in ALL {
+        let credentialed: Vec<&str> = ALL.into_iter().filter(|name| *name != missing).collect();
+        let ids = listed_model_ids(RouterState::credentialed_for(
+            tier_config_path(),
+            &credentialed,
+        ))
+        .await;
+
+        let prefix = format!("{missing}/");
+        assert!(
+            !ids.iter().any(|id| id.starts_with(&prefix)),
+            "{missing} lanes must vanish when {missing} has no credential: {ids:?}"
+        );
+        assert!(
+            ids.iter().all(|id| !id.starts_with(&prefix)) && !ids.is_empty(),
+            "only {missing}'s lanes should go, not the catalog: {ids:?}"
+        );
+    }
+}
+
+/// A deployment with NO provider secrets publishes an empty catalog rather than
+/// a full one it cannot serve.
+///
+/// The degenerate case, and it is asserted rather than assumed because it is
+/// what a fresh environment looks like — and because "publish everything when
+/// you know nothing" was precisely the old behaviour.
+#[tokio::test]
+async fn a_deployment_with_no_credentials_advertises_nothing() {
+    let ids = listed_model_ids(RouterState::credentialed_for(tier_config_path(), &[])).await;
+    assert!(ids.is_empty(), "{ids:?}");
 }
 
 #[tokio::test]
@@ -870,7 +940,7 @@ async fn models_omit_a_withheld_tier_and_its_pinned_candidates() {
     let path = catalog_fixture("models_below_cost", &two_tier_source("3.00")).await;
 
     assert_eq!(
-        listed_model_ids(RouterState::new(path)).await,
+        listed_model_ids(RouterState::fully_credentialed(path)).await,
         ["openai/healthy", "zero/fixture-healthy"]
     );
 }
@@ -933,7 +1003,7 @@ output_per_mtok = 0.20
         "a duplicate concrete id must refuse the whole catalog"
     );
 
-    let response = app(RouterState::new(path))
+    let response = app(RouterState::fully_credentialed(path))
         .oneshot(
             Request::builder()
                 .uri("/v1/models")
@@ -1062,7 +1132,7 @@ async fn a_basis_hike_above_sell_withholds_that_tier_and_nothing_else() {
     // survivors and that is the point of naming it — the two lanes serve the
     // same weights on different accounts, so a repricing of the first-party
     // one withholds only the first-party one.
-    let listed = listed_model_ids(RouterState::new(path)).await;
+    let listed = listed_model_ids(RouterState::fully_credentialed(path)).await;
     assert_eq!(listed.len(), 11);
     assert!(listed.iter().any(|id| id == "bedrock/claude-sonnet-5"));
     assert!(listed.iter().any(|id| id == "openai/gpt-5.6-luna"));
