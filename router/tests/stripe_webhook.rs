@@ -1095,18 +1095,39 @@ async fn checkout_session_form_is_the_pinned_stripe_wire_contract() {
         // Render the form inside the portal rather than on a Stripe-hosted
         // page. This is the parameter that makes Stripe mint a client secret.
         ("ui_mode", "embedded_page"),
+        // TWO line items, so Stripe's own summary reads the way the portal's
+        // copy does. Line 0 is the credits the buyer receives — $25.00, exactly
+        // what the webhook will credit — and line 1 is the deposit fee,
+        // ceil(0.055 * 25) = $1.38. They sum to the EX-TAX gross of $26.38,
+        // which is the single number the intent row, the reuse-cache key and
+        // both webhook corroborations are built on. Tax is added on top of that
+        // sum by Stripe.
+        //
+        // Before this shape there was ONE line priced at the gross, so the
+        // iframe drew "ZeroRouter credits $26.38" and a $26.38 subtotal, which
+        // claimed the buyer was getting $26.38 of credits when they were
+        // getting $25.00.
         ("line_items[0][price_data][currency]", "usd"),
-        // The unit amount is the EX-TAX gross: $25.00 credit + ceil(0.055 * 25)
-        // = $1.38 fee = $26.38. Tax is added on top of this by Stripe.
-        ("line_items[0][price_data][unit_amount]", "2638"),
+        ("line_items[0][price_data][unit_amount]", "2500"),
         (
             "line_items[0][price_data][product_data][name]",
             "ZeroRouter credits",
         ),
         ("line_items[0][quantity]", "1"),
+        ("line_items[1][price_data][currency]", "usd"),
+        ("line_items[1][price_data][unit_amount]", "138"),
+        // The portal's own word for this charge ("includes $1.38 processing
+        // fee"), so the line the iframe draws is recognisably the same fee the
+        // app just quoted rather than a second, unexplained one.
+        (
+            "line_items[1][price_data][product_data][name]",
+            "Processing fee",
+        ),
+        ("line_items[1][quantity]", "1"),
         // The whole of ZeroRouter's tax integration. No tax code and no tax
         // behavior: those are Tax Settings' job, so the operator can revise the
-        // classification without a deploy.
+        // classification without a deploy. That holds for BOTH lines — see
+        // `neither_checkout_line_item_carries_a_tax_code_of_its_own`.
         ("automatic_tax[enabled]", "true"),
         // Offer the buyer a VAT/tax-ID field so a VAT-registered business is
         // reverse-charged rather than taxed as a consumer. No `required` key:
@@ -1177,6 +1198,227 @@ async fn checkout_session_form_is_the_pinned_stripe_wire_contract() {
     assert_eq!(intent.expected_amount_cents, 2_638);
     assert_eq!(intent.expected_credit_usd, Decimal::from(25));
     assert_eq!(intent.user_id, user_id);
+
+    // Exactly two line items, and no third: the equality above already pins
+    // that, but a bare count says out loud what the shape is meant to be.
+    assert_eq!(
+        form.keys()
+            .filter(|key| key.ends_with("[quantity]") && key.starts_with("line_items["))
+            .count(),
+        2,
+        "the session is sold as exactly two line items"
+    );
+    assert!(
+        form.keys().all(|key| !key.starts_with("line_items[2]")),
+        "a third line item would be money nobody quoted"
+    );
+}
+
+/// Read the `unit_amount` of one line item out of a captured form.
+fn line_item_cents(form: &HashMap<String, String>, index: usize) -> i64 {
+    form.get(&format!("line_items[{index}][price_data][unit_amount]"))
+        .unwrap_or_else(|| panic!("line item {index} must carry a unit_amount"))
+        .parse()
+        .unwrap_or_else(|_| panic!("line item {index} unit_amount must be an integer"))
+}
+
+/// The arithmetic that makes the split safe: the two lines must sum to the
+/// EX-TAX GROSS — the one number the whole accounting chain is built on — and
+/// the credits line must be the credit and nothing more.
+///
+/// # Why this is a separate test from the wire contract
+///
+/// The wire contract pins literals for one amount ($25). It would keep passing
+/// if the split were re-derived some other way that happens to agree at $25 and
+/// disagrees a cent elsewhere — which is exactly the failure a second,
+/// independent 5.5% computation in the line items would produce, since
+/// `deposit_fee_quote` CEILS to the whole cent. So this sweeps the fee schedule
+/// instead: the $0.80 floor, the floor/percentage crossover, and amounts whose
+/// percentage is a sub-cent that ceils. A cent lost here is not cosmetic — the
+/// lines would sum to something other than `expected_amount_cents`, Stripe
+/// would collect that other number, and BOTH webhook corroborations would then
+/// refuse a payment the customer really made.
+#[tokio::test]
+async fn the_two_checkout_line_items_sum_to_the_gross_and_the_credits_line_is_the_credit() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    // (credit dollars, credit cents, fee cents, gross cents). Every fee here is
+    // `deposit_fee_quote`'s: max(ceil(0.055 * credit), 80).
+    let cases = [
+        // The floor: 0.055 * 5 = 0.275 -> ceils to 0.28, under the $0.80 floor.
+        ("5.00", 500_i64, 80_i64, 580_i64),
+        // The last credit the floor still wins at, and the first it does not:
+        // 0.055 * 14.54 = 0.7997 -> 0.80 ties, 0.055 * 14.55 = 0.80025 -> 0.81.
+        ("14.54", 1_454, 80, 1_534),
+        ("14.55", 1_455, 81, 1_536),
+        // Sub-cent percentages that must ceil, not round: 1.375 -> 1.38 and
+        // 2.475 -> 2.48. A second, independent 5.5% that rounded instead would
+        // put the fee line a cent low and the sum a cent under the gross.
+        ("25.00", 2_500, 138, 2_638),
+        ("45.00", 4_500, 248, 4_748),
+        // An exact percentage, no rounding involved at all.
+        ("100.00", 10_000, 550, 10_550),
+    ];
+    for (credit_usd, credit_cents, fee_cents, gross_cents) in cases {
+        let user_id = create_user(&pool, &format!("split-{credit_usd}")).await;
+        let session_id = unique_session_id();
+        let (api_base, captured, _version) = mock_checkout_stripe(session_id.clone()).await;
+        let (status, body) = post_checkout(&pool, &api_base, user_id, credit_usd).await;
+        assert_eq!(status, StatusCode::OK, "{credit_usd}: body: {body}");
+        let form = captured
+            .lock()
+            .expect("captured form must lock")
+            .clone()
+            .expect("stripe must have been called");
+
+        let line_credit = line_item_cents(&form, 0);
+        let line_fee = line_item_cents(&form, 1);
+        assert_eq!(
+            line_credit, credit_cents,
+            "{credit_usd}: the credits line must be the credit exactly"
+        );
+        assert_eq!(
+            line_fee, fee_cents,
+            "{credit_usd}: the fee line must be the quoted deposit fee"
+        );
+        assert_eq!(
+            line_credit + line_fee,
+            gross_cents,
+            "{credit_usd}: the line items must sum to the ex-tax gross"
+        );
+
+        // The sum is not merely equal to a literal — it is equal to the number
+        // ZeroRouter recorded and will later require Stripe to have collected.
+        // These are the same quantity by construction and this asserts it.
+        let intent = checkout_intent(&pool, &session_id)
+            .await
+            .expect("intent must query")
+            .expect("intent must exist");
+        assert_eq!(
+            line_credit + line_fee,
+            intent.expected_amount_cents,
+            "{credit_usd}: the lines must sum to the gross on the intent row"
+        );
+        assert_eq!(
+            Decimal::from(line_credit) / Decimal::ONE_HUNDRED,
+            intent.expected_credit_usd,
+            "{credit_usd}: the credits line must equal the credit the intent row will grant"
+        );
+        // And the same again against the metadata the webhook reads.
+        assert_eq!(
+            form.get("metadata[credit_usd]").map(String::as_str),
+            Some(credit_usd),
+            "{credit_usd}: metadata still names the credit, not the gross"
+        );
+        assert_eq!(
+            form.get("metadata[gross_usd]")
+                .map(|raw| Decimal::from_str(raw).expect("gross must parse")),
+            Some(Decimal::from(gross_cents) / Decimal::ONE_HUNDRED),
+            "{credit_usd}: metadata still names the gross the lines sum to"
+        );
+    }
+}
+
+/// The end the split has to reach: what Stripe renders on the credits line is
+/// what the ledger actually grants.
+///
+/// The presentation bug this fixes was precisely a divergence between those two
+/// — the iframe said $26.38 of credits, the ledger granted $25.00 — so pinning
+/// the amounts alone would miss the point. This drives the real purchase all
+/// the way through: create the session, read the credits line off the wire,
+/// then deliver a signed, taxed `checkout.session.completed` for the gross the
+/// two lines sum to, and require the balance to land on the credits line's
+/// number. Nothing here is asserted against a literal the split could also have
+/// been wrong about.
+#[tokio::test]
+async fn the_credits_line_is_exactly_what_the_webhook_credits() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let user_id = create_user(&pool, "line-credits").await;
+    let session_id = unique_session_id();
+    let (api_base, captured, _version) = mock_checkout_stripe(session_id.clone()).await;
+    let (status, body) = post_checkout(&pool, &api_base, user_id, "25.00").await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let form = captured
+        .lock()
+        .expect("captured form must lock")
+        .clone()
+        .expect("stripe must have been called");
+    let line_credit = line_item_cents(&form, 0);
+    let line_fee = line_item_cents(&form, 1);
+
+    // Stripe collects the SUM of the lines, plus tax on top of it. $1.65 of tax
+    // is a plausible 6.25% MA figure and, more importantly, is not derivable
+    // from anything else here — so a corroboration that quietly compared the
+    // wrong quantity would show up as a rejection.
+    let tax_cents = 165;
+    let (status, _) = post_webhook_against(
+        &pool,
+        UNREACHABLE_STRIPE,
+        &taxed_session_event(
+            &session_id,
+            user_id,
+            "25.00",
+            line_credit + line_fee,
+            tax_cents,
+            "usd",
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the taxed purchase must be accepted"
+    );
+
+    // The credited balance is the CREDITS LINE, to the cent — not the gross the
+    // buyer paid, and not the gross plus tax.
+    assert_eq!(
+        balance(&pool, user_id).await.expect("balance must query"),
+        Decimal::from(line_credit) / Decimal::ONE_HUNDRED,
+        "the balance must be exactly what the credits line said it would be"
+    );
+    assert_eq!(purchase_count(&pool, user_id).await, 1);
+}
+
+/// The tax treatment must NOT have been split along with the presentation.
+///
+/// The operator's standing decision is to do this the default Stripe way: the
+/// Tax Settings preset classifies the sale, so a contested classification can be
+/// revised in the dashboard rather than in a deploy. That was already true of
+/// the single line item; the risk the split introduces is that the fee line
+/// picks up an override "because a fee is different" — which would both take
+/// the classification back out of Tax Settings AND be the wrong tax answer, as
+/// the fee is part of the taxable consideration for the same single service in
+/// the regimes ZeroRouter is registered in. Neither line may carry one.
+#[tokio::test]
+async fn neither_checkout_line_item_carries_a_tax_code_of_its_own() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let user_id = create_user(&pool, "uniform-tax").await;
+    let session_id = unique_session_id();
+    let (api_base, captured, _version) = mock_checkout_stripe(session_id).await;
+    let (status, body) = post_checkout(&pool, &api_base, user_id, "25.00").await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let form = captured
+        .lock()
+        .expect("captured form must lock")
+        .clone()
+        .expect("stripe must have been called");
+
+    assert!(
+        form.keys()
+            .all(|key| !key.contains("tax_code") && !key.contains("tax_behavior")),
+        "no line item may hardcode a tax code or tax behavior; Tax Settings owns both"
+    );
+    assert_eq!(
+        form.get("automatic_tax[enabled]").map(String::as_str),
+        Some("true"),
+        "one automatic_tax flag still covers both lines"
+    );
 }
 
 /// The one parameter that makes Stripe compute tax, and the two that must NOT

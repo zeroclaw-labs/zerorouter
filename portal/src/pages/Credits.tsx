@@ -188,7 +188,9 @@ export function Credits() {
   // Price the deposit on the server whenever the amount changes — the fee is
   // never recomputed in TypeScript. Reset first so a stale fee never shows
   // against a new amount; a failed quote (billing off, out of bounds) simply
-  // omits the fee line, and the server is still the authority at checkout.
+  // omits the sentence below, and the server is still the authority at
+  // checkout. (Distinct from the "Processing fee" LINE ITEM Stripe renders
+  // inside the embedded form, which the server sends and this file never sees.)
   useEffect(() => {
     setQuote(null)
     if (normalized === null) return

@@ -337,7 +337,19 @@ const CHARGE_REFUNDED_EVENT: &str = "charge.refunded";
 /// A cardholder disputed a charge. The event object is the DISPUTE; the money
 /// has already left the ZeroRouter balance at Stripe by the time it arrives.
 const DISPUTE_CREATED_EVENT: &str = "charge.dispute.created";
+/// The name Stripe renders on the CREDIT line of the Checkout Session — the
+/// thing the buyer is actually acquiring, priced at the credit amount and
+/// nothing else.
 const CHECKOUT_PRODUCT_NAME: &str = "ZeroRouter credits";
+/// The name Stripe renders on the FEE line of the Checkout Session.
+///
+/// The wording is the portal's, not a new coinage: `Credits.tsx` calls this
+/// "processing fee" in both the amount step ("includes $0.80 processing fee")
+/// and the summary above the embedded form, so the line item the iframe draws
+/// reads as the same charge the app just described rather than as a second,
+/// unexplained one. Capitalized because it is a standalone label here and
+/// mid-sentence prose there.
+const CHECKOUT_FEE_PRODUCT_NAME: &str = "Processing fee";
 /// Render Checkout as a form inside the portal rather than on a Stripe-hosted
 /// page. Stripe's enum spells this `embedded_page` (`hosted_page` is the
 /// default, and `elements` is the lower-level Checkout-elements mode).
@@ -664,7 +676,7 @@ async fn create_checkout(
     // `amount_usd` is the CREDIT (net) the user picked. Validate its bounds and
     // whole-cent granularity, then price the deposit: the fee rides on top and
     // Stripe collects the gross.
-    validate_checkout_amount(amount_usd, stripe)?;
+    let credit_cents = validate_checkout_amount(amount_usd, stripe)?;
     let quote = deposit_fee_quote(amount_usd);
     // Credit and fee are each whole cents, so the gross is too; refuse rather
     // than quote a sub-cent unit_amount Stripe would reject.
@@ -711,7 +723,11 @@ async fn create_checkout(
             credit_usd: amount_usd,
             fee_usd: quote.fee_usd,
             gross_usd: quote.gross_usd,
-            unit_amount_cents: gross_cents,
+            // Both cent figures come from the SAME quote the intent row and the
+            // reuse-cache key are built from, so the two line items Stripe
+            // renders cannot disagree with what the webhook will corroborate.
+            credit_cents,
+            gross_cents,
             return_url: ctx.config.absolute_url(CHECKOUT_RETURN_PATH),
         },
     )
@@ -1179,8 +1195,14 @@ struct CheckoutSessionParams<'a> {
     fee_usd: Decimal,
     /// The GROSS Stripe collects, stamped into `metadata[gross_usd]`.
     gross_usd: Decimal,
-    /// The gross, in cents — the `unit_amount` Stripe actually charges.
-    unit_amount_cents: i64,
+    /// The credit, in cents — the `unit_amount` of the "ZeroRouter credits"
+    /// line item, and exactly the figure the webhook will credit.
+    credit_cents: i64,
+    /// The gross, in cents — what the line items must SUM to, and the ex-tax
+    /// figure both webhook corroborations compare against. Not itself a
+    /// `unit_amount` any more: the fee line's amount is derived from this and
+    /// [`Self::credit_cents`], never recomputed from the fee rate.
+    gross_cents: i64,
     /// Where Checkout sends the browser once the payment attempt finishes.
     /// Carries the `{CHECKOUT_SESSION_ID}` template variable, which Stripe
     /// substitutes before redirecting.
@@ -1211,6 +1233,8 @@ struct CheckoutSessionResponse {
 enum CheckoutError {
     #[error("the Stripe HTTP client could not be constructed")]
     Client,
+    #[error("the checkout line items do not sum to the gross being collected")]
+    Mispriced,
     #[error("the Stripe checkout session request failed")]
     Request,
     #[error("Stripe rejected the checkout session request")]
@@ -1225,28 +1249,127 @@ impl From<CheckoutError> for StripeHttpError {
     }
 }
 
-/// Create a Stripe Checkout Session over the form-encoded REST API.
+/// Build the form body for the Checkout Session create call.
 ///
-/// Logs never include the secret key, the form body, or the raw response.
-async fn create_checkout_session(
-    settings: &StripeSettings,
-    params: CheckoutSessionParams<'_>,
-) -> Result<CheckoutSession, CheckoutError> {
-    let client = checkout_client()?;
-    let unit_amount = params.unit_amount_cents.to_string();
-    let user_id = params.user_id.to_string();
-    let credit_usd = params.credit_usd.to_string();
-    let fee_usd = params.fee_usd.to_string();
-    let gross_usd = params.gross_usd.to_string();
+/// Split out from [`create_checkout_session`] and kept pure so the one part of
+/// the request that does arithmetic — the split of the gross across two line
+/// items — can be exercised directly, including shapes the live fee schedule
+/// cannot currently produce.
+///
+/// # Why TWO line items
+///
+/// Stripe renders the line items it is given, and it used to be given one: a
+/// single "ZeroRouter credits" line priced at the GROSS. On a $10 purchase the
+/// iframe therefore drew "ZeroRouter credits $10.80" and "Subtotal $10.80",
+/// which reads as $10.80 of credits being bought. That contradicted the
+/// portal's own sentence one element above it ("$10.80 (includes $0.80
+/// processing fee) plus tax → $10.00 credit") and, more seriously, it
+/// contradicted what the webhook actually credits, which is $10.00. Splitting
+/// the same gross across a credits line and a fee line makes Stripe's own
+/// summary — credits $10.00, processing fee $0.80, subtotal $10.80, tax, total
+/// — say exactly what ZeroRouter charges and grants.
+///
+/// **No money moves as a result.** The lines sum to the identical gross, so
+/// `amount_total` is byte-for-byte what it was, and every downstream check is
+/// untouched: both webhook corroborations compare `amount_total - amount_tax`
+/// against the gross, `metadata[credit_usd]` still names the credit, and the
+/// session-reuse cache is still keyed on `(user, gross_cents)`.
+///
+/// # Why the fee line carries no tax code of its own
+///
+/// Neither line sends `product_data[tax_code]` or `price_data[tax_behavior]` —
+/// the same omission the single-line form made, for the same reason, and it is
+/// a decision rather than an oversight. The Dashboard's Tax Settings preset
+/// applies to both lines, which keeps the classification where the operator can
+/// revise it without a deploy. It is also the right tax answer: the two lines
+/// are one sale of one service, and in the regimes ZeroRouter is registered in
+/// the processing fee is part of the taxable consideration for that service
+/// rather than a separately-classified supply. Splitting the presentation must
+/// not silently split the tax treatment, so the fee line is deliberately given
+/// no override of any kind.
+fn checkout_session_form(
+    params: &CheckoutSessionParams<'_>,
+) -> Result<Vec<(String, String)>, CheckoutError> {
+    // The fee line's amount is the REMAINDER — gross minus credit — and is
+    // never recomputed from DEPOSIT_FEE_RATE here. That is the whole safety
+    // argument for this split: `deposit_fee_quote` already ceiled the
+    // percentage to a whole cent, and a second, independent 5.5% evaluated at
+    // this point could land a cent away from the first. The lines would then
+    // sum to something other than the gross on the intent row, Stripe would
+    // collect that other number, and both webhook corroborations would refuse
+    // the payment — taking the customer's money and crediting nothing.
+    let Some(fee_cents) = params.gross_cents.checked_sub(params.credit_cents) else {
+        tracing::error!("checkout session pricing overflowed while splitting the gross");
+        return Err(CheckoutError::Mispriced);
+    };
+    // Belt and braces on the line above: an explicit re-addition, checked in
+    // release builds too, so a future refactor that computes the fee some other
+    // way trips here rather than at Stripe. `credit_cents` must also be
+    // positive — a zero or negative credits line is both nonsense and rejected
+    // by Stripe.
+    if params.credit_cents <= 0
+        || fee_cents < 0
+        || params.credit_cents.checked_add(fee_cents) != Some(params.gross_cents)
+    {
+        tracing::error!(
+            credit_cents = params.credit_cents,
+            fee_cents,
+            gross_cents = params.gross_cents,
+            "checkout session line items do not sum to the gross; refusing to create it"
+        );
+        return Err(CheckoutError::Mispriced);
+    }
+
+    let mut form: Vec<(String, String)> = Vec::with_capacity(18);
+    let mut push = |key: &str, value: &str| form.push((key.to_owned(), value.to_owned()));
+    push("mode", "payment");
+    push("ui_mode", CHECKOUT_UI_MODE);
+
+    push("line_items[0][price_data][currency]", CHECKOUT_CURRENCY);
+    push(
+        "line_items[0][price_data][unit_amount]",
+        &params.credit_cents.to_string(),
+    );
+    push(
+        "line_items[0][price_data][product_data][name]",
+        CHECKOUT_PRODUCT_NAME,
+    );
+    push("line_items[0][quantity]", "1");
+
+    // The fee line is OMITTED when the fee is zero, because Stripe rejects a
+    // zero-amount line item in `mode=payment` and a rejected session is a
+    // failed purchase rather than a cosmetic problem.
+    //
+    // Today's fee schedule cannot reach this: `deposit_fee_quote` returns
+    // `max(ceil(0.055 * credit), $0.80)`, so the $0.80 floor alone puts every
+    // fee at or above 80 cents, and even with the floor removed the ceiling of
+    // a positive percentage is at least one cent. The branch exists because the
+    // floor and the rate are constants an operator may revise — a fee schedule
+    // with a genuinely free tier would otherwise turn every free-tier purchase
+    // into a Stripe 400. Degrading to the one-line form is the correct fallback
+    // there: with no fee to disclose, one line priced at the gross IS accurate.
+    if fee_cents > 0 {
+        push("line_items[1][price_data][currency]", CHECKOUT_CURRENCY);
+        push(
+            "line_items[1][price_data][unit_amount]",
+            &fee_cents.to_string(),
+        );
+        push(
+            "line_items[1][price_data][product_data][name]",
+            CHECKOUT_FEE_PRODUCT_NAME,
+        );
+        push("line_items[1][quantity]", "1");
+    }
+
     // fee/gross ride alongside credit so the webhook can see the full price the
     // session was sold at without a database read; the corroboration still
     // RECOMPUTES gross from credit (deposit_fee_quote) rather than trusting
     // these attacker-writable fields.
     //
-    // `unit_amount` remains the EX-TAX gross. `automatic_tax[enabled]` asks
+    // The line items sum to the EX-TAX gross. `automatic_tax[enabled]` asks
     // Stripe to determine the tax from the buyer's address and the dashboard's
-    // registrations and add it on top — so the card is charged more than
-    // `unit_amount`, and the webhook compares against `amount_total` minus that
+    // registrations and add it on top — so the card is charged more than that
+    // sum, and the webhook compares against `amount_total` minus that
     // tax rather than against `amount_total`.
     //
     // `tax_id_collection[enabled]` makes the embedded form offer a VAT/tax-ID
@@ -1302,25 +1425,26 @@ async fn create_checkout_session(
     // `{CHECKOUT_SESSION_ID}` template variable is substituted by Checkout on
     // the way back, which is how the return route knows which session to ask
     // about.
-    let form: [(&str, &str); 14] = [
-        ("mode", "payment"),
-        ("ui_mode", CHECKOUT_UI_MODE),
-        ("line_items[0][price_data][currency]", CHECKOUT_CURRENCY),
-        ("line_items[0][price_data][unit_amount]", &unit_amount),
-        (
-            "line_items[0][price_data][product_data][name]",
-            CHECKOUT_PRODUCT_NAME,
-        ),
-        ("line_items[0][quantity]", "1"),
-        ("automatic_tax[enabled]", "true"),
-        ("tax_id_collection[enabled]", "true"),
-        ("metadata[user_id]", &user_id),
-        ("metadata[credit_usd]", &credit_usd),
-        ("metadata[fee_usd]", &fee_usd),
-        ("metadata[gross_usd]", &gross_usd),
-        ("customer_email", params.customer_email),
-        ("return_url", &params.return_url),
-    ];
+    push("automatic_tax[enabled]", "true");
+    push("tax_id_collection[enabled]", "true");
+    push("metadata[user_id]", &params.user_id.to_string());
+    push("metadata[credit_usd]", &params.credit_usd.to_string());
+    push("metadata[fee_usd]", &params.fee_usd.to_string());
+    push("metadata[gross_usd]", &params.gross_usd.to_string());
+    push("customer_email", params.customer_email);
+    push("return_url", &params.return_url);
+    Ok(form)
+}
+
+/// Create a Stripe Checkout Session over the form-encoded REST API.
+///
+/// Logs never include the secret key, the form body, or the raw response.
+async fn create_checkout_session(
+    settings: &StripeSettings,
+    params: CheckoutSessionParams<'_>,
+) -> Result<CheckoutSession, CheckoutError> {
+    let client = checkout_client()?;
+    let form = checkout_session_form(&params)?;
     let response = client
         .post(checkout_sessions_url(settings))
         .bearer_auth(&settings.secret_key)
@@ -1660,8 +1784,11 @@ fn received() -> Json<Value> {
 /// ZeroRouter sold and the sales tax Stripe added to it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CollectedAmounts {
-    /// The money collected for the line item itself — the figure every
-    /// ZeroRouter-side amount is compared against.
+    /// The money collected for the line items themselves — the credits line
+    /// plus the fee line, which is the ex-tax gross and the figure every
+    /// ZeroRouter-side amount is compared against. How that gross is presented
+    /// to the buyer is [`checkout_session_form`]'s business and never changes
+    /// this number.
     ex_tax_cents: i64,
     /// Sales tax, collected on ZeroRouter's behalf and owed to a taxing
     /// jurisdiction. Never revenue, never credit; carried only so it can be
@@ -2191,6 +2318,36 @@ mod tests {
         assert_eq!(deposit_fee_quote(decimal("14.55")).fee_usd, decimal("0.81"));
     }
 
+    /// The fee schedule can never price a ZERO fee, which is what makes the
+    /// omit-the-fee-line branch in [`checkout_session_form`] unreachable today.
+    ///
+    /// Worth pinning rather than reasoning about at the call site, because the
+    /// two constants that guarantee it are exactly the two an operator might
+    /// revise. `max(ceil(0.055 * credit), $0.80)` is at or above the floor for
+    /// every input, and even with the floor deleted the ceiling of a positive
+    /// percentage is at least a cent — a free deposit would need a rate of zero
+    /// AND a floor of zero. If this test ever has to change, the branch it
+    /// documents stops being dead code and starts carrying live purchases.
+    #[test]
+    fn the_fee_schedule_never_prices_a_free_deposit() {
+        for raw in [
+            "0.01", "0.02", "1", "4.99", "5", "5.01", "14.54", "14.55", "25", "99.99", "100",
+            "1000", "100000",
+        ] {
+            let quote = deposit_fee_quote(decimal(raw));
+            assert!(
+                quote.fee_usd >= DEPOSIT_FEE_FLOOR_USD,
+                "fee for {raw} ({}) must be at least the floor",
+                quote.fee_usd
+            );
+            assert!(
+                usd_to_cents(quote.fee_usd).is_some_and(|cents| cents > 0),
+                "fee for {raw} ({}) must be a positive whole number of cents",
+                quote.fee_usd
+            );
+        }
+    }
+
     #[test]
     fn deposit_fee_gross_is_always_whole_cents() {
         // The charge path feeds gross straight into usd_to_cents, which rejects
@@ -2209,6 +2366,154 @@ mod tests {
                 "gross is exactly credit + fee for {raw}"
             );
         }
+    }
+
+    /// A [`CheckoutSessionParams`] priced however the caller says, including
+    /// ways the live fee schedule cannot price. The dollar fields are only
+    /// stamped into metadata, so they follow the cents rather than lead them.
+    fn split_params(credit_cents: i64, gross_cents: i64) -> CheckoutSessionParams<'static> {
+        let credit_usd = Decimal::from(credit_cents) / Decimal::ONE_HUNDRED;
+        let gross_usd = Decimal::from(gross_cents) / Decimal::ONE_HUNDRED;
+        CheckoutSessionParams {
+            user_id: Uuid::nil(),
+            customer_email: "buyer@example.test",
+            credit_usd,
+            fee_usd: gross_usd - credit_usd,
+            gross_usd,
+            credit_cents,
+            gross_cents,
+            return_url: "https://portal.test/credits/return?session_id={CHECKOUT_SESSION_ID}"
+                .to_owned(),
+        }
+    }
+
+    fn form_value<'a>(form: &'a [(String, String)], key: &str) -> Option<&'a str> {
+        form.iter()
+            .find(|(name, _)| name == key)
+            .map(|(_, value)| value.as_str())
+    }
+
+    #[test]
+    fn the_checkout_form_splits_the_gross_into_a_credit_line_and_a_fee_line() {
+        // $25.00 credit + $1.38 fee = $26.38 gross, the same worked example the
+        // wire-contract test drives over HTTP.
+        let form = checkout_session_form(&split_params(2_500, 2_638)).expect("form must build");
+        assert_eq!(
+            form_value(&form, "line_items[0][price_data][unit_amount]"),
+            Some("2500")
+        );
+        assert_eq!(
+            form_value(&form, "line_items[0][price_data][product_data][name]"),
+            Some(CHECKOUT_PRODUCT_NAME)
+        );
+        assert_eq!(
+            form_value(&form, "line_items[1][price_data][unit_amount]"),
+            Some("138")
+        );
+        assert_eq!(
+            form_value(&form, "line_items[1][price_data][product_data][name]"),
+            Some(CHECKOUT_FEE_PRODUCT_NAME)
+        );
+        // Both lines are quoted in the one currency the module prices in, and
+        // both are a single unit — a quantity of 2 would double the charge.
+        for index in 0..2 {
+            assert_eq!(
+                form_value(&form, &format!("line_items[{index}][price_data][currency]")),
+                Some(CHECKOUT_CURRENCY)
+            );
+            assert_eq!(
+                form_value(&form, &format!("line_items[{index}][quantity]")),
+                Some("1")
+            );
+        }
+        assert_eq!(form.len(), 18, "the two-line form is exactly 18 parameters");
+    }
+
+    /// The fee line is derived, never re-derived: whatever the fee happens to
+    /// be, it is the remainder of the gross, so the lines cannot fail to add up.
+    #[test]
+    fn the_fee_line_is_the_remainder_of_the_gross() {
+        for (credit_cents, gross_cents) in [(500, 580), (1_454, 1_534), (1_455, 1_536), (1, 81)] {
+            let form = checkout_session_form(&split_params(credit_cents, gross_cents))
+                .expect("must build");
+            let credit: i64 = form_value(&form, "line_items[0][price_data][unit_amount]")
+                .expect("credit line")
+                .parse()
+                .expect("credit line is an integer");
+            let fee: i64 = form_value(&form, "line_items[1][price_data][unit_amount]")
+                .expect("fee line")
+                .parse()
+                .expect("fee line is an integer");
+            assert_eq!(credit, credit_cents);
+            assert_eq!(credit + fee, gross_cents);
+        }
+    }
+
+    /// A zero fee omits the fee line rather than sending a zero-amount one,
+    /// which Stripe rejects in `mode=payment`.
+    ///
+    /// Unreachable through [`deposit_fee_quote`] today — see
+    /// [`the_fee_schedule_never_prices_a_free_deposit`] — so the guard is
+    /// exercised here by pricing the params directly. Without this the branch
+    /// would be an untested claim, and the first fee schedule with a free tier
+    /// would find out in production that it was wrong.
+    #[test]
+    fn a_zero_fee_omits_the_fee_line_instead_of_sending_a_zero_amount_one() {
+        let form = checkout_session_form(&split_params(2_500, 2_500)).expect("form must build");
+        assert_eq!(
+            form_value(&form, "line_items[0][price_data][unit_amount]"),
+            Some("2500"),
+            "with no fee to disclose, one line priced at the gross is accurate"
+        );
+        assert!(
+            form.iter()
+                .all(|(key, _)| !key.starts_with("line_items[1]")),
+            "a zero-amount line item is rejected by Stripe and must not be sent"
+        );
+        assert_eq!(form.len(), 14, "the one-line form is exactly 14 parameters");
+    }
+
+    /// A split that cannot be sold is refused before Stripe sees it.
+    ///
+    /// The guard exists for the one way this change could cost money: a second,
+    /// independent evaluation of the fee rate in the line items, rounding a cent
+    /// away from the quote the intent row and the webhook both use. Stripe would
+    /// collect the lines' sum, the corroborations would demand the quote, and a
+    /// customer who really paid would be credited nothing. Failing the session
+    /// creation instead is loud, immediate, and takes no money.
+    ///
+    /// **Only the reachable arms are asserted here.** With `fee = gross -
+    /// credit` the re-addition arm is true by construction, so no input can
+    /// reach it — it is a tripwire for a future refactor, and the way it was
+    /// verified is a mutation: forcing the fee a cent off makes both this
+    /// module's callers and the HTTP wire-contract test fail. What IS reachable
+    /// is a negative fee line, a non-positive credits line, and an overflow, and
+    /// those are below.
+    #[test]
+    fn a_split_that_cannot_be_sold_is_refused() {
+        for (credit_cents, gross_cents) in [
+            // Credit above gross: the fee line would be negative.
+            (2_639_i64, 2_638_i64),
+            (1, 0),
+            // A zero or negative credits line is nonsense, and Stripe rejects
+            // it outright in payment mode.
+            (0, 80),
+            (-2_500, 2_638),
+            // The subtraction is checked rather than wrapping.
+            (i64::MIN, 1),
+        ] {
+            assert!(
+                matches!(
+                    checkout_session_form(&split_params(credit_cents, gross_cents)),
+                    Err(CheckoutError::Mispriced)
+                ),
+                "credit {credit_cents} against gross {gross_cents} must be refused"
+            );
+        }
+        // The control: the same helper with a sane split does build, so the
+        // assertions above are failing for the reason claimed and not because
+        // the helper is broken.
+        assert!(checkout_session_form(&split_params(2_500, 2_638)).is_ok());
     }
 
     fn session_with_tax(reported_tax: Value) -> Value {
