@@ -3331,16 +3331,22 @@ async fn calculate_autopay_tax(
 ///
 /// The money is already correct at this point: the card was charged and the
 /// balance was credited. A failure to record leaves the collected tax missing
-/// from the filing report, which is a reporting defect an operator must fix,
-/// not a reason to fail a webhook that would then be redelivered and find
-/// nothing left to settle. The log carries the calculation id precisely so it
-/// can be replayed by hand.
+/// from the filing report, which is a reporting defect the sweep's
+/// [`sweep_autopay_tax_lifecycle`] pass retries from the durable row
+/// (migration 0024), not a reason to fail a webhook that would then be
+/// redelivered and find nothing left to settle. The log still carries the
+/// calculation id so a stuck row can be resolved by hand.
+///
+/// Returns the recorded tax transaction id, which the caller must persist
+/// (`billing::freeze_autopay_tax_transaction`): `create_reversal` accepts only
+/// a transaction ID and the Tax API has no lookup by reference, so an id that
+/// is not stored at this moment is unrecoverable.
 async fn record_autopay_tax_transaction(
     settings: &StripeSettings,
     client: &reqwest::Client,
     payment_intent_id: &str,
     calculation_id: &str,
-) {
+) -> Option<String> {
     let form: [(&str, &str); 2] = [
         ("calculation", calculation_id),
         ("reference", payment_intent_id),
@@ -3356,27 +3362,202 @@ async fn record_autopay_tax_transaction(
         .await;
     match response {
         Ok(response) if response.status().is_success() => {
-            tracing::info!(
-                payment_intent = %payment_intent_id,
-                tax_calculation = %calculation_id,
-                "autopay tax transaction recorded"
-            );
+            let transaction_id = response
+                .json::<Value>()
+                .await
+                .ok()
+                .and_then(|body| Some(body.get("id")?.as_str()?.to_owned()));
+            match &transaction_id {
+                Some(transaction_id) => tracing::info!(
+                    payment_intent = %payment_intent_id,
+                    tax_calculation = %calculation_id,
+                    tax_transaction = %transaction_id,
+                    "autopay tax transaction recorded"
+                ),
+                // Recorded, but the body did not yield the id. Returning None
+                // leaves the row unstamped, so the sweep retries; the retry is
+                // refused as a duplicate reference and stays operator-visible
+                // rather than silently unreversible.
+                None => tracing::error!(
+                    payment_intent = %payment_intent_id,
+                    tax_calculation = %calculation_id,
+                    "autopay tax transaction recorded but its response did not carry an id; the row stays unstamped for the sweep to surface"
+                ),
+            }
+            transaction_id
         }
         Ok(response) => {
             tracing::error!(
                 payment_intent = %payment_intent_id,
                 tax_calculation = %calculation_id,
                 status = response.status().as_u16(),
-                "autopay tax was COLLECTED but its tax transaction was not recorded; it will be missing from the Stripe Tax filing report until an operator creates it from this calculation"
+                "autopay tax was COLLECTED but its tax transaction was not recorded; the sweep will retry it from the stored calculation"
             );
+            None
         }
         Err(_) => {
             tracing::error!(
                 payment_intent = %payment_intent_id,
                 tax_calculation = %calculation_id,
-                "autopay tax was COLLECTED but the tax transaction call could not be sent; it will be missing from the Stripe Tax filing report until an operator creates it from this calculation"
+                "autopay tax was COLLECTED but the tax transaction call could not be sent; the sweep will retry it from the stored calculation"
             );
+            None
         }
+    }
+}
+
+/// Withdraw a recorded tax transaction after its charge was refunded or
+/// disputed: a full reversal, so the filing report no longer claims tax on
+/// money that went back to the customer.
+///
+/// The reversal's `reference` must be unique across all transactions exactly
+/// like the forward reference, so it is derived deterministically from the
+/// intent id. That makes the endpoint self-deduplicating here too: if a
+/// previous attempt landed but its response was lost, the retry is refused
+/// rather than double-reversing.
+async fn reverse_autopay_tax_transaction(
+    settings: &StripeSettings,
+    client: &reqwest::Client,
+    payment_intent_id: &str,
+    tax_transaction_id: &str,
+) -> Option<String> {
+    let reference = format!("{payment_intent_id}-tax-reversal");
+    let form: [(&str, &str); 3] = [
+        ("mode", "full"),
+        ("original_transaction", tax_transaction_id),
+        ("reference", &reference),
+    ];
+    let response = client
+        .post(format!(
+            "{}/v1/tax/transactions/create_reversal",
+            settings.api_base
+        ))
+        .bearer_auth(&settings.secret_key)
+        .form(&form)
+        .send()
+        .await;
+    match response {
+        Ok(response) if response.status().is_success() => {
+            let reversal_id = response
+                .json::<Value>()
+                .await
+                .ok()
+                .and_then(|body| Some(body.get("id")?.as_str()?.to_owned()));
+            match &reversal_id {
+                Some(reversal_id) => tracing::info!(
+                    payment_intent = %payment_intent_id,
+                    tax_transaction = %tax_transaction_id,
+                    tax_reversal = %reversal_id,
+                    "autopay tax transaction reversed after refund/dispute"
+                ),
+                None => tracing::error!(
+                    payment_intent = %payment_intent_id,
+                    tax_transaction = %tax_transaction_id,
+                    "autopay tax reversal recorded but its response did not carry an id; the row stays unstamped for the sweep to surface"
+                ),
+            }
+            reversal_id
+        }
+        Ok(response) => {
+            tracing::error!(
+                payment_intent = %payment_intent_id,
+                tax_transaction = %tax_transaction_id,
+                status = response.status().as_u16(),
+                "a refunded/disputed autopay charge still has its tax transaction standing; the sweep will retry the reversal"
+            );
+            None
+        }
+        Err(_) => {
+            tracing::error!(
+                payment_intent = %payment_intent_id,
+                tax_transaction = %tax_transaction_id,
+                "the tax reversal call could not be sent; the sweep will retry it"
+            );
+            None
+        }
+    }
+}
+
+/// One sweep pass over the durable tax lifecycle (migration 0024): re-record
+/// tax transactions whose inline recording failed, reverse recorded tax whose
+/// credit the ledger shows refunded, and surface the rows automation cannot
+/// finish.
+///
+/// Runs entirely off the request path and against Stripe's two
+/// deduplicating-by-reference endpoints, so every action here is safe to
+/// repeat: a retry either completes the missing half of the lifecycle or is
+/// refused by Stripe and logged for an operator. Public for the same reason
+/// [`run_autopay_sweep_once`] is: tests drive the exact code production loops.
+pub async fn sweep_autopay_tax_lifecycle(pool: &crate::sqlx::PgPool, settings: &StripeSettings) {
+    let Ok(client) = stripe_client() else {
+        return;
+    };
+    match billing::unrecorded_autopay_tax(pool, AUTOPAY_SWEEP_BATCH).await {
+        Ok(unrecorded) => {
+            for (intent_id, calculation_id) in unrecorded {
+                if let Some(transaction_id) =
+                    record_autopay_tax_transaction(settings, &client, &intent_id, &calculation_id)
+                        .await
+                    && let Err(error) =
+                        billing::freeze_autopay_tax_transaction(pool, &intent_id, &transaction_id)
+                            .await
+                {
+                    // The transaction exists at Stripe but the stamp did not
+                    // land — and the id is gone with it. The next pass
+                    // re-records, is refused as a duplicate, and cannot stamp
+                    // either, so the row stays loud until an OPERATOR stamps
+                    // it (DEPLOY.md): the filing is correct, the noise is the
+                    // cost of never guessing at an undocumented error shape.
+                    tracing::error!(
+                        payment_intent = %intent_id,
+                        tax_transaction = %transaction_id,
+                        %error,
+                        "recorded an autopay tax transaction but could not store its id"
+                    );
+                }
+            }
+        }
+        Err(error) => tracing::warn!(%error, "could not list unrecorded autopay tax"),
+    }
+    match billing::unreversed_autopay_tax(pool, AUTOPAY_SWEEP_BATCH).await {
+        Ok(unreversed) => {
+            for (intent_id, tax_transaction_id) in unreversed {
+                if let Some(reversal_id) = reverse_autopay_tax_transaction(
+                    settings,
+                    &client,
+                    &intent_id,
+                    &tax_transaction_id,
+                )
+                .await
+                    && let Err(error) =
+                        billing::mark_autopay_tax_reversed(pool, &intent_id, &reversal_id).await
+                {
+                    tracing::error!(
+                        payment_intent = %intent_id,
+                        tax_reversal = %reversal_id,
+                        %error,
+                        "reversed an autopay tax transaction but could not store the stamp"
+                    );
+                }
+            }
+        }
+        Err(error) => {
+            tracing::warn!(%error, "could not list refunded autopay charges with standing tax")
+        }
+    }
+    // Refunded charges whose recorded transaction has no stored id (the 0024
+    // backfill, or an id lost to a duplicate-reference refusal): automation
+    // cannot reverse these, so they are surfaced on every pass until an
+    // operator reverses them in Dashboard → Tax → Transactions, the same
+    // loud-until-resolved shape the withheld and overdue rows use.
+    match billing::unreversible_autopay_tax(pool).await {
+        Ok(unreversible) if !unreversible.is_empty() => tracing::error!(
+            count = unreversible.len(),
+            payment_intents = ?unreversible,
+            "refunded autopay charges have standing tax transactions with no stored id; reverse them by hand in Dashboard → Tax → Transactions"
+        ),
+        Ok(_) => {}
+        Err(error) => tracing::warn!(%error, "could not list unreversible autopay tax"),
     }
 }
 
@@ -3725,8 +3906,22 @@ async fn handle_autopay_intent_event(
             .and_then(|metadata| metadata.get(AUTOPAY_TAX_CALCULATION_KEY))
             .and_then(Value::as_str)
         && let Ok(client) = stripe_client()
+        && let Some(transaction_id) =
+            record_autopay_tax_transaction(stripe, &client, intent_id, calculation_id).await
+        && let Err(error) =
+            billing::freeze_autopay_tax_transaction(&ctx.pool, intent_id, &transaction_id).await
     {
-        record_autopay_tax_transaction(stripe, &client, intent_id, calculation_id).await;
+        // Recorded at Stripe but the stamp did not land — and the id is gone
+        // with it: the sweep's re-record is refused as a duplicate reference
+        // and cannot stamp either, so the row stays loud until an operator
+        // stamps it (DEPLOY.md). Never a reason to fail the webhook — the
+        // money and the filing are both already correct.
+        tracing::error!(
+            payment_intent = %intent_id,
+            tax_transaction = %transaction_id,
+            %error,
+            "recorded an autopay tax transaction but could not store its id"
+        );
     }
     Ok(received())
 }
@@ -3736,6 +3931,7 @@ async fn handle_autopay_intent_event(
 /// synchronous so tests drive the exact code production loops.
 pub async fn run_autopay_sweep_once(pool: &crate::sqlx::PgPool, settings: &StripeSettings) {
     reconcile_stale_intents(pool, settings).await;
+    sweep_autopay_tax_lifecycle(pool, settings).await;
     let candidates = match billing::autopay_candidates(pool, AUTOPAY_SWEEP_BATCH).await {
         Ok(candidates) => candidates,
         Err(error) => {
@@ -4158,8 +4354,22 @@ async fn replay_charge(
             // tax authority when both fire, which they routinely do.
             if outcome == billing::AutopayOutcome::Credited
                 && let Some(calculation_id) = tax.calculation_id.as_deref()
+                && let Some(transaction_id) =
+                    record_autopay_tax_transaction(settings, &client, intent_id, calculation_id)
+                        .await
+                && let Err(error) =
+                    billing::freeze_autopay_tax_transaction(pool, intent_id, &transaction_id).await
             {
-                record_autopay_tax_transaction(settings, &client, intent_id, calculation_id).await;
+                // Same shape as the webhook site: the id is lost with the
+                // failed write, the sweep's re-record is refused as a
+                // duplicate, and the row stays loud until an operator stamps
+                // it (DEPLOY.md).
+                tracing::error!(
+                    payment_intent = %intent_id,
+                    tax_transaction = %transaction_id,
+                    %error,
+                    "recorded an autopay tax transaction but could not store its id"
+                );
             }
         }
         return Ok(());

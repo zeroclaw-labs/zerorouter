@@ -1164,14 +1164,15 @@ async fn migration_chain_applies_on_a_fresh_database() {
         "the 0023 key columns are nullable with no default, so every key that \
          predates them reads NULL: never expires, unlimited"
     );
-    // 23, not 19: 0013 (dispute resolution), 0014 (dispatched reservations),
+    // 24, not 20: 0013 (dispute resolution), 0014 (dispatched reservations),
     // 0015 (released reservations), 0016 (deposit fee), 0017 (stripe observed
     // reversals), 0018 (autopay withheld state), 0019 (monthly spend rollup),
     // 0020 (usage gap and real finish reason), 0021 (autopay tax), 0022
-    // (checkout intent cleanup) and 0023 (key expiry and credit limits) are
-    // numbered with a gap so 0010-0012 stay available to branches in flight.
-    // The chain's head is the highest version applied, not a count of files.
-    assert_eq!(outcome.19, 23, "the chain reaches migration version 23");
+    // (checkout intent cleanup), 0023 (key expiry and credit limits) and 0024
+    // (autopay tax lifecycle) are numbered with a gap so 0010-0012 stay
+    // available to branches in flight. The chain's head is the highest
+    // version applied, not a count of files.
+    assert_eq!(outcome.19, 24, "the chain reaches migration version 24");
 }
 
 /// Rewrite the database name in a Postgres URL, keeping any query string

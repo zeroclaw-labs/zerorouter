@@ -2183,6 +2183,163 @@ pub async fn freeze_autopay_tax(
     }))
 }
 
+/// Remember that a claim's tax transaction is recorded at Stripe, and under
+/// which id (migration 0024).
+///
+/// First writer wins (`tax_recorded_at IS NULL`): the inline record after a
+/// credited settle and the sweep's retry pass can both confirm the same
+/// recording — the reference is the PaymentIntent id, so Stripe returns the
+/// same transaction either way — and the second confirmation must not
+/// overwrite the stamp or the id the first one stored.
+///
+/// The id is the half that matters later: `create_reversal` takes only a
+/// transaction ID, and the Tax API has no lookup by reference, so a row whose
+/// id was lost (the recording POST succeeded but its response did not come
+/// back) can never be reversed automatically. Such a row stays
+/// `tax_recorded_at IS NULL` and the sweep retries it; the retry is refused as
+/// a duplicate reference and logged until an operator resolves it from the
+/// dashboard.
+pub async fn freeze_autopay_tax_transaction(
+    pool: &PgPool,
+    payment_intent_id: &str,
+    tax_transaction_id: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"
+        UPDATE stripe_autopay_intents
+        SET tax_transaction_id = $2,
+            tax_recorded_at = NOW(),
+            updated_at = NOW()
+        WHERE payment_intent_id = $1 AND tax_recorded_at IS NULL
+        "#,
+    )
+    .bind(payment_intent_id)
+    .bind(tax_transaction_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Credited claims whose priced tax has no confirmed tax transaction yet:
+/// each is a sale COLLECTED from a card but missing from the Stripe Tax
+/// filing report. Returns (payment_intent_id, tax_calculation_id) for the
+/// sweep to re-record; the endpoint deduplicates on the intent-id reference,
+/// so a retry can never double-report.
+///
+/// Scoped to `status = 'succeeded'` on purpose: `withheld` rows deliberately
+/// record no tax (their money is queued for refund), `pending` rows have not
+/// been collected, and `failed` rows never will be.
+pub async fn unrecorded_autopay_tax(
+    pool: &PgPool,
+    limit: i64,
+) -> Result<Vec<(String, String)>, sqlx::Error> {
+    sqlx::query_as::<_, (String, String)>(
+        r#"
+        SELECT payment_intent_id, tax_calculation_id
+        FROM stripe_autopay_intents
+        WHERE status = 'succeeded'
+          AND tax_calculation_id IS NOT NULL
+          AND tax_recorded_at IS NULL
+        ORDER BY updated_at
+        LIMIT $1
+        "#,
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+}
+
+/// Recorded tax transactions whose underlying credit the ledger shows
+/// reversed — a `refund` row naming the intent, written by `reverse_purchase`
+/// or `apply_observed_reversals` — and whose tax has not been reversed yet.
+/// Each is tax standing in the filing report for money that went back to the
+/// customer. Returns (payment_intent_id, tax_transaction_id) for the sweep to
+/// reverse in full.
+///
+/// Detection is BY THE LEDGER, not by webhook bookkeeping, which is what makes
+/// the pass order-independent: whether the refund arrived before or after the
+/// credit (the tombstone path), and whether the tax transaction was recorded
+/// inline or by a later sweep retry, the reversal is due exactly when both a
+/// refund row and a recorded transaction exist. Zero-tax transactions are
+/// reversed on the same terms as taxed ones — they evidence per-jurisdiction
+/// sales volume, and a refunded sale's evidence should be withdrawn too.
+pub async fn unreversed_autopay_tax(
+    pool: &PgPool,
+    limit: i64,
+) -> Result<Vec<(String, String)>, sqlx::Error> {
+    sqlx::query_as::<_, (String, String)>(
+        r#"
+        SELECT i.payment_intent_id, i.tax_transaction_id
+        FROM stripe_autopay_intents i
+        WHERE i.tax_recorded_at IS NOT NULL
+          AND i.tax_transaction_id IS NOT NULL
+          AND i.tax_reversed_at IS NULL
+          AND EXISTS (
+              SELECT 1 FROM credit_ledger l
+              WHERE l.entry_type = 'refund'
+                AND l.stripe_payment_intent_id = i.payment_intent_id
+          )
+        ORDER BY i.updated_at
+        LIMIT $1
+        "#,
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+}
+
+/// Stamp a claim's tax reversal as recorded at Stripe.
+///
+/// First writer wins, mirroring [`freeze_autopay_tax_transaction`]: the stamp
+/// is what stops the sweep re-reversing, so it is only written once and only
+/// by a caller that saw Stripe accept the reversal.
+pub async fn mark_autopay_tax_reversed(
+    pool: &PgPool,
+    payment_intent_id: &str,
+    reversal_transaction_id: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"
+        UPDATE stripe_autopay_intents
+        SET tax_reversal_transaction_id = $2,
+            tax_reversed_at = NOW(),
+            updated_at = NOW()
+        WHERE payment_intent_id = $1 AND tax_reversed_at IS NULL
+        "#,
+    )
+    .bind(payment_intent_id)
+    .bind(reversal_transaction_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Reversed credits whose tax transaction is confirmed recorded but whose id
+/// is unknown (the migration 0024 backfill, or a recording confirmed via a
+/// duplicate-reference refusal). Automation cannot reverse these —
+/// `create_reversal` needs the transaction ID — so they are surfaced loudly
+/// for an operator to reverse in Dashboard → Tax → Transactions, the same
+/// per-sweep pattern `withheld_autopay_intents` uses.
+pub async fn unreversible_autopay_tax(pool: &PgPool) -> Result<Vec<String>, sqlx::Error> {
+    sqlx::query_scalar::<_, String>(
+        r#"
+        SELECT i.payment_intent_id
+        FROM stripe_autopay_intents i
+        WHERE i.tax_recorded_at IS NOT NULL
+          AND i.tax_transaction_id IS NULL
+          AND i.tax_reversed_at IS NULL
+          AND EXISTS (
+              SELECT 1 FROM credit_ledger l
+              WHERE l.entry_type = 'refund'
+                AND l.stripe_payment_intent_id = i.payment_intent_id
+          )
+        ORDER BY i.updated_at
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+}
+
 /// What settling an autopay charge did.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AutopayOutcome {

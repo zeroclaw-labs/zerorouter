@@ -394,20 +394,42 @@ Three things worth knowing when it stops being inert:
   no tax where it should. To fix `no_billing_address` at the source, turn on
   billing-address collection for the card-setup session in Stripe's checkout
   settings; existing saved cards need the customer to re-add the card.
-- **Tax reversals on a refund are NOT automatic.** Stripe reverses tax
-  automatically only for Checkout and for its own simplified PaymentIntent
-  link, neither of which this path uses. A refunded or disputed autopay charge
-  leaves its tax transaction standing, so the tax must be reversed by hand in
-  Dashboard → Tax → Transactions. The same is true of an autopay charge whose
-  credit was **withheld** (collected from a frozen or indebted account): no tax
-  transaction is recorded for it, and the operator refund must be the **taxed**
-  total — `withheld_autopay_intents` reports that figure, not the ex-tax gross.
-- **A tax transaction that fails to record does not fail the charge.** The
-  money is already correct by then, so the failure is logged at ERROR naming
-  the `payment_intent` and the `tax_calculation`, and the sale is missing from
-  the filing report until an operator creates the transaction from that
-  calculation. Search the logs for `tax transaction was not recorded` before
-  filing.
+- **Tax reversals on a refund are automatic (migration 0024).** Stripe
+  reverses tax on its own only for Checkout and for its simplified
+  PaymentIntent link, neither of which this path uses — so the autopay sweep
+  does it instead: when the ledger shows a charge's credit reversed (a refund
+  or covering chargeback) and its tax transaction id is stored, the sweep
+  records a **full tax reversal** and stamps the row. The one case that stays
+  manual is a row whose transaction id was never stored (rows settled before
+  migration 0024, or an id lost to a network failure): the Tax API cannot look
+  a transaction up by reference, so those are surfaced at ERROR on every sweep
+  pass until an operator reverses them in Dashboard → Tax → Transactions.
+  **Reversing at Stripe does not quiet the log by itself** — ZeroRouter's row
+  still says unreversed, so close the loop by stamping it:
+
+  ```sql
+  UPDATE stripe_autopay_intents SET tax_reversed_at = NOW()
+  WHERE payment_intent_id = 'pi_...';   -- after reversing it at Stripe
+  ```
+
+  The same applies to a recording that can never complete automatically (the
+  transaction exists at Stripe but its id was lost, so every retry is refused
+  as a duplicate — or the calculation passed its 90-day expiry): resolve it at
+  Stripe first, then stamp `tax_recorded_at` the same way. Stamp only what
+  Stripe's dashboard confirms is done; the stamp is the sweep's off-switch,
+  not a way to silence a report that is genuinely missing. An
+  autopay charge whose credit was **withheld** (collected from a frozen or
+  indebted account) still records no tax transaction at all, and the operator
+  refund must be the **taxed** total — `withheld_autopay_intents` reports that
+  figure, not the ex-tax gross.
+- **A tax transaction that fails to record does not fail the charge — and is
+  no longer an operator task.** The money is already correct by then; the
+  failure is logged at ERROR and the sweep retries the recording from the
+  calculation id frozen on the intent row until it lands (the reference is the
+  PaymentIntent id, unique across all transactions, so a retry can never
+  double-report). A row that keeps failing keeps logging — a quiet log before
+  filing means the report is complete. Note Tax Calculations expire after 90
+  days; a recording stuck longer than that needs the operator path above.
 
 The ledger is unchanged by all of this: the buyer is credited exactly the
 top-up, the recorded charge stays the ex-tax gross so fee revenue is still
