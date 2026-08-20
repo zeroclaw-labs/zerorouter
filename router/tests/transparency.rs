@@ -138,3 +138,59 @@ async fn the_endpoint_is_public_and_always_on() {
         "the caveat must travel with every payload"
     );
 }
+
+/// The live-ECS shape first observed in production: `ImageDigest` empty, but
+/// the task pinned to a digest-carrying image reference. The digest embedded
+/// in the reference completes the chain instead of leaving it null.
+#[tokio::test]
+async fn a_digest_pinned_reference_fills_a_missing_image_digest() {
+    let registry = "161457899654.dkr.ecr.us-east-1.amazonaws.com/zerorouter-beta-router";
+    let digest = "sha256:14b5dc3374f8471df705acba7b0dcc5216cdfdb81dcbaee0f329ef72f9409a81";
+    let payload = json!({ "Image": format!("{registry}:2f3dde1@{digest}"), "ImageDigest": "" });
+    let metadata = serve(Router::new().route(
+        "/",
+        get(move || {
+            let payload = payload.clone();
+            async move { axum::Json(payload) }
+        }),
+    ))
+    .await;
+
+    let report = build_report(Some(&metadata), Some("2f3dde1")).await;
+
+    assert_eq!(report.image_digest.as_deref(), Some(digest));
+    assert_eq!(
+        report.verify.as_deref(),
+        Some(
+            format!(
+                "gh attestation verify oci://{registry}@{digest} --repo zeroclaw-labs/zerorouter"
+            )
+            .as_str()
+        )
+    );
+    assert!(
+        report
+            .attestations
+            .as_deref()
+            .is_some_and(|url| url.ends_with(digest))
+    );
+}
+
+/// A digest-less, non-sha256 suffix after `@` is not a digest and must not be
+/// promoted into one.
+#[tokio::test]
+async fn a_non_sha256_suffix_is_not_mistaken_for_a_digest() {
+    let payload = json!({ "Image": "registry.example/app@sig-abcdef", "ImageDigest": "" });
+    let metadata = serve(Router::new().route(
+        "/",
+        get(move || {
+            let payload = payload.clone();
+            async move { axum::Json(payload) }
+        }),
+    ))
+    .await;
+
+    let report = build_report(Some(&metadata), None).await;
+    assert_eq!(report.image_digest, None);
+    assert_eq!(report.verify, None);
+}
