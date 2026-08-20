@@ -655,6 +655,7 @@ mod tests {
             id.to_owned(),
             TierDefinition {
                 rates: schedule.clone(),
+                retention: None,
                 candidates: vec![TierCandidate {
                     id: id.to_owned(),
                     provider: provider.to_owned(),
@@ -667,6 +668,7 @@ mod tests {
         TierCatalog {
             schema_version: 1,
             tiers,
+            retention: BTreeMap::new(),
             unavailable: BTreeMap::new(),
         }
     }
@@ -1120,6 +1122,7 @@ mod tests {
             "zero/edge".to_owned(),
             TierDefinition {
                 rates: RateSchedule::flat(rates(2.0, 0.2, 10.0)),
+                retention: None,
                 candidates: vec![TierCandidate {
                     id: "local-llama/qwen3-8b".to_owned(),
                     provider: "local-llama".to_owned(),
@@ -1136,6 +1139,7 @@ mod tests {
         let edge = TierCatalog {
             schema_version: 1,
             tiers,
+            retention: BTreeMap::new(),
             unavailable: BTreeMap::new(),
         };
         let found = crate::drift::reconcile_with(&edge, PRIMARY, &|_| true);
@@ -1185,6 +1189,7 @@ mod tests {
             "anthropic/claude-sonnet-5".to_owned(),
             TierDefinition {
                 rates: RateSchedule::flat(rates(2.0, 0.2, 10.0)),
+                retention: None,
                 candidates: vec![TierCandidate {
                     id: "anthropic/claude-sonnet-5".to_owned(),
                     provider: "anthropic".to_owned(),
@@ -1197,6 +1202,7 @@ mod tests {
         let both = TierCatalog {
             schema_version: 1,
             tiers,
+            retention: BTreeMap::new(),
             unavailable: BTreeMap::new(),
         };
         let primary = PRIMARY.replace(

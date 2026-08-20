@@ -58,8 +58,88 @@ model = "upstream/dear"
 [tiers."zero/fixture-dear".candidates.rates]
 input_per_mtok = {dear_basis}
 output_per_mtok = 10.00
+
+# Both lanes are `standard`, so this fixture's wire order stays the plain
+# alphabetical one it has always asserted. The zero-first ordering has its own
+# fixture (`retention_ordering_source`), where it is the thing under test.
+[retention.openai]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/openai"
+verified = "2026-08-20"
+source_sha256 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+[retention.anthropic]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/anthropic"
+verified = "2026-08-20"
+source_sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 "#
     )
+}
+
+/// A catalog with BOTH postures, for the ordering rule.
+///
+/// Deliberately adversarial to the sort. `openai` is the ZERO-retention
+/// provider here and `anthropic`/`google` are the retaining ones, so the
+/// zero-retention ids sort LAST alphabetically. A listing that merely kept its
+/// old by-id order would read anthropic, google, openai; only a real
+/// posture-first sort lifts the openai rows to the top. The two ids inside each
+/// posture also check the alphabetical tie-break.
+///
+/// The postures here are fixture data chosen to exercise ordering, and bear no
+/// relation to the shipped catalog — where all three providers are `standard`.
+fn retention_ordering_source() -> String {
+    let mut source = String::from(
+        r#"
+schema_version = 1
+
+[retention.openai]
+posture = "zero"
+description = "fixture: retains nothing"
+source_url = "https://example.test/openai"
+verified = "2026-08-20"
+source_sha256 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+[retention.anthropic]
+posture = "standard"
+description = "fixture: retains"
+source_url = "https://example.test/anthropic"
+verified = "2026-08-20"
+source_sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+[retention.google]
+posture = "standard"
+description = "fixture: retains"
+source_url = "https://example.test/google"
+verified = "2026-08-20"
+source_sha256 = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+"#,
+    );
+    for (provider, model) in [
+        ("openai", "private-b"),
+        ("openai", "private-a"),
+        ("anthropic", "retains-a"),
+        ("google", "retains-b"),
+    ] {
+        source.push_str(&format!(
+            r#"
+[tiers."{provider}/{model}"]
+[tiers."{provider}/{model}".rates]
+input_per_mtok = 1.00
+output_per_mtok = 2.00
+[[tiers."{provider}/{model}".candidates]]
+id = "{provider}/{model}"
+provider = "{provider}"
+model = "{model}"
+[tiers."{provider}/{model}".candidates.rates]
+input_per_mtok = 1.00
+output_per_mtok = 2.00
+"#
+        ));
+    }
+    source
 }
 
 /// The parsed `/v1/models` body served by a state.
@@ -293,6 +373,16 @@ async fn model_pricing_matches_zeroclaws_model_pricing_wire_contract() {
             "max_output_tokens": 128_000,
             "input_modalities": ["text", "image", "pdf"],
             "tool_call": true,
+            // Unlike every other field here, `retention` is present on EVERY
+            // row and never omitted — a customer reading a row with no posture
+            // would have to guess, and the guess a zero-retention brand invites
+            // is the favourable one. `source_url` and `source_sha256` stay off
+            // the wire: they are the operator's verification trail, not a claim.
+            "retention": {
+                "posture": "standard",
+                "description": "OpenAI retains API inputs and outputs in abuse-monitoring logs for up to 30 days, unless longer retention is required by law; API data is not used to train its models.",
+                "verified": "2026-08-20",
+            },
         })
     );
 
@@ -342,6 +432,11 @@ async fn model_pricing_matches_zeroclaws_model_pricing_wire_contract() {
             "max_output_tokens": 64_000,
             "input_modalities": ["text", "image", "pdf"],
             "tool_call": true,
+            "retention": {
+                "posture": "standard",
+                "description": "Anthropic deletes API inputs and outputs from its backend within 30 days; longer only for Usage Policy enforcement or where law requires it.",
+                "verified": "2026-08-20",
+            },
         })
     );
 }
@@ -431,7 +526,92 @@ async fn a_model_that_declares_no_metadata_omits_the_keys_rather_than_nulling_th
             model["pricing"]["prompt"].is_string(),
             "{id} should still carry its pricing"
         );
+        // Retention is the deliberate exception to the rule this test pins.
+        // A model may decline to describe its context window; it may never
+        // decline to say what happens to the customer's prompt. The file this
+        // fixture builds declares no metadata at all and still labels every
+        // lane, because the catalog would not have loaded otherwise.
+        assert_eq!(
+            model["retention"]["posture"], "standard",
+            "{id} must publish a posture even when it declares no metadata"
+        );
     }
+}
+
+#[tokio::test]
+async fn zero_retention_lanes_sort_before_standard_ones() {
+    // THE ORDERING CLAIM, pinned. The operator tells upstream providers in
+    // writing that this catalog "orders zero-retention lanes first"; this is
+    // what makes that sentence true, and what fails if someone reorders the
+    // `RetentionPosture` variants or drops the sort in `ModelList::from_listing`.
+    //
+    // The fixture is built so the two orderings disagree: by id alone the
+    // answer would be anthropic, google, openai, openai — the zero lanes last.
+    let path = catalog_fixture("models_retention_order", &retention_ordering_source()).await;
+    let ids = listed_model_ids(RouterState::new(path)).await;
+
+    assert_eq!(
+        ids,
+        [
+            // Zero-retention first, alphabetical within the posture...
+            "openai/private-a",
+            "openai/private-b",
+            // ...then the retaining lanes, also alphabetical.
+            "anthropic/retains-a",
+            "google/retains-b",
+        ],
+        "zero-retention lanes must be listed first, alphabetical within each posture"
+    );
+}
+
+#[tokio::test]
+async fn every_shipped_lane_publishes_a_retention_posture() {
+    // The claim the whole feature exists to support: EVERY row carries a
+    // posture, and today every one of them is honest about retaining. If a
+    // future lane is pinned zero, this test is where the count changes and
+    // someone has to have meant it.
+    let data = listed_models(RouterState::new(tier_config_path())).await;
+
+    for model in &data {
+        let id = model["id"].as_str().expect("every model carries an id");
+        let retention = &model["retention"];
+        assert!(
+            retention.is_object(),
+            "{id} must publish a retention block, not omit it"
+        );
+        let posture = retention["posture"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{id} must publish a posture"));
+        assert!(
+            matches!(posture, "zero" | "standard"),
+            "{id} publishes an unknown posture {posture}"
+        );
+        assert!(
+            retention["description"]
+                .as_str()
+                .is_some_and(|text| !text.trim().is_empty()),
+            "{id} must publish a human description of its posture"
+        );
+        assert!(
+            retention["verified"]
+                .as_str()
+                .is_some_and(|date| date.len() == "YYYY-MM-DD".len()),
+            "{id} must publish the date its posture was verified"
+        );
+    }
+
+    // The shipped catalog's honest state, asserted rather than assumed: every
+    // lane is a standard API account and the zero-retention section is EMPTY.
+    // A ZDR arrangement landing should flip this deliberately, with a signed
+    // agreement behind it — see docs/DEPLOY.md.
+    let zero = data
+        .iter()
+        .filter(|model| model["retention"]["posture"] == "zero")
+        .count();
+    assert_eq!(
+        zero, 0,
+        "no shipped lane may claim zero retention until a ZDR arrangement exists for it"
+    );
 }
 
 #[tokio::test]

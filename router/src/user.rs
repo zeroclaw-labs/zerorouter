@@ -900,11 +900,14 @@ fn render_models(output: &Output, document: &serde_json::Value) {
         .max("MODEL".len());
 
     output.line(&format!(
-        "{:<width$}  {:>12}  {:>12}  {:>10}",
+        // The last column is not width-padded: it is the final field on the
+        // line, so padding it would emit trailing whitespace on every row.
+        "{:<width$}  {:>12}  {:>12}  {:>10}  {}",
         "MODEL",
         "IN $/MTOK",
         "OUT $/MTOK",
         "CONTEXT",
+        "RETENTION",
         width = width
     ));
     for row in rows {
@@ -925,8 +928,19 @@ fn render_models(output: &Output, document: &serde_json::Value) {
             .get("context_length")
             .and_then(serde_json::Value::as_u64)
             .map_or_else(|| "-".to_owned(), |value| value.to_string());
+        // A marker rather than the full sentence: the description runs to a
+        // clause or two and would wrap the table past any terminal. `zero` is
+        // the claim worth spotting at a glance, `standard` is its honest
+        // opposite, and the footnote below expands both. An unrecognized value
+        // prints verbatim rather than being coerced to either — a posture this
+        // client does not understand must not be shown as the flattering one.
+        let retention = row
+            .get("retention")
+            .and_then(|retention| retention.get("posture"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unstated");
         output.line(&format!(
-            "{id:<width$}  {input:>12}  {completion:>12}  {context:>10}",
+            "{id:<width$}  {input:>12}  {completion:>12}  {context:>10}  {retention}",
             width = width
         ));
     }
@@ -949,6 +963,39 @@ fn render_models(output: &Output, document: &serde_json::Value) {
              the rates above are the base band. Use --json for the full schedule."
         ));
     }
+
+    // The retention footnote, in the same shape as the repricing one: one
+    // counted sentence pointing at `--json` for the detail.
+    //
+    // It says what the rows MEAN, because the column alone is a word without a
+    // referent, and the meaning is the whole product claim. The zero count is
+    // stated even when it is nought — "0 of 10 lanes are zero-retention" is the
+    // honest reading of today's catalog, and silence there would let the column
+    // imply a lineup the operator does not have.
+    let zero = posture_count(rows, "zero");
+    let standard = posture_count(rows, "standard");
+    if zero + standard > 0 {
+        output.line("");
+        output.line(&format!(
+            "Retention: {zero} lane(s) zero-retention, listed first; {standard} where the \
+             provider retains data."
+        ));
+        output.line(
+            "Use --json for each lane's full retention statement and the date it was verified.",
+        );
+    }
+}
+
+/// How many listed rows declare `posture`.
+fn posture_count(rows: &[serde_json::Value], posture: &str) -> usize {
+    rows.iter()
+        .filter(|row| {
+            row.get("retention")
+                .and_then(|retention| retention.get("posture"))
+                .and_then(serde_json::Value::as_str)
+                == Some(posture)
+        })
+        .count()
 }
 
 /// `/v1/models` quotes per single token (OpenRouter's shape); a human table

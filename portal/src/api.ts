@@ -143,6 +143,13 @@ export interface Model {
   max_output_tokens?: number | null
   input_modalities?: string[] | null
   tool_call?: boolean | null
+  /** What the upstream serving this model does with the request afterwards.
+   * Unlike the metadata fields above, this is never absent — the router refuses
+   * to load a catalog with an unlabelled lane, so a row without it means the
+   * response did not come from a ZeroRouter that understands retention. It is
+   * typed optional anyway so an older router cannot crash this page; the
+   * renderer shows "unstated" rather than guessing the favourable answer. */
+  retention?: { posture: 'zero' | 'standard' | string; description: string; verified: string }
 }
 
 /** A server-priced deposit: the credit picked, the fee on top, and the gross

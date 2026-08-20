@@ -33,6 +33,23 @@ pub const TIER_CONFIG_PATH_ENV: &str = "ZEROROUTER_TIERS_PATH";
 pub struct TierCatalog {
     pub schema_version: u32,
     pub tiers: BTreeMap<String, TierDefinition>,
+    /// What each upstream does with a request after it answers, keyed by the
+    /// provider key a candidate names (`anthropic`, `openai`, `google`).
+    ///
+    /// Provider-level because retention is a property of **the operator's
+    /// account with that provider**, not of a model: every model reached on
+    /// one API key rests under one arrangement, and a per-model claim would
+    /// invite the file to say two different things about one account.
+    /// [`TierDefinition::retention`] overrides it for the one case the account
+    /// rule cannot express — a lane bought under a separate agreement.
+    ///
+    /// `#[serde(default)]` here is *not* a default posture. An empty map
+    /// parses and then fails [`validate_tier_catalog`] at the first candidate
+    /// whose provider is unlabelled, which is how an unlabelled lane is made
+    /// impossible rather than merely discouraged: the refusal carries the
+    /// provider's name, where a serde error would only say a key was missing.
+    #[serde(default)]
+    pub retention: BTreeMap<String, RetentionPin>,
     /// Tiers withheld for below-cost pricing, keyed by tier id. Never
     /// deserialized from the file — it is a verdict about the file, not a
     /// field in it.
@@ -60,6 +77,19 @@ pub struct TierDefinition {
     pub candidates: Vec<TierCandidate>,
     #[serde(deserialize_with = "deserialize_rate_schedule")]
     pub rates: RateSchedule,
+    /// Retention posture for this tier alone, overriding the provider-level
+    /// pin its candidates would otherwise resolve to.
+    ///
+    /// A COMPLETE replacement, never a patch — the same rule a conditional
+    /// rate band follows. A tier that overrides states its own posture, its own
+    /// evidence, and its own verification date, because a half-inherited claim
+    /// would cite a page that was never read for this lane.
+    ///
+    /// The case it exists for: one lane bought under a separate agreement (a
+    /// negotiated ZDR endpoint) while the rest of that provider's account stays
+    /// standard. Absent on every shipped tier today.
+    #[serde(default)]
+    pub retention: Option<RetentionPin>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -305,6 +335,116 @@ impl ModelMetadata {
     }
 }
 
+/// What an upstream does with a request once it has answered it.
+///
+/// Two values and no third, because the catalog publishes this to customers as
+/// a claim about their data and "probably not retained" is not a claim anyone
+/// can act on. Absence is not a value either — a lane with no resolvable
+/// posture does not load (see [`TierConfigError::UnlabelledLane`]).
+#[derive(Clone, Copy, Debug, Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum RetentionPosture {
+    /// The upstream retains nothing: prompts and completions are not written
+    /// to durable storage on their side, including for abuse monitoring.
+    ///
+    /// **Only pinnable against a signed or confirmed zero-retention
+    /// arrangement with that provider.** Every major vendor offers ZDR by
+    /// negotiated agreement rather than by default, so the posture is a fact
+    /// about the operator's contract, never about the vendor's marketing. See
+    /// `docs/DEPLOY.md`, "Changing a retention posture".
+    Zero,
+    /// The upstream retains prompts and completions for some period — commonly
+    /// for abuse monitoring, whether or not it trains on them.
+    ///
+    /// This is the honest default posture for an ordinary API account, and it
+    /// is what every lane in the shipped catalog carries today.
+    Standard,
+}
+
+impl RetentionPosture {
+    /// Sort rank for the public catalog: zero-retention lanes come first.
+    ///
+    /// Written out rather than derived from the variant order, because a
+    /// `#[derive(Ord)]` would make the catalog's ordering a silent consequence
+    /// of how the enum happens to be typed — reordering two variants during an
+    /// unrelated edit would quietly demote every zero-retention lane. This
+    /// function is the ordering, it is greppable, and
+    /// `zero_retention_lanes_sort_before_standard_ones` fails if it is flipped.
+    #[must_use]
+    pub const fn ordering_rank(self) -> u8 {
+        match self {
+            Self::Zero => 0,
+            Self::Standard => 1,
+        }
+    }
+
+    /// The short label the catalog publishes for this posture.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Zero => "zero retention",
+            Self::Standard => "provider retains data",
+        }
+    }
+
+    /// The weaker of two postures: `standard` always wins.
+    ///
+    /// The retention analogue of [`ModelMetadata::narrowed`], and it fails in
+    /// the same direction. A tier that can route to a zero-retention rung *and*
+    /// a retaining one retains data, because the customer cannot tell which
+    /// rung served them — so the tier may only advertise the weaker claim.
+    #[must_use]
+    pub const fn weaker(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Zero, Self::Zero) => Self::Zero,
+            _ => Self::Standard,
+        }
+    }
+}
+
+/// A pinned retention claim: what the posture is, and the evidence it was read
+/// from.
+///
+/// Every field is required. A half-written pin is refused at load rather than
+/// accepted with blanks, because the three evidence fields are what make this a
+/// checkable claim instead of an assertion: `source_url` is where a human
+/// verified it, `verified` is when, and `source_sha256` is what that page said
+/// at the time, so `zerorouter admin retention-drift` can tell a human the page
+/// has moved since (see `src/retention.rs`).
+///
+/// The pin is never written back by any tool, exactly as prices are never
+/// written back by `catalog-drift` — a retention label is a legal-adjacent
+/// claim about a customer's data, and the one thing worse than a stale label is
+/// one a network fetch invented.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct RetentionPin {
+    pub posture: RetentionPosture,
+    /// Short human text shown beside the label, e.g. "provider retains prompts
+    /// up to 30 days". Qualitative when the vendor publishes no window —
+    /// inventing a number is worse than declining to state one.
+    pub description: String,
+    /// The provider policy page the claim was verified against.
+    pub source_url: String,
+    /// ISO date (`YYYY-MM-DD`) a human last read `source_url` and confirmed the
+    /// posture.
+    pub verified: String,
+    /// SHA-256 of the normalized visible text of `source_url` as of `verified`.
+    /// `retention-drift` re-fetches and compares; a mismatch means the page
+    /// changed and a human must look, never that the posture flipped.
+    pub source_sha256: String,
+    /// This provider's slug in OpenRouter's provider directory, when one
+    /// corresponds. Advisory only — it feeds the corroboration pass and can
+    /// never change an exit code.
+    ///
+    /// Explicit rather than inferred from the provider key because the mapping
+    /// is genuinely not mechanical: ZeroRouter's `google` lane is the Gemini
+    /// *Developer* API, which OpenRouter calls `google-ai-studio`, while its
+    /// `google-vertex` slug is a different product under a different data
+    /// policy. Guessing `google` would have corroborated the wrong account.
+    #[serde(default)]
+    pub openrouter_slug: Option<String>,
+}
+
 #[derive(Clone, Debug)]
 pub struct ResolvedRoute {
     pub requested_model: String,
@@ -529,6 +669,42 @@ pub enum TierConfigError {
         input: f64,
         cached: f64,
     },
+    #[error(
+        "candidate {candidate} in tier {tier} dispatches to provider {provider}, which declares no \
+         retention posture: add a [retention.{provider}] block naming the posture, the policy page \
+         it was verified against, and the date. An unlabelled lane is refused rather than defaulted \
+         — the catalog publishes this claim to customers, and a lane whose posture nobody wrote \
+         down is one nobody checked"
+    )]
+    UnlabelledLane {
+        tier: String,
+        candidate: String,
+        provider: String,
+    },
+    #[error(
+        "retention pin for {subject} leaves {field} blank: every field of a retention pin is \
+         evidence for a claim about a customer's data, and a blank one asserts the claim without it"
+    )]
+    IncompleteRetentionPin {
+        subject: String,
+        field: &'static str,
+    },
+    #[error(
+        "retention pin for {subject} records verified = {verified}: it must be an ISO calendar date \
+         (YYYY-MM-DD) naming the day a human last read the policy page, because \
+         `admin retention-drift` reports staleness against it"
+    )]
+    InvalidRetentionDate { subject: String, verified: String },
+    #[error(
+        "retention pin for {subject} records source_url {url}: it must be an http(s) URL that \
+         `admin retention-drift` can fetch, or the claim has no re-verification loop"
+    )]
+    InvalidRetentionSourceUrl { subject: String, url: String },
+    #[error(
+        "retention pin for {subject} records source_sha256 {digest}: it must be 64 hexadecimal \
+         characters — the normalized-text digest `admin retention-drift` prints for that page"
+    )]
+    InvalidRetentionDigest { subject: String, digest: String },
 }
 
 impl TierCatalog {
@@ -647,26 +823,89 @@ impl TierCatalog {
                 .iter()
                 .all(|candidate| candidate.id != *tier_id);
             if is_routing_alias {
+                // A load-time invariant, not a runtime possibility: the catalog
+                // does not load unless every candidate resolves a posture, so
+                // this cannot be `None` for a tier that is being served.
+                let Some(retention) = self.tier_retention(definition) else {
+                    continue;
+                };
                 models.insert(
                     tier_id.clone(),
                     ModelListing {
                         owned_by: "zerorouter".to_owned(),
                         sell_rates: definition.rates.clone(),
                         metadata: ModelMetadata::narrowed(&definition.candidates),
+                        retention,
                     },
                 );
             }
             for candidate in &definition.candidates {
+                let Some(retention) = self.candidate_retention(definition, candidate) else {
+                    continue;
+                };
                 models
                     .entry(candidate.id.clone())
                     .or_insert_with(|| ModelListing {
                         owned_by: candidate.provider.clone(),
                         sell_rates: definition.rates.clone(),
                         metadata: candidate.metadata.clone(),
+                        retention,
                     });
             }
         }
         models
+    }
+
+    /// The posture one candidate serves under: its tier's override if the tier
+    /// declares one, otherwise the pin for the provider it dispatches to.
+    ///
+    /// `None` means the file never should have loaded — see
+    /// [`TierConfigError::UnlabelledLane`], which is raised for exactly this
+    /// condition at validation time.
+    #[must_use]
+    pub fn candidate_retention(
+        &self,
+        definition: &TierDefinition,
+        candidate: &TierCandidate,
+    ) -> Option<RetentionPin> {
+        definition
+            .retention
+            .clone()
+            .or_else(|| self.retention.get(&candidate.provider).cloned())
+    }
+
+    /// The posture a whole TIER may advertise: its override if it declares one,
+    /// otherwise the weakest posture across every candidate a request for it
+    /// could land on.
+    ///
+    /// Weakest rather than first, for the reason [`RetentionPosture::weaker`]
+    /// gives: a customer cannot tell which rung served them, so a tier with one
+    /// retaining rung retains. The *description* carried alongside is the one
+    /// belonging to the rung that set the posture, so the text a customer reads
+    /// always names a real arrangement rather than a blend of two.
+    #[must_use]
+    pub fn tier_retention(&self, definition: &TierDefinition) -> Option<RetentionPin> {
+        if let Some(override_pin) = &definition.retention {
+            return Some(override_pin.clone());
+        }
+        definition
+            .candidates
+            .iter()
+            .map(|candidate| self.retention.get(&candidate.provider).cloned())
+            .try_fold(None::<RetentionPin>, |weakest, pin| {
+                let pin = pin?;
+                Some(Some(match weakest {
+                    None => pin,
+                    Some(weakest) => {
+                        if weakest.posture.weaker(pin.posture) == weakest.posture {
+                            weakest
+                        } else {
+                            pin
+                        }
+                    }
+                }))
+            })
+            .flatten()
     }
 }
 
@@ -688,6 +927,20 @@ pub struct ModelListing {
     /// unchanged.
     pub sell_rates: RateSchedule,
     pub metadata: ModelMetadata,
+    /// What the upstream serving this row does with the request afterwards.
+    ///
+    /// Not an `Option`. Every row the catalog publishes carries a posture,
+    /// because the whole point of the label is that a customer never has to
+    /// wonder about a lane that omitted one — and `validate_tier_catalog`
+    /// refuses to load a file in which any candidate could reach this point
+    /// unlabelled.
+    ///
+    /// Follows the METADATA rule rather than the sell-rate rule: a candidate
+    /// row carries its own provider's posture, because a request for
+    /// `anthropic/claude-sonnet-5` reaches Anthropic's account whatever tier the
+    /// id sits under. A routing-alias row carries the weakest posture across
+    /// everything it can route to ([`RetentionPosture::weaker`]).
+    pub retention: RetentionPin,
 }
 
 pub async fn load_tier_catalog(path: &Path) -> Result<TierCatalog, TierConfigError> {
@@ -805,10 +1058,21 @@ fn validate_tier_catalog(
         return Err(TierConfigError::UnsupportedSchema(catalog.schema_version));
     }
 
+    // Shape first, for every pin the file declares — including one no tier
+    // happens to use. A malformed pin is a malformed claim, and leaving an
+    // unused one unchecked would let it rot until the day a candidate points at
+    // it, which is the worst possible moment to discover the date is a typo.
+    for (provider, pin) in &catalog.retention {
+        validate_retention_pin(&format!("provider {provider}"), pin)?;
+    }
+
     let mut concrete_ids = BTreeSet::new();
     let mut withheld: BTreeMap<String, TierConfigError> = BTreeMap::new();
 
     for (tier_id, definition) in &catalog.tiers {
+        if let Some(override_pin) = &definition.retention {
+            validate_retention_pin(&format!("tier {tier_id}"), override_pin)?;
+        }
         // A tier id is one of two shapes. A reserved `zero/*` id names a routing
         // alias (the namespace kept for future intent/routed tiers). A
         // vendor-named pin is keyed by the `{vendor}/{model}` id of one of its
@@ -849,6 +1113,22 @@ fn validate_tier_catalog(
             }
             if !concrete_ids.insert(candidate.id.clone()) {
                 return Err(TierConfigError::DuplicateModelId(candidate.id.clone()));
+            }
+            // STRUCTURAL, not economic: this refuses the whole file rather than
+            // withholding the one tier. A withheld tier would also keep the
+            // unlabelled lane off `/v1/models`, so the invariant would survive
+            // either way — but the catalog would then quietly serve a partial
+            // lineup because someone forgot a block, and the operator's claim is
+            // that EVERY lane is labelled. A file that cannot make that claim is
+            // not a file to serve half of.
+            if definition.retention.is_none()
+                && !catalog.retention.contains_key(&candidate.provider)
+            {
+                return Err(TierConfigError::UnlabelledLane {
+                    tier: tier_id.clone(),
+                    candidate: candidate.id.clone(),
+                    provider: candidate.provider.clone(),
+                });
             }
             validate_rate_schedule(tier_id, &candidate.rates)?;
             validate_metadata(tier_id, candidate)?;
@@ -1138,6 +1418,51 @@ fn validate_zero_price(tier: &str, candidate: &TierCandidate) -> Result<(), Tier
     Ok(())
 }
 
+/// Reject a retention pin that is present but unusable as evidence.
+///
+/// Every check here is about the *claim being checkable*, not about whether it
+/// is true — nothing in this process can know that. A blank description labels
+/// a lane with nothing; an unfetchable `source_url` or a malformed digest
+/// silently removes that provider from `admin retention-drift`'s re-verification
+/// loop, so the label would keep asserting itself with no mechanism left to
+/// notice the page had changed. Those are the failures that look fine forever.
+fn validate_retention_pin(subject: &str, pin: &RetentionPin) -> Result<(), TierConfigError> {
+    for (field, value) in [
+        ("description", &pin.description),
+        ("source_url", &pin.source_url),
+        ("verified", &pin.verified),
+        ("source_sha256", &pin.source_sha256),
+    ] {
+        if value.trim().is_empty() {
+            return Err(TierConfigError::IncompleteRetentionPin {
+                subject: subject.to_owned(),
+                field,
+            });
+        }
+    }
+    if chrono::NaiveDate::parse_from_str(pin.verified.trim(), "%Y-%m-%d").is_err() {
+        return Err(TierConfigError::InvalidRetentionDate {
+            subject: subject.to_owned(),
+            verified: pin.verified.clone(),
+        });
+    }
+    let url = pin.source_url.trim();
+    if !url.starts_with("https://") && !url.starts_with("http://") {
+        return Err(TierConfigError::InvalidRetentionSourceUrl {
+            subject: subject.to_owned(),
+            url: pin.source_url.clone(),
+        });
+    }
+    let digest = pin.source_sha256.trim();
+    if digest.len() != 64 || !digest.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(TierConfigError::InvalidRetentionDigest {
+            subject: subject.to_owned(),
+            digest: pin.source_sha256.clone(),
+        });
+    }
+    Ok(())
+}
+
 /// Reject metadata that is present but says nothing, on the *structural* side
 /// of the split described on [`validate_tier_catalog`].
 ///
@@ -1372,6 +1697,36 @@ mod tests {
         let source = format!(
             r#"
 schema_version = 1
+[retention.anthropic]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/anthropic"
+verified = "2026-08-20"
+source_sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+[retention.openai]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/openai"
+verified = "2026-08-20"
+source_sha256 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+[retention.google]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/google"
+verified = "2026-08-20"
+source_sha256 = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+[retention."local-llama"]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/local-llama"
+verified = "2026-08-20"
+source_sha256 = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+[retention.local]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/local"
+verified = "2026-08-20"
+source_sha256 = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
 [tiers."openai/pin"]
 [tiers."openai/pin".rates]
 {sell}
@@ -1486,6 +1841,36 @@ output_per_mtok = 1.80
         // a real free-settling provider in `tests/local_candidates.rs`.
         let source = r#"
 schema_version = 1
+[retention.anthropic]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/anthropic"
+verified = "2026-08-20"
+source_sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+[retention.openai]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/openai"
+verified = "2026-08-20"
+source_sha256 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+[retention.google]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/google"
+verified = "2026-08-20"
+source_sha256 = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+[retention."local-llama"]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/local-llama"
+verified = "2026-08-20"
+source_sha256 = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+[retention.local]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/local"
+verified = "2026-08-20"
+source_sha256 = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
 [tiers."zero/burst"]
 [tiers."zero/burst".rates]
 input_per_mtok = 0.20
@@ -1538,6 +1923,36 @@ output_per_mtok = 1.80
         // at the base band, where the violation actually is.
         let source = r#"
 schema_version = 1
+[retention.anthropic]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/anthropic"
+verified = "2026-08-20"
+source_sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+[retention.openai]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/openai"
+verified = "2026-08-20"
+source_sha256 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+[retention.google]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/google"
+verified = "2026-08-20"
+source_sha256 = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+[retention."local-llama"]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/local-llama"
+verified = "2026-08-20"
+source_sha256 = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+[retention.local]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/local"
+verified = "2026-08-20"
+source_sha256 = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
 [tiers."zero/burst"]
 [tiers."zero/burst".rates]
 input_per_mtok = 0.20
@@ -1662,6 +2077,36 @@ output_per_mtok = 2.0
         // declares nor the base band covers.
         let source = r#"
 schema_version = 1
+[retention.anthropic]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/anthropic"
+verified = "2026-08-20"
+source_sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+[retention.openai]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/openai"
+verified = "2026-08-20"
+source_sha256 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+[retention.google]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/google"
+verified = "2026-08-20"
+source_sha256 = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+[retention."local-llama"]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/local-llama"
+verified = "2026-08-20"
+source_sha256 = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+[retention.local]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/local"
+verified = "2026-08-20"
+source_sha256 = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
 [tiers."openai/discounted"]
 [tiers."openai/discounted".rates]
 input_per_mtok = 0.40
@@ -1908,6 +2353,36 @@ output_per_mtok = 2.0
         let catalog: TierCatalog = toml::from_str(
             r#"
 schema_version = 1
+[retention.anthropic]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/anthropic"
+verified = "2026-08-20"
+source_sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+[retention.openai]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/openai"
+verified = "2026-08-20"
+source_sha256 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+[retention.google]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/google"
+verified = "2026-08-20"
+source_sha256 = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+[retention."local-llama"]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/local-llama"
+verified = "2026-08-20"
+source_sha256 = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+[retention.local]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/local"
+verified = "2026-08-20"
+source_sha256 = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
 [tiers."zero/test"]
 [tiers."zero/test".rates]
 input_per_mtok = 1
@@ -1939,6 +2414,36 @@ output_per_mtok = 2
         let catalog: TierCatalog = toml::from_str(
             r#"
 schema_version = 1
+[retention.anthropic]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/anthropic"
+verified = "2026-08-20"
+source_sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+[retention.openai]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/openai"
+verified = "2026-08-20"
+source_sha256 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+[retention.google]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/google"
+verified = "2026-08-20"
+source_sha256 = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+[retention."local-llama"]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/local-llama"
+verified = "2026-08-20"
+source_sha256 = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+[retention.local]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/local"
+verified = "2026-08-20"
+source_sha256 = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
 [tiers."zero/test"]
 [tiers."zero/test".rates]
 input_per_mtok = 10
@@ -1970,6 +2475,36 @@ output_per_mtok = 2
         toml::from_str(&format!(
             r#"
 schema_version = 1
+[retention.anthropic]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/anthropic"
+verified = "2026-08-20"
+source_sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+[retention.openai]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/openai"
+verified = "2026-08-20"
+source_sha256 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+[retention.google]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/google"
+verified = "2026-08-20"
+source_sha256 = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+[retention."local-llama"]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/local-llama"
+verified = "2026-08-20"
+source_sha256 = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+[retention.local]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/local"
+verified = "2026-08-20"
+source_sha256 = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
 [tiers."zero/test"]
 [tiers."zero/test".rates]
 {sell}
@@ -2151,6 +2686,36 @@ model = "upstream-model"
         toml::from_str(&format!(
             r#"
 schema_version = 1
+[retention.anthropic]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/anthropic"
+verified = "2026-08-20"
+source_sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+[retention.openai]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/openai"
+verified = "2026-08-20"
+source_sha256 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+[retention.google]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/google"
+verified = "2026-08-20"
+source_sha256 = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+[retention."local-llama"]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/local-llama"
+verified = "2026-08-20"
+source_sha256 = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+[retention.local]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/local"
+verified = "2026-08-20"
+source_sha256 = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
 [tiers."zero/test"]
 [tiers."zero/test".rates]
 input_per_mtok = 2.00
@@ -2338,6 +2903,36 @@ output_per_mtok = 2.00
         toml::from_str(&format!(
             r#"
 schema_version = 1
+[retention.anthropic]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/anthropic"
+verified = "2026-08-20"
+source_sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+[retention.openai]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/openai"
+verified = "2026-08-20"
+source_sha256 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+[retention.google]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/google"
+verified = "2026-08-20"
+source_sha256 = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+[retention."local-llama"]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/local-llama"
+verified = "2026-08-20"
+source_sha256 = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+[retention.local]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/local"
+verified = "2026-08-20"
+source_sha256 = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
 [tiers."zero/healthy"]
 [tiers."zero/healthy".rates]
 input_per_mtok = 1.00
@@ -2519,6 +3114,36 @@ output_per_mtok = 0.20
             let toml = format!(
                 r#"
 schema_version = 1
+[retention.anthropic]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/anthropic"
+verified = "2026-08-20"
+source_sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+[retention.openai]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/openai"
+verified = "2026-08-20"
+source_sha256 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+[retention.google]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/google"
+verified = "2026-08-20"
+source_sha256 = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+[retention."local-llama"]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/local-llama"
+verified = "2026-08-20"
+source_sha256 = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+[retention.local]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/local"
+verified = "2026-08-20"
+source_sha256 = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
 [tiers."{id_line}"]
 [tiers."{id_line}".rates]
 input_per_mtok = 1
@@ -2544,6 +3169,36 @@ output_per_mtok = 2
         let catalog: TierCatalog = toml::from_str(
             r#"
 schema_version = 1
+[retention.anthropic]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/anthropic"
+verified = "2026-08-20"
+source_sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+[retention.openai]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/openai"
+verified = "2026-08-20"
+source_sha256 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+[retention.google]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/google"
+verified = "2026-08-20"
+source_sha256 = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+[retention."local-llama"]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/local-llama"
+verified = "2026-08-20"
+source_sha256 = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+[retention.local]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/local"
+verified = "2026-08-20"
+source_sha256 = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
 [tiers."zero/test"]
 [tiers."zero/test".rates]
 input_per_mtok = 1
@@ -2574,6 +3229,36 @@ output_per_mtok = 2
         let catalog: TierCatalog = toml::from_str(
             r#"
 schema_version = 1
+[retention.anthropic]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/anthropic"
+verified = "2026-08-20"
+source_sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+[retention.openai]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/openai"
+verified = "2026-08-20"
+source_sha256 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+[retention.google]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/google"
+verified = "2026-08-20"
+source_sha256 = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+[retention."local-llama"]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/local-llama"
+verified = "2026-08-20"
+source_sha256 = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+[retention.local]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/local"
+verified = "2026-08-20"
+source_sha256 = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
 [tiers."zero/test"]
 [tiers."zero/test".rates]
 input_per_mtok = 1
@@ -2603,6 +3288,36 @@ output_per_mtok = 2
         let catalog: TierCatalog = toml::from_str(
             r#"
 schema_version = 1
+[retention.anthropic]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/anthropic"
+verified = "2026-08-20"
+source_sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+[retention.openai]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/openai"
+verified = "2026-08-20"
+source_sha256 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+[retention.google]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/google"
+verified = "2026-08-20"
+source_sha256 = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+[retention."local-llama"]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/local-llama"
+verified = "2026-08-20"
+source_sha256 = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+[retention.local]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/local"
+verified = "2026-08-20"
+source_sha256 = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
 [tiers."zero/one"]
 [tiers."zero/one".rates]
 input_per_mtok = 1.00
@@ -2829,6 +3544,36 @@ output_per_mtok = 8.00
         let catalog: TierCatalog = toml::from_str(
             r#"
 schema_version = 1
+[retention.anthropic]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/anthropic"
+verified = "2026-08-20"
+source_sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+[retention.openai]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/openai"
+verified = "2026-08-20"
+source_sha256 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+[retention.google]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/google"
+verified = "2026-08-20"
+source_sha256 = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+[retention."local-llama"]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/local-llama"
+verified = "2026-08-20"
+source_sha256 = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+[retention.local]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/local"
+verified = "2026-08-20"
+source_sha256 = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
 [tiers."zero/pending"]
 candidates = []
 [tiers."zero/pending".rates]
@@ -2842,5 +3587,315 @@ output_per_mtok = 2
             validate_tier_catalog(&catalog),
             Err(TierConfigError::EmptyTier { .. })
         ));
+    }
+
+    // ------------------------------------------------------------------
+    // Retention posture
+    // ------------------------------------------------------------------
+
+    /// A catalog whose `[retention]` section is exactly what the caller passes,
+    /// serving one `anthropic` pin. Everything else is held constant so a test
+    /// varies only the posture declaration it is about.
+    fn catalog_with_retention(retention: &str) -> Result<TierCatalog, TierConfigError> {
+        let catalog: TierCatalog = toml::from_str(&format!(
+            r#"
+schema_version = 1
+{retention}
+[tiers."anthropic/pin"]
+[tiers."anthropic/pin".rates]
+input_per_mtok = 1.00
+output_per_mtok = 2.00
+[[tiers."anthropic/pin".candidates]]
+id = "anthropic/pin"
+provider = "anthropic"
+model = "pin"
+[tiers."anthropic/pin".candidates.rates]
+input_per_mtok = 1.00
+output_per_mtok = 2.00
+"#
+        ))
+        .expect("catalog should parse");
+        validate_tier_catalog(&catalog)?;
+        Ok(catalog)
+    }
+
+    const GOOD_PIN: &str = r#"
+[retention.anthropic]
+posture = "standard"
+description = "retains for 30 days"
+source_url = "https://example.test/anthropic"
+verified = "2026-08-20"
+source_sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+"#;
+
+    /// THE INVARIANT: an unlabelled lane is impossible, not defaulted.
+    ///
+    /// This is the test that fails when a provider's retention pin is deleted,
+    /// and the reason the check is STRUCTURAL rather than economic — the file
+    /// is refused outright, so there is no half-labelled catalog to serve.
+    #[test]
+    fn a_lane_whose_provider_declares_no_posture_refuses_the_file() {
+        let error = catalog_with_retention("").expect_err("an unlabelled lane must not load");
+        assert!(
+            matches!(
+                &error,
+                TierConfigError::UnlabelledLane { provider, candidate, .. }
+                    if provider == "anthropic" && candidate == "anthropic/pin"
+            ),
+            "expected an UnlabelledLane naming the provider, got {error:?}"
+        );
+        // And the message must name the block an operator has to add, because
+        // this refusal is the only guidance they get.
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("[retention.anthropic]"),
+            "the refusal must name the missing block: {rendered}"
+        );
+    }
+
+    /// A pin for a DIFFERENT provider does not label this lane. Guards against
+    /// a resolution rule that checks "any pin exists" rather than "a pin for
+    /// this candidate's provider exists".
+    #[test]
+    fn a_pin_for_another_provider_does_not_label_this_lane() {
+        let error = catalog_with_retention(
+            r#"
+[retention.openai]
+posture = "standard"
+description = "retains"
+source_url = "https://example.test/openai"
+verified = "2026-08-20"
+source_sha256 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+"#,
+        )
+        .expect_err("a pin for another provider labels nothing");
+        assert!(matches!(
+            error,
+            TierConfigError::UnlabelledLane { ref provider, .. } if provider == "anthropic"
+        ));
+    }
+
+    #[test]
+    fn a_labelled_lane_loads_and_publishes_its_providers_posture() {
+        let catalog = catalog_with_retention(GOOD_PIN).expect("a labelled lane loads");
+        let listing = catalog.model_listing();
+        let row = &listing["anthropic/pin"];
+        assert_eq!(row.retention.posture, RetentionPosture::Standard);
+        assert_eq!(row.retention.description, "retains for 30 days");
+        assert_eq!(row.retention.verified, "2026-08-20");
+    }
+
+    /// Each evidence field is load-bearing, so each must be refused when blank.
+    /// A pin missing its URL or digest keeps asserting a claim with no
+    /// re-verification loop behind it — the failure that looks fine forever.
+    #[test]
+    fn a_pin_with_a_blank_evidence_field_refuses_the_file() {
+        for (field, blanked) in [
+            ("description", GOOD_PIN.replace("retains for 30 days", "  ")),
+            (
+                "source_url",
+                GOOD_PIN.replace("https://example.test/anthropic", ""),
+            ),
+            ("verified", GOOD_PIN.replace("2026-08-20", "")),
+            ("source_sha256", GOOD_PIN.replace(&"a".repeat(64), "")),
+        ] {
+            let error =
+                catalog_with_retention(&blanked).expect_err("a blank {field} must refuse the file");
+            assert!(
+                matches!(
+                    error,
+                    TierConfigError::IncompleteRetentionPin { .. }
+                        | TierConfigError::InvalidRetentionSourceUrl { .. }
+                ),
+                "blanking {field} produced {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_pin_with_a_malformed_date_url_or_digest_refuses_the_file() {
+        let cases = [
+            // A date nobody can compare against is a date that cannot go stale.
+            ("20th August 2026", "verified"),
+        ];
+        for (bad, field) in cases {
+            let error = catalog_with_retention(&GOOD_PIN.replace("2026-08-20", bad))
+                .expect_err("a malformed {field} must refuse the file");
+            assert!(
+                matches!(error, TierConfigError::InvalidRetentionDate { .. }),
+                "{field}={bad} produced {error:?}"
+            );
+        }
+
+        let error = catalog_with_retention(
+            &GOOD_PIN.replace("https://example.test/anthropic", "example.test/anthropic"),
+        )
+        .expect_err("a non-http source_url must refuse the file");
+        assert!(matches!(
+            error,
+            TierConfigError::InvalidRetentionSourceUrl { .. }
+        ));
+
+        let error = catalog_with_retention(&GOOD_PIN.replace(&"a".repeat(64), "not-a-digest"))
+            .expect_err("a malformed digest must refuse the file");
+        assert!(matches!(
+            error,
+            TierConfigError::InvalidRetentionDigest { .. }
+        ));
+    }
+
+    /// A partial pin must not deserialize into a pin with blanks. Every field
+    /// is required at the serde layer, so half a claim is not a claim.
+    #[test]
+    fn a_pin_missing_a_field_entirely_fails_to_parse() {
+        let partial = r#"
+[retention.anthropic]
+posture = "standard"
+description = "retains"
+"#;
+        let parsed: Result<TierCatalog, _> = toml::from_str(&format!(
+            r#"
+schema_version = 1
+{partial}
+[tiers."anthropic/pin"]
+[tiers."anthropic/pin".rates]
+input_per_mtok = 1.00
+output_per_mtok = 2.00
+[[tiers."anthropic/pin".candidates]]
+id = "anthropic/pin"
+provider = "anthropic"
+model = "pin"
+[tiers."anthropic/pin".candidates.rates]
+input_per_mtok = 1.00
+output_per_mtok = 2.00
+"#
+        ));
+        assert!(parsed.is_err(), "a pin missing source_url must not parse");
+    }
+
+    /// A tier override replaces the provider pin for that tier alone.
+    #[test]
+    fn a_tier_override_replaces_its_providers_posture() {
+        let catalog: TierCatalog = toml::from_str(&format!(
+            r#"
+schema_version = 1
+{GOOD_PIN}
+[tiers."anthropic/pin"]
+[tiers."anthropic/pin".rates]
+input_per_mtok = 1.00
+output_per_mtok = 2.00
+[tiers."anthropic/pin".retention]
+posture = "zero"
+description = "negotiated ZDR endpoint"
+source_url = "https://example.test/zdr-agreement"
+verified = "2026-08-20"
+source_sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
+[[tiers."anthropic/pin".candidates]]
+id = "anthropic/pin"
+provider = "anthropic"
+model = "pin"
+[tiers."anthropic/pin".candidates.rates]
+input_per_mtok = 1.00
+output_per_mtok = 2.00
+"#
+        ))
+        .expect("catalog should parse");
+        validate_tier_catalog(&catalog).expect("an overridden tier loads");
+
+        let listing = catalog.model_listing();
+        assert_eq!(
+            listing["anthropic/pin"].retention.posture,
+            RetentionPosture::Zero,
+            "the tier override must win over the provider pin"
+        );
+        assert_eq!(
+            listing["anthropic/pin"].retention.description,
+            "negotiated ZDR endpoint"
+        );
+    }
+
+    /// The narrowing rule: a routing alias that can reach a retaining rung
+    /// retains, whichever order its candidates appear in.
+    #[test]
+    fn an_alias_advertises_the_weakest_posture_it_can_route_to() {
+        assert_eq!(
+            RetentionPosture::Zero.weaker(RetentionPosture::Standard),
+            RetentionPosture::Standard
+        );
+        assert_eq!(
+            RetentionPosture::Standard.weaker(RetentionPosture::Zero),
+            RetentionPosture::Standard
+        );
+        assert_eq!(
+            RetentionPosture::Zero.weaker(RetentionPosture::Zero),
+            RetentionPosture::Zero
+        );
+
+        // And through a real two-rung alias: one zero rung, one retaining rung.
+        let catalog: TierCatalog = toml::from_str(
+            r#"
+schema_version = 1
+[retention.openai]
+posture = "zero"
+description = "retains nothing"
+source_url = "https://example.test/openai"
+verified = "2026-08-20"
+source_sha256 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+[retention.anthropic]
+posture = "standard"
+description = "retains for 30 days"
+source_url = "https://example.test/anthropic"
+verified = "2026-08-20"
+source_sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+[tiers."zero/mixed"]
+[tiers."zero/mixed".rates]
+input_per_mtok = 5.00
+output_per_mtok = 10.00
+[[tiers."zero/mixed".candidates]]
+id = "openai/private"
+provider = "openai"
+model = "private"
+[tiers."zero/mixed".candidates.rates]
+input_per_mtok = 1.00
+output_per_mtok = 2.00
+[[tiers."zero/mixed".candidates]]
+id = "anthropic/retaining"
+provider = "anthropic"
+model = "retaining"
+[tiers."zero/mixed".candidates.rates]
+input_per_mtok = 1.00
+output_per_mtok = 2.00
+"#,
+        )
+        .expect("catalog should parse");
+        validate_tier_catalog(&catalog).expect("a mixed alias loads");
+        let listing = catalog.model_listing();
+
+        assert_eq!(
+            listing["zero/mixed"].retention.posture,
+            RetentionPosture::Standard,
+            "an alias that can reach a retaining rung must not advertise zero"
+        );
+        // The concrete rows still carry their OWN provider's posture: a request
+        // pinning `openai/private` reaches the zero-retention account whatever
+        // the alias above it must advertise.
+        assert_eq!(
+            listing["openai/private"].retention.posture,
+            RetentionPosture::Zero
+        );
+        assert_eq!(
+            listing["anthropic/retaining"].retention.posture,
+            RetentionPosture::Standard
+        );
+    }
+
+    /// The ordering rank is written out rather than derived, so it gets a test
+    /// of its own: this is what `ModelList::from_listing` sorts on.
+    #[test]
+    fn zero_ranks_before_standard() {
+        assert!(
+            RetentionPosture::Zero.ordering_rank() < RetentionPosture::Standard.ordering_rank(),
+            "zero-retention lanes must sort before retaining ones"
+        );
     }
 }

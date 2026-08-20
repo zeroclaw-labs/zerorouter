@@ -46,3 +46,32 @@ input_modalities = ["text"]
 input_per_mtok = 0.00
 cached_input_per_mtok = 0.00
 output_per_mtok = 0.00
+
+# ---------------------------------------------------------------------------
+# RETENTION POSTURE — required. A catalog in which any candidate's provider has
+# no resolvable posture does not load, so an unlabelled lane is impossible
+# rather than defaulted.
+#
+# A local rung is the one case where `zero` needs no vendor negotiation: the
+# model runs on YOUR hardware, so the arrangement is with yourself and nothing
+# leaves the box. That makes it the only lane in any shipped file here that can
+# honestly carry the label — and `/v1/models` will sort it above every cloud
+# lane because of it.
+#
+# CONFIRM IT BEFORE YOU SHIP IT. "Runs locally" is not the same claim as
+# "retains nothing": llama.cpp, Ollama, and vLLM can all be configured to write
+# prompts to a request log, and some distributions do by default. Check your
+# server's logging configuration, then set `verified` to the day you checked.
+# If you are not sure, write `standard` — a conservative label costs nothing and
+# a wrong `zero` is a false statement to a customer about their data.
+#
+# `source_url` here points at your own runbook rather than a vendor page, and
+# `source_sha256` is that document's normalized-text digest, which
+# `zerorouter admin retention-drift` prints for you. The mechanism is the same:
+# if the runbook changes, someone re-reads it.
+[retention.local]
+posture = "zero"
+description = "Served from the operator's own hardware; prompts and completions are not written to durable storage and never leave the machine."
+source_url = "https://example.invalid/runbooks/local-inference-logging"
+verified = "2026-08-20"
+source_sha256 = "1111111111111111111111111111111111111111111111111111111111111111"

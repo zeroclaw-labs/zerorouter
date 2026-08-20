@@ -78,3 +78,26 @@ tool_call = false
 input_per_mtok = 0.20
 cached_input_per_mtok = 0.02
 output_per_mtok = 1.20
+
+# ---------------------------------------------------------------------------
+# RETENTION POSTURE — required: `validate_tier_catalog` refuses a catalog in
+# which any candidate's provider has no resolvable posture, so a fixture must
+# label its lanes exactly as the shipped catalog does. Fixture values: the URLs
+# are unreachable by design and the digests are filler, because no test here
+# fetches anything — `admin retention-drift` is what reads these fields, and it
+# is exercised against its own fixture.
+# ---------------------------------------------------------------------------
+
+[retention.local-mock]
+posture = "standard"
+description = "Fixture lane: posture declared so the catalog loads."
+source_url = "https://example.test/local-mock/retention"
+verified = "2026-08-20"
+source_sha256 = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+
+[retention.metered-mock]
+posture = "standard"
+description = "Fixture lane: posture declared so the catalog loads."
+source_url = "https://example.test/metered-mock/retention"
+verified = "2026-08-20"
+source_sha256 = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
