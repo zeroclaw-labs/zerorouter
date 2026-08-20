@@ -33,10 +33,13 @@
 //!
 
 mod anthropic;
+mod bedrock_runtime;
 mod chat_completions;
+mod eventstream;
 mod responses;
 
 pub use anthropic::AnthropicWire;
+pub use bedrock_runtime::BedrockRuntimeWire;
 pub use chat_completions::ChatCompletionsWire;
 pub use responses::OpenAiResponsesWire;
 

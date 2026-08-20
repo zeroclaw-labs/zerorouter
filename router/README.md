@@ -46,7 +46,7 @@ an empty catalog, which is the honest answer.
 
 This reverses an earlier rule — the catalog used to be "the stable full catalog
 rather than changing with credential availability" — and the reversal was paid
-for in production. A deploy without `BEDROCK_API_KEY` advertised both Bedrock
+for in production. A deploy without `BEDROCK_API_KEY` advertised the Bedrock
 zero-retention lanes, the ones the product leads with, while every call to them
 returned 503. Stability is not worth much when what is stable is untrue. If you
 need to see the catalog a fully-provisioned deployment would publish, read
@@ -55,18 +55,37 @@ anything.
 
 `BEDROCK_API_KEY` is an Amazon Bedrock API key (an IAM service-specific
 credential), not the AWS access-key ID and secret used for Terraform.
-**`BEDROCK_REGION` must be set alongside it** — the endpoint carries the region
-in its hostname (`bedrock-mantle.{region}.api.aws`), and with no region the
-Bedrock rungs drop out of every route exactly as a missing key would. Nothing is
-defaulted: a guessed region would silently move customer prompts across a
-boundary the operator did not choose.
+**`BEDROCK_REGION` must be set alongside it** — both Bedrock endpoints carry the
+region in their hostname, and with no region the Bedrock rungs drop out of every
+route exactly as a missing key would. Nothing is defaulted: a guessed region
+would silently move customer prompts across a boundary the operator did not
+choose.
 
-The Bedrock lane reaches Claude over the **Anthropic Messages API** on Bedrock's
-mantle plane (`/anthropic/v1/messages`), not the OpenAI-compatible
-`/v1/chat/completions` that plane also serves — AWS's model cards mark Chat
-Completions and Responses unsupported for Claude, and Messages supported. It
-therefore rides the same wire the first-party Anthropic lane uses, which already
-sends the `x-api-key` and `anthropic-version` headers that endpoint takes.
+One AWS account, two API planes, and the shipped lanes are on the second one.
+`config/providers.json` declares both under the single `bedrock` entry — the
+entry's own endpoint is Bedrock's **mantle** plane
+(`bedrock-mantle.{region}.api.aws/anthropic/v1/messages`, the Anthropic Messages
+API verbatim), and its `classic_runtime` **surface** is the classic runtime plane
+(`bedrock-runtime.{region}.amazonaws.com`, AWS's `InvokeModel`). A candidate
+picks one with `surface = "..."` in `tiers.toml`.
+
+They are not interchangeable, and not only because the wires differ: they host
+different model generations. The mantle plane serves 5-generation Claude, the
+classic runtime plane serves 4.5- and 4.6-generation. On this account AWS's
+per-generation Sales entitlement cuts between 4.6 and 4.7 — opus 4.6 and the
+three 4.5-generation models answer, everything from 4.7 up (including every
+5-generation model, and therefore the whole mantle plane) returns 403 `not
+available for this account`. So the 5-generation tiers are commented out in
+`tiers.toml` and the four shipped `bedrock/claude-*` lanes all ride the runtime
+plane. See `docs/DEPLOY.md` for the probe results, the re-enable condition, and
+why the runtime lanes stay even after it is met.
+
+The runtime wire (`src/wire/bedrock_runtime.rs`) sends the same Messages request
+body the mantle wire does, with four differences that are each an opaque AWS 400
+if got wrong — the model id moves to the URL path, `anthropic_version` becomes a
+required body field, the `anthropic-version` header is dropped, and auth is
+`Authorization: Bearer` rather than `x-api-key`. Its streaming is AWS event
+stream binary framing rather than SSE, decoded by `src/wire/eventstream.rs`.
 
 Start the service:
 

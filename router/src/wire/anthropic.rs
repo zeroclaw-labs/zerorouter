@@ -79,56 +79,102 @@ impl AnthropicWire {
         temperature: Option<f64>,
         stream: bool,
     ) -> Value {
-        let (system, mut turns) = build_anthropic_messages(messages);
-        // Cache breakpoints, matching what the pinned adapter set: the
-        // system prompt, the last tool definition, and the last block of the
-        // final turn. Dropping these on the swap would silently forfeit the
-        // upstream cache discount on every multi-turn conversation (sol
-        // review) — the discount the cached_input_tokens dimension exists to
-        // meter. Three markers, under the API's limit of four.
-        let cache_marker = json!({ "type": "ephemeral" });
-        if let Some(block) = turns
-            .last_mut()
-            .and_then(|turn| turn["content"].as_array_mut())
-            .and_then(|content| content.last_mut())
-            .and_then(Value::as_object_mut)
-        {
-            block.insert("cache_control".to_owned(), cache_marker.clone());
-        }
-        let mut body = json!({
-            "model": model,
-            "messages": turns,
-            "max_tokens": self.max_tokens,
-            "stream": stream,
-        });
-        if !system.trim().is_empty() {
-            body["system"] = json!([{
-                "type": "text",
-                "text": system,
-                "cache_control": cache_marker.clone(),
-            }]);
-        }
-        if let Some(tools) = tools.filter(|tools| !tools.is_empty()) {
-            let mut tools_json = tools
-                .iter()
-                .map(|tool| {
-                    json!({
-                        "name": tool.name,
-                        "description": tool.description,
-                        "input_schema": tool.parameters,
-                    })
-                })
-                .collect::<Vec<Value>>();
-            if let Some(last) = tools_json.last_mut().and_then(Value::as_object_mut) {
-                last.insert("cache_control".to_owned(), cache_marker);
-            }
-            body["tools"] = json!(tools_json);
-        }
-        if let Some(temperature) = temperature {
-            body["temperature"] = json!(temperature);
-        }
-        body
+        messages_request_body(
+            Some(model),
+            messages,
+            tools,
+            temperature,
+            Some(stream),
+            self.max_tokens,
+        )
     }
+}
+
+/// Build a Messages-API request body, shared by every wire that speaks this
+/// dialect.
+///
+/// Extracted from `AnthropicWire::request_body` on 2026-08-20 so the Bedrock
+/// classic-runtime wire (`super::bedrock_runtime`) sends the SAME body this one
+/// does — same turn packing, same tool shape, and above all the same three
+/// cache breakpoints. A second hand-written builder would have been the obvious
+/// alternative and it is the wrong one: the breakpoints are what the
+/// `cached_input_tokens` dimension exists to meter, and a copy that silently
+/// lost one would forfeit the upstream cache discount on that lane's every
+/// multi-turn conversation without failing anything.
+///
+/// Two parameters are `Option` precisely because the classic runtime differs
+/// from the Messages endpoint in exactly two places, and nowhere else:
+///
+/// - `model` is `None` there, because the model id rides in the URL path
+///   (`/model/{id}/invoke`) and AWS's InvokeModel body schema has no `model`
+///   member at all — an extraneous key is refused with a `ValidationException`.
+/// - `stream` is `None` there, because the runtime chooses streaming by URL
+///   (`/invoke` vs `/invoke-with-response-stream`) rather than by a body flag.
+///
+/// Both omissions are asserted by the Bedrock wire's own contract tests, and
+/// this function's output for the Messages case is pinned byte-for-byte by
+/// `request_body_characterization` below.
+pub(super) fn messages_request_body(
+    model: Option<&str>,
+    messages: &[ChatMessage],
+    tools: Option<&[crate::provider::ToolSpec]>,
+    temperature: Option<f64>,
+    stream: Option<bool>,
+    max_tokens: u32,
+) -> Value {
+    let (system, mut turns) = build_anthropic_messages(messages);
+    // Cache breakpoints, matching what the pinned adapter set: the
+    // system prompt, the last tool definition, and the last block of the
+    // final turn. Dropping these on the swap would silently forfeit the
+    // upstream cache discount on every multi-turn conversation (sol
+    // review) — the discount the cached_input_tokens dimension exists to
+    // meter. Three markers, under the API's limit of four.
+    let cache_marker = json!({ "type": "ephemeral" });
+    if let Some(block) = turns
+        .last_mut()
+        .and_then(|turn| turn["content"].as_array_mut())
+        .and_then(|content| content.last_mut())
+        .and_then(Value::as_object_mut)
+    {
+        block.insert("cache_control".to_owned(), cache_marker.clone());
+    }
+    let mut body = json!({
+        "messages": turns,
+        "max_tokens": max_tokens,
+    });
+    if let Some(model) = model {
+        body["model"] = json!(model);
+    }
+    if let Some(stream) = stream {
+        body["stream"] = json!(stream);
+    }
+    if !system.trim().is_empty() {
+        body["system"] = json!([{
+            "type": "text",
+            "text": system,
+            "cache_control": cache_marker.clone(),
+        }]);
+    }
+    if let Some(tools) = tools.filter(|tools| !tools.is_empty()) {
+        let mut tools_json = tools
+            .iter()
+            .map(|tool| {
+                json!({
+                    "name": tool.name,
+                    "description": tool.description,
+                    "input_schema": tool.parameters,
+                })
+            })
+            .collect::<Vec<Value>>();
+        if let Some(last) = tools_json.last_mut().and_then(Value::as_object_mut) {
+            last.insert("cache_control".to_owned(), cache_marker);
+        }
+        body["tools"] = json!(tools_json);
+    }
+    if let Some(temperature) = temperature {
+        body["temperature"] = json!(temperature);
+    }
+    body
 }
 
 /// Append a content block to the last turn if it has `role`, else open a new
@@ -378,7 +424,7 @@ impl AnthropicUsage {
 
 /// The Messages envelope fields billing needs.
 #[derive(Deserialize)]
-struct MessagesEnvelope {
+pub(super) struct MessagesEnvelope {
     #[serde(default)]
     content: Vec<Value>,
     #[serde(default)]
@@ -412,7 +458,7 @@ fn anthropic_stop_reason(stop_reason: Option<&str>) -> Option<StopReason> {
     }
 }
 
-fn parse_messages_envelope(envelope: MessagesEnvelope) -> ChatResponse {
+pub(super) fn parse_messages_envelope(envelope: MessagesEnvelope) -> ChatResponse {
     let mut text_parts: Vec<String> = Vec::new();
     let mut tool_calls = Vec::new();
     for block in &envelope.content {
@@ -489,7 +535,7 @@ pub(super) struct AnthropicStreamMachine {
     /// Anthropic's own stop reason, which arrives on `message_delta` — one
     /// event BEFORE the `message_stop` terminal that carries it out.
     stop_reason: Option<StopReason>,
-    finished: bool,
+    pub(super) finished: bool,
 }
 
 impl AnthropicStreamMachine {
@@ -506,7 +552,7 @@ impl AnthropicStreamMachine {
     /// billable, wire-reported numbers — settling such a stream with no
     /// usage would charge zero for delivered output (sol review). The caller
     /// emits this before surfacing the stream error.
-    fn partial_usage(&mut self) -> Option<TokenUsage> {
+    pub(super) fn partial_usage(&mut self) -> Option<TokenUsage> {
         let usage = std::mem::take(&mut self.usage).into_token_usage()?;
         (usage.input_tokens.is_some() || usage.output_tokens.is_some()).then_some(usage)
     }
@@ -1358,6 +1404,92 @@ mod anthropic_review_fix_tests {
             .filter_map(|block| block["text"].as_str())
             .collect();
         assert_eq!(joined, "broken [IMAGE:no-close");
+    }
+}
+
+#[cfg(test)]
+mod request_body_characterization {
+    //! A byte-for-byte pin on the Messages request body, written BEFORE the
+    //! body builder was factored out for the Bedrock classic-runtime wire to
+    //! share (2026-08-20) and unchanged by that refactor.
+    //!
+    //! `request_body_sets_the_three_cache_breakpoints` above checks the
+    //! breakpoints; this checks EVERYTHING ELSE at once — the full key set,
+    //! the turn shape, the tool shape, and the `model`/`max_tokens`/`stream`
+    //! triple — because a refactor that shares this builder with a second wire
+    //! can plausibly drop or rename a field without touching a breakpoint.
+    //!
+    //! The comparison is against the serialized STRING rather than `Value`
+    //! equality, which pins one more thing than it looks like: this crate
+    //! builds `serde_json` without `preserve_order`, so a `Value::Object` is a
+    //! `BTreeMap` and serializes its keys alphabetically. The expected strings
+    //! below are therefore in alphabetical key order — that is the observed
+    //! behavior, recorded rather than assumed (the first draft of this test
+    //! asserted insertion order and failed, which is the point of writing it
+    //! against the unchanged code first). The Bedrock classic-runtime wire
+    //! builds the same object with `model` dropped and `anthropic_version`
+    //! added, and that diff is asserted over there.
+    use super::*;
+
+    fn fixture_messages() -> Vec<ChatMessage> {
+        vec![
+            ChatMessage::system("be terse"),
+            ChatMessage::user("first question"),
+            ChatMessage::assistant("first answer"),
+            ChatMessage::user("second question"),
+        ]
+    }
+
+    fn fixture_tools() -> Vec<crate::provider::ToolSpec> {
+        vec![crate::provider::ToolSpec {
+            name: "shell".into(),
+            description: "run a command".into(),
+            parameters: json!({"type": "object", "properties": {"command": {"type": "string"}}}),
+        }]
+    }
+
+    #[test]
+    fn the_messages_request_body_is_byte_stable() {
+        let wire = AnthropicWire::new("anthropic", "k", None, 512, 900);
+        let body = wire.request_body(
+            "claude-sonnet-5",
+            &fixture_messages(),
+            Some(&fixture_tools()),
+            Some(0.25),
+            true,
+        );
+        assert_eq!(
+            body.to_string(),
+            concat!(
+                r#"{"max_tokens":512,"#,
+                r#""messages":["#,
+                r#"{"content":[{"text":"first question","type":"text"}],"role":"user"},"#,
+                r#"{"content":[{"text":"first answer","type":"text"}],"role":"assistant"},"#,
+                r#"{"content":[{"cache_control":{"type":"ephemeral"},"text":"second question","type":"text"}],"role":"user"}"#,
+                r#"],"#,
+                r#""model":"claude-sonnet-5","#,
+                r#""stream":true,"#,
+                r#""system":[{"cache_control":{"type":"ephemeral"},"text":"be terse","type":"text"}],"#,
+                r#""temperature":0.25,"#,
+                r#""tools":[{"cache_control":{"type":"ephemeral"},"description":"run a command","input_schema":{"properties":{"command":{"type":"string"}},"type":"object"},"name":"shell"}]}"#,
+            )
+        );
+    }
+
+    #[test]
+    fn the_minimal_messages_request_body_is_byte_stable() {
+        // No system, no tools, no temperature: the three optional keys must
+        // stay ABSENT rather than becoming nulls or empty arrays.
+        let wire = AnthropicWire::new("anthropic", "k", None, 64, 900);
+        let body = wire.request_body("m", &[ChatMessage::user("hi")], None, None, false);
+        assert_eq!(
+            body.to_string(),
+            concat!(
+                r#"{"max_tokens":64,"messages":[{"content":"#,
+                r#"[{"cache_control":{"type":"ephemeral"},"text":"hi","type":"text"}],"role":"user"}],"#,
+                r#""model":"m","stream":false}"#,
+            )
+        );
     }
 }
 

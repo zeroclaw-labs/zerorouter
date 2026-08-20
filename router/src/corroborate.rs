@@ -670,6 +670,7 @@ mod tests {
                     id: id.to_owned(),
                     provider: provider.to_owned(),
                     model: model.to_owned(),
+                    surface: None,
                     rates: schedule,
                     metadata: ModelMetadata::default(),
                 }],
@@ -1137,6 +1138,7 @@ mod tests {
                     id: "local-llama/qwen3-8b".to_owned(),
                     provider: "local-llama".to_owned(),
                     model: "qwen3-8b".to_owned(),
+                    surface: None,
                     rates: RateSchedule::flat(ModelRates {
                         input_per_mtok: Some(0.0),
                         cached_input_per_mtok: None,
@@ -1204,6 +1206,7 @@ mod tests {
                     id: "anthropic/claude-sonnet-5".to_owned(),
                     provider: "anthropic".to_owned(),
                     model: "claude-sonnet-5".to_owned(),
+                    surface: None,
                     rates: RateSchedule::flat(rates(2.0, 0.2, 10.0)),
                     metadata: ModelMetadata::default(),
                 }],

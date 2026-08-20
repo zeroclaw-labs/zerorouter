@@ -615,7 +615,12 @@ cached_input_per_mtok = 0.40
 output_per_mtok = 18.00
 
 # ---------------------------------------------------------------------------
-# BEDROCK (added 2026-08-20) — THE ZERO-RETENTION LANES.
+# BEDROCK, MANTLE PLANE (added 2026-08-20) — THE ZERO-RETENTION LANES, AND THEY
+# ARE CURRENTLY COMMENTED OUT. The reasoning below is the ORIGINAL argument for
+# these two tiers and is kept verbatim because it is still the argument for
+# them; what changed the same day is that AWS will not serve this account the
+# models, which is explained where the commented tiers begin. The live Bedrock
+# lanes are the classic-runtime ones in the section after that.
 #
 # Same two Claude models the `anthropic/*` pins above serve, reached instead
 # through the operator's AWS Bedrock account, whose `data_retention_mode` is
@@ -703,51 +708,361 @@ output_per_mtok = 18.00
 # (`unreconcilable_reason`), prints its reason on every drift run, and means
 # these rates have NO automated check — re-verify them by hand with the curl
 # above when AWS moves anything.
-[tiers."bedrock/claude-sonnet-5"]
+# THE 5-GENERATION MANTLE LANES ARE COMMENTED OUT (2026-08-20, same day they
+# were added). DO NOT DELETE THIS BLOCK — uncommenting it is the whole
+# re-enable procedure, and the argument for why it is commented rather than
+# removed is below.
+#
+# WHAT HAPPENED. These two tiers were written against the mantle plane and
+# shipped believing the account could reach it. It cannot. Every model the
+# mantle plane hosts 403s for this AWS account with "not available for this
+# account" — an AWS SALES gate on 5-generation Claude, per-account and
+# per-model-generation, entirely separate from IAM. The credential is valid, the
+# region is right, `data_retention_mode` reads `none`, IAM grants invoke: the
+# request is refused before any of that matters.
+#
+# WHY COMMENTING OUT RATHER THAN LEAVING THEM HIDDEN. #89 made `/v1/models`
+# publish only what a deployment can serve, and its filter reads credential and
+# region presence. Both are about to be present in production — the deploy
+# adopts a task definition carrying BEDROCK_API_KEY — so the filter would have
+# PASSED these two lanes and put them back on the storefront, unservable. That
+# is #89's incident again, one layer deeper: a credential check cannot see an
+# account entitlement, because nothing in the environment records one. The only
+# honest place to encode "AWS will not serve this account these models" is here,
+# in the file that says what ZeroRouter sells.
+#
+# THE RE-ENABLE CONDITION, precisely: AWS Sales grants account 161457899654
+# access to 5-generation Claude on Bedrock. Verify with a real invocation, not
+# with a console page. Then uncomment this block verbatim; nothing else needs to
+# change, because everything these tiers depend on is deliberately still in
+# place — `[retention.bedrock]` above (same account, same posture, and the
+# runtime lanes below rely on it), the `bedrock` entry in `config/providers.json`
+# with its mantle `base_url` intact, and the `unreconcilable_reason` that exempts
+# every bedrock candidate from `catalog-drift`.
+#
+# RE-CHECK THE PRICES WHEN YOU UNCOMMENT. They were read on 2026-08-20 and have
+# had no automated check since (that is what the exemption costs). The curl is
+# in the pricing note below.
+#
+# [tiers."bedrock/claude-sonnet-5"]
+#
+# [tiers."bedrock/claude-sonnet-5".rates]
+# input_per_mtok = 2.20
+# cached_input_per_mtok = 0.22
+# output_per_mtok = 11.00
+#
+# [[tiers."bedrock/claude-sonnet-5".candidates]]
+# id = "bedrock/claude-sonnet-5"
+# provider = "bedrock"
+# # The bare, unprefixed model id. Mantle is in-region only, so the geo (`us.`)
+# # and global (`global.`) inference-profile ids the runtime endpoint accepts are
+# # documented N/A here — sending one is an error, not a routing preference.
+# model = "anthropic.claude-sonnet-5"
+#
+# [tiers."bedrock/claude-sonnet-5".candidates.metadata]
+# context_window = 1000000
+# max_output_tokens = 128000
+# input_modalities = ["text", "image", "pdf"]
+# tool_call = true
+#
+# [tiers."bedrock/claude-sonnet-5".candidates.rates]
+# input_per_mtok = 2.20
+# cached_input_per_mtok = 0.22
+# output_per_mtok = 11.00
+#
+# [tiers."bedrock/claude-opus-5"]
+#
+# [tiers."bedrock/claude-opus-5".rates]
+# input_per_mtok = 5.50
+# cached_input_per_mtok = 0.55
+# output_per_mtok = 27.50
+#
+# [[tiers."bedrock/claude-opus-5".candidates]]
+# id = "bedrock/claude-opus-5"
+# provider = "bedrock"
+# model = "anthropic.claude-opus-5"
+#
+# [tiers."bedrock/claude-opus-5".candidates.metadata]
+# context_window = 1000000
+# max_output_tokens = 128000
+# input_modalities = ["text", "image", "pdf"]
+# tool_call = true
+#
+# [tiers."bedrock/claude-opus-5".candidates.rates]
+# input_per_mtok = 5.50
+# cached_input_per_mtok = 0.55
+# output_per_mtok = 27.50
 
-[tiers."bedrock/claude-sonnet-5".rates]
-input_per_mtok = 2.20
-cached_input_per_mtok = 0.22
-output_per_mtok = 11.00
+# ---------------------------------------------------------------------------
+# BEDROCK, CLASSIC RUNTIME PLANE (added 2026-08-20) — THE ZERO-RETENTION LANES
+# THAT ACTUALLY ANSWER.
+#
+# Same AWS account as the block above, same `data_retention_mode: none`, same
+# `[retention.bedrock]` pin, same `BEDROCK_API_KEY`. A DIFFERENT API PLANE:
+# `bedrock-runtime.{region}.amazonaws.com`, AWS's classic `InvokeModel`, which
+# the `bedrock` provider entry declares as the `classic_runtime` surface and
+# each candidate below selects with `surface = "classic_runtime"`.
+#
+# These four are live. Verified by real HTTP 200 completions on 2026-08-20
+# against all four ids below, on an account whose effective retention mode is
+# `none`. They are the ONLY dispatchable Bedrock lanes ZeroRouter has, and
+# therefore the first zero-retention lanes a customer can actually buy.
+#
+# WHERE THE ACCOUNT GATE CUTS, verified model by model on 2026-08-20 against
+# this plane. This is the map; do not add a lane above the line without probing
+# it first:
+#
+#   opus 4.5, sonnet 4.5, haiku 4.5   HTTP 200   <- shipped below
+#   opus 4.6                          HTTP 200   <- shipped below
+#   opus 4.7, opus 4.8                403        <- account not entitled
+#   every 5-generation model          403        <- account not entitled
+#
+# So the gate is not "the mantle plane" and it is not "the new API" — it is a
+# per-model-generation entitlement on the ACCOUNT, and it happens to cut between
+# 4.6 and 4.7. The 403 reads `not available for this account` and arrives before
+# IAM, region, or retention mode matter. Adding `us.anthropic.claude-opus-4-7-v1`
+# here because the id looks plausible would ship a lane that 403s on every call,
+# which is the exact failure the commented block above records.
+#
+# WHY 4.5/4.6-GENERATION AND NOT 5. Not a compromise and not temporary — read
+# this before "upgrading" these. The two planes host DIFFERENT MODEL
+# GENERATIONS. 5-generation Claude is mantle-only (and gated, above).
+# 4.5- and 4.6-generation Claude is classic-runtime-only: the mantle plane does
+# not host it at all. So these tiers do not become redundant when AWS unlocks the
+# account — when that happens the catalog gains the two 5-generation lanes
+# ALONGSIDE these four, and a customer picks a generation rather than a plane.
+# Deleting these later would remove four models nothing else serves.
+#
+# WHY THE MODEL IDS CARRY A `us.` PREFIX, and do not remove it. These are
+# GEOGRAPHIC INFERENCE PROFILE ids. The bare and dated forms
+# (`anthropic.claude-opus-4-5-20251101-v1:0`) are documented In-Region N/A for
+# these models on the runtime plane and are refused; the geographic profile is
+# the only id that answers. It is also the pricing-relevant fact — see below.
+#
+# WHY THE WIRE IS ITS OWN ADAPTER. The request BODY is the Anthropic Messages
+# body, but four things around it differ and each is an opaque AWS 400 if got
+# wrong: the model id rides in the URL path (`/model/<id>/invoke`) instead of
+# the body, `anthropic_version = "bedrock-2023-05-31"` is a REQUIRED body field,
+# the `anthropic-version` HTTP header belongs to the mantle plane and is not
+# part of this operation, and auth is `Authorization: Bearer` rather than
+# `x-api-key`. Streaming differs entirely — `/invoke-with-response-stream`
+# answers AWS event stream binary framing, not SSE. See
+# `src/wire/bedrock_runtime.rs`, whose tests pin every clause.
+#
+# PRICING IS PASS-THROUGH, basis == sell, AND THESE COST ~10% MORE THAN THE
+# GLOBAL CLASS. Same shape of argument as the mantle block's, but a DIFFERENT
+# SKU-naming convention, which is the trap: 4.5-generation SKUs are not named
+# like 5-generation ones and neither form is guessable from the other.
+#
+# Read from the AWS Price List API, offer `AmazonBedrockFoundationModels`,
+# us-east-1, verified 2026-08-20 (the 4.5-generation models are NOT in the older
+# `AmazonBedrock` offer — that offer carries no Claude servicenames at all):
+#
+#   curl -s --compressed \
+#     https://pricing.us-east-1.amazonaws.com/offers/v1.0/aws/\
+# AmazonBedrockFoundationModels/current/us-east-1/index.json
+#
+#   servicenames "Claude Opus 4.6 / Opus 4.5 / Sonnet 4.5 / Haiku 4.5 (Amazon
+#   Bedrock Edition)". Opus 4.6 and Opus 4.5 price identically:
+#
+#   usagetype (regional above, global below)            opus 4.6  opus 4.5  sonnet 4.5  haiku 4.5
+#   USE1-MP:USE1_InputTokenCount-Units                      5.50      5.50        3.30       1.10
+#   USE1-MP:USE1_InputTokenCount_Global-Units               5.00      5.00        3.00       1.00
+#   USE1-MP:USE1_OutputTokenCount-Units                    27.50     27.50       16.50       5.50
+#   USE1-MP:USE1_OutputTokenCount_Global-Units             25.00     25.00       15.00       5.00
+#   USE1-MP:USE1_CacheReadInputTokenCount-Units             0.55      0.55        0.33       0.11
+#   USE1-MP:USE1_CacheReadInputTokenCount_Global-Units      0.50      0.50        0.30       0.10
+#
+#   Opus 4.6's regional SKU ids, for a spot re-check: input GZG423Y4VEBAMFMP,
+#   cache read H9AHG8JC5XET4BBQ, output HTCQM6TSYSHDEY34.
+#
+# The unqualified SKUs' priceDimension descriptions read "... Regional"; the
+# `_Global-Units` ones read "... Global". There is no third class.
+#
+# WHICH CLASS A `us.` PROFILE METERS, and this one IS documented. AWS's
+# cross-region-inference guide compares the two directly: geographic
+# cross-region inference is "Standard pricing", global cross-region inference is
+# "approximately 10% savings" — and Anthropic's own Bedrock page states the same
+# from the other side ("Regional endpoints include a 10% pricing premium over
+# global endpoints"). A `us.` profile is geographic, so it meters the REGIONAL
+# class. Those are the numbers below.
+#
+# DO NOT "correct" these down to the global figures. That sells every one of
+# these lanes below what AWS invoices, on every token. Reaching the global class
+# would mean dispatching `global.`-prefixed ids, which is a different routing
+# decision with a different data-residency story — not a price fix.
+#
+# AN INDEPENDENT CHECK THAT THESE NUMBERS ARE THE RIGHT CLASS. Every rate below
+# is EXACTLY 1.10x Anthropic's own first-party rate for the same model
+# (opus 4.6 and opus 4.5 both 5.00->5.50 and 25.00->27.50, sonnet 4.5
+# 3.00->3.30 and 15.00->16.50, haiku 4.5 1.00->1.10 and 5.00->5.50; models.dev,
+# read 2026-08-20). Four models, twelve dimensions, one ratio — and it is the same 10%
+# the AWS and Anthropic docs quote for regional over global. That is a second,
+# independent source agreeing that the unqualified SKU is the one a geographic
+# profile bills, arrived at from prices rather than from prose. If a future
+# re-verification finds a rate that is NOT 1.10x its first-party twin, that is
+# the signal to stop and re-read the SKU table rather than to update the number.
+#
+# ONE INFERENCE REMAINS LOAD-BEARING, exactly as in the mantle block. AWS
+# documents the price LEVEL of each profile kind but never maps a profile prefix
+# to a Price List `usagetype` string, and its Cost and Usage Report page uses a
+# third naming scheme again with no distinct geographic entry. So "a `us.` call
+# bills the unqualified `_TokenCount-Units` SKU" is forced by elimination (two
+# classes exist; geographic is the standard-priced one) rather than stated. Close
+# it empirically: after the first real invocation, read the CUR line item and
+# confirm the routing column reads In-region rather than Cross-region-global.
+# docs/DEPLOY.md records that as the operator's post-launch step.
+#
+# `admin catalog-drift` DOES NOT RECONCILE THESE, by the same declared
+# `unreconcilable_reason` on the `bedrock` provider entry that covered the
+# mantle lanes — models.dev prices the bare Bedrock ids at the global rate,
+# under a key that means in-region. These rates therefore have NO automated
+# check; re-verify by hand with the curl above whenever AWS moves anything.
+[tiers."bedrock/claude-opus-4-6"]
 
-[[tiers."bedrock/claude-sonnet-5".candidates]]
-id = "bedrock/claude-sonnet-5"
+[tiers."bedrock/claude-opus-4-6".rates]
+input_per_mtok = 5.50
+cached_input_per_mtok = 0.55
+output_per_mtok = 27.50
+
+[[tiers."bedrock/claude-opus-4-6".candidates]]
+id = "bedrock/claude-opus-4-6"
 provider = "bedrock"
-# The bare, unprefixed model id. Mantle is in-region only, so the geo (`us.`)
-# and global (`global.`) inference-profile ids the runtime endpoint accepts are
-# documented N/A here — sending one is an error, not a routing preference.
-model = "anthropic.claude-sonnet-5"
+surface = "classic_runtime"
+# NOTE THE ID SHAPE, which differs from every other candidate in this section
+# and is NOT a mistake to tidy up: no date stamp and no `-v1:0` suffix, just
+# `-v1`. The 4.5-generation profiles are dated
+# (`us.anthropic.claude-opus-4-5-20251101-v1:0`); this one is not. It is the id
+# that returned HTTP 200 on 2026-08-20; "correcting" it into the dated shape
+# invents a profile AWS does not publish. The response's own `model` field reads
+# `claude-opus-4-6`.
+model = "us.anthropic.claude-opus-4-6-v1"
 
-[tiers."bedrock/claude-sonnet-5".candidates.metadata]
+# The full 1,000,000-token window is stated here where sonnet 4.5's is
+# deliberately understated below, and the difference is intentional. Sonnet
+# 4.5's extended window is an opt-in beta on the surfaces that offer it, so
+# publishing it would be claiming something this wire does not request. Opus
+# 4.6's 1M window is its documented default, not a beta — models.dev and
+# Anthropic's own model documentation both state it plainly. Same source, same
+# date (2026-08-20), different confidence, recorded so the inconsistency reads
+# as a decision rather than an oversight.
+[tiers."bedrock/claude-opus-4-6".candidates.metadata]
 context_window = 1000000
 max_output_tokens = 128000
 input_modalities = ["text", "image", "pdf"]
 tool_call = true
 
-[tiers."bedrock/claude-sonnet-5".candidates.rates]
-input_per_mtok = 2.20
-cached_input_per_mtok = 0.22
-output_per_mtok = 11.00
-
-[tiers."bedrock/claude-opus-5"]
-
-[tiers."bedrock/claude-opus-5".rates]
+[tiers."bedrock/claude-opus-4-6".candidates.rates]
 input_per_mtok = 5.50
 cached_input_per_mtok = 0.55
 output_per_mtok = 27.50
 
-[[tiers."bedrock/claude-opus-5".candidates]]
-id = "bedrock/claude-opus-5"
-provider = "bedrock"
-model = "anthropic.claude-opus-5"
+[tiers."bedrock/claude-opus-4-5"]
 
-[tiers."bedrock/claude-opus-5".candidates.metadata]
-context_window = 1000000
-max_output_tokens = 128000
+[tiers."bedrock/claude-opus-4-5".rates]
+input_per_mtok = 5.50
+cached_input_per_mtok = 0.55
+output_per_mtok = 27.50
+
+[[tiers."bedrock/claude-opus-4-5".candidates]]
+id = "bedrock/claude-opus-4-5"
+provider = "bedrock"
+surface = "classic_runtime"
+model = "us.anthropic.claude-opus-4-5-20251101-v1:0"
+
+# Limits from models.dev's `anthropic/claude-opus-4-5` entry, read 2026-08-20 —
+# the same source and the same rule the first-party pins above use: the
+# dispatched string is a dated snapshot inside a geographic inference profile,
+# and models.dev catalogues the undated family name. Taking the FAMILY's limits
+# is correct because these are the same weights; what Bedrock changes is the
+# price and the retention posture, not the model.
+#
+# Note this is a different question from the pricing one, and the
+# `unreconcilable_reason` does NOT taint it: models.dev's Bedrock defect is that
+# its `amazon-bedrock` rows carry global-class prices. Its `anthropic` rows'
+# context and output limits are a property of the model and are not in dispute.
+[tiers."bedrock/claude-opus-4-5".candidates.metadata]
+context_window = 200000
+max_output_tokens = 64000
 input_modalities = ["text", "image", "pdf"]
 tool_call = true
 
-[tiers."bedrock/claude-opus-5".candidates.rates]
+[tiers."bedrock/claude-opus-4-5".candidates.rates]
 input_per_mtok = 5.50
 cached_input_per_mtok = 0.55
 output_per_mtok = 27.50
+
+[tiers."bedrock/claude-sonnet-4-5"]
+
+[tiers."bedrock/claude-sonnet-4-5".rates]
+input_per_mtok = 3.30
+cached_input_per_mtok = 0.33
+output_per_mtok = 16.50
+
+[[tiers."bedrock/claude-sonnet-4-5".candidates]]
+id = "bedrock/claude-sonnet-4-5"
+provider = "bedrock"
+surface = "classic_runtime"
+model = "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
+
+# DELIBERATELY UNDERSTATED, and this is the one metadata line in this file that
+# does not simply copy its source. models.dev reports a 1,000,000-token context
+# for `claude-sonnet-4-5`; that is the EXTENDED context, which on every surface
+# that offers it is an opt-in (`anthropic_beta`) rather than the default, and
+# this wire sends no beta opt-in. Whether the classic runtime plane serves the
+# extended window to this account without one was NOT verified — the live probes
+# on 2026-08-20 were ordinary short completions.
+#
+# So 200,000 is published: the window this lane is known to deliver. The two
+# errors are not symmetric. Understating means a client budgets less context than
+# it might have got, which costs a little capability and nothing else.
+# Overstating means a client packs a 900,000-token prompt and the request fails
+# — after the customer has already spent the time assembling it. This file's own
+# rule is that a tier advertises the narrowest thing it can do, and its header is
+# explicit that a wrong number is worse than a cautious one.
+#
+# To raise it: send one real request at, say, 300,000 tokens against
+# `us.anthropic.claude-sonnet-4-5-20250929-v1:0` on this plane. If it completes,
+# the extended window is on by default here and this becomes 1000000 with the
+# date of that check; if it 400s, add the `anthropic_beta` opt-in to the wire
+# first and re-test. Do not raise it from a documentation page alone.
+[tiers."bedrock/claude-sonnet-4-5".candidates.metadata]
+context_window = 200000
+max_output_tokens = 64000
+input_modalities = ["text", "image", "pdf"]
+tool_call = true
+
+[tiers."bedrock/claude-sonnet-4-5".candidates.rates]
+input_per_mtok = 3.30
+cached_input_per_mtok = 0.33
+output_per_mtok = 16.50
+
+[tiers."bedrock/claude-haiku-4-5"]
+
+[tiers."bedrock/claude-haiku-4-5".rates]
+input_per_mtok = 1.10
+cached_input_per_mtok = 0.11
+output_per_mtok = 5.50
+
+[[tiers."bedrock/claude-haiku-4-5".candidates]]
+id = "bedrock/claude-haiku-4-5"
+provider = "bedrock"
+surface = "classic_runtime"
+model = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+
+# The one 4.5-generation lane whose limits ARE stated, because the same model
+# already has a first-party pin in this file (`anthropic/claude-haiku-4-5`) whose
+# metadata was read from models.dev on 2026-08-08 and reviewed then. Copied from
+# it rather than re-derived: it is the same weights, so a second reading would be
+# a second thing to keep in sync. Note this lane sells at 1.10/5.50 against that
+# lane's 1.00/5.00 — the same in-region premium the block header explains.
+[tiers."bedrock/claude-haiku-4-5".candidates.metadata]
+context_window = 200000
+max_output_tokens = 64000
+input_modalities = ["text", "image", "pdf"]
+tool_call = true
+
+[tiers."bedrock/claude-haiku-4-5".candidates.rates]
+input_per_mtok = 1.10
+cached_input_per_mtok = 0.11
+output_per_mtok = 5.50
