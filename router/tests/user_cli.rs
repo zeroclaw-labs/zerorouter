@@ -361,6 +361,30 @@ async fn user_cli_logs_in_through_the_device_flow_then_reports_and_clears_the_cr
         .expect("the model list should carry a data array");
     assert!(!rows.is_empty(), "the shipped catalog should list models");
     assert!(rows.iter().all(|row| row["id"].is_string()));
+    // The retention block rides through the pass-through unchanged, so `--json`
+    // needed no CLI change to carry it. Asserted here because "unchanged
+    // pass-through" is the property that makes that true, and a future reshape
+    // of this command would break it silently.
+    assert!(
+        rows.iter().all(|row| matches!(
+            row["retention"]["posture"].as_str(),
+            Some("zero" | "standard")
+        )),
+        "every listed lane must carry a retention posture in --json"
+    );
+
+    // The human table renders the posture as a column and explains it beneath.
+    let table = run_user_cli(&config_dir, &["models"]);
+    assert!(table.status.success(), "models should exit 0");
+    let rendered = String::from_utf8(table.stdout).expect("stdout should be UTF-8");
+    assert!(
+        rendered.contains("RETENTION"),
+        "the table needs a retention column: {rendered}"
+    );
+    assert!(
+        rendered.contains("Retention:") && rendered.contains("zero-retention, listed first"),
+        "the table needs the retention footnote: {rendered}"
+    );
 
     // logout removes the file, and is idempotent.
     let logout = run_user_cli(&config_dir, &["logout", "--json"]);

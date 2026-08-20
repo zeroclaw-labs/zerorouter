@@ -432,6 +432,97 @@ credits required, so inference is refused for users with no funded balance.
 Either fund balances / set `ZEROROUTER_SIGNUP_CREDIT_USD`, or set
 `ZEROROUTER_REQUIRE_CREDITS=false` explicitly if cap-only is what you want.
 
+## Retention posture: how to change a label, and when you may
+
+ZeroRouter's catalog labels **every** lane with what its upstream does with a
+request after answering it, and `/v1/models` lists zero-retention lanes first.
+The labels are pinned in `router/config/tiers.toml` under `[retention.<provider>]`
+and are never written by any tool — the same rule prices follow, for a sharper
+reason: a retention label is a claim to a customer about their own data.
+
+**Today every lane is `standard` and the zero-retention section is empty.** All
+three upstreams (`anthropic`, `openai`, `google`) are ordinary API accounts.
+That is correct, and the catalog says so plainly rather than implying otherwise.
+
+### The rule for `posture = "zero"`
+
+> A lane may be labelled zero-retention **only when a signed or confirmed
+> zero-data-retention arrangement is in force with that provider, covering the
+> account that lane dispatches on.**
+
+Not because the vendor *offers* ZDR to somebody. Not because a policy page says
+data is not used for training — **training and retention are different claims**,
+and all three current providers disclaim training while still retaining. When
+in doubt, write `standard`. A wrong `standard` costs a little marketing; a wrong
+`zero` is a false statement to a customer about their data, and the kind of
+claim a regulator or a plaintiff reads literally.
+
+The one exception that needs no vendor: a **local rung on your own hardware**
+(see `examples/edge/tiers.toml`). Even there, confirm your inference server is
+not writing prompts to a request log before you label it — several do by
+default.
+
+### Changing a posture
+
+1. **Re-verify first.** Open the provider's policy page and read what it now
+   says. If the posture is changing to `zero`, confirm the arrangement is
+   actually executed — an email saying "we can offer that" is not an
+   arrangement.
+2. **Edit the pin** in `router/config/tiers.toml`: `posture`, `description`,
+   `source_url`, and `verified` (today's date). Keep the description
+   qualitative when the vendor publishes no window — Google's terms say prompts
+   are logged "for a limited period of time" and state no number, so ours does
+   not invent one.
+3. **Re-pin the digest.** Run the drift check; it prints the digest it observed:
+
+   ```bash
+   cd router
+   ./target/debug/zerorouter admin retention-drift --tiers config/tiers.toml
+   ```
+
+   Copy the `observed source_sha256` into the pin. Copy it only *after* step 1
+   — pasting the new digest without reading the page is the one way to misuse
+   this tool, and it converts the check into a rubber stamp.
+4. **Confirm green.** Re-run the command; it should report every page unchanged
+   and exit zero.
+
+A tier that needs its own posture (one lane bought under a separate agreement)
+declares a complete `[tiers."<id>".retention]` block. It **replaces** the
+provider pin rather than patching it, so an overriding tier states its own
+evidence and its own date.
+
+### What the drift check does and does not mean
+
+`admin retention-drift` fetches each pinned `source_url`, reduces it to visible
+text, and compares the SHA-256 against the pin. It **never** compares postures —
+no public source states what your contract with a provider says.
+
+| verdict | meaning | exit |
+|---|---|---|
+| `UNCHANGED` | the page still reads as it did on `verified` | 0 |
+| `PAGE CHANGED` | the wording moved — **a human must re-read it** | non-zero |
+| `UNREACHABLE` | the page could not be fetched, so the claim has no re-verification loop | non-zero |
+
+**A changed page does not mean the posture flipped.** It usually means the
+vendor reworded or relaid-out something. The loop is: alert on change → a human
+re-verifies → bump `verified` and `source_sha256`. `--allow-drift` reports and
+exits zero when you need to unblock; `--source-dir` reads pages from disk for a
+deterministic CI fixture.
+
+`--corroborate` adds OpenRouter's provider directory as a second opinion. It is
+**advisory and cannot change the exit code**, and it is doubly indirect: it
+describes *OpenRouter's* account with each provider, so a private ZDR
+arrangement of yours is invisible to it. Expect a `zero` pin to look like a
+disagreement there. Note also that `google` corroborates against
+`google-ai-studio`, not `google-vertex` — different products, different
+policies, and the slug is pinned explicitly in the file for exactly that reason.
+
+### If a provider's posture actually changes
+
+Raise `standard` first. A lane labelled `standard` that is really zero costs
+nothing but a missed selling point; a lane labelled `zero` that is really
+standard is the failure this whole mechanism exists to prevent.
+
 ## Rollback
 
 The workflow deploys immutable per-commit image tags. To roll back, re-run

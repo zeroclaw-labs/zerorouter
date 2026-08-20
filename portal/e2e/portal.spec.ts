@@ -178,3 +178,40 @@ test('the api surface the SPA consumes returns the documented shapes', async ({ 
     usageHasTotals: true,
   })
 })
+
+test('the models catalog labels every lane with its retention posture', async ({ page }) => {
+  // The catalog is a storefront — reachable signed OUT — and the retention
+  // label is a claim ZeroRouter makes to anyone who reads it, so this is
+  // exercised without a session on purpose.
+  await page.goto('/models')
+
+  const header = page.getByRole('columnheader', { name: /^retention$/i })
+  await expect(header).toBeVisible({ timeout: 15_000 })
+
+  // EVERY row carries a label. A blank cell here is the failure the whole
+  // feature exists to prevent: an unlabelled lane a reader has to guess about.
+  const rows = page.locator('table.table tbody tr')
+  const count = await rows.count()
+  expect(count).toBeGreaterThan(0)
+  for (let i = 0; i < count; i += 1) {
+    await expect(rows.nth(i).locator('td').last()).toHaveText(
+      /zero retention|provider retains data/,
+    )
+  }
+
+  // And the page explains what the label means rather than leaving a bare word
+  // in a column. Today's honest state: no lane carries a zero-retention label.
+  await expect(page.getByText(/zero-retention lanes are listed first/i)).toBeVisible()
+  await expect(page.getByText(/no lane currently carries a zero-retention label/i)).toBeVisible()
+
+  // Ordering, read off the rendered table: once a zero-retention lane appears,
+  // no retaining lane may precede it. Vacuously true for today's all-standard
+  // catalog, and the guard that fails the day a ZDR lane is pinned and the
+  // page's own sort is not updated with it.
+  const labels = await rows.locator('td:last-child').allTextContents()
+  const lastZero = labels.map((t) => t.trim()).lastIndexOf('zero retention')
+  const firstStandard = labels.map((t) => t.trim()).indexOf('provider retains data')
+  if (lastZero >= 0 && firstStandard >= 0) {
+    expect(lastZero).toBeLessThan(firstStandard)
+  }
+})

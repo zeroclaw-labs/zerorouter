@@ -458,6 +458,37 @@ pub struct ModelObject {
     /// same claim as `false`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call: Option<bool>,
+    /// What the upstream serving this model does with the request afterwards.
+    ///
+    /// **The one field on this object with no `skip_serializing_if`**, and the
+    /// exception is the point. Every other field here follows "absent means
+    /// unknown", which is the right contract for a capability nobody has
+    /// described. It is the wrong contract for this: a customer reading a row
+    /// with no retention key would have to guess, and the guess a zero-retention
+    /// brand invites is the favourable one. So the catalog either states a
+    /// posture for every row or does not load
+    /// (`TierConfigError::UnlabelledLane`).
+    ///
+    /// Additive all the same — a new object-valued key that no existing
+    /// consumer reads. ZeroClaw's `ModelPricing`/model structs carry no
+    /// `deny_unknown_fields`, and serde ignores unknown fields by default, so an
+    /// older client sees exactly what it saw before.
+    pub retention: ModelRetention,
+}
+
+/// The published half of a [`crate::config::RetentionPin`].
+///
+/// `source_url` and `source_sha256` stay out of the wire deliberately. They are
+/// ZeroRouter's *verification trail* — the page a human read and what it said
+/// that day — and the label is ZeroRouter's own claim, standing on its own. A
+/// published link would invite a customer to check the label against a page
+/// that may have moved since `verified`, which is precisely the discrepancy
+/// `admin retention-drift` exists to route to a human first.
+#[derive(Debug, Serialize)]
+pub struct ModelRetention {
+    pub posture: crate::config::RetentionPosture,
+    pub description: String,
+    pub verified: String,
 }
 
 /// OpenRouter-shaped per-token pricing, string-valued. This is ZeroClaw's
@@ -556,9 +587,31 @@ fn per_token_price(rate_per_mtok: f64) -> String {
 impl ModelList {
     #[must_use]
     pub fn from_listing(listing: BTreeMap<String, crate::config::ModelListing>) -> Self {
+        // ZERO-RETENTION LANES FIRST, then alphabetical within each posture.
+        //
+        // The catalog's order is a statement, not a convenience: a gateway whose
+        // brand is zero retention puts the lanes that keep that promise at the
+        // top, and the ones that do not below them. Sorting here rather than in
+        // `model_listing` keeps `BTreeMap`'s by-id order as the catalog's
+        // internal shape — every other caller still gets a stable alphabetical
+        // map — and makes this the single place the published order is decided.
+        //
+        // Ordering is by `ordering_rank`, never by the enum's derived order; see
+        // `RetentionPosture::ordering_rank` for why that distinction is load
+        // bearing. `then_with` on the id keeps the result total and stable, so
+        // two lanes of the same posture read alphabetically exactly as the whole
+        // catalog did before this existed.
+        let mut rows: Vec<(String, crate::config::ModelListing)> = listing.into_iter().collect();
+        rows.sort_by(|(left_id, left), (right_id, right)| {
+            left.retention
+                .posture
+                .ordering_rank()
+                .cmp(&right.retention.posture.ordering_rank())
+                .then_with(|| left_id.cmp(right_id))
+        });
         Self {
             object: "list",
-            data: listing
+            data: rows
                 .into_iter()
                 .map(|(id, row)| ModelObject {
                     id,
@@ -570,6 +623,11 @@ impl ModelList {
                     max_output_tokens: row.metadata.max_output_tokens,
                     input_modalities: row.metadata.input_modalities,
                     tool_call: row.metadata.tool_call,
+                    retention: ModelRetention {
+                        posture: row.retention.posture,
+                        description: row.retention.description,
+                        verified: row.retention.verified,
+                    },
                 })
                 .collect(),
         }

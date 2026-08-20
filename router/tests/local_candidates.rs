@@ -166,6 +166,82 @@ async fn load_catalog_pricing(
         format!(
             r#"
 schema_version = 1
+# Every provider these fixtures can name, labelled `standard`: the loader
+# refuses a catalog with an unlabelled lane, and an over-broad pin set is
+# harmless because only the providers a candidate actually names are required.
+[retention.openai]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/openai"
+verified = "2026-08-20"
+source_sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
+[retention.anthropic]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/anthropic"
+verified = "2026-08-20"
+source_sha256 = "2222222222222222222222222222222222222222222222222222222222222222"
+[retention.google]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/google"
+verified = "2026-08-20"
+source_sha256 = "3333333333333333333333333333333333333333333333333333333333333333"
+[retention."local-llama"]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/local-llama"
+verified = "2026-08-20"
+source_sha256 = "4444444444444444444444444444444444444444444444444444444444444444"
+[retention.local]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/local"
+verified = "2026-08-20"
+source_sha256 = "5555555555555555555555555555555555555555555555555555555555555555"
+[retention."hosted-zr"]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/hosted-zr"
+verified = "2026-08-20"
+source_sha256 = "6666666666666666666666666666666666666666666666666666666666666666"
+[retention."secure-local"]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/secure-local"
+verified = "2026-08-20"
+source_sha256 = "7777777777777777777777777777777777777777777777777777777777777777"
+[retention."burst-local"]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/burst-local"
+verified = "2026-08-20"
+source_sha256 = "8888888888888888888888888888888888888888888888888888888888888888"
+[retention."metered-chat"]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/metered-chat"
+verified = "2026-08-20"
+source_sha256 = "9999999999999999999999999999999999999999999999999999999999999999"
+[retention."metered-priced"]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/metered-priced"
+verified = "2026-08-20"
+source_sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+[retention."metered-twin"]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/metered-twin"
+verified = "2026-08-20"
+source_sha256 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+[retention."priced-tier-local"]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/priced-tier-local"
+verified = "2026-08-20"
+source_sha256 = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+
 [tiers."zero/{name}"]
 [tiers."zero/{name}".rates]
 input_per_mtok = 2.00
@@ -198,6 +274,82 @@ async fn load_catalog_rates(
         format!(
             r#"
 schema_version = 1
+# Every provider these fixtures can name, labelled `standard`: the loader
+# refuses a catalog with an unlabelled lane, and an over-broad pin set is
+# harmless because only the providers a candidate actually names are required.
+[retention.openai]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/openai"
+verified = "2026-08-20"
+source_sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
+[retention.anthropic]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/anthropic"
+verified = "2026-08-20"
+source_sha256 = "2222222222222222222222222222222222222222222222222222222222222222"
+[retention.google]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/google"
+verified = "2026-08-20"
+source_sha256 = "3333333333333333333333333333333333333333333333333333333333333333"
+[retention."local-llama"]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/local-llama"
+verified = "2026-08-20"
+source_sha256 = "4444444444444444444444444444444444444444444444444444444444444444"
+[retention.local]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/local"
+verified = "2026-08-20"
+source_sha256 = "5555555555555555555555555555555555555555555555555555555555555555"
+[retention."hosted-zr"]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/hosted-zr"
+verified = "2026-08-20"
+source_sha256 = "6666666666666666666666666666666666666666666666666666666666666666"
+[retention."secure-local"]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/secure-local"
+verified = "2026-08-20"
+source_sha256 = "7777777777777777777777777777777777777777777777777777777777777777"
+[retention."burst-local"]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/burst-local"
+verified = "2026-08-20"
+source_sha256 = "8888888888888888888888888888888888888888888888888888888888888888"
+[retention."metered-chat"]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/metered-chat"
+verified = "2026-08-20"
+source_sha256 = "9999999999999999999999999999999999999999999999999999999999999999"
+[retention."metered-priced"]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/metered-priced"
+verified = "2026-08-20"
+source_sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+[retention."metered-twin"]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/metered-twin"
+verified = "2026-08-20"
+source_sha256 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+[retention."priced-tier-local"]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/priced-tier-local"
+verified = "2026-08-20"
+source_sha256 = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+
 [tiers."zero/{name}"]
 [tiers."zero/{name}".rates]
 {sell}
@@ -359,6 +511,82 @@ async fn a_zero_price_on_a_cloud_provider_is_still_refused_with_the_overlay_inst
         &path,
         r#"
 schema_version = 1
+# Every provider these fixtures can name, labelled `standard`: the loader
+# refuses a catalog with an unlabelled lane, and an over-broad pin set is
+# harmless because only the providers a candidate actually names are required.
+[retention.openai]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/openai"
+verified = "2026-08-20"
+source_sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
+[retention.anthropic]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/anthropic"
+verified = "2026-08-20"
+source_sha256 = "2222222222222222222222222222222222222222222222222222222222222222"
+[retention.google]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/google"
+verified = "2026-08-20"
+source_sha256 = "3333333333333333333333333333333333333333333333333333333333333333"
+[retention."local-llama"]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/local-llama"
+verified = "2026-08-20"
+source_sha256 = "4444444444444444444444444444444444444444444444444444444444444444"
+[retention.local]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/local"
+verified = "2026-08-20"
+source_sha256 = "5555555555555555555555555555555555555555555555555555555555555555"
+[retention."hosted-zr"]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/hosted-zr"
+verified = "2026-08-20"
+source_sha256 = "6666666666666666666666666666666666666666666666666666666666666666"
+[retention."secure-local"]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/secure-local"
+verified = "2026-08-20"
+source_sha256 = "7777777777777777777777777777777777777777777777777777777777777777"
+[retention."burst-local"]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/burst-local"
+verified = "2026-08-20"
+source_sha256 = "8888888888888888888888888888888888888888888888888888888888888888"
+[retention."metered-chat"]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/metered-chat"
+verified = "2026-08-20"
+source_sha256 = "9999999999999999999999999999999999999999999999999999999999999999"
+[retention."metered-priced"]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/metered-priced"
+verified = "2026-08-20"
+source_sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+[retention."metered-twin"]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/metered-twin"
+verified = "2026-08-20"
+source_sha256 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+[retention."priced-tier-local"]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/priced-tier-local"
+verified = "2026-08-20"
+source_sha256 = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+
 [tiers."zero/sneaky"]
 [tiers."zero/sneaky".rates]
 input_per_mtok = 2.00
@@ -1823,6 +2051,82 @@ async fn the_edge_ladder_still_loads_once_its_hosted_rung_reprices() {
         &path,
         r#"
 schema_version = 1
+# Every provider these fixtures can name, labelled `standard`: the loader
+# refuses a catalog with an unlabelled lane, and an over-broad pin set is
+# harmless because only the providers a candidate actually names are required.
+[retention.openai]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/openai"
+verified = "2026-08-20"
+source_sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
+[retention.anthropic]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/anthropic"
+verified = "2026-08-20"
+source_sha256 = "2222222222222222222222222222222222222222222222222222222222222222"
+[retention.google]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/google"
+verified = "2026-08-20"
+source_sha256 = "3333333333333333333333333333333333333333333333333333333333333333"
+[retention."local-llama"]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/local-llama"
+verified = "2026-08-20"
+source_sha256 = "4444444444444444444444444444444444444444444444444444444444444444"
+[retention.local]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/local"
+verified = "2026-08-20"
+source_sha256 = "5555555555555555555555555555555555555555555555555555555555555555"
+[retention."hosted-zr"]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/hosted-zr"
+verified = "2026-08-20"
+source_sha256 = "6666666666666666666666666666666666666666666666666666666666666666"
+[retention."secure-local"]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/secure-local"
+verified = "2026-08-20"
+source_sha256 = "7777777777777777777777777777777777777777777777777777777777777777"
+[retention."burst-local"]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/burst-local"
+verified = "2026-08-20"
+source_sha256 = "8888888888888888888888888888888888888888888888888888888888888888"
+[retention."metered-chat"]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/metered-chat"
+verified = "2026-08-20"
+source_sha256 = "9999999999999999999999999999999999999999999999999999999999999999"
+[retention."metered-priced"]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/metered-priced"
+verified = "2026-08-20"
+source_sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+[retention."metered-twin"]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/metered-twin"
+verified = "2026-08-20"
+source_sha256 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+[retention."priced-tier-local"]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/priced-tier-local"
+verified = "2026-08-20"
+source_sha256 = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+
 [tiers."zero/burst"]
 [tiers."zero/burst".rates]
 input_per_mtok = 0.20

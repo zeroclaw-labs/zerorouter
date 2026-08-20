@@ -800,6 +800,7 @@ mod tests {
             "zero/test".to_owned(),
             TierDefinition {
                 rates: sell.into(),
+                retention: None,
                 candidates: vec![TierCandidate {
                     id: format!("anthropic/{model}"),
                     provider: "anthropic".to_owned(),
@@ -812,6 +813,7 @@ mod tests {
         TierCatalog {
             schema_version: 1,
             tiers,
+            retention: BTreeMap::new(),
             unavailable: BTreeMap::new(),
         }
     }
@@ -1388,6 +1390,7 @@ mod tests {
             "zero/edge".to_owned(),
             TierDefinition {
                 rates: RateSchedule::flat(rates(2.0, 0.2, 10.0)),
+                retention: None,
                 candidates: vec![TierCandidate {
                     id: format!("{provider}/qwen3-8b"),
                     provider: provider.to_owned(),
@@ -1400,6 +1403,7 @@ mod tests {
         TierCatalog {
             schema_version: 1,
             tiers,
+            retention: BTreeMap::new(),
             unavailable: BTreeMap::new(),
         }
     }

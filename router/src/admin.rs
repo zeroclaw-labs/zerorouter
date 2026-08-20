@@ -68,6 +68,65 @@ pub enum AdminCommand {
     /// a price, because a bad fetch that repriced a live billing catalog would
     /// be worse than the staleness it fixed.
     CatalogDrift(CatalogDriftArgs),
+    /// Re-read the evidence behind every pinned retention label: fetch each
+    /// `source_url` and check it still says what it said on `verified`.
+    /// Read-only and database-free, so it runs in CI beside `catalog-drift`.
+    ///
+    /// Exits non-zero when a policy page CHANGED or could not be read — never
+    /// because a posture looks wrong, which nothing here can determine. A
+    /// changed page means a human must re-read it and re-pin; it does not mean
+    /// the posture flipped. Nothing here ever writes to `tiers.toml`.
+    RetentionDrift(RetentionDriftArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct RetentionDriftArgs {
+    /// Read the policy pages from a directory instead of the network (offline
+    /// / CI), one file per claim named `<subject>.html` — `anthropic.html`,
+    /// `openai.html`. A tier override's subject `tier zero/x` becomes
+    /// `tier-zero-x.html`: every character outside `[A-Za-z0-9._-]` becomes a
+    /// dash. A claim with no matching file is reported UNREACHABLE, exactly as
+    /// a failed fetch would be, so an incomplete fixture cannot pass silently.
+    #[arg(long)]
+    pub source_dir: Option<std::path::PathBuf>,
+    /// Cross-check the pinned postures against OpenRouter's provider
+    /// directory. Advisory: it reports what a third party says about each
+    /// upstream and CANNOT change the exit code — see `src/retention.rs`.
+    ///
+    /// Opt-in for the same reason `catalog-drift --corroborate` is: the daily
+    /// CI job runs this bare, and a default-on second fetch would put another
+    /// party's availability into a job that is supposed to answer one question
+    /// about `tiers.toml`.
+    #[arg(long)]
+    pub corroborate: bool,
+    /// The provider directory. Only consulted with --corroborate.
+    #[arg(long, default_value = crate::retention::DEFAULT_CORROBORATION_URL)]
+    pub corroborate_url: String,
+    /// Read the provider directory from a file instead of the network.
+    /// Implies --corroborate.
+    #[arg(long)]
+    pub corroborate_file: Option<std::path::PathBuf>,
+    /// Tier file to check. Defaults to the same path the server serves.
+    #[arg(long)]
+    pub tiers: Option<std::path::PathBuf>,
+    /// Operator provider inventory, if the tier file names upstreams the
+    /// shipped inventory does not (edge mode).
+    #[arg(long)]
+    pub providers: Option<std::path::PathBuf>,
+    /// Warn when a claim was last verified more than this many days ago.
+    ///
+    /// OFF by default, and off rather than set to a plausible number on
+    /// purpose: how often a retention claim must be re-read is a policy the
+    /// operator owns, and a default would turn an arbitrary number into a
+    /// promise on a date nobody chose. Staleness is ADVISORY even when set — it
+    /// is reported, never wired to the exit code — because a calendar passing
+    /// is not evidence that anything changed, and a job that reddens on a date
+    /// teaches people to bump the date.
+    #[arg(long)]
+    pub max_age_days: Option<i64>,
+    /// Report and exit zero even when a page changed.
+    #[arg(long)]
+    pub allow_drift: bool,
 }
 
 #[derive(Debug, Args)]
@@ -347,6 +406,11 @@ pub async fn run(args: AdminArgs) -> Result<()> {
     if let AdminCommand::CatalogDrift(args) = args.command {
         return catalog_drift(args).await;
     }
+    // Same reasoning, same shape: a retention label is a property of the FILE
+    // and the pages behind it, so this too answers before a pool exists.
+    if let AdminCommand::RetentionDrift(args) = args.command {
+        return retention_drift(args).await;
+    }
 
     let pool = database_pool_from_env().await?;
     migrate(&pool).await?;
@@ -370,7 +434,9 @@ pub async fn run(args: AdminArgs) -> Result<()> {
         AdminCommand::OwedSettlements(args) => owed_settlements(&pool, args).await,
         AdminCommand::SettleOwed(args) => settle_owed(&pool, args).await,
         // Handled above, before the pool exists.
-        AdminCommand::CatalogDrift(_) => unreachable!("dispatched before the pool"),
+        AdminCommand::CatalogDrift(_) | AdminCommand::RetentionDrift(_) => {
+            unreachable!("dispatched before the pool")
+        }
     }
 }
 
@@ -1279,6 +1345,267 @@ async fn catalog_drift(args: CatalogDriftArgs) -> Result<()> {
             .as_ref()
             .map_or(args.source_url.clone(), |p| p.display().to_string())
     )
+}
+
+/// Re-read the evidence behind every pinned retention label.
+///
+/// Read-only by construction, and narrower than it looks: it never decides
+/// whether a posture is *correct*. No public source states what the operator's
+/// contract with a provider says, so the only checkable claim is "the page this
+/// was read from still reads the same". A difference routes a human to the
+/// page; it never relabels a lane, and nothing here writes to `tiers.toml` —
+/// for the same reason `catalog-drift` never writes a price, only sharper,
+/// because a retention label is a claim about a customer's data.
+async fn retention_drift(args: RetentionDriftArgs) -> Result<()> {
+    use crate::retention::{Verdict, check, claims, fetch, unfetchable};
+
+    let tiers_path = args.tiers.unwrap_or_else(|| {
+        std::env::var("ZEROROUTER_TIERS_PATH")
+            .unwrap_or_else(|_| crate::config::DEFAULT_TIER_CONFIG_PATH.to_owned())
+            .into()
+    });
+    let providers_path = args.providers.or_else(|| {
+        std::env::var_os(crate::providers::PROVIDER_INVENTORY_PATH_ENV)
+            .map(std::path::PathBuf::from)
+    });
+    if let Some(path) = providers_path {
+        let count = crate::providers::load_operator_inventory(&path).with_context(|| {
+            format!(
+                "loading the operator provider inventory from {}",
+                path.display()
+            )
+        })?;
+        println!(
+            "operator providers: {count} from {path}",
+            path = path.display()
+        );
+    }
+    // Loading the catalog is itself the first half of the check: a file with an
+    // unlabelled lane does not parse, so reaching this line already proves every
+    // servable candidate resolves a posture.
+    let catalog = crate::config::load_tier_catalog(&tiers_path)
+        .await
+        .with_context(|| format!("loading the tier catalog from {}", tiers_path.display()))?;
+
+    let pinned = claims(&catalog);
+    if pinned.is_empty() {
+        println!(
+            "No retention claims are pinned in {}.",
+            tiers_path.display()
+        );
+        return Ok(());
+    }
+
+    let mut checks = Vec::with_capacity(pinned.len());
+    for (subject, pin) in &pinned {
+        let document = match &args.source_dir {
+            Some(dir) => {
+                let path = dir.join(format!("{}.html", sanitize_subject(subject)));
+                tokio::fs::read_to_string(&path)
+                    .await
+                    .map_err(|error| format!("{} could not be read ({error})", path.display()))
+            }
+            None => fetch(&pin.source_url)
+                .await
+                .map_err(|error| format!("{error:#}")),
+        };
+        checks.push(match document {
+            Ok(document) => check(subject, pin, &document),
+            Err(error) => unfetchable(subject, pin, &error),
+        });
+    }
+
+    println!(
+        "{:<24} {:<22} {:<12} {:<14} SOURCE",
+        "SUBJECT", "POSTURE", "VERIFIED", "VERDICT"
+    );
+    for found in &checks {
+        println!(
+            "{:<24} {:<22} {:<12} {:<14} {}",
+            found.subject,
+            found.pin.posture.label(),
+            found.pin.verified,
+            found.verdict.label(),
+            found.pin.source_url,
+        );
+    }
+
+    // Advisory, and printed before the exit-deciding lines so those stay last.
+    if let Some(max_age) = args.max_age_days {
+        report_stale_claims(&checks, max_age);
+    }
+    if args.corroborate || args.corroborate_file.is_some() {
+        print_retention_corroboration(
+            &pinned,
+            &args.corroborate_url,
+            args.corroborate_file.as_deref(),
+        )
+        .await;
+    }
+
+    let actionable: Vec<_> = checks
+        .iter()
+        .filter(|found| found.verdict.is_actionable())
+        .collect();
+    if actionable.is_empty() {
+        println!(
+            "\n{} retention claim(s) re-verified, every policy page unchanged.",
+            checks.len()
+        );
+        return Ok(());
+    }
+
+    println!("\n{} retention claim(s) need a human:", actionable.len());
+    for found in &actionable {
+        match found.verdict {
+            Verdict::Changed => {
+                println!(
+                    "  {} — policy page changed since verified date ({}) — re-verify and re-pin",
+                    found.subject, found.pin.verified
+                );
+                println!("      {}", found.pin.source_url);
+                println!(
+                    "      pinned   source_sha256 = \"{}\"",
+                    found.pin.source_sha256
+                );
+                // Printed so re-pinning after a human has READ the page is a
+                // copy, not a second command. Copying it without reading the
+                // page is the one way to misuse this tool, which is why the
+                // line above says re-verify first.
+                println!(
+                    "      observed source_sha256 = \"{}\"",
+                    found.observed_sha256.as_deref().unwrap_or("-")
+                );
+            }
+            Verdict::Unfetchable => {
+                println!(
+                    "  {} — policy page could not be read: {}",
+                    found.subject,
+                    found.error.as_deref().unwrap_or("unknown error")
+                );
+                println!("      {}", found.pin.source_url);
+            }
+            Verdict::Unchanged => unreachable!("filtered to actionable verdicts"),
+        }
+    }
+    println!("\nA changed page does NOT mean the posture flipped. Read the page, confirm what the");
+    println!(
+        "posture should be, then update `verified` and `source_sha256` in the tier file. A ZDR"
+    );
+    println!("label may only be pinned against a signed arrangement — see docs/DEPLOY.md.");
+
+    if args.allow_drift {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "{} retention claim(s) need re-verification; re-read the policy page and re-pin \
+         deliberately, or pass --allow-drift",
+        actionable.len()
+    )
+}
+
+/// Map a claim's subject to a filename for `--source-dir`.
+fn sanitize_subject(subject: &str) -> String {
+    subject
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect()
+}
+
+/// Report claims whose `verified` date is older than the operator's threshold.
+///
+/// Advisory only — it never touches the exit code. See `--max-age-days`.
+fn report_stale_claims(checks: &[crate::retention::ProviderCheck], max_age_days: i64) {
+    let today = chrono::Utc::now().date_naive();
+    let stale: Vec<_> = checks
+        .iter()
+        .filter_map(|found| {
+            let verified =
+                chrono::NaiveDate::parse_from_str(found.pin.verified.trim(), "%Y-%m-%d").ok()?;
+            let age = (today - verified).num_days();
+            (age > max_age_days).then_some((found, age))
+        })
+        .collect();
+    if stale.is_empty() {
+        return;
+    }
+    println!("\nLast verified more than {max_age_days} day(s) ago — advisory, the exit code is");
+    println!("unchanged. A page that has not changed may still describe a contract that has:");
+    for (found, age) in stale {
+        println!(
+            "  {} — verified {} ({age} days ago)",
+            found.subject, found.pin.verified
+        );
+    }
+}
+
+/// Print OpenRouter's view of each pinned provider.
+///
+/// **Returns nothing and cannot fail**, the same contract as
+/// [`print_corroboration`] and for the same reason: a third party's
+/// availability must never redden this job. It is doubly advisory here — the
+/// directory describes OPENROUTER's account with each provider, not
+/// ZeroRouter's, so a negotiated ZDR arrangement is invisible to it by
+/// construction and a `zero` pin is expected to look like a disagreement.
+async fn print_retention_corroboration(
+    claims: &[(String, crate::config::RetentionPin)],
+    url: &str,
+    file: Option<&std::path::Path>,
+) {
+    use crate::retention::{corroborate, fetch_corroboration};
+
+    let origin = file.map_or_else(|| url.to_owned(), |path| path.display().to_string());
+    let document = match file {
+        Some(path) => tokio::fs::read_to_string(path)
+            .await
+            .map_err(|error| anyhow::anyhow!("could not be read ({error})")),
+        None => fetch_corroboration(url).await,
+    };
+    let report = match document.and_then(|document| corroborate(claims, &document)) {
+        Ok(report) => report,
+        Err(error) => {
+            println!("\nProvider directory ({origin}): SKIPPED — {error:#}.");
+            println!("  Corroboration is advisory; the verdict above is unchanged.");
+            return;
+        }
+    };
+    if report.is_empty() {
+        println!("\nProvider directory ({origin}): no pinned claim declares an openrouter_slug.");
+        return;
+    }
+
+    println!("\nProvider directory ({origin}) — corroboration only, never authoritative.");
+    println!("It describes OpenRouter's OWN account with each upstream, so it cannot see a");
+    println!("private ZDR arrangement. Nothing below changes the verdict above or the exit code.");
+    for row in &report {
+        let window = row
+            .retention_days
+            .map_or_else(|| "unstated".to_owned(), |days| format!("{days}d"));
+        let retains = row
+            .retains_prompts
+            .map_or("unknown", |retains| if retains { "yes" } else { "no" });
+        let trains = row
+            .training
+            .map_or("unknown", |trains| if trains { "yes" } else { "no" });
+        println!(
+            "  {:<24} {:<20} retains {retains}, window {window}, trains {trains}",
+            row.subject, row.slug,
+        );
+        if row.appears_to_disagree {
+            println!(
+                "      NOTE: pinned zero-retention while this source reports prompts retained."
+            );
+            println!(
+                "      Expected when the ZDR arrangement is private; confirm it still exists."
+            );
+        }
+    }
 }
 
 /// Print the second source's cross-check.

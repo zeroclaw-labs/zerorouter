@@ -100,6 +100,11 @@ OpenRouter shaped) rather than reshaped, so there is only one contract to keep
 in step. The human table converts the wire's per-single-token rates to
 per-million and flags models that reprice above a prompt-size threshold.
 
+Each row also carries its **retention posture** — `zero` when a zero-data-retention
+arrangement is in force with that upstream, `standard` when the provider retains
+data under its own published policy. `--json` carries the full statement and the
+date it was last verified; `docs/DEPLOY.md` covers how a posture is changed.
+
 ### `logout`
 
 Removes the credential file. Idempotent: exits `0` whether or not one was
@@ -204,16 +209,24 @@ wait $!
 `zerorouter user models` (human):
 
 ```
-MODEL                             IN $/MTOK    OUT $/MTOK     CONTEXT
-anthropic/claude-fable-5              10.00         50.00     1000000
-anthropic/claude-haiku-4-5             1.00          5.00      200000
-anthropic/claude-opus-5                5.00         25.00     1000000
-anthropic/claude-sonnet-5              2.00         10.00     1000000
-google/gemini-3.1-pro-preview          2.00         12.00     1048576
-openai/gpt-5.6-luna                    0.20          1.20     1050000
+MODEL                             IN $/MTOK    OUT $/MTOK     CONTEXT  RETENTION
+anthropic/claude-fable-5              10.00         50.00     1000000  standard
+anthropic/claude-haiku-4-5             1.00          5.00      200000  standard
+anthropic/claude-opus-5                5.00         25.00     1000000  standard
+anthropic/claude-sonnet-5              2.00         10.00     1000000  standard
+google/gemini-3.1-pro-preview          2.00         12.00     1048576  standard
+openai/gpt-5.6-luna                    0.20          1.20     1050000  standard
 
 4 model(s) reprice above a prompt-size threshold; the rates above are the base band. Use --json for the full schedule.
+
+Retention: 0 lane(s) zero-retention, listed first; 10 where the provider retains data.
+Use --json for each lane's full retention statement and the date it was verified.
 ```
+
+Rows arrive in the server's order, which lists **zero-retention lanes first**,
+then alphabetically within each posture. The shipped catalog has none today —
+every lane runs on a standard API account — so the table reads alphabetically
+and the footnote says so rather than leaving the column unexplained.
 
 ## Credential file
 

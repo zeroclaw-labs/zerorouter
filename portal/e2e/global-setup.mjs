@@ -43,6 +43,13 @@ export default async function globalSetup() {
       ZEROROUTER_BIND: `127.0.0.1:${ROUTER_PORT}`,
       ZEROROUTER_PUBLIC_BASE_URL: BASE_URL,
       ZEROROUTER_PORTAL_DIST: path.resolve(here, '..', 'dist'),
+      // Without this the router resolves the default `config/tiers.toml`
+      // relative to ITS cwd — which is `portal/` here, where no such file
+      // exists — so `/v1/models` answered "catalog unavailable" and the
+      // storefront page rendered an error banner. Nothing asserted on that
+      // page, so the gap was invisible until the catalog gained something
+      // worth testing.
+      ZEROROUTER_TIERS_PATH: path.resolve(repo, 'router', 'config', 'tiers.toml'),
       OIDC_ISSUER_URL: `http://127.0.0.1:${IDP_PORT}`,
       OIDC_CLIENT_ID: 'e2e-portal',
       OIDC_CLIENT_SECRET: 'e2e-secret',
