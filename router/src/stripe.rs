@@ -3503,9 +3503,11 @@ pub async fn sweep_autopay_tax_lifecycle(pool: &crate::sqlx::PgPool, settings: &
                             .await
                 {
                     // The transaction exists at Stripe but the stamp did not
-                    // land; the next pass re-records, is refused as a
-                    // duplicate, and keeps the row loud until this write
-                    // succeeds.
+                    // land — and the id is gone with it. The next pass
+                    // re-records, is refused as a duplicate, and cannot stamp
+                    // either, so the row stays loud until an OPERATOR stamps
+                    // it (DEPLOY.md): the filing is correct, the noise is the
+                    // cost of never guessing at an undocumented error shape.
                     tracing::error!(
                         payment_intent = %intent_id,
                         tax_transaction = %transaction_id,
@@ -3909,10 +3911,11 @@ async fn handle_autopay_intent_event(
         && let Err(error) =
             billing::freeze_autopay_tax_transaction(&ctx.pool, intent_id, &transaction_id).await
     {
-        // Recorded at Stripe but the stamp did not land: the sweep re-records,
-        // is refused as a duplicate reference, and keeps the row loud until
-        // this write succeeds. Never a reason to fail the webhook — the money
-        // and the filing are both already correct.
+        // Recorded at Stripe but the stamp did not land — and the id is gone
+        // with it: the sweep's re-record is refused as a duplicate reference
+        // and cannot stamp either, so the row stays loud until an operator
+        // stamps it (DEPLOY.md). Never a reason to fail the webhook — the
+        // money and the filing are both already correct.
         tracing::error!(
             payment_intent = %intent_id,
             tax_transaction = %transaction_id,
@@ -4357,8 +4360,10 @@ async fn replay_charge(
                 && let Err(error) =
                     billing::freeze_autopay_tax_transaction(pool, intent_id, &transaction_id).await
             {
-                // Same shape as the webhook site: recorded but unstamped rows
-                // stay loud through the sweep until the stamp lands.
+                // Same shape as the webhook site: the id is lost with the
+                // failed write, the sweep's re-record is refused as a
+                // duplicate, and the row stays loud until an operator stamps
+                // it (DEPLOY.md).
                 tracing::error!(
                     payment_intent = %intent_id,
                     tax_transaction = %transaction_id,

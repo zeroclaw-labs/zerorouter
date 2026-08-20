@@ -382,7 +382,21 @@ Three things worth knowing when it stops being inert:
   manual is a row whose transaction id was never stored (rows settled before
   migration 0024, or an id lost to a network failure): the Tax API cannot look
   a transaction up by reference, so those are surfaced at ERROR on every sweep
-  pass until an operator reverses them in Dashboard → Tax → Transactions. An
+  pass until an operator reverses them in Dashboard → Tax → Transactions.
+  **Reversing at Stripe does not quiet the log by itself** — ZeroRouter's row
+  still says unreversed, so close the loop by stamping it:
+
+  ```sql
+  UPDATE stripe_autopay_intents SET tax_reversed_at = NOW()
+  WHERE payment_intent_id = 'pi_...';   -- after reversing it at Stripe
+  ```
+
+  The same applies to a recording that can never complete automatically (the
+  transaction exists at Stripe but its id was lost, so every retry is refused
+  as a duplicate — or the calculation passed its 90-day expiry): resolve it at
+  Stripe first, then stamp `tax_recorded_at` the same way. Stamp only what
+  Stripe's dashboard confirms is done; the stamp is the sweep's off-switch,
+  not a way to silence a report that is genuinely missing. An
   autopay charge whose credit was **withheld** (collected from a frozen or
   indebted account) still records no tax transaction at all, and the operator
   refund must be the **taxed** total — `withheld_autopay_intents` reports that

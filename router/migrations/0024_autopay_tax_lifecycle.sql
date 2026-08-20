@@ -41,8 +41,9 @@
 -- BACKFILL: rows that settled before this migration ran had their tax
 -- transaction recorded (or its failure logged) by the fire-and-forget path,
 -- and their ids are gone either way. Stamping tax_recorded_at on them keeps
--- the new sweep from re-POSTing those references forever: the retry would be
--- refused as a duplicate every 30 minutes and the log would never go quiet.
+-- the new sweep from re-POSTing those references forever: the sweep runs
+-- every minute, so each un-backfilled row would be refused as a duplicate
+-- 1,440 times a day and the log would never go quiet.
 -- Their reversal path degrades to the operator surface, which is exactly
 -- where it was before this migration existed. The backfill deliberately
 -- covers only rows already terminal at migration time ('succeeded' with a
@@ -60,3 +61,16 @@ UPDATE stripe_autopay_intents
 SET tax_recorded_at = updated_at
 WHERE status = 'succeeded'
   AND tax_calculation_id IS NOT NULL;
+
+-- The reversal pass asks, once a minute, "which recorded charges does the
+-- ledger show refunded?" — an EXISTS probe on
+-- credit_ledger.stripe_payment_intent_id, a column no index covered. Without
+-- this, the planner answers with a hash semi-join that SEQ-SCANS
+-- credit_ledger — the table that grows with every settled request — every 60
+-- seconds, forever, to find refund rows that almost always number zero.
+-- Partial on the refund rows, so the index holds only the handful of rows the
+-- question is about; it equally serves reverse_purchase's already-reversed
+-- lookup, which probed the same unindexed column on every reversal webhook.
+CREATE INDEX credit_ledger_refunds_by_intent
+    ON credit_ledger (stripe_payment_intent_id)
+    WHERE entry_type = 'refund';
