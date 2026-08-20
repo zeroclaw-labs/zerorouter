@@ -487,6 +487,57 @@ async fn open_reservations(pool: &PgPool, api_key_id: Uuid) -> i64 {
         .expect("reservation count must query")
 }
 
+/// Admission tells the same story the catalog does.
+///
+/// This runs the REAL provider-construction path — no injected route — against
+/// a process holding no upstream credentials, so every candidate drops out and
+/// the route cannot be built. That used to answer `no_provider_available`,
+/// which reads as "the upstream fleet is down" and sends an operator to look at
+/// the wrong thing. It is now the same `model_unavailable` a tier withheld for
+/// below-cost pricing returns, naming the lane, because both mean the identical
+/// thing to a caller: ZeroRouter cannot serve this and you cannot fix it.
+///
+/// The money property is asserted alongside, because this refusal moved: route
+/// construction runs BEFORE `admit_usage`, so a refused request must leave no
+/// reservation behind. It never did, and this is what keeps that true if the
+/// order is ever shuffled.
+#[tokio::test]
+async fn a_lane_with_no_credential_is_refused_by_name_and_reserves_nothing() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let (api_key_id, key) = create_funded_key(&pool, "uncredentialed").await;
+    // The production constructor: no injected route, so `provider_route` builds
+    // from the environment exactly as it does in a real deployment.
+    let state = RouterState::with_database(tier_config_path(), pool.clone(), true);
+
+    // `zero/test-solo` runs on `openai`, whose key this process does not hold —
+    // the same condition production hit with `bedrock`.
+    let refused = app(state)
+        .oneshot(completion_request(
+            &key,
+            &completion_body("zero/test-solo", false),
+        ))
+        .await
+        .expect("completion request should complete");
+
+    assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = json_body(refused).await;
+    assert_eq!(body["error"]["code"], "model_unavailable");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("zero/test-solo"),
+        "the refusal must name the lane the caller asked for: {body}"
+    );
+    assert_eq!(
+        open_reservations(&pool, api_key_id).await,
+        0,
+        "a request refused for want of a credential must reserve nothing"
+    );
+}
+
 #[tokio::test]
 async fn a_withheld_tier_is_refused_while_a_healthy_tier_in_the_same_catalog_serves() {
     // The whole point of scoping the margin verdict, proven on the real

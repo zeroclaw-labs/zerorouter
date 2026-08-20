@@ -81,6 +81,18 @@ async fn start_router(database_url: &str) -> Router {
         .env("ZEROROUTER_PUBLIC_BASE_URL", &base_url)
         .env("ZEROROUTER_DEVICE_CLIENT_IDS", "zeroclaw")
         .env("ZEROROUTER_TIERS_PATH", "config/tiers.toml")
+        // `/v1/models` publishes only lanes this deployment can dispatch to, so
+        // a server started with no provider secrets serves an EMPTY catalog —
+        // correctly, and this test is about the CLI rendering a populated one.
+        // These stand for "the secret is provisioned" and nothing more: the
+        // catalog route never dials an upstream, so no value here is ever sent
+        // anywhere. Placeholders rather than plausible keys, so nobody reads
+        // them as credentials that could work.
+        .env("ANTHROPIC_API_KEY", "not-a-real-key")
+        .env("OPENAI_API_KEY", "not-a-real-key")
+        .env("GEMINI_API_KEY", "not-a-real-key")
+        .env("BEDROCK_API_KEY", "not-a-real-key")
+        .env("BEDROCK_REGION", "us-east-1")
         .env("RUST_LOG", "warn")
         .stdout(Stdio::null())
         .stderr(Stdio::null())

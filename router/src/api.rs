@@ -52,7 +52,7 @@ use crate::{
         stream_tool_call_delta, stream_usage_json, task_signature, tool_args_all_json, usage_cost,
     },
     priority::Priority,
-    providers::{ProviderCandidate, ProviderRoute},
+    providers::{ProviderBuildError, ProviderCandidate, ProviderRoute},
     retry,
     sqlx::PgPool,
 };
@@ -524,8 +524,21 @@ pub type InjectedRoute = Arc<dyn Fn(&ResolvedRoute, u32) -> ProviderRoute + Send
 #[derive(Clone)]
 pub struct RouterState {
     tier_config_path: Arc<PathBuf>,
+    /// Which providers this deployment can dispatch to, for the catalog filter.
+    ///
+    /// `None` — every production path — asks the environment through
+    /// [`crate::providers::provider_is_dispatchable`], because the environment
+    /// is what actually decides. A `Some` is a test stating the deployment it
+    /// means to describe, and there is no way to reach it from `serve`: the only
+    /// constructor that sets it is [`RouterState::fully_credentialed`], which
+    /// production does not call (`main.rs` builds state with
+    /// [`RouterState::with_database`]).
+    dispatchable: Option<DispatchableProviders>,
     services: Option<Arc<RouterServices>>,
 }
+
+/// "Can this deployment dispatch to this provider?", as a value.
+type DispatchableProviders = Arc<dyn Fn(&str) -> bool + Send + Sync>;
 
 struct RouterServices {
     pool: PgPool,
@@ -561,12 +574,63 @@ impl RuntimeControl {
 
 impl RouterState {
     /// Construct a public-surface-only state for health/catalog tests.
+    ///
+    /// Reads provider credentials from the environment exactly as production
+    /// does, so a test built this way sees the catalog its own environment can
+    /// serve — usually empty, since a test process holds no provider keys. That
+    /// is the honest default: it is what a deployment with no secrets publishes.
+    /// A test asserting the full catalog wants
+    /// [`RouterState::fully_credentialed`] and should say so.
     #[must_use]
     pub fn new(tier_config_path: impl Into<PathBuf>) -> Self {
         Self {
             tier_config_path: Arc::new(tier_config_path.into()),
+            dispatchable: None,
             services: None,
         }
+    }
+
+    /// A catalog-surface state for a deployment that holds EVERY provider's
+    /// credential.
+    ///
+    /// The counterpart to [`RouterState::new`], and it exists so a test that
+    /// asserts what the storefront publishes has to state which deployment it
+    /// is describing. Before the catalog consulted credentials at all there was
+    /// nothing to state, and that silence is what let the Bedrock lanes ship
+    /// listed-but-unservable: every test described a fully-credentialed
+    /// deployment and none of them said so, so nothing failed when production
+    /// turned out not to be one.
+    ///
+    /// Not reachable from `serve`, which builds state through
+    /// [`RouterState::with_database`].
+    #[must_use]
+    pub fn fully_credentialed(tier_config_path: impl Into<PathBuf>) -> Self {
+        Self {
+            dispatchable: Some(Arc::new(|_| true)),
+            ..Self::new(tier_config_path)
+        }
+    }
+
+    /// A catalog-surface state for a deployment holding only `providers`' keys.
+    ///
+    /// The shape of every real partial deployment, including the one that
+    /// caused the incident: region configured, `BEDROCK_API_KEY` absent.
+    #[must_use]
+    pub fn credentialed_for(tier_config_path: impl Into<PathBuf>, providers: &[&str]) -> Self {
+        let providers: Vec<String> = providers.iter().map(|name| (*name).to_owned()).collect();
+        Self {
+            dispatchable: Some(Arc::new(move |provider| {
+                providers.iter().any(|name| name == provider)
+            })),
+            ..Self::new(tier_config_path)
+        }
+    }
+
+    /// The catalog filter this state publishes through.
+    fn dispatchable(&self) -> &(dyn Fn(&str) -> bool + Send + Sync) {
+        self.dispatchable
+            .as_deref()
+            .unwrap_or(&crate::providers::provider_is_dispatchable)
     }
 
     #[must_use]
@@ -577,6 +641,7 @@ impl RouterState {
     ) -> Self {
         Self {
             tier_config_path: Arc::new(tier_config_path.into()),
+            dispatchable: None,
             services: Some(Arc::new(RouterServices {
                 pool,
                 authenticator: KeyAuthenticator::new(),
@@ -603,6 +668,7 @@ impl RouterState {
     ) -> Self {
         Self {
             tier_config_path: Arc::new(tier_config_path.into()),
+            dispatchable: None,
             services: Some(Arc::new(RouterServices {
                 pool,
                 authenticator: KeyAuthenticator::new(),
@@ -801,8 +867,23 @@ impl RouterServices {
         if let Some(route) = &self.injected_route {
             return Ok(route(resolved, max_output_tokens));
         }
-        ProviderRoute::new(resolved.candidates.clone(), max_output_tokens)
-            .map_err(|_| ApiError::NoProviderAvailable)
+        ProviderRoute::new(resolved.candidates.clone(), max_output_tokens).map_err(|error| {
+            match error {
+                // The catalog no longer lists this lane, so the honest answer
+                // names it rather than blaming the upstream fleet. The two
+                // answers must agree: `/v1/models` omits a lane whose credential
+                // is absent, and a request that names it anyway is told THAT lane
+                // is unavailable — not that no provider anywhere is up, which
+                // reads like an outage and sends an operator looking at the
+                // wrong thing. `model_unavailable` is the same code a tier
+                // withheld for below-cost pricing returns, and deliberately so:
+                // both mean "ZeroRouter cannot serve this and you cannot fix it".
+                ProviderBuildError::NoAvailableCredentials { .. } => ApiError::ModelUnavailable {
+                    tier: resolved.requested_model.clone(),
+                },
+                _ => ApiError::NoProviderAvailable,
+            }
+        })
     }
 }
 
@@ -978,7 +1059,14 @@ async fn list_models(State(state): State<RouterState>) -> Result<Json<ModelList>
     let catalog = load_tier_catalog(state.tier_config_path())
         .await
         .map_err(|_| ApiError::TierCatalogUnavailable)?;
-    Ok(Json(ModelList::from_listing(catalog.model_listing())))
+    // Only lanes this deployment can actually serve. A catalog that advertises
+    // a model whose credential is absent is a storefront selling something the
+    // till refuses, and it is worse than useless for the lane it hid behind:
+    // the Bedrock zero-retention lanes shipped listed and unservable, which is
+    // the incident this argument exists to prevent recurring.
+    Ok(Json(ModelList::from_listing(
+        catalog.model_listing(state.dispatchable()),
+    )))
 }
 
 async fn chat_completions(

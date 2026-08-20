@@ -800,6 +800,27 @@ impl TierCatalog {
     /// Withheld tiers are absent from `tiers` and so are their candidates:
     /// the catalog never offers a model that a request for it would refuse.
     ///
+    /// `dispatchable` extends that same promise to the OTHER reason a request
+    /// would be refused, and it is a required argument rather than an option
+    /// because forgetting it is precisely the bug it exists to fix. Withholding
+    /// answers "is this tier priced so we cannot serve it"; this answers "does
+    /// this deployment hold the credential needed to serve it". Both are
+    /// "a customer cannot use this", and a catalog that filters one and not the
+    /// other still advertises models that fail.
+    ///
+    /// It was not always here, and the omission shipped. `/v1/models` was
+    /// deliberately credential-blind — documented as publishing "the stable full
+    /// catalog rather than changing with credential availability" — which was a
+    /// defensible choice while every shipped provider's key was always present
+    /// in production. The first lane deployed without its secret broke it: the
+    /// storefront advertised both Bedrock zero-retention lanes, the flagship of
+    /// the whole product, while every call to them returned 503. A stable
+    /// catalog is worth less than a truthful one.
+    ///
+    /// Pass the predicate rather than reading the environment here so this stays
+    /// a pure function of the catalog plus one declared fact — the same reason
+    /// [`crate::drift::reconcile_with`] takes its questions as arguments.
+    ///
     /// Metadata does *not* follow the sell-rate rule, and the asymmetry is
     /// deliberate. A price is a property of the tier a request is billed
     /// through, so a pinned candidate inherits its tier's. A context window is
@@ -809,9 +830,28 @@ impl TierCatalog {
     /// its own metadata and a tier row carries
     /// [`ModelMetadata::narrowed`] across everything it can route to.
     #[must_use]
-    pub fn model_listing(&self) -> BTreeMap<String, ModelListing> {
+    pub fn model_listing(
+        &self,
+        dispatchable: &dyn Fn(&str) -> bool,
+    ) -> BTreeMap<String, ModelListing> {
         let mut models = BTreeMap::new();
         for (tier_id, definition) in &self.tiers {
+            // The rungs this deployment could actually reach. Everything below
+            // is computed over THESE and not over the tier's full candidate
+            // list, which matters for more than the row's existence: a routing
+            // alias advertises the narrowest metadata and the weakest retention
+            // posture across what it can route to, and including a rung with no
+            // credential would let the published claim describe a lane no
+            // request can land on.
+            let reachable: Vec<TierCandidate> = definition
+                .candidates
+                .iter()
+                .filter(|candidate| dispatchable(&candidate.provider))
+                .cloned()
+                .collect();
+            if reachable.is_empty() {
+                continue;
+            }
             // A vendor-named pin's tier id equals its single candidate's id, so
             // the catalog publishes one row for it — owned by the vendor, from
             // the candidate loop below — matching OpenRouter, where `owned_by`
@@ -823,10 +863,14 @@ impl TierCatalog {
                 .iter()
                 .all(|candidate| candidate.id != *tier_id);
             if is_routing_alias {
+                let reachable_definition = TierDefinition {
+                    candidates: reachable.clone(),
+                    ..definition.clone()
+                };
                 // A load-time invariant, not a runtime possibility: the catalog
                 // does not load unless every candidate resolves a posture, so
                 // this cannot be `None` for a tier that is being served.
-                let Some(retention) = self.tier_retention(definition) else {
+                let Some(retention) = self.tier_retention(&reachable_definition) else {
                     continue;
                 };
                 models.insert(
@@ -834,12 +878,12 @@ impl TierCatalog {
                     ModelListing {
                         owned_by: "zerorouter".to_owned(),
                         sell_rates: definition.rates.clone(),
-                        metadata: ModelMetadata::narrowed(&definition.candidates),
+                        metadata: ModelMetadata::narrowed(&reachable),
                         retention,
                     },
                 );
             }
-            for candidate in &definition.candidates {
+            for candidate in &reachable {
                 let Some(retention) = self.candidate_retention(definition, candidate) else {
                     continue;
                 };
@@ -2758,7 +2802,10 @@ output_per_mtok = 2.00
         let catalog = catalog_with_candidates(&candidate("plain", ""));
         validate_tier_catalog(&catalog).expect("metadata must be optional");
 
-        let listing = catalog.model_listing();
+        // Every provider credentialed: these assert the listing's SHAPE
+        // (rates, metadata, posture), not which lanes a deployment can
+        // reach. The credential filter has its own tests.
+        let listing = catalog.model_listing(&|_| true);
         for id in ["zero/test", "openai/plain"] {
             assert_eq!(
                 listing[id].metadata,
@@ -2789,7 +2836,10 @@ output_per_mtok = 2.00
             ),
         ));
         validate_tier_catalog(&catalog).expect("catalog should validate");
-        let listing = catalog.model_listing();
+        // Every provider credentialed: these assert the listing's SHAPE
+        // (rates, metadata, posture), not which lanes a deployment can
+        // reach. The credential filter has its own tests.
+        let listing = catalog.model_listing(&|_| true);
 
         assert_eq!(
             listing["zero/test"].metadata,
@@ -2841,7 +2891,10 @@ output_per_mtok = 2.00
             candidate("silent", ""),
         ));
         validate_tier_catalog(&catalog).expect("catalog should validate");
-        let listing = catalog.model_listing();
+        // Every provider credentialed: these assert the listing's SHAPE
+        // (rates, metadata, posture), not which lanes a deployment can
+        // reach. The credential filter has its own tests.
+        let listing = catalog.model_listing(&|_| true);
 
         assert_eq!(
             listing["zero/test"].metadata,
@@ -3013,7 +3066,10 @@ output_per_mtok = 10.00
         assert!(catalog.unavailable_for("zero/healthy").is_none());
         assert!(catalog.unavailable_for("nonsense/model").is_none());
 
-        let listing = catalog.model_listing();
+        // Every provider credentialed: these assert the listing's SHAPE
+        // (rates, metadata, posture), not which lanes a deployment can
+        // reach. The credential filter has its own tests.
+        let listing = catalog.model_listing(&|_| true);
         assert_eq!(
             listing.keys().map(String::as_str).collect::<Vec<_>>(),
             ["openai/cheap", "zero/healthy"]
@@ -3678,7 +3734,10 @@ source_sha256 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
     #[test]
     fn a_labelled_lane_loads_and_publishes_its_providers_posture() {
         let catalog = catalog_with_retention(GOOD_PIN).expect("a labelled lane loads");
-        let listing = catalog.model_listing();
+        // Every provider credentialed: these assert the listing's SHAPE
+        // (rates, metadata, posture), not which lanes a deployment can
+        // reach. The credential filter has its own tests.
+        let listing = catalog.model_listing(&|_| true);
         let row = &listing["anthropic/pin"];
         assert_eq!(row.retention.posture, RetentionPosture::Standard);
         assert_eq!(row.retention.description, "retains for 30 days");
@@ -3802,7 +3861,10 @@ output_per_mtok = 2.00
         .expect("catalog should parse");
         validate_tier_catalog(&catalog).expect("an overridden tier loads");
 
-        let listing = catalog.model_listing();
+        // Every provider credentialed: these assert the listing's SHAPE
+        // (rates, metadata, posture), not which lanes a deployment can
+        // reach. The credential filter has its own tests.
+        let listing = catalog.model_listing(&|_| true);
         assert_eq!(
             listing["anthropic/pin"].retention.posture,
             RetentionPosture::Zero,
@@ -3869,7 +3931,10 @@ output_per_mtok = 2.00
         )
         .expect("catalog should parse");
         validate_tier_catalog(&catalog).expect("a mixed alias loads");
-        let listing = catalog.model_listing();
+        // Every provider credentialed: these assert the listing's SHAPE
+        // (rates, metadata, posture), not which lanes a deployment can
+        // reach. The credential filter has its own tests.
+        let listing = catalog.model_listing(&|_| true);
 
         assert_eq!(
             listing["zero/mixed"].retention.posture,

@@ -129,6 +129,52 @@ struct ProviderMetadata {
 /// The token a regional `base_url` writes where its region belongs.
 const REGION_PLACEHOLDER: &str = "{region}";
 
+/// Whether a deployment holds everything one upstream needs.
+enum Dispatchable {
+    Ready {
+        credential: String,
+        /// The endpoint to dial, region already substituted. `None` means the
+        /// wire uses its own default.
+        endpoint: Option<String>,
+    },
+    /// The environment variable whose absence disqualifies this provider.
+    /// Empty only for a malformed entry that validation already refuses.
+    Missing { env: String },
+}
+
+/// Whether this deployment can dispatch to `provider` at all.
+///
+/// **The catalog's gate, and it must answer exactly as route construction
+/// does** — both read [`ProviderMetadata::dispatchable`], which is why that
+/// function exists rather than the two growing their own conditions.
+///
+/// An unknown provider is not dispatchable. That is the conservative answer for
+/// the caller that matters: `/v1/models` would otherwise advertise a lane whose
+/// upstream this build has no entry for, and the catalog validator already
+/// refuses such a file at load, so this branch is reachable only if the two ever
+/// disagree.
+#[must_use]
+pub fn provider_is_dispatchable(provider: &str) -> bool {
+    provider_is_dispatchable_with(provider, read_credential)
+}
+
+/// [`provider_is_dispatchable`], with the environment supplied.
+///
+/// The seam exists so the property that matters can be tested for what it is:
+/// this function and [`build_with_credentials`] must reach the SAME verdict
+/// from the same environment. Reading the process environment in both would
+/// make that untestable, and untestable is how the two drift.
+fn provider_is_dispatchable_with<F>(provider: &str, read_env: F) -> bool
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    ProviderInventory::load().is_ok_and(|inventory| {
+        inventory.provider(provider).is_some_and(|metadata| {
+            matches!(metadata.dispatchable(read_env), Dispatchable::Ready { .. })
+        })
+    })
+}
+
 /// Whether an upstream's traffic costs anyone money.
 ///
 /// The free lane is entered by this declaration and by nothing else — not by
@@ -458,6 +504,77 @@ impl ProviderMetadata {
             });
         }
         Ok(())
+    }
+
+    /// Everything this upstream needs before a request can be sent to it, or
+    /// the name of the one environment variable that is missing.
+    ///
+    /// **This is the single definition of "can this deployment dispatch to this
+    /// provider", and it exists because the answer is now read from two
+    /// places.** [`build_with_credentials`] reads it to decide whether a rung
+    /// joins a route; [`provider_is_dispatchable`] reads it to decide whether a
+    /// lane appears in `/v1/models`. Those two answers must be the same answer.
+    ///
+    /// They were not, and that is the incident this function was extracted for.
+    /// The catalog was credential-blind by design, so a deployment missing
+    /// `BEDROCK_API_KEY` advertised both Bedrock lanes on the storefront —
+    /// ZeroRouter's flagship zero-retention lanes — while every call to them
+    /// was refused. Two separate implementations of "is this provider usable"
+    /// would let that reopen the first time one grew a condition the other
+    /// lacked, which is exactly how it happened: the region check was added to
+    /// dispatch and the listing never had a check at all.
+    ///
+    /// A test-seam base-URL override is honored here rather than in the caller,
+    /// so a harness that stands a fake upstream in front of a provider makes
+    /// that provider dispatchable AND listable, in one place.
+    fn dispatchable<F>(&self, mut read_env: F) -> Dispatchable
+    where
+        F: FnMut(&str) -> Option<String>,
+    {
+        // The endpoint before the credential, because an unresolvable region
+        // disqualifies for the same reason and by the same mechanism a missing
+        // key does. A test-seam override is a complete URL supplied by a
+        // harness, so it wins and never interpolates.
+        let endpoint = match base_url_override(&self.key) {
+            Some(url) => Some(Some(url)),
+            None => self.endpoint(&mut read_env),
+        };
+        let Some(endpoint) = endpoint else {
+            // Named in the same list a missing credential reports. Both answer
+            // the operator's one question — which environment variable is this
+            // deployment missing — and an endpoint this provider cannot address
+            // is as disqualifying as a key it cannot present.
+            return Dispatchable::Missing {
+                env: self.region_env.clone().unwrap_or_default(),
+            };
+        };
+        let credential = match self.credential {
+            // A keyless upstream has nothing to look up, so it can never be the
+            // rung a route loses to a missing key — which is the whole point: a
+            // local server that takes no credential must not need a fake one to
+            // stay in the walk. Inventory validation has already refused this
+            // declaration on every adapter that owns a cloud endpoint, so
+            // nothing reachable from here can be a paid upstream dispatched
+            // without authentication.
+            CredentialRequirement::None => String::new(),
+            CredentialRequirement::Required => {
+                // Validated present; `unwrap_or_default` reads an empty name
+                // rather than panicking, and an empty name resolves to no
+                // credential, so the rung drops out exactly as it would for a
+                // genuinely absent key.
+                let credential_env = self.credential_env.as_deref().unwrap_or_default();
+                let Some(credential) = read_env(credential_env) else {
+                    return Dispatchable::Missing {
+                        env: credential_env.to_owned(),
+                    };
+                };
+                credential
+            }
+        };
+        Dispatchable::Ready {
+            credential,
+            endpoint,
+        }
     }
 
     /// Enforce that an exemption from price reconciliation states its case.
@@ -902,46 +1019,15 @@ where
         let provider = if let Some(provider) = providers.get(provider_key) {
             Arc::clone(provider)
         } else {
-            // The endpoint before the credential, because an unresolvable
-            // region makes this provider unavailable for the same reason and by
-            // the same mechanism a missing key does — the rung drops out and
-            // the rest of the route serves. A test-seam override is a complete
-            // URL supplied by a harness, so it wins and never interpolates.
-            let endpoint = match base_url_override(provider_key) {
-                Some(url) => Some(Some(url)),
-                None => metadata.endpoint(&mut credential_for),
-            };
-            let Some(endpoint) = endpoint else {
-                // Named in the same list a missing credential reports. Both
-                // answer the operator's one question — which environment
-                // variable is this deployment missing — and an endpoint this
-                // provider cannot address is as disqualifying as a key it
-                // cannot present.
-                missing_credentials.push(metadata.region_env.clone().unwrap_or_default());
-                unavailable.insert(provider_key);
-                continue;
-            };
-            let credential = match metadata.credential {
-                // A keyless upstream has nothing to look up, so it can never be
-                // the rung a route loses to a missing key — which is the whole
-                // point: a local server that takes no credential must not need
-                // a fake one to stay in the walk. Inventory validation has
-                // already refused this declaration on every adapter that owns a
-                // cloud endpoint, so nothing reachable from here can be a paid
-                // upstream dispatched without authentication.
-                CredentialRequirement::None => String::new(),
-                CredentialRequirement::Required => {
-                    // Validated present; `unwrap_or_default` reads an empty
-                    // name rather than panicking, and an empty name resolves to
-                    // no credential, so the rung drops out exactly as it would
-                    // for a genuinely absent key.
-                    let credential_env = metadata.credential_env.as_deref().unwrap_or_default();
-                    let Some(credential) = credential_for(credential_env) else {
-                        missing_credentials.push(credential_env.to_owned());
-                        unavailable.insert(provider_key);
-                        continue;
-                    };
-                    credential
+            let (credential, endpoint) = match metadata.dispatchable(&mut credential_for) {
+                Dispatchable::Ready {
+                    credential,
+                    endpoint,
+                } => (credential, endpoint),
+                Dispatchable::Missing { env } => {
+                    missing_credentials.push(env);
+                    unavailable.insert(provider_key);
+                    continue;
                 }
             };
             let provider = create_provider(
@@ -1699,6 +1785,84 @@ mod tests {
     // -----------------------------------------------------------------------
     // The price-reconciliation exemption.
     // -----------------------------------------------------------------------
+
+    /// THE ANTI-DRIFT PROPERTY, and the reason
+    /// [`ProviderMetadata::dispatchable`] was extracted.
+    ///
+    /// `/v1/models` and route construction must reach the same verdict from the
+    /// same environment, for every provider, in every state. When they disagree
+    /// the catalog either advertises a lane that cannot serve — the incident —
+    /// or hides one that can.
+    ///
+    /// The Bedrock row is the one a second implementation gets wrong: a
+    /// credential-only check passes it with `BEDROCK_API_KEY` set and
+    /// `BEDROCK_REGION` unset, while dispatch drops it for want of an address.
+    #[test]
+    fn the_catalog_and_the_route_agree_on_every_environment() {
+        let inventory = ProviderInventory::load().expect("inventory should load");
+        // (name, environment) pairs covering each way a provider can fail.
+        let environments: Vec<(&str, Vec<&str>)> = vec![
+            ("nothing set", vec![]),
+            ("only anthropic", vec!["ANTHROPIC_API_KEY"]),
+            ("bedrock key without its region", vec!["BEDROCK_API_KEY"]),
+            ("bedrock region without its key", vec!["BEDROCK_REGION"]),
+            (
+                "bedrock fully configured",
+                vec!["BEDROCK_API_KEY", "BEDROCK_REGION"],
+            ),
+            (
+                "everything set",
+                vec![
+                    "ANTHROPIC_API_KEY",
+                    "OPENAI_API_KEY",
+                    "GEMINI_API_KEY",
+                    "BEDROCK_API_KEY",
+                    "BEDROCK_REGION",
+                ],
+            ),
+        ];
+
+        for (label, present) in environments {
+            let read_env = |name: &str| present.contains(&name).then(|| "value".to_owned());
+            for provider in ["anthropic", "openai", "google", "bedrock"] {
+                let listed = provider_is_dispatchable_with(provider, read_env);
+                // The route builder's verdict for the same provider and the
+                // same environment: it either keeps the rung or drops it.
+                let routed = build_with_credentials(
+                    &inventory,
+                    vec![candidate("only", provider)],
+                    crate::provider::BASELINE_MAX_TOKENS,
+                    read_env,
+                )
+                .is_ok();
+                assert_eq!(
+                    listed, routed,
+                    "{label}: /v1/models says dispatchable={listed} for {provider} \
+                     but route construction says {routed}"
+                );
+            }
+        }
+    }
+
+    /// The specific pair that a credential-only check would get wrong, spelled
+    /// out so the failure names the region rather than just "they disagree".
+    #[test]
+    fn a_key_without_its_region_is_not_dispatchable() {
+        let with_key_only = |name: &str| (name == "BEDROCK_API_KEY").then(|| "value".to_owned());
+        assert!(
+            !provider_is_dispatchable_with("bedrock", with_key_only),
+            "a regional provider with no region has no address, so it must not be listed"
+        );
+
+        let with_both = |name: &str| {
+            matches!(name, "BEDROCK_API_KEY" | "BEDROCK_REGION").then(|| "value".to_owned())
+        };
+        assert!(provider_is_dispatchable_with("bedrock", with_both));
+
+        // And a non-regional provider is unaffected by the region rule.
+        let anthropic_only = |name: &str| (name == "ANTHROPIC_API_KEY").then(|| "value".to_owned());
+        assert!(provider_is_dispatchable_with("anthropic", anthropic_only));
+    }
 
     #[test]
     fn an_exemption_from_price_reconciliation_must_state_its_case() {
