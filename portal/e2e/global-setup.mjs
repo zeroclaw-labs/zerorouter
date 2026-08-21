@@ -66,6 +66,15 @@ export default async function globalSetup() {
       GEMINI_API_KEY: 'not-a-real-key',
       BEDROCK_API_KEY: 'not-a-real-key',
       BEDROCK_REGION: 'us-east-1',
+      // Added 2026-08-20 with the Qwen 3.8 Max lane, and it was MISSING before
+      // that: the Fireworks lanes shipped the same day this list was last
+      // described as "fully credentialed", so for the whole of that day the
+      // storefront under test rendered six fewer rows than the product does and
+      // the comment above was quietly false. Nothing failed, because the
+      // retention assertions here only needed SOME zero-retention lane and the
+      // Bedrock four supplied it. The per-tier override test below is the first
+      // thing that names a Fireworks lane, and it could not pass without this.
+      FIREWORKS_API_KEY: 'not-a-real-key',
       OIDC_ISSUER_URL: `http://127.0.0.1:${IDP_PORT}`,
       OIDC_CLIENT_ID: 'e2e-portal',
       OIDC_CLIENT_SECRET: 'e2e-secret',
