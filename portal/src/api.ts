@@ -34,6 +34,28 @@ export interface Me {
    * than a form whose every submission would be refused. Optional in the type
    * so an older router cannot crash this page. */
   byok_providers?: string[]
+  /** Where you stand against this month's free BYOK allowance. ABSENT when
+   * bring-your-own-key is not configured here, on the same contract as the
+   * empty provider list above.
+   *
+   * All three figures come from the server rather than being derived here. The
+   * allowance is a number ZeroRouter chose and may revise, so a portal that
+   * subtracted against its own hardcoded copy would keep showing the old
+   * promise after a change — and this panel is where a customer reads what
+   * they will be billed. */
+  byok_allowance?: ByokAllowance
+}
+
+/** This month's free BYOK allowance, as `/api/me` reports it. Amounts are
+ * decimal strings for the same reason every other money field here is: a
+ * JavaScript number cannot hold the router's exact `Decimal`. */
+export interface ByokAllowance {
+  allowance_usd: string
+  /** Catalog-equivalent BYOK usage settled this UTC month. Keeps growing past
+   * the allowance — it is a usage figure, not a countdown. */
+  consumed_usd: string
+  /** What is left, floored at zero. */
+  remaining_usd: string
 }
 
 /** One attached provider key, as the portal is ever allowed to see it.
@@ -50,6 +72,12 @@ export interface ByokKey {
   last4: string
   created_at: string
   last_used_at: string | null
+  /** Whether a failure on this key is retried on ZeroRouter's own credential.
+   * FALSE by default and for every key attached before the option existed.
+   * Those retries bill at the FULL catalog price, not the BYOK fee, and do not
+   * draw on the monthly allowance — which is why the control that sets this
+   * says so on itself. */
+  fallback_enabled: boolean
 }
 
 /** The reset cadences a key's credit limit can use; `null` never resets. */
@@ -282,6 +310,10 @@ export const api = {
     request<ByokKey>('POST', '/api/byok', { provider, api_key: apiKey }),
   removeByokKey: (provider: string) =>
     request<void>('DELETE', `/api/byok/${encodeURIComponent(provider)}`),
+  // Sends the state it wants rather than "flip it", so a retried request lands
+  // on the same setting the customer clicked instead of its opposite.
+  setByokFallback: (provider: string, enabled: boolean) =>
+    request<void>('PATCH', `/api/byok/${encodeURIComponent(provider)}`, { enabled }),
   ledger: (limit: number) =>
     request<{ limit: number; entries: LedgerEntry[] }>(
       'GET',

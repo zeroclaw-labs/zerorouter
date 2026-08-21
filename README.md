@@ -283,7 +283,7 @@ aborts startup rather than running with a silently disabled security control
 | `ZEROROUTER_SESSION_TTL_SECS` | no | `604800` (7 days) | portal session lifetime, capped at 90 days |
 | `ZEROROUTER_PORTAL_DIST` | no | `portal/dist` | built portal SPA to serve |
 | `ZEROROUTER_DEVICE_CLIENT_IDS` | no | `zeroclaw` | comma-separated client IDs allowed to start a device authorization |
-| `BYOK_ENCRYPTION_KEY` | no | — | 64 lowercase hex characters (32 bytes; `openssl rand -hex 32`). Enables bring-your-own-key: customers attach their own provider API keys, requests dispatch on them, and ZeroRouter charges 5% of the catalog price. **Unset disables the feature entirely** — attach attempts are refused and the portal shows no BYOK section. A malformed value aborts startup. Losing this key makes every stored customer credential unreadable; they are not recoverable, and customers must re-attach |
+| `BYOK_ENCRYPTION_KEY` | no | — | 64 lowercase hex characters (32 bytes; `openssl rand -hex 32`). Enables bring-your-own-key: customers attach their own provider API keys, requests dispatch on them, and ZeroRouter charges 5% of the catalog price above a free allowance of $5,000 of catalog-equivalent usage per customer per UTC calendar month (migration 0027). **Unset disables the feature entirely** — attach attempts are refused and the portal shows no BYOK section. A malformed value aborts startup. Losing this key makes every stored customer credential unreadable; they are not recoverable, and customers must re-attach |
 
 `RUST_LOG` controls verbosity (default `info`). The provider dependency's log
 targets are force-disabled regardless of `RUST_LOG` — see

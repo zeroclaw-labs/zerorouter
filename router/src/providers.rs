@@ -1555,6 +1555,28 @@ pub struct ProviderCandidate {
     /// cases that matter — a credential that failed to open, or a key detached
     /// while the request was in flight.
     byok: bool,
+    /// The provider whose BYOK attempt this candidate exists to fall back FROM
+    /// (migration 0028), on the house-credential twin of a candidate whose key
+    /// the customer opted in for. `None` on every ordinary candidate.
+    ///
+    /// # Why the fallback is a second CANDIDATE and not a second try
+    ///
+    /// Expressing it as a rung means the walk needs no new dispatch path: the
+    /// existing loop already tries candidates in order, already records one
+    /// attempt row each, already stops at the first that serves, and already
+    /// prices the settled row from whichever candidate that was
+    /// (`RequestFeatures::on_candidate`). A fallback attempt is therefore
+    /// billed at the full catalog price by exactly the mechanism that bills
+    /// every other house dispatch — there is no second fee decision to keep in
+    /// agreement with the first — and "exactly one attempt settles" is
+    /// inherited rather than re-argued.
+    ///
+    /// It also puts the house credential back where the attestation lives: this
+    /// twin is built with `byok = false`, so `create_provider` gives it the
+    /// per-response retention check that a BYOK dispatch deliberately skips.
+    /// The customer's own attempt stays exempt and the house attempt does not,
+    /// which is the honest reading of who is promising what.
+    byok_fallback_for: Option<String>,
 }
 
 #[cfg(test)]
@@ -1593,6 +1615,9 @@ impl ProviderCandidate {
             // customer's. A test that means to describe BYOK dispatch drives
             // the real assembly path (`router/tests/byok.rs`).
             byok: false,
+            // Nor is it anyone's fallback: the opted-in twin is built only by
+            // the real assembly path, beside the BYOK candidate it belongs to.
+            byok_fallback_for: None,
         }
     }
 }
@@ -1607,6 +1632,18 @@ impl ProviderCandidate {
     #[must_use]
     pub fn is_byok(&self) -> bool {
         self.byok
+    }
+
+    /// The provider whose BYOK attempt this candidate is the opted-in
+    /// house-credential fallback for, if it is one (migration 0028).
+    ///
+    /// The walk uses this to keep the rung CLOSED by default: a fallback twin
+    /// is skipped unless its own BYOK twin has already run and failed in a way
+    /// the opt-in covers. That default-closed reading is what makes a
+    /// mis-ordered route lose the fallback rather than mis-bill for it.
+    #[must_use]
+    pub fn byok_fallback_for(&self) -> Option<&str> {
+        self.byok_fallback_for.as_deref()
     }
 
     #[must_use]
@@ -1679,14 +1716,30 @@ pub struct ProviderRoute {
 /// immediately rather than at the end of some TTL.
 #[derive(Default)]
 pub struct ByokCredentials {
-    by_provider: BTreeMap<String, String>,
+    by_provider: BTreeMap<String, (String, bool)>,
 }
 
 impl ByokCredentials {
+    /// Credentials with no fallback opt-in — migration 0026's behaviour, and
+    /// what every caller that does not care about 0028 should build.
     #[must_use]
     pub fn new(pairs: Vec<(String, String)>) -> Self {
         Self {
-            by_provider: pairs.into_iter().collect(),
+            by_provider: pairs
+                .into_iter()
+                .map(|(provider, credential)| (provider, (credential, false)))
+                .collect(),
+        }
+    }
+
+    /// Credentials carrying each key's fallback opt-in (migration 0028).
+    #[must_use]
+    pub fn with_fallback(pairs: Vec<(String, String, bool)>) -> Self {
+        Self {
+            by_provider: pairs
+                .into_iter()
+                .map(|(provider, credential, fallback)| (provider, (credential, fallback)))
+                .collect(),
         }
     }
 
@@ -1696,7 +1749,18 @@ impl ByokCredentials {
     }
 
     fn get(&self, provider: &str) -> Option<&str> {
-        self.by_provider.get(provider).map(String::as_str)
+        self.by_provider
+            .get(provider)
+            .map(|(credential, _)| credential.as_str())
+    }
+
+    /// Whether this customer asked for a house-credential retry when their key
+    /// for `provider` fails. FALSE for a provider they hold no key for, which
+    /// is the same answer as declining and needs no separate arm.
+    fn falls_back(&self, provider: &str) -> bool {
+        self.by_provider
+            .get(provider)
+            .is_some_and(|(_, fallback)| *fallback)
     }
 }
 
@@ -1941,7 +2005,15 @@ where
     // one between them would dispatch a candidate's request at the other
     // plane's endpoint. Candidates on the SAME plane still share, which is the
     // connection-pool saving this map exists for.
-    let mut providers = BTreeMap::<(&str, Option<String>), Arc<dyn ModelProvider>>::new();
+    // Keyed by whose credential the client holds as well as by plane. Since
+    // migration 0028 a route may legitimately carry TWO clients for one
+    // (provider, surface) — the customer's and, as its opted-in fallback,
+    // ZeroRouter's — and they are emphatically not interchangeable: one dials
+    // as the customer and asserts no retention guarantee, the other dials as
+    // ZeroRouter and asserts one. Sharing a cache slot between them would hand
+    // a BYOK candidate the house client, which is the exact substitution #103's
+    // no-fallback rule exists to make impossible.
+    let mut providers = BTreeMap::<(&str, Option<String>, bool), Arc<dyn ModelProvider>>::new();
     let mut unavailable = BTreeSet::new();
 
     for definition in candidates {
@@ -1971,62 +2043,136 @@ where
             .then(|| byok.get(provider_key))
             .flatten();
 
-        let provider = if let Some(provider) = providers.get(&(provider_key, surface.clone())) {
-            Arc::clone(provider)
-        } else {
-            // Only the entry's OWN credential variable is answered from the
-            // customer's key. Every other variable `dispatchable` reads — the
-            // region, the project — still comes from the deployment, because
-            // those describe where ZeroRouter dials, not who it dials as.
-            let credential_env = metadata.credential_env.clone();
-            let mut credential_for_entry = |env: &str| -> Option<String> {
-                match byok_credential {
-                    Some(credential) if Some(env) == credential_env.as_deref() => {
-                        Some(credential.to_owned())
-                    }
-                    _ => credential_for(env),
-                }
-            };
-            let (credential, endpoint, surfaces) =
-                match metadata.dispatchable(&mut credential_for_entry) {
-                    Dispatchable::Ready {
-                        credential,
-                        endpoint,
-                        surfaces,
-                    } => (credential, endpoint, surfaces),
-                    Dispatchable::Missing { env } => {
-                        missing_credentials.push(env);
-                        unavailable.insert(provider_key);
-                        continue;
+        let byok_slot = byok_credential.is_some();
+        let provider =
+            if let Some(provider) = providers.get(&(provider_key, surface.clone(), byok_slot)) {
+                Arc::clone(provider)
+            } else {
+                // Only the entry's OWN credential variable is answered from the
+                // customer's key. Every other variable `dispatchable` reads — the
+                // region, the project — still comes from the deployment, because
+                // those describe where ZeroRouter dials, not who it dials as.
+                let credential_env = metadata.credential_env.clone();
+                let mut credential_for_entry = |env: &str| -> Option<String> {
+                    match byok_credential {
+                        Some(credential) if Some(env) == credential_env.as_deref() => {
+                            Some(credential.to_owned())
+                        }
+                        _ => credential_for(env),
                     }
                 };
-            let (adapter, endpoint) = metadata
-                .plane(surface.as_deref(), endpoint.as_deref(), &surfaces)
-                .ok_or_else(|| ProviderBuildError::UnknownSurface {
-                    candidate: definition.id.clone(),
-                    provider: definition.provider.clone(),
-                    surface: surface.clone().unwrap_or_default(),
-                })?;
-            let provider = create_provider(
-                metadata,
-                adapter,
-                &credential,
-                max_output_tokens,
-                endpoint.as_deref(),
-                byok_credential.is_some(),
-            )?;
-            providers.insert((provider_key, surface), Arc::clone(&provider));
-            provider
-        };
+                let (credential, endpoint, surfaces) =
+                    match metadata.dispatchable(&mut credential_for_entry) {
+                        Dispatchable::Ready {
+                            credential,
+                            endpoint,
+                            surfaces,
+                        } => (credential, endpoint, surfaces),
+                        Dispatchable::Missing { env } => {
+                            missing_credentials.push(env);
+                            unavailable.insert(provider_key);
+                            continue;
+                        }
+                    };
+                let (adapter, endpoint) = metadata
+                    .plane(surface.as_deref(), endpoint.as_deref(), &surfaces)
+                    .ok_or_else(|| ProviderBuildError::UnknownSurface {
+                        candidate: definition.id.clone(),
+                        provider: definition.provider.clone(),
+                        surface: surface.clone().unwrap_or_default(),
+                    })?;
+                let provider = create_provider(
+                    metadata,
+                    adapter,
+                    &credential,
+                    max_output_tokens,
+                    endpoint.as_deref(),
+                    byok_credential.is_some(),
+                )?;
+                providers.insert(
+                    (provider_key, surface.clone(), byok_slot),
+                    Arc::clone(&provider),
+                );
+                provider
+            };
         if byok_credential.is_some() {
             byok_providers.insert(provider_key.to_owned());
         }
 
+        // The opted-in house-credential twin (migration 0028), built HERE so it
+        // is bound to the candidate it falls back from and lands immediately
+        // after it.
+        //
+        // Ordering later permutes the route, and the two rungs carry the same
+        // definition — same id, same rates — so they sort on identical keys and
+        // a stable sort keeps this one behind its original. That is a
+        // convenience rather than the guarantee: the walk arms a fallback twin
+        // only after its BYOK twin has actually failed, so a route that somehow
+        // put the twin first would skip it and lose the fallback rather than
+        // dispatch a house request the customer had not paid for yet.
+        //
+        // A twin that cannot be built is simply absent. `credential_for` is
+        // consulted WITHOUT the customer's override, so this asks the real
+        // question — does ZeroRouter hold its own key for this upstream? — and
+        // a deployment that does not keeps serving the BYOK rung alone. Nothing
+        // is added to `unavailable` on that path: the upstream is perfectly
+        // dispatchable on the customer's credential, and marking it otherwise
+        // would delete the very candidate this twin exists to protect.
+        let fallback_twin = byok_credential
+            .filter(|_| byok.falls_back(provider_key))
+            .and_then(|_| {
+                let cached = providers.get(&(provider_key, surface.clone(), false));
+                if let Some(provider) = cached {
+                    return Some(Arc::clone(provider));
+                }
+                let Dispatchable::Ready {
+                    credential,
+                    endpoint,
+                    surfaces,
+                } = metadata.dispatchable(&mut credential_for)
+                else {
+                    return None;
+                };
+                let (adapter, endpoint) =
+                    metadata.plane(surface.as_deref(), endpoint.as_deref(), &surfaces)?;
+                // `byok = false`: this client dials as ZeroRouter, so the
+                // per-response retention attestation this lane is sold under is
+                // asserted on it, exactly as it is for a customer who brought
+                // no key at all.
+                let provider = create_provider(
+                    metadata,
+                    adapter,
+                    &credential,
+                    max_output_tokens,
+                    endpoint.as_deref(),
+                    false,
+                )
+                .ok()?;
+                providers.insert(
+                    (provider_key, surface.clone(), false),
+                    Arc::clone(&provider),
+                );
+                Some(provider)
+            });
+
         available.push(ProviderCandidate {
-            definition,
+            definition: definition.clone(),
             provider,
             byok: byok_credential.is_some(),
+            byok_fallback_for: None,
         });
+        if let Some(provider) = fallback_twin {
+            available.push(ProviderCandidate {
+                definition,
+                provider,
+                // Not BYOK: it holds ZeroRouter's credential, so it settles at
+                // the full catalog price and consumes none of the customer's
+                // monthly allowance. One flag decides both, which is what keeps
+                // the price and the disclosure from ever disagreeing.
+                byok: false,
+                byok_fallback_for: Some(provider_key.to_owned()),
+            });
+        }
     }
 
     if available.is_empty() {

@@ -458,10 +458,28 @@ test('a provider key can be attached, is shown only by fingerprint, and is never
   // router/tests/portal.rs for the other half of that contract.
   await expect(page.getByRole('heading', { name: /your own provider keys/i })).toBeVisible()
 
-  // The two things the copy must say, because they are what a customer is
-  // agreeing to: what the fee is, and whose retention agreement governs.
+  // The three things the copy must say, because they are what a customer is
+  // agreeing to: what is free, what the fee is beyond it, and whose retention
+  // agreement governs.
+  await expect(page.getByText(/of catalog-equivalent usage each month is free/i)).toBeVisible()
   await expect(page.getByText(/5% of what the same usage would have cost/i)).toBeVisible()
   await expect(page.getByText(/governed by your agreement with that provider/i)).toBeVisible()
+
+  // The allowance meter. A fresh e2e user has run no BYOK traffic, so the whole
+  // $5,000 is still there — and the figures come from `/api/me` rather than
+  // from the bundle, which is what this assertion is really pinning: a portal
+  // that hardcoded the allowance would keep rendering it after the server
+  // changed the number, and this panel is where a customer reads what they will
+  // be billed.
+  await expect(page.getByText(/of this month.s \$5,000\.00 allowance remaining/i)).toBeVisible()
+  await expect(page.getByText(/Usage within the allowance is not charged at all/i)).toBeVisible()
+  const allowance = await page.evaluate(async () => {
+    const res = await fetch('/api/me')
+    return (await res.json()) as { byok_allowance?: Record<string, string> }
+  })
+  expect(allowance.byok_allowance, 'the allowance must be reported').toBeTruthy()
+  expect(allowance.byok_allowance?.allowance_usd).toBe('5000')
+  expect(Number(allowance.byok_allowance?.remaining_usd)).toBe(5000)
 
   const providerKey = `sk-ant-e2e-${Date.now()}-0123456789abcdef`
   await page.getByLabel(/^provider$/i).selectOption({ label: 'Anthropic' })
@@ -493,6 +511,30 @@ test('a provider key can be attached, is shown only by fingerprint, and is never
   expect(attached?.api_key).toBeUndefined()
   expect(String(attached?.fingerprint)).toHaveLength(16)
   expect(attached?.last4).toBe(providerKey.slice(-4))
+
+  // The fallback opt-in renders OFF, and the control states the consequence on
+  // itself. Both halves matter: a customer must be able to see that the default
+  // is no-fallback, and must not have to go looking for what turning it on
+  // costs.
+  const fallback = row.getByRole('checkbox', { name: /use zerorouter's key if my anthropic key fails/i })
+  await expect(fallback).toBeVisible()
+  await expect(fallback).not.toBeChecked()
+  await expect(row).toContainText(/those attempts bill at full catalog price, not 5%/i)
+  await expect(row).toContainText(/do not use your monthly allowance/i)
+
+  // Turning it on persists, and the server is the thing that says so — a
+  // checkbox that only looked checked would be the failure worth catching.
+  await fallback.check()
+  await expect(fallback).toBeChecked()
+  const attachedKeys = await page.evaluate(async () => {
+    const res = await fetch('/api/byok')
+    return (await res.json()) as { keys: Array<Record<string, unknown>> }
+  })
+  expect(attachedKeys.keys.find((k) => k.provider === 'anthropic')?.fallback_enabled).toBe(true)
+
+  // And off again, because an opt-in you cannot withdraw is not one.
+  await fallback.uncheck()
+  await expect(fallback).not.toBeChecked()
 
   // And it can be taken away again, which is the promise that makes attaching
   // one reasonable in the first place.

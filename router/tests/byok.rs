@@ -158,7 +158,9 @@ async fn a_stored_credential_is_not_recoverable_from_the_column() {
         .expect("opening must succeed");
     assert_eq!(
         opened,
-        vec![("anthropic".to_owned(), CUSTOMER_KEY.to_owned())]
+        // `false`: migration 0028's fallback opt-in is off until the customer
+        // asks for it, and a freshly attached key has not.
+        vec![("anthropic".to_owned(), CUSTOMER_KEY.to_owned(), false)]
     );
 }
 
@@ -575,17 +577,47 @@ async fn a_byok_dispatch_carries_the_customers_key_and_never_the_houses() {
     // the arithmetic tests above pin `apply_fee`, and `apply_fee` would still
     // be correct if `persist_usage` simply stopped calling it with the BYOK
     // rate.
-    settles_a_byok_request_at_five_percent(&plain_url).await;
+    //
+    // Three prices, because the monthly allowance (migration 0027) made one
+    // request's price depend on what the customer has already run this month:
+    // wholly inside the allowance is free, wholly outside is 5%, and the
+    // request that straddles the boundary pays 5% of only the part above it.
+    settles_free_inside_the_monthly_allowance(&plain_url).await;
+    settles_at_five_percent_once_the_allowance_is_spent(&plain_url).await;
+    settles_on_only_the_part_above_the_allowance(&plain_url).await;
+    concurrent_settles_cannot_both_claim_the_last_of_the_allowance(&plain_url).await;
+
+    // 5. The opt-in fallback (migration 0028), against an upstream that refuses
+    //    the customer's key and serves ZeroRouter's. Same test, same reason:
+    //    every one of these needs the process-global base-URL override.
+    let (refusing_url, refusing_seen) = upstream_refusing_the_customer(false).await;
+    // SAFETY: as above — sequential, single test, single binary.
+    unsafe {
+        std::env::set_var("ZEROROUTER_PROVIDER_BASE_URL_GOOGLE", &refusing_url);
+    }
+    a_refused_key_fails_the_request_without_the_opt_in(&refusing_url, &refusing_seen).await;
+    an_opted_in_key_falls_back_and_is_billed_at_full_catalog(&refusing_url, &refusing_seen).await;
+    // The xai lane, whose house dispatch must attest. The upstream refuses the
+    // customer's key and serves ZeroRouter's WITHOUT the header.
+    let (refusing_unattested_url, _) = upstream_refusing_the_customer(false).await;
+    the_fallback_attempt_carries_the_house_attestation(&refusing_unattested_url).await;
 }
 
-/// Drive one real request on a customer's own credential and read what the
-/// ledger says it cost.
-async fn settles_a_byok_request_at_five_percent(upstream_url: &str) {
-    let Some(pool) = connect().await else {
-        return;
-    };
+/// The catalog price of one fixture request.
+///
+/// The fixture tier sells at $3.00/Mtok in and $15.00/Mtok out, and the
+/// recording upstream reports 3 prompt tokens and 1 completion token, so the
+/// catalog price is (3 x 3.00 + 1 x 15.00) / 1e6 = $0.000024. Named because
+/// every assertion below is arithmetic on it and a bare `Decimal::new(24, 6)`
+/// repeated six times is six chances to typo the number the test is about.
+const FIXTURE_CATALOG_USD: Decimal = Decimal::from_parts(24, 0, 0, false, 6);
+
+/// One BYOK customer, funded, with a key attached and the fixture upstream
+/// wired up. Returns the pool, the user, and the plaintext API key.
+async fn byok_customer(label: &str, upstream_url: &str) -> Option<(PgPool, Uuid, String)> {
+    let pool = connect().await?;
     let keyring = test_keyring();
-    let user_id = create_user(&pool, "settle").await;
+    let user_id = create_user(&pool, label).await;
     let plaintext = generate_api_key();
     query(
         "INSERT INTO api_keys (id, user_id, key_hash, name, spend_cap_usd, \
@@ -608,7 +640,164 @@ async fn settles_a_byok_request_at_five_percent(upstream_url: &str) {
     unsafe {
         std::env::set_var("ZEROROUTER_PROVIDER_BASE_URL_GOOGLE", upstream_url);
     }
+    Some((pool, user_id, plaintext))
+}
 
+/// Put `catalog_usd` of BYOK usage into this user's month WITHOUT going through
+/// the request path.
+///
+/// It writes a `usage_events` row and lets migration 0019's accrual trigger do
+/// the rest, which is the only way a test may move this number: the rollup
+/// refuses direct writes (`usage_key_month_spend_reject_direct_mutation`), and
+/// that refusal is a property worth not working around — a test that reached
+/// past the trigger would be seeding a state the production path cannot produce.
+///
+/// `cost_usd` is bound to zero rather than to the fee. What this row seeds is
+/// the ALLOWANCE basis, and leaving the spend total alone keeps the seeding
+/// from also consuming the key's spend cap and changing what admission decides.
+async fn seed_byok_month(pool: &PgPool, user_id: Uuid, catalog_usd: Decimal) {
+    let api_key_id = query_scalar::<_, Uuid>("SELECT id FROM api_keys WHERE user_id = $1 LIMIT 1")
+        .bind(user_id)
+        .fetch_one(pool)
+        .await
+        .expect("the seeded user must own a key");
+    query(
+        "INSERT INTO usage_events (request_id, api_key_id, tier, upstream_provider, \
+         upstream_model, input_tokens, cached_input_tokens, output_tokens, cost_usd, \
+         latency_ms, status, byok, byok_catalog_usd) \
+         VALUES ($1, $2, 'zero/byok-plain', 'google', 'seed', 0, 0, 0, 0, 0, 200, TRUE, $3)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(api_key_id)
+    .bind(catalog_usd)
+    .execute(pool)
+    .await
+    .expect("the seed usage row must insert");
+
+    // The trigger, not the test, is what made the number true. Asserted here so
+    // a seeding helper that silently stopped working cannot make every test
+    // below pass for the wrong reason.
+    assert_eq!(
+        consumed_allowance(pool, user_id).await,
+        catalog_usd,
+        "seeding must accrue through the 0019 trigger"
+    );
+}
+
+/// This user's month-to-date BYOK catalog consumption, read the way admission
+/// and the settle transaction read it.
+async fn consumed_allowance(pool: &PgPool, user_id: Uuid) -> Decimal {
+    query_scalar::<_, Decimal>(
+        r#"
+        SELECT COALESCE(SUM(rollup.byok_catalog_usd), 0)
+        FROM usage_key_month_spend AS rollup
+        INNER JOIN api_keys ON api_keys.id = rollup.api_key_id
+        WHERE api_keys.user_id = $1
+          AND rollup.month >= usage_event_utc_month(NOW())
+        "#,
+    )
+    .bind(user_id)
+    .fetch_one(pool)
+    .await
+    .expect("the allowance rollup must read")
+}
+
+/// An upstream that REFUSES the customer's key and serves ZeroRouter's.
+///
+/// The shape the fallback opt-in exists for: a customer's credential that has
+/// been revoked, expired, or mistyped. A 401 classifies as non-retryable, so the
+/// walk abandons that rung immediately rather than burning its retries — which
+/// is what makes "did the walk move to the house twin?" the only question the
+/// tests below are asking.
+///
+/// `attest` controls whether the HOUSE response carries the zero-retention
+/// header the `xai` lane is sold under, so the same helper can play both "the
+/// fallback is allowed to serve" and "the fallback must fail closed".
+async fn upstream_refusing_the_customer(attest: bool) -> (String, Arc<Mutex<Vec<Option<String>>>>) {
+    let seen: Arc<Mutex<Vec<Option<String>>>> = Arc::new(Mutex::new(Vec::new()));
+    let recorder = Arc::clone(&seen);
+    let app = axum::Router::new().route(
+        "/v1/chat/completions",
+        axum::routing::post(move |headers: axum::http::HeaderMap| {
+            let recorder = Arc::clone(&recorder);
+            async move {
+                let authorization = headers
+                    .get(axum::http::header::AUTHORIZATION)
+                    .map(|value| value.to_str().unwrap_or("<binary>").to_owned());
+                recorder
+                    .lock()
+                    .expect("recorder lock")
+                    .push(authorization.clone());
+                if authorization.as_deref() == Some(&format!("Bearer {CUSTOMER_KEY}")) {
+                    return (
+                        StatusCode::UNAUTHORIZED,
+                        axum::Json(serde_json::json!({
+                            "error": {"message": "invalid api key", "type": "invalid_request_error"}
+                        })),
+                    )
+                        .into_response();
+                }
+                let body = axum::Json(serde_json::json!({
+                    "choices": [{"message": {"role": "assistant", "content": "hi"}}],
+                    "usage": {"prompt_tokens": 3, "completion_tokens": 1}
+                }));
+                if attest {
+                    ([("x-zero-data-retention", "true")], body).into_response()
+                } else {
+                    body.into_response()
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("refusing upstream should bind");
+    let address = listener
+        .local_addr()
+        .expect("refusing upstream should report its address");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    (format!("http://{address}/v1/chat/completions"), seen)
+}
+
+/// Drive one completion and return whatever came back, refusing nothing.
+async fn attempt_completion(pool: &PgPool, plaintext: &str, model: &str) -> (StatusCode, Value) {
+    let state = RouterState::with_database(fixture("byok_tiers.toml"), pool.clone(), true)
+        .with_byok(Some(Arc::new(test_keyring())));
+    let response = app(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("authorization", format!("Bearer {plaintext}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": model,
+                        "messages": [{"role": "user", "content": "hello"}]
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("the request should complete");
+    let status = response.status();
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .expect("body should read")
+        .to_bytes();
+    (
+        status,
+        serde_json::from_slice(&body).expect("the response should be JSON"),
+    )
+}
+
+/// Drive one completion through the real HTTP path and return the response body.
+async fn one_completion(pool: &PgPool, plaintext: &str) -> Value {
     let state = RouterState::with_database(fixture("byok_tiers.toml"), pool.clone(), true)
         .with_byok(Some(Arc::new(test_keyring())));
     let response = app(state)
@@ -638,47 +827,96 @@ async fn settles_a_byok_request_at_five_percent(upstream_url: &str) {
         .to_bytes();
     let body: Value = serde_json::from_slice(&body).expect("the response should be JSON");
     assert_eq!(status, StatusCode::OK, "the request should serve: {body}");
+    body
+}
 
-    // The disclosure. A BYOK request carries the block even though this request
-    // never engaged the priority knob, because the customer has to be told
-    // whose agreement governs their traffic.
+/// What the settled row says this user was charged, and on what basis.
+async fn settled_row(pool: &PgPool, user_id: Uuid) -> (Decimal, Option<bool>, Option<Decimal>) {
+    query_as::<_, (Decimal, Option<bool>, Option<Decimal>)>(
+        "SELECT usage_events.cost_usd, usage_events.byok, usage_events.byok_catalog_usd \
+         FROM usage_events JOIN api_keys ON api_keys.id = usage_events.api_key_id \
+         WHERE api_keys.user_id = $1 AND usage_events.upstream_model <> 'seed'",
+    )
+    .bind(user_id)
+    .fetch_one(pool)
+    .await
+    .expect("a settled usage row must exist")
+}
+
+/// A customer whose month is untouched pays NOTHING for a BYOK request.
+async fn settles_free_inside_the_monthly_allowance(upstream_url: &str) {
+    let Some((pool, user_id, plaintext)) = byok_customer("allowance-free", upstream_url).await
+    else {
+        return;
+    };
+
+    let body = one_completion(&pool, &plaintext).await;
+    // The disclosure still fires. A free BYOK request is still a BYOK request,
+    // and the customer still has to be told whose agreement governs it — the
+    // block is about the contract, not about the price.
     assert_eq!(
         body["zerorouter"]["byok"],
         json!(true),
-        "a BYOK response must say so: {body}"
+        "a BYOK response must say so even when it costs nothing: {body}"
     );
 
-    // The price. The fixture tier sells at $3.00/Mtok in and $15.00/Mtok out,
-    // and the recording upstream reports 3 prompt tokens and 1 completion
-    // token, so the catalog price is (3 x 3.00 + 1 x 15.00) / 1e6 = $0.000024.
-    // Five percent of that is $0.0000012, and it is written exactly.
-    let (cost_usd, byok_flag) = query_as::<_, (Decimal, Option<bool>)>(
-        "SELECT usage_events.cost_usd, usage_events.byok FROM usage_events \
-         JOIN api_keys ON api_keys.id = usage_events.api_key_id WHERE api_keys.user_id = $1",
+    let (cost_usd, byok_flag, catalog) = settled_row(&pool, user_id).await;
+    assert_eq!(
+        cost_usd,
+        Decimal::ZERO,
+        "a request wholly inside the ${} monthly allowance is free",
+        byok::monthly_allowance()
+    );
+    assert_eq!(byok_flag, Some(true), "it was still a BYOK request");
+    assert_eq!(
+        catalog,
+        Some(FIXTURE_CATALOG_USD),
+        "the catalog basis must be recorded even when nothing is charged — it is \
+         what consumes the allowance"
+    );
+
+    // A zero charge writes NO ledger row: the ledger forbids zero amounts, and
+    // a $0.00 debit would be a line item for something that did not happen.
+    let debits = query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM credit_ledger WHERE user_id = $1 AND entry_type = 'usage'",
     )
     .bind(user_id)
     .fetch_one(&pool)
     .await
-    .expect("a settled usage row must exist");
+    .expect("the ledger must count");
+    assert_eq!(debits, 0, "a free request debits nothing");
 
-    let catalog = Decimal::new(24, 6);
+    // And the allowance moved by the catalog price, not by the fee.
+    assert_eq!(
+        consumed_allowance(&pool, user_id).await,
+        FIXTURE_CATALOG_USD,
+        "the allowance is consumed in catalog dollars"
+    );
+}
+
+/// Once the month's allowance is spent, BYOK prices exactly as #103 priced it.
+async fn settles_at_five_percent_once_the_allowance_is_spent(upstream_url: &str) {
+    let Some((pool, user_id, plaintext)) = byok_customer("allowance-spent", upstream_url).await
+    else {
+        return;
+    };
+    seed_byok_month(&pool, user_id, byok::monthly_allowance()).await;
+
+    one_completion(&pool, &plaintext).await;
+
+    let (cost_usd, _, catalog) = settled_row(&pool, user_id).await;
     assert_eq!(
         cost_usd,
         Decimal::new(12, 7),
-        "a BYOK request must settle at 5% of the ${catalog} catalog price, not at it"
+        "with the allowance spent, a ${FIXTURE_CATALOG_USD} catalog request settles at 5%"
     );
+    assert_eq!(catalog, Some(FIXTURE_CATALOG_USD));
     assert_ne!(
-        cost_usd, catalog,
-        "settling at the catalog price would charge the customer twenty times the fee"
-    );
-    assert_eq!(
-        byok_flag,
-        Some(true),
-        "the metering row must record that this was a BYOK request"
+        cost_usd, FIXTURE_CATALOG_USD,
+        "settling at the catalog price would charge twenty times the fee"
     );
 
-    // And the ledger debit matches the settled row, so the customer's balance
-    // moved by the fee rather than by the catalog price.
+    // The debit matches the settled row, so the balance moved by the fee.
     let debit = query_scalar::<_, Decimal>(
         "SELECT amount_usd FROM credit_ledger WHERE user_id = $1 AND entry_type = 'usage'",
     )
@@ -694,4 +932,339 @@ async fn settles_a_byok_request_at_five_percent(upstream_url: &str) {
         listed[0].last_used_at.is_some(),
         "dispatching on the credential must record that it was used"
     );
+}
+
+/// THE straddle, end to end: the request that crosses the boundary is billed on
+/// the part above it and free on the part below.
+async fn settles_on_only_the_part_above_the_allowance(upstream_url: &str) {
+    let Some((pool, user_id, plaintext)) = byok_customer("allowance-straddle", upstream_url).await
+    else {
+        return;
+    };
+    // Leave exactly $0.00001 of allowance — less than one fixture request's
+    // $0.000024 catalog cost, so this request lands on BOTH sides of the line.
+    let remaining = Decimal::new(1, 5);
+    seed_byok_month(&pool, user_id, byok::monthly_allowance() - remaining).await;
+
+    one_completion(&pool, &plaintext).await;
+
+    // $0.000024 catalog, $0.00001 of it free, so $0.000014 is billable and the
+    // fee is 5% of that = $0.0000007. Written as the literal it is, because the
+    // whole point of the straddle is that this is neither of the two numbers a
+    // simpler implementation would produce.
+    let (cost_usd, _, catalog) = settled_row(&pool, user_id).await;
+    assert_eq!(
+        cost_usd,
+        Decimal::new(7, 7),
+        "only the ${} above the allowance is charged, at 5%",
+        FIXTURE_CATALOG_USD - remaining
+    );
+    assert_ne!(
+        cost_usd,
+        Decimal::ZERO,
+        "a straddling request must NOT ride free on its remaining allowance"
+    );
+    assert_ne!(
+        cost_usd,
+        Decimal::new(12, 7),
+        "a straddling request must NOT be billed as though it had no allowance left"
+    );
+    assert_eq!(catalog, Some(FIXTURE_CATALOG_USD));
+
+    // The accumulator takes the WHOLE catalog cost, not just the billed part:
+    // it is the honest month-to-date figure, and clamping it at the boundary
+    // would make the next request's arithmetic wrong.
+    assert_eq!(
+        consumed_allowance(&pool, user_id).await,
+        byok::monthly_allowance() - remaining + FIXTURE_CATALOG_USD
+    );
+}
+
+/// Two settles racing for the last of the allowance must not both win it.
+async fn concurrent_settles_cannot_both_claim_the_last_of_the_allowance(upstream_url: &str) {
+    let Some((pool, user_id, plaintext)) = byok_customer("allowance-race", upstream_url).await
+    else {
+        return;
+    };
+    // Leave room for EXACTLY one of the two requests below.
+    seed_byok_month(
+        &pool,
+        user_id,
+        byok::monthly_allowance() - FIXTURE_CATALOG_USD,
+    )
+    .await;
+
+    // Both in flight at once. Whichever settles first consumes the remaining
+    // allowance and pays nothing; the second finds none left and pays the full
+    // 5%. Which of them is which is a race and the test does not care — what it
+    // asserts is the SUM, which is the same either way and is what a lost
+    // update would change.
+    let (first, second) = tokio::join!(
+        one_completion(&pool, &plaintext),
+        one_completion(&pool, &plaintext)
+    );
+    assert_eq!(first["zerorouter"]["byok"], json!(true));
+    assert_eq!(second["zerorouter"]["byok"], json!(true));
+
+    let charged = query_scalar::<_, Decimal>(
+        "SELECT COALESCE(SUM(usage_events.cost_usd), 0) FROM usage_events \
+         JOIN api_keys ON api_keys.id = usage_events.api_key_id \
+         WHERE api_keys.user_id = $1 AND usage_events.upstream_model <> 'seed'",
+    )
+    .bind(user_id)
+    .fetch_one(&pool)
+    .await
+    .expect("the settled rows must sum");
+
+    // If both settles read the same "one request's worth remaining" and both
+    // treated themselves as covered, this would be $0. The advisory lock the
+    // settle transaction takes is what makes it $0.0000012 instead: the second
+    // settle cannot read the accumulator until the first has committed to it.
+    assert_eq!(
+        charged,
+        Decimal::new(12, 7),
+        "exactly one of two concurrent requests may claim the last of the allowance"
+    );
+    assert_ne!(
+        charged,
+        Decimal::ZERO,
+        "both requests claiming the same last dollar of allowance is the lost update \
+         this test exists to catch"
+    );
+
+    // Both requests consumed allowance, so the month is now past it by one
+    // request's catalog cost.
+    assert_eq!(
+        consumed_allowance(&pool, user_id).await,
+        byok::monthly_allowance() + FIXTURE_CATALOG_USD
+    );
+}
+
+// ---------------------------------------------------------------------------
+// (5) The opt-in fallback (migration 0028)
+// ---------------------------------------------------------------------------
+
+/// Without the opt-in, a refused customer key fails the request. #103's
+/// structural no-fallback, still true.
+async fn a_refused_key_fails_the_request_without_the_opt_in(
+    upstream_url: &str,
+    seen: &Arc<Mutex<Vec<Option<String>>>>,
+) {
+    let Some((pool, user_id, plaintext)) = byok_customer("fallback-off", upstream_url).await else {
+        return;
+    };
+    seen.lock().expect("recorder lock").clear();
+
+    let (status, body) = attempt_completion(&pool, &plaintext, "zero/byok-plain").await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_GATEWAY,
+        "a refused key with no opt-in must fail rather than serve: {body}"
+    );
+
+    // The assertion that actually means something: ZeroRouter's own credential
+    // never went anywhere. A fallback that fired without being asked for would
+    // show up here as a second request carrying the house key.
+    let calls = seen.lock().expect("recorder lock").clone();
+    assert_eq!(
+        calls,
+        vec![Some(format!("Bearer {CUSTOMER_KEY}"))],
+        "exactly one dispatch, on the customer's key, and never on ZeroRouter's"
+    );
+    assert!(
+        !calls
+            .iter()
+            .any(|call| call.as_deref().is_some_and(|c| c.contains("ZEROROUTER"))),
+        "the house credential must not be presented for a customer who did not opt in"
+    );
+
+    // And nothing was billed, because nothing was served.
+    let settled = query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM usage_events JOIN api_keys ON api_keys.id = usage_events.api_key_id \
+         WHERE api_keys.user_id = $1 AND usage_events.status = 200",
+    )
+    .bind(user_id)
+    .fetch_one(&pool)
+    .await
+    .expect("the settled rows must count");
+    assert_eq!(settled, 0, "a failed walk serves nothing and bills nothing");
+}
+
+/// With the opt-in, the walk retries on ZeroRouter's key — and bills the FULL
+/// catalog price for it.
+async fn an_opted_in_key_falls_back_and_is_billed_at_full_catalog(
+    upstream_url: &str,
+    seen: &Arc<Mutex<Vec<Option<String>>>>,
+) {
+    let Some((pool, user_id, plaintext)) = byok_customer("fallback-on", upstream_url).await else {
+        return;
+    };
+    assert!(
+        byok::set_fallback(&pool, user_id, "google", true)
+            .await
+            .expect("the toggle must apply"),
+        "the customer has a google key to toggle"
+    );
+    seen.lock().expect("recorder lock").clear();
+
+    let (status, body) = attempt_completion(&pool, &plaintext, "zero/byok-plain").await;
+    assert_eq!(status, StatusCode::OK, "the fallback must serve: {body}");
+
+    // Both credentials went out, in that order: the customer's first, then
+    // ZeroRouter's. The order is the product — a fallback that dialled the
+    // house key first would be billing full price without ever trying the key
+    // the customer attached.
+    let calls = seen.lock().expect("recorder lock").clone();
+    assert_eq!(
+        calls,
+        vec![
+            Some(format!("Bearer {CUSTOMER_KEY}")),
+            Some(format!("Bearer {HOUSE_KEY}")),
+        ],
+        "the customer's key is tried first and the house key only after it fails"
+    );
+
+    // The honest metadata shape. `byok` is FALSE — this request was served on
+    // ZeroRouter's credential under ZeroRouter's agreement, and saying
+    // otherwise would tell the customer their own provider contract governed
+    // traffic it did not. `byok_fallback` is what explains the price.
+    assert_eq!(
+        body["zerorouter"]["byok_fallback"],
+        json!(true),
+        "a fallback response must say so: {body}"
+    );
+    assert!(
+        body["zerorouter"].get("byok").is_none(),
+        "a fallback attempt did NOT dispatch on the customer's credential: {body}"
+    );
+
+    // The price: FULL catalog, not the 5% fee and not free.
+    let (cost_usd, byok_flag, catalog) = settled_row(&pool, user_id).await;
+    assert_eq!(
+        cost_usd, FIXTURE_CATALOG_USD,
+        "a fallback attempt is a house dispatch and bills the full catalog price"
+    );
+    assert_ne!(
+        cost_usd,
+        Decimal::new(12, 7),
+        "billing a fallback at the BYOK fee would sell house inference at 5% of cost"
+    );
+    assert_ne!(
+        cost_usd,
+        Decimal::ZERO,
+        "the monthly allowance does not discount a house dispatch"
+    );
+    assert_eq!(
+        byok_flag,
+        Some(false),
+        "the metering row records a house dispatch"
+    );
+    assert_eq!(
+        catalog, None,
+        "a house dispatch records no allowance basis, so it consumes none"
+    );
+    assert_eq!(
+        consumed_allowance(&pool, user_id).await,
+        Decimal::ZERO,
+        "a fallback must not eat into the customer's free allowance"
+    );
+
+    // Exactly one attempt settled, and the walk ledger shows both rungs — the
+    // refused customer attempt and the house one that served.
+    let (attempt_count, served_count) = query_as::<_, (i64, i64)>(
+        "SELECT COUNT(*), COUNT(*) FILTER (WHERE served) FROM request_attempts \
+         WHERE user_id = $1",
+    )
+    .bind(user_id)
+    .fetch_one(&pool)
+    .await
+    .expect("the attempt rows must count");
+    assert_eq!(attempt_count, 2, "both rungs are on the record");
+    assert_eq!(
+        served_count, 1,
+        "exactly one attempt served, so exactly one attempt is priced"
+    );
+
+    // One usage debit, at the full price. No double billing.
+    let debits = query_as::<_, (i64, Decimal)>(
+        "SELECT COUNT(*), COALESCE(SUM(-amount_usd), 0) FROM credit_ledger \
+         WHERE user_id = $1 AND entry_type = 'usage'",
+    )
+    .bind(user_id)
+    .fetch_one(&pool)
+    .await
+    .expect("the ledger must count");
+    assert_eq!(debits, (1, FIXTURE_CATALOG_USD));
+
+    // The customer's key was not marked as having served anything, because it
+    // did not.
+    let listed = byok::list_keys(&pool, user_id).await.expect("list");
+    assert!(
+        listed[0].last_used_at.is_none(),
+        "a key that was refused has not served a request"
+    );
+    assert!(listed[0].fallback_enabled, "the opt-in is reported back");
+}
+
+/// The fallback attempt is a HOUSE dispatch, so the house attestation applies
+/// to it — and fails closed when the upstream will not attest.
+async fn the_fallback_attempt_carries_the_house_attestation(unattested_url: &str) {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let keyring = test_keyring();
+    let user_id = create_user(&pool, "fallback-attested").await;
+    let plaintext = generate_api_key();
+    query(
+        "INSERT INTO api_keys (id, user_id, key_hash, name, spend_cap_usd, \
+         velocity_cap_tokens_per_min) VALUES ($1, $2, $3, 'byok', 20, 1000000)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(user_id)
+    .bind(hash_api_key(&plaintext))
+    .execute(&pool)
+    .await
+    .expect("test API key must insert");
+    grant_promo(&pool, user_id, Decimal::from(50), "byok")
+        .await
+        .expect("funding promo must apply");
+    byok::attach_key(&pool, &keyring, user_id, "xai", CUSTOMER_KEY)
+        .await
+        .expect("attaching must succeed");
+    byok::set_fallback(&pool, user_id, "xai", true)
+        .await
+        .expect("the toggle must apply");
+
+    // SAFETY: sequential, inside the one env-owning test in this binary.
+    unsafe {
+        std::env::set_var("ZEROROUTER_PROVIDER_BASE_URL_XAI", unattested_url);
+    }
+
+    let (status, body) = attempt_completion(&pool, &plaintext, "zero/byok-attested").await;
+    // The customer's own attempt is refused by the upstream (401) and asserts
+    // no retention guarantee — that exemption is #103's and is untouched. The
+    // FALLBACK attempt is ZeroRouter dispatching on ZeroRouter's key, so the
+    // zero-retention guarantee this lane is sold under is ZeroRouter's to make
+    // and is checked. The upstream does not attest, so it must refuse rather
+    // than serve from a lane it cannot vouch for.
+    assert_eq!(
+        status,
+        StatusCode::BAD_GATEWAY,
+        "the fallback must fail closed on a missing house attestation: {body}"
+    );
+    assert_eq!(
+        body["error"]["code"],
+        json!("retention_attestation_failed"),
+        "and it must say WHY, rather than reporting a generic upstream failure: {body}"
+    );
+
+    let settled = query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM usage_events JOIN api_keys ON api_keys.id = usage_events.api_key_id \
+         WHERE api_keys.user_id = $1 AND usage_events.status = 200",
+    )
+    .bind(user_id)
+    .fetch_one(&pool)
+    .await
+    .expect("the settled rows must count");
+    assert_eq!(settled, 0, "nothing was served, so nothing was billed");
 }
