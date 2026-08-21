@@ -211,7 +211,7 @@ posture = "standard"
 description = "OpenAI retains API inputs and outputs in abuse-monitoring logs for up to 30 days, unless longer retention is required by law; API data is not used to train its models."
 source_url = "https://developers.openai.com/api/docs/guides/your-data"
 verified = "2026-08-20"
-source_sha256 = "2b8f51b83d369349da71a498373acdaf794da5195ef8d424030317ac961c3bcd"
+source_sha256 = "66b8f42859a4b3f4b88349d7059057f077a50b994607cf77e99b35aa11bfa4cf"
 openrouter_slug = "openai"
 
 # Google publishes NO retention window for the paid Gemini API — the terms say
