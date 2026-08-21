@@ -1,0 +1,105 @@
+version: 2
+
+# Dependabot is the other half of the Security workflow. cargo-deny and
+# pnpm audit tell you a dependency has become a problem; this is what routinely
+# moves versions so that fewer of them do. Weekly rather than daily on purpose:
+# this is a small team, and a queue nobody can drain is the same as no queue.
+#
+# Every ecosystem is grouped so that a week's updates arrive as a few reviewable
+# pull requests instead of one per crate. `patch`/`minor` are grouped together
+# because they are reviewed the same way (read the changelog, check CI);
+# `major` updates are deliberately left ungrouped so each arrives alone and
+# gets argued for on its own merits.
+
+updates:
+  # ---------------------------------------------------------------------------
+  - package-ecosystem: cargo
+    # The Rust crate is its own Cargo workspace rooted at router/, not at the
+    # repository root — Dependabot needs the directory holding Cargo.toml.
+    directory: /router
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:30"
+      timezone: Etc/UTC
+    open-pull-requests-limit: 5
+    groups:
+      cargo-minor-and-patch:
+        applies-to: version-updates
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
+      # Security fixes arrive as their own group so they are not buried in the
+      # routine batch, and are not held back by an unrelated update failing CI.
+      cargo-security:
+        applies-to: security-updates
+        patterns:
+          - "*"
+    commit-message:
+      prefix: "deps"
+    # Only `dependencies` is requested: Dependabot creates that label itself,
+    # while a label that does not exist in the repository is reported as an
+    # error in its run log and then dropped. Add `rust`/`portal`/`ci` here once
+    # those labels exist in repository settings.
+    labels:
+      - dependencies
+
+  # ---------------------------------------------------------------------------
+  - package-ecosystem: npm
+    # pnpm is detected from portal/pnpm-lock.yaml; the `npm` ecosystem is the
+    # correct value for pnpm projects.
+    directory: /portal
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:30"
+      timezone: Etc/UTC
+    open-pull-requests-limit: 5
+    groups:
+      portal-minor-and-patch:
+        applies-to: version-updates
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
+      portal-security:
+        applies-to: security-updates
+        patterns:
+          - "*"
+    ignore:
+      # React 19 is a major upgrade of the portal's core rendering library and
+      # is a decision, not a routine bump. Left out of the queue so it is not
+      # repeatedly opened and closed; remove this when it is time to plan it.
+      - dependency-name: react
+        update-types: ["version-update:semver-major"]
+      - dependency-name: react-dom
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "@types/react"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "@types/react-dom"
+        update-types: ["version-update:semver-major"]
+    commit-message:
+      prefix: "deps(portal)"
+    labels:
+      - dependencies
+
+  # ---------------------------------------------------------------------------
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:30"
+      timezone: Etc/UTC
+    open-pull-requests-limit: 5
+    groups:
+      github-actions:
+        patterns:
+          - "*"
+    commit-message:
+      prefix: "ci"
+    labels:
+      - dependencies

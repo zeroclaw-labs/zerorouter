@@ -24,7 +24,16 @@ on:
   pull_request:
     paths:
       - 'router/config/tiers.toml'
+      # A retention label is only as good as the attestation that backs it.
+      # `attestation_header` / `attestation_expect` live in providers.json and
+      # are what a response must carry for a zero-retention lane to be served
+      # as one — so changing them changes what this job is re-verifying, while
+      # `tiers.toml` stays byte-identical. Before this entry, such a pull
+      # request ran neither drift job.
+      - 'router/config/providers.json'
       - 'router/src/retention.rs'
+      # Where the attestation fields are parsed and validated.
+      - 'router/src/providers.rs'
       - '.github/workflows/retention-drift.yml'
   workflow_dispatch:
 

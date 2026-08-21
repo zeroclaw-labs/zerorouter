@@ -18,7 +18,18 @@ on:
   pull_request:
     paths:
       - 'router/config/tiers.toml'
+      # `providers.json` is half of the reconciliation input, not a detail of
+      # it: `source_provider_key` is what joins a candidate's provider to the
+      # upstream pricing source, and `unreconcilable_reason` is what excuses a
+      # provider from the join entirely. Editing either changes what this job
+      # concludes while leaving `tiers.toml` untouched — so before this entry
+      # existed, a pull request that renamed a source key or added an excuse
+      # ran no drift check at all.
+      - 'router/config/providers.json'
       - 'router/src/drift.rs'
+      # The loader that parses and validates providers.json; a change to how
+      # `source_provider_key` is read is a change to this job's input.
+      - 'router/src/providers.rs'
       - '.github/workflows/catalog-drift.yml'
   workflow_dispatch:
 
