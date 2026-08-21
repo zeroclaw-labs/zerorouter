@@ -138,7 +138,10 @@ schema_version = 1
 # the Bedrock lanes shipped, which was a stale sentence making a false claim
 # about the product): `anthropic`, `openai`, and `google` are ORDINARY API
 # ACCOUNTS and every lane on them is `standard`. `bedrock` and `fireworks` are
-# `zero`, on two different bases — see each pin.
+# `zero`, on two different bases — see each pin. One `fireworks` LANE is
+# nonetheless `standard`: `fireworks/qwen3.8-max` overrides the provider pin,
+# because it is closed-weight and that pin's evidence covers open models only. A
+# provider pin is the default for its lanes, not a guarantee about every row.
 #
 # THE RULE FOR `posture = "zero"`, and it is not a style preference. A lane may
 # be pinned zero-retention only on one of THREE bases, and the third was added
@@ -168,8 +171,15 @@ schema_version = 1
 #
 # Retention is declared per PROVIDER because it is a property of the operator's
 # ACCOUNT with that provider — one API key, one arrangement, every model on it.
-# A tier may override with its own complete block when a single lane is bought
-# under a separate agreement; none does today.
+# A tier may override with its own complete block, and exactly one does:
+# `fireworks/qwen3.8-max` publishes `standard` on a `zero` provider (2026-08-20,
+# the first use of the mechanism). The reason is worth knowing before writing
+# another one, because it is NOT the case the override was designed for. It was
+# built for a lane bought under a separate AGREEMENT. This one is a lane the
+# provider's own published statement does not COVER: same key, same account, same
+# policy page — a scope limit inside the evidence rather than a second contract.
+# Both are the same shape in the file (a complete replacement block) and both
+# want the same discipline: say what the narrower claim is and why.
 #
 # `source_sha256` is the SHA-256 of the normalized visible text of `source_url`
 # on `verified` (scripts, styles, comments, and tags stripped; whitespace
@@ -335,11 +345,16 @@ openrouter_slug = "amazon-bedrock"
 # TWO SCOPE LIMITS THAT BOUND WHAT THIS PIN COVERS, both load-bearing:
 #
 #   1. "for any open MODELS". The sentence is scoped to open models, and every
-#      Fireworks lane below is deliberately an open-weights one for exactly that
-#      reason. Fireworks also serves closed-weight flagships (Qwen 3.7 Plus,
-#      Qwen 3.8 Max) — those are NOT pinned, because a provider-level `zero`
-#      posture would then cover a lane this sentence does not reach. See the
-#      note above the Fireworks tiers.
+#      Fireworks lane that INHERITS this pin is deliberately an open-weights one
+#      for exactly that reason. Fireworks also serves closed-weight flagships
+#      (Qwen 3.7 Plus, Qwen 3.8 Max). Such a lane may not inherit this pin,
+#      because a provider-level `zero` posture would then cover a lane this
+#      sentence does not reach — it may only ship with its own per-tier
+#      `standard` override, which is what `fireworks/qwen3.8-max` does
+#      (2026-08-20). Qwen 3.7 Plus is simply not carried. Adding any further
+#      closed-weight Fireworks lane WITHOUT an override would silently extend
+#      this pin past its evidence; that is the failure this scope limit exists to
+#      name. See the note above the Fireworks tiers.
 #   2. THE RESPONSE API IS EXCLUDED, and it is the one real carve-out on the
 #      page: it stores conversation data when `store=True`, which is its
 #      DEFAULT, with 30-day deletion. ZeroRouter never dials it. These lanes ride
@@ -1160,15 +1175,23 @@ cached_input_per_mtok = 0.11
 output_per_mtok = 5.50
 
 # ---------------------------------------------------------------------------
-# FIREWORKS (added 2026-08-20) — THE OPEN-WEIGHT ZERO-RETENTION LANES.
+# FIREWORKS (added 2026-08-20) — FIVE OPEN-WEIGHT ZERO-RETENTION LANES, PLUS ONE
+# CLOSED-WEIGHT LANE THAT SAYS SO.
 #
-# Five open-weights flagships nothing else in this catalog carries, reached over
-# Fireworks' OpenAI-compatible chat-completions endpoint, on an account whose
-# provider pin is `zero` by Fireworks' PUBLISHED DEFAULT rather than by contract
-# or by account setting (`[retention.fireworks]` above, basis 3 of the rule in
-# this file's header). They are the first zero-retention lanes that are not
-# Claude, and the first that are not also purchasable from another lane here at
-# a different price.
+# Six flagships nothing else in this catalog carries, reached over Fireworks'
+# OpenAI-compatible chat-completions endpoint. FIVE are open-weights and inherit
+# an account whose provider pin is `zero` by Fireworks' PUBLISHED DEFAULT rather
+# than by contract or by account setting (`[retention.fireworks]` above, basis 3
+# of the rule in this file's header). They are the first zero-retention lanes
+# that are not Claude, and the first that are not also purchasable from another
+# lane here at a different price.
+#
+# THE SIXTH, `fireworks/qwen3.8-max`, is closed-weight and therefore outside the
+# sentence that pin rests on, so it carries a per-tier `standard` retention
+# override — the first in this file. It is the same account and the same key; it
+# is NOT the same claim. Read its block at the end of this section before adding
+# any further Fireworks lane, because the open/closed distinction decides the
+# label and nothing in the dispatch path will notice if you get it wrong.
 #
 # THIS LANE SHIPS DARK. As of the commit that added it the operator holds no
 # Fireworks account and `FIREWORKS_API_KEY` is unset, so #89's dispatchability
@@ -1240,23 +1263,20 @@ output_per_mtok = 5.50
 # - GLM-5.3. Not served. https://fireworks.ai/models/fireworks/glm-5p3 is a 404
 #   and there is no 5.3 row in the price list (checked 2026-08-20, six days after
 #   Z.ai's 2026-08-14 launch). GLM 5.2 is Fireworks' newest GLM and is pinned.
-# - QWEN 3.7 PLUS AND QWEN 3.8 MAX, and this is a retention decision rather than
-#   a catalog one. Both are CLOSED-WEIGHT (Qwen 3.7 Plus is Alibaba's proprietary
-#   flagship, served outside Alibaba's own infrastructure only by Fireworks), and
-#   the zero-retention sentence this provider's pin rests on is scoped: "does not
-#   log or store prompt or generation data for any open MODELS". A retention pin
-#   is per PROVIDER — one posture covering every lane on the key — so adding a
-#   closed-weight lane would extend a `zero` label over a model the evidence for
-#   that label does not reach. The house rule is that when in doubt the answer is
-#   `standard`, and there is no way to say `standard` for one lane on a `zero`
-#   provider except by giving that tier its own complete `[tiers."<id>".retention]`
-#   override. That is a deliberate product decision about what ZeroRouter sells
-#   under its own brand, not a config detail, so it is left for the operator.
-#   Qwen 3.8 Max has a second, independent blocker: its id is rendered
-#   `accounts/fireworks/models/qwen3p8-max` on app.fireworks.ai and
-#   `accounts/fireworks/models/qwen3p8-2p4t-a95b` on fireworks.ai, the latter
-#   URL 404s, and with no API key there is no way to settle which string
-#   dispatches. Resolve with `GET /inference/v1/models` once the key exists.
+# - QWEN 3.7 PLUS. Still not carried, and now by operator choice rather than by
+#   the blanket exclusion this note used to record. Both closed-weight Qwen
+#   flagships were held out on 2026-08-20 because the zero-retention sentence
+#   this provider's pin rests on is scoped — "does not log or store prompt or
+#   generation data for any open MODELS" — and a per-provider pin would have
+#   stretched a `zero` label over a model that sentence does not reach. The
+#   operator resolved that the same day for ONE of them: Qwen 3.8 Max ships
+#   below with its own complete `[tiers."<id>".retention]` override declaring
+#   `standard`, so the closed-weight problem is answered by labelling rather
+#   than by omission. Qwen 3.7 Plus was not asked for and is not here; nothing
+#   technical blocks it, and if it is ever added it needs the same override.
+#   Its id ambiguity is likewise resolved — see the Qwen 3.8 Max block for how
+#   `accounts/fireworks/models/qwen3p8-max` was settled against the
+#   `qwen3p8-2p4t-a95b` architecture string without an API key.
 # - `accounts/fireworks/models/deepseek-v4-pro-0813`. See the note on the
 #   DeepSeek V4 Pro tier below; its price is genuinely unresolved.
 
@@ -1451,3 +1471,147 @@ tool_call = true
 input_per_mtok = 0.30
 cached_input_per_mtok = 0.06
 output_per_mtok = 1.20
+
+# ---------------------------------------------------------------------------
+# QWEN 3.8 MAX — THE FIRST LANE IN THIS CATALOG TO OVERRIDE ITS PROVIDER'S
+# RETENTION POSTURE, and the override is the whole reason it can be sold here.
+#
+# Every other Fireworks lane above is open-weights, which is not a coincidence:
+# `[retention.fireworks]` pins `zero` on the strength of one sentence — "does not
+# log or store prompt or generation data for any open MODELS" — and that sentence
+# does not reach a closed-weight model. Qwen 3.8 Max is closed-weight (models.dev
+# reports `open_weights: false`; it is Alibaba's proprietary 2.4T MoE flagship),
+# so the lane sits OUTSIDE the evidence for its own provider's pin.
+#
+# #95 responded to that by leaving the model out of the catalog entirely, which
+# was the right call for a commit that had no way to say `standard` for one lane
+# on a `zero` provider. The operator's decision is to sell it anyway and LABEL IT
+# HONESTLY, which is exactly what the per-tier override exists for: the
+# `[tiers."fireworks/qwen3.8-max".retention]` block below is a COMPLETE
+# replacement of the provider pin for this tier and nothing else. Fireworks'
+# `zero` posture is untouched for the five open-weight lanes above; this one row
+# publishes `standard`, sorts below every zero lane in `/v1/models`, in the
+# portal and in the CLI, and carries a description that says WHY rather than
+# muttering "provider retains data".
+#
+# READ THE DESCRIPTION AS A CLAIM ABOUT EVIDENCE, NOT ABOUT FIREWORKS. It does
+# not say Fireworks retains this lane's prompts — nothing published says that
+# either way. It says the published commitment does not extend here, so
+# ZeroRouter will not repeat it. That is the house rule from this file's header
+# ("when in doubt the answer is `standard`") applied at tier granularity for the
+# first time, and it is the conservative direction: a wrong `standard` costs a
+# little marketing, a wrong `zero` is a false statement about a customer's data.
+#
+# THE OVERRIDE'S EVIDENCE IS THE SAME PAGE AS THE PROVIDER PIN'S, deliberately.
+# The claim being made here is precisely about that page's SCOPE, so the page a
+# human must re-read when it moves is that page. `admin retention-drift` checks
+# it twice under two subjects (`fireworks` and `tier fireworks/qwen3.8-max`) and
+# that duplication is the point: if Fireworks ever widens the sentence to cover
+# closed models, both lines go PAGE CHANGED and a human re-reads a page that now
+# has TWO pins depending on it. The digest below was re-verified live on
+# 2026-08-20, not copied on faith — `retention-drift` reported UNCHANGED for the
+# page on that date.
+#
+# NO `openrouter_slug`, and the omission is reasoned rather than lazy. The
+# corroboration pass joins on that slug to ask a third party what a PROVIDER
+# does. OpenRouter's `fireworks` entry reports the provider-level default
+# (`retainsPrompts: false`) — which is the very statement this override exists to
+# say does not reach this lane. Joining would corroborate the wrong claim, the
+# same `google-vertex` trap the retention header warns about. An unslugged pin is
+# simply not corroborated, which is the correct amount of corroboration
+# available for a scope argument.
+#
+# THE ID WAS AMBIGUOUS AND IS NOW SETTLED. #95 could not choose between
+# `qwen3p8-max` (rendered on app.fireworks.ai) and `qwen3p8-2p4t-a95b` (rendered
+# on fireworks.ai) and parked the lane. Resolved 2026-08-20 without an API key,
+# by the order this file already trusts for Fireworks:
+#
+#   1. models.dev files Fireworks models under the EXACT full dispatch string,
+#      and it carries `accounts/fireworks/models/qwen3p8-max`. There is no
+#      `qwen3p8-2p4t-a95b` entry under `fireworks-ai` — or anywhere in the
+#      source. This alone settles it, and it settles the price at the same time.
+#   2. app.fireworks.ai/models/fireworks/qwen3p8-max renders the same string as
+#      the model's API id.
+#   3. `qwen3p8-2p4t-a95b` is an ARCHITECTURE name (2.4-trillion parameters, 95B
+#      active), not a dispatch id: it appears as display text on the marketing
+#      page while https://fireworks.ai/models/fireworks/qwen3p8-2p4t-a95b answers
+#      404. The page that renders it lives at the `qwen3p8-max` URL.
+#
+# Two independent sources agree and the dissenting string has no reachable URL,
+# so this is pinned rather than parked. Confirm with `GET /inference/v1/models`
+# on the first day a key exists — that is the only source that can be wrong-proof
+# — and if it disagrees, `catalog-drift` will already be reporting NOT IN SOURCE.
+#
+# PRICING: $2.00 / $0.25 / $6.00 per million (input / cached input / output),
+# from Fireworks' serverless price list (https://docs.fireworks.ai/serverless/
+# pricing, read 2026-08-20) and independently equal to models.dev's `cost` for
+# the same id. basis == sell, the standard serving path, no conditional bands —
+# the same shape as every lane above. Note this is the DEAREST Fireworks lane
+# here, roughly 5x Qwen 3.7 Plus, which is what a closed-weight flagship costs.
+#
+# QWEN 3.7 PLUS IS STILL NOT HERE, and that is an operator decision rather than
+# an unresolved question. Its id (`accounts/fireworks/models/qwen3p7-plus`) and
+# its price ($0.40/$0.08/$1.60) are both settled in the same sources consulted
+# above, so it could be added the same way this lane was, with its own override.
+# It was not asked for. Do not add it as a matched pair on the assumption that
+# the argument generalises — the argument that generalises is the override, not
+# the shopping list.
+[tiers."fireworks/qwen3.8-max"]
+
+# A COMPLETE replacement of `[retention.fireworks]` for this tier — every field
+# restated, because a retention pin is never a patch. Removing this block does
+# not make the lane unlabelled; it makes it silently inherit `zero`, which is the
+# false claim this whole entry exists to avoid. `a_closed_weight_fireworks_lane_
+# publishes_standard_from_its_tier_override` in `router/tests/http.rs` fails if
+# it is deleted.
+[tiers."fireworks/qwen3.8-max".retention]
+posture = "standard"
+description = "Fireworks' published zero-data-retention default is scoped to open models — it states that prompt and generation data are not logged or stored 'for any open models' — and Qwen 3.8 Max is closed-weight, so that commitment does not extend to this lane. Nothing Fireworks publishes states what is retained here, so ZeroRouter makes no zero-retention claim for it."
+source_url = "https://docs.fireworks.ai/guides/security_compliance/data_handling"
+verified = "2026-08-20"
+source_sha256 = "9ba1f724b75de399bc3ff239e52007ee7e9df602063532867e733202128918e7"
+
+[tiers."fireworks/qwen3.8-max".rates]
+input_per_mtok = 2.00
+cached_input_per_mtok = 0.25
+output_per_mtok = 6.00
+
+[[tiers."fireworks/qwen3.8-max".candidates]]
+id = "fireworks/qwen3.8-max"
+provider = "fireworks"
+# `qwen3p8-max`, with Fireworks' usual `p`-for-decimal spelling, and NOT the
+# `qwen3p8-2p4t-a95b` architecture string — see the id argument above.
+model = "accounts/fireworks/models/qwen3p8-max"
+
+# TWO FIELDS OMITTED, both under this section's rule (declare on agreement or on
+# the vendor merely being less precise; omit on genuine contradiction), and both
+# resolvable with one probe each once a key exists:
+#
+# - max_output_tokens. models.dev publishes 131072. Neither Fireworks page states
+#   a max-output figure at all: fireworks.ai does not mention one, and
+#   app.fireworks.ai shows 4000 only as the value in a sample request — which
+#   states what an example asks for, not what the model will grant, and is 32x
+#   below models.dev. This is the DeepSeek V4 situation exactly (two numbers,
+#   neither a documented limit), and #95 declined to claim there for the same
+#   reason. Close it by asking for a 100,000-token completion.
+# - input_modalities. Fireworks' two pages contradict each other outright:
+#   fireworks.ai lists "Support image input: Not supported" while
+#   app.fireworks.ai lists "Image Input: Supported" and demonstrates an image URL
+#   in its example. models.dev sides with the first (`modalities.input: ["text"]`,
+#   `attachment: false`). That is a 2-1 split, and the MiniMax M3 lane above is
+#   the precedent: it was also 2-1 (the other way) and #95 still omitted, because
+#   a client that believes it can send an image builds a request that fails.
+#   Close it by sending one image request.
+#
+# context_window IS declared: models.dev's exact 262144 and fireworks.ai's "262k
+# tokens" are the same claim, the vendor merely being less precise.
+# app.fireworks.ai renders "N/A" here, which states nothing and contradicts
+# nothing. tool_call is declared: all three sources say supported.
+[tiers."fireworks/qwen3.8-max".candidates.metadata]
+context_window = 262144
+tool_call = true
+
+[tiers."fireworks/qwen3.8-max".candidates.rates]
+input_per_mtok = 2.00
+cached_input_per_mtok = 0.25
+output_per_mtok = 6.00

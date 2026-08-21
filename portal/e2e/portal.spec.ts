@@ -225,3 +225,55 @@ test('the models catalog labels every lane with its retention posture', async ({
   expect(firstStandard).toBeGreaterThanOrEqual(0)
   expect(lastZero).toBeLessThan(firstStandard)
 })
+
+test('a per-tier retention override renders on the storefront, not the provider pin', async ({
+  page,
+}) => {
+  // The override's first real use, checked at the surface a CUSTOMER reads.
+  //
+  // `fireworks/qwen3.8-max` dispatches the same Fireworks account and the same
+  // key as the five open-weight lanes beside it, and `[retention.fireworks]`
+  // pins that provider `zero`. The lane is closed-weight, so the sentence
+  // backing that pin does not reach it, and a per-tier override in `tiers.toml`
+  // publishes `standard` instead. Every path between that block and this badge
+  // — catalog load, `candidate_retention`, `/v1/models`, this page's own
+  // re-sort — has to carry the override rather than the provider pin, and until
+  // this lane shipped none of them had ever been asked to.
+  //
+  // This is deliberately NOT a re-test of the router's JSON (http.rs does that).
+  // The portal re-sorts the rows for vendor grouping and picks the badge itself
+  // from `m.retention?.posture`, so it is capable of reversing both the label
+  // and the order on its own.
+  await page.goto('/models')
+  await expect(page.getByRole('columnheader', { name: /^retention$/i })).toBeVisible({
+    timeout: 15_000,
+  })
+
+  const rows = page.locator('table.table tbody tr')
+  const ids = (await rows.locator('td:nth-child(2)').allTextContents()).map((t) => t.trim())
+  const labels = (await rows.locator('td:last-child').allTextContents()).map((t) => t.trim())
+
+  const overridden = ids.indexOf('fireworks/qwen3.8-max')
+  expect(overridden).toBeGreaterThanOrEqual(0)
+  expect(labels[overridden]).toBe('provider retains data')
+
+  // Its siblings on the same provider still read zero — which is what makes the
+  // line above an override rather than the provider pin having been changed.
+  for (const sibling of ['fireworks/kimi-k3', 'fireworks/minimax-m3']) {
+    const at = ids.indexOf(sibling)
+    expect(at).toBeGreaterThanOrEqual(0)
+    expect(labels[at]).toBe('zero retention')
+    // ...and the overridden lane sorts BELOW them, despite sharing a vendor
+    // prefix that this page groups on. A retaining lane rendered inside the
+    // zero block would misrepresent it by position alone.
+    expect(overridden).toBeGreaterThan(at)
+  }
+
+  // The hover text must carry the REASON. A bare "provider retains data" badge
+  // on a lane whose provider is advertised as zero-retention two rows above is
+  // exactly the thing a reader would assume is a bug; the tooltip is where the
+  // scope limit gets explained, so it has to actually be there.
+  const title = await rows.nth(overridden).locator('td').last().getAttribute('title')
+  expect(title).toMatch(/open models/i)
+  expect(title).toMatch(/closed-weight/i)
+})

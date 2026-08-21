@@ -1096,4 +1096,52 @@ mod tests {
         assert!(truncated.ends_with("..."));
         assert_eq!(truncate("  short  "), "short");
     }
+
+    /// The CLI reads a per-tier retention OVERRIDE, not the provider pin.
+    ///
+    /// `zerorouter models` prints one posture per row and a counted footnote
+    /// underneath, and both come from the row's `retention.posture` — so both
+    /// are wrong together if the override is ever bypassed. Until
+    /// `fireworks/qwen3.8-max` shipped, no lane in the file used an override,
+    /// which meant every CLI retention assertion was really an assertion about
+    /// the provider-level path.
+    ///
+    /// `render_models` writes through `println!` and has no capture seam, so
+    /// this asserts the two things it reads rather than the bytes it emits:
+    /// the posture on the overridden row, and `posture_count`, which is the
+    /// footnote's arithmetic. Both move if the override stops being honoured —
+    /// deleting the block flips this lane to `zero` and turns 9/11 into 10/10.
+    #[tokio::test]
+    async fn the_cli_reads_a_tier_override_rather_than_its_providers_pin() {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("config/tiers.toml");
+        let catalog = crate::config::load_tier_catalog(&path)
+            .await
+            .expect("the shipped catalog must load");
+        let listing = crate::openai::ModelList::from_listing(catalog.model_listing(&|_| true));
+        let document = serde_json::to_value(&listing).expect("the model list serializes");
+        let rows = document["data"].as_array().expect("data is an array");
+
+        let posture = |id: &str| -> String {
+            rows.iter()
+                .find(|row| row["id"] == id)
+                .unwrap_or_else(|| panic!("{id} must be listed"))["retention"]["posture"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{id} must publish a posture"))
+                .to_owned()
+        };
+
+        // The overridden lane, and a sibling on the same provider and key that
+        // still inherits `[retention.fireworks]`. Asserting the pair is what
+        // makes this an override rather than a relabelled provider.
+        assert_eq!(posture("fireworks/qwen3.8-max"), "standard");
+        assert_eq!(posture("fireworks/kimi-k3"), "zero");
+
+        // The footnote's counts. Stated as literals on purpose: this is the
+        // arithmetic a customer reads as "9 lane(s) zero-retention", and an
+        // override silently stopping working would show up here as a lane
+        // moving from one side of the sentence to the other.
+        assert_eq!(posture_count(rows, "zero"), 9);
+        assert_eq!(posture_count(rows, "standard"), 11);
+        assert_eq!(rows.len(), 20, "every shipped lane is counted exactly once");
+    }
 }

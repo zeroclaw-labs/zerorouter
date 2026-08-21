@@ -270,13 +270,15 @@ async fn models_are_materialized_from_tiers_toml() {
     // One row per model PIN, keyed by its OpenRouter-standard {vendor}/{model}
     // id. The pre-rename catalog published a `zero/*` alias row AND a concrete
     // candidate row per model (14 rows); each pin now equals its candidate, so
-    // it contributes exactly one row — nineteen models, nineteen rows (the
+    // it contributes exactly one row — twenty models, twenty rows (the
     // four Bedrock classic-runtime zero-retention lanes joined on 2026-08-20,
-    // and the five open-weight Fireworks lanes the same day; the two Bedrock
-    // mantle lanes added alongside them are commented out in `tiers.toml`
-    // because AWS's per-account Sales gate refuses this account 5-generation
-    // Claude, so they could be listed but never served).
-    assert_eq!(data.len(), 19);
+    // the five open-weight Fireworks lanes the same day, and the closed-weight
+    // `fireworks/qwen3.8-max` alongside them carrying a per-tier `standard`
+    // retention override; the two Bedrock mantle lanes added with the rest are
+    // commented out in `tiers.toml` because AWS's per-account Sales gate refuses
+    // this account 5-generation Claude, so they could be listed but never
+    // served).
+    assert_eq!(data.len(), 20);
     assert!(data.iter().all(|model| model["object"] == "model"));
 
     let ids = data
@@ -303,6 +305,7 @@ async fn models_are_materialized_from_tiers_toml() {
             "fireworks/glm-5.2",
             "fireworks/kimi-k3",
             "fireworks/minimax-m3",
+            "fireworks/qwen3.8-max",
             "google/gemini-3.1-pro-preview",
             "google/gemini-3.5-flash-lite",
             "google/gemini-3.7-flash",
@@ -486,18 +489,30 @@ async fn every_shipped_model_publishes_what_it_can_take_and_produce() {
     // a lane that omits metadata must appear here, so the omission is reviewed
     // once, in the diff, by a human. A NEW tier that forgets its metadata is not
     // on these lists and still fails.
-    const NO_MAX_OUTPUT: [&str; 3] = [
+    const NO_MAX_OUTPUT: [&str; 4] = [
         "fireworks/deepseek-v4-flash",
         "fireworks/deepseek-v4-pro",
         "fireworks/minimax-m3",
+        // models.dev says 131072; neither Fireworks page documents a max output
+        // at all, and the only figure on one of them is a sample request's
+        // `max_tokens: 4000` — 32x lower, and a statement about an example
+        // rather than about the model. Same shape as the DeepSeek pair above.
+        "fireworks/qwen3.8-max",
     ];
-    const NO_IMAGE_INPUT: [&str; 4] = [
+    const NO_IMAGE_INPUT: [&str; 5] = [
         "fireworks/deepseek-v4-flash",
         "fireworks/deepseek-v4-pro",
         "fireworks/glm-5.2",
         // Omits the modality list entirely: Fireworks' own two pages contradict
         // each other about whether this model takes images.
         "fireworks/minimax-m3",
+        // Also omits it entirely, and for the mirror-image reason: here
+        // fireworks.ai says "Not supported" while app.fireworks.ai says
+        // "Supported" and demonstrates an image URL. models.dev sides with
+        // text-only. MiniMax was the same 2-1 split the other way and was also
+        // left unstated — a client that wrongly believes it can send an image
+        // builds a request that fails.
+        "fireworks/qwen3.8-max",
     ];
 
     for model in listed_models(RouterState::fully_credentialed(tier_config_path())).await {
@@ -694,6 +709,16 @@ async fn every_shipped_lane_publishes_a_retention_posture() {
     //                state to re-read, so the pinned page hash is the entire
     //                re-verification loop.
     //
+    // NOT EVERY `fireworks/*` LANE IS HERE, and the absentee is the point.
+    // `fireworks/qwen3.8-max` dispatches the same account on the same key, and
+    // it is deliberately missing from this list because it is CLOSED-WEIGHT and
+    // the sentence backing the Fireworks pin is scoped to open models. It ships
+    // `standard` via a per-tier `[tiers."fireworks/qwen3.8-max".retention]`
+    // override — the first in the file — and this assertion is the tripwire for
+    // that override being deleted or weakened: inheritance would put the lane
+    // back in this list, and the failure would name it. Do not "fix" such a
+    // failure by adding the id here.
+    //
     // See docs/DEPLOY.md, "The rule for `posture = zero`", which names three
     // admissible bases and the conditions on each.
     let zero: Vec<&str> = data
@@ -754,6 +779,156 @@ async fn the_shipped_catalog_lists_its_zero_retention_lanes_first() {
 }
 
 // ---------------------------------------------------------------------------
+// THE PER-TIER RETENTION OVERRIDE, ON THE WIRE.
+//
+// The override landed as a mechanism with no user: `TierCatalog::
+// candidate_retention` preferred a tier's own pin over its provider's, one unit
+// test in `config.rs` covered that preference on a hand-built catalog, and no
+// shipped tier exercised it. Every `/v1/models` retention test above therefore
+// proved only the PROVIDER-level path, because that was the only path the real
+// file took.
+//
+// `fireworks/qwen3.8-max` is the first genuine use, and it is the case where
+// getting it wrong is worst: the override is the ONLY thing standing between a
+// closed-weight lane and a `zero` label its provider's evidence does not cover.
+// So the override is asserted end to end here — through the real `tiers.toml`,
+// through `model_listing`, through the sort, out to the JSON a customer reads —
+// rather than trusted because a resolver unit test passes.
+// ---------------------------------------------------------------------------
+
+/// The override beats the provider pin, on the shipped file, at the wire.
+///
+/// Deliberately asserts BOTH halves against each other in one test: the lane's
+/// provider is pinned `zero` and the lane publishes `standard`. Asserting only
+/// the second would pass just as well if someone flipped `[retention.fireworks]`
+/// to `standard` wholesale — which would be a different and much larger change,
+/// silently demoting five zero-retention lanes — so the test pins that the
+/// provider is still `zero` and that this one row diverges from it anyway. That
+/// divergence IS the mechanism; nothing else in the catalog produces it.
+#[tokio::test]
+async fn a_closed_weight_fireworks_lane_publishes_standard_from_its_tier_override() {
+    let data = listed_models(RouterState::fully_credentialed(tier_config_path())).await;
+
+    let row = data
+        .iter()
+        .find(|model| model["id"] == "fireworks/qwen3.8-max")
+        .expect("the closed-weight Fireworks lane must be published");
+    assert_eq!(
+        row["retention"]["posture"], "standard",
+        "the per-tier override is what keeps this lane out of the zero-retention \
+         group; it published {:?} instead",
+        row["retention"]["posture"]
+    );
+
+    // Its sibling lanes on the SAME provider and the SAME credential still
+    // publish `zero`. This is what makes the assertion above an override rather
+    // than a provider-wide relabelling.
+    for sibling in [
+        "fireworks/kimi-k3",
+        "fireworks/glm-5.2",
+        "fireworks/deepseek-v4-pro",
+        "fireworks/deepseek-v4-flash",
+        "fireworks/minimax-m3",
+    ] {
+        let row = data
+            .iter()
+            .find(|model| model["id"] == sibling)
+            .unwrap_or_else(|| panic!("{sibling} must be published"));
+        assert_eq!(
+            row["retention"]["posture"], "zero",
+            "{sibling} inherits `[retention.fireworks]` and must still be zero — \
+             if this fails the provider pin moved, which is not what the Qwen \
+             override was supposed to do"
+        );
+    }
+
+    // The description must give the REASON, not a generic label. The whole
+    // argument for selling a closed-weight lane under a zero-retention brand is
+    // that the row says plainly why it is not zero; a description that merely
+    // restated the posture would leave the customer to guess whether ZeroRouter
+    // had checked. `open models` is the scope limit the claim turns on.
+    let description = row["retention"]["description"]
+        .as_str()
+        .expect("the override publishes a description");
+    assert!(
+        description.contains("open models"),
+        "the override's description must name the scope limit that makes this \
+         lane standard, not just assert the posture: {description}"
+    );
+    assert!(
+        description.contains("closed-weight"),
+        "the override's description must say what this lane is, so the reason \
+         reads as a fact about the model rather than a hedge: {description}"
+    );
+}
+
+/// The override decides SORT ORDER too, not just the label.
+///
+/// A row could carry `standard` and still be printed among the zero lanes if the
+/// sort read the provider pin — or read nothing. `/v1/models` leads with the
+/// lanes that keep the promise, so a retaining lane sitting inside that block is
+/// a false impression created by ordering alone, which no amount of correct
+/// labelling further down the row would undo.
+#[tokio::test]
+async fn the_overridden_lane_sorts_into_the_standard_group_not_the_zero_one() {
+    let data = listed_models(RouterState::fully_credentialed(tier_config_path())).await;
+    let ids: Vec<&str> = data
+        .iter()
+        .map(|model| model["id"].as_str().expect("id is a string"))
+        .collect();
+
+    let qwen = ids
+        .iter()
+        .position(|id| *id == "fireworks/qwen3.8-max")
+        .expect("the overridden lane is published");
+    let last_zero = data
+        .iter()
+        .rposition(|model| model["retention"]["posture"] == "zero")
+        .expect("the shipped catalog has zero-retention lanes");
+    assert!(
+        qwen > last_zero,
+        "the overridden lane must sort BELOW every zero-retention lane; it landed \
+         at {qwen} with the last zero lane at {last_zero}: {ids:?}"
+    );
+
+    // ...and INSIDE the standard block, which is a stronger claim than the line
+    // above and is what catches the posture sort being removed outright. This
+    // lane's id sorts after every other `fireworks/*` id alphabetically, so a
+    // catalog sorted by id alone would still place it after the Fireworks zero
+    // lanes and satisfy the assertion above by accident. It would not satisfy
+    // this one: without the posture sort the `anthropic/*` standard lanes come
+    // first and the two groups interleave.
+    let first_standard = data
+        .iter()
+        .position(|model| model["retention"]["posture"] == "standard")
+        .expect("the shipped catalog has retaining lanes");
+    assert!(
+        last_zero < first_standard,
+        "the two postures must form contiguous blocks, zero first: last zero at \
+         {last_zero}, first standard at {first_standard}: {ids:?}"
+    );
+    assert!(
+        qwen >= first_standard,
+        "the overridden lane must sit inside the standard block, not merely after \
+         the zero ones: {ids:?}"
+    );
+
+    // And specifically below its own provider's lanes, which is the ordering a
+    // reader is most likely to find surprising and most needs to be able to
+    // trust: same vendor prefix, different block.
+    for sibling in ["fireworks/kimi-k3", "fireworks/minimax-m3"] {
+        let at = ids
+            .iter()
+            .position(|id| *id == sibling)
+            .unwrap_or_else(|| panic!("{sibling} is published"));
+        assert!(
+            qwen > at,
+            "{sibling} is zero-retention and must precede the overridden lane: {ids:?}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The catalog publishes only what this deployment can serve.
 //
 // These pin the fix for a production incident: `/v1/models` was credential-blind
@@ -777,11 +952,14 @@ async fn a_lane_whose_credential_is_absent_is_not_advertised() {
         "an uncredentialed lane must not appear in /v1/models: {ids:?}"
     );
     // And the rest of the catalog is untouched — a missing key removes its own
-    // lanes and nothing else. The count is the shipped nineteen minus Bedrock's
-    // four AND minus Fireworks' five, because this deployment names only three
-    // providers and so holds neither key. Asserting the survivors by name would
-    // just restate the catalog; asserting that the ONLY lanes lost are the ones
-    // whose credentials are absent is the claim.
+    // lanes and nothing else. The count is the shipped twenty minus Bedrock's
+    // four AND minus Fireworks' six, because this deployment names only three
+    // providers and so holds neither key. Note the Fireworks six includes
+    // `fireworks/qwen3.8-max`, whose retention override does NOT make it a
+    // separate provider: dispatchability follows the credential, and it goes
+    // dark with its siblings. Asserting the survivors by name would just restate
+    // the catalog; asserting that the ONLY lanes lost are the ones whose
+    // credentials are absent is the claim.
     assert_eq!(ids.len(), 10, "{ids:?}");
     assert!(ids.iter().any(|id| id == "anthropic/claude-sonnet-5"));
 }
@@ -849,6 +1027,7 @@ async fn bundled_tier_catalog_has_expected_virtual_models() {
             "fireworks/glm-5.2",
             "fireworks/kimi-k3",
             "fireworks/minimax-m3",
+            "fireworks/qwen3.8-max",
             "google/gemini-3.1-pro-preview",
             "google/gemini-3.5-flash-lite",
             "google/gemini-3.7-flash",
@@ -856,22 +1035,28 @@ async fn bundled_tier_catalog_has_expected_virtual_models() {
             "openai/gpt-5.6-sol",
             "openai/gpt-5.6-terra",
         ],
-        "the nineteen vendor-named model pins (Gemini flash + flash-lite added \
+        "the twenty vendor-named model pins (Gemini flash + flash-lite added \
          2026-08-18; Gemini Pro joined them once conditional rates could \
          express the 200,000-token boundary Google prices it at; the four \
-         Bedrock classic-runtime zero-retention lanes on 2026-08-20, and the \
-         five open-weight Fireworks lanes the same day). \
+         Bedrock classic-runtime zero-retention lanes on 2026-08-20, the \
+         five open-weight Fireworks lanes the same day, and closed-weight \
+         Qwen 3.8 Max alongside them under a per-tier retention override). \
          \
          THE FIREWORKS IDS ARE `fireworks/<model>` AND THE DISPATCHED STRINGS \
          ARE NOT: Fireworks addresses models as \
          `accounts/fireworks/models/<slug>`, which carries two slashes and so \
          cannot be a {{vendor}}/{{model}} id at all, and it writes decimals as \
-         `p` (`glm-5p2`). Only `fireworks/glm-5.2` and its `glm-5p2` model \
-         string are expected to differ by more than a prefix. Fireworks' \
-         closed-weight Qwen lanes are deliberately absent — the vendor's \
-         zero-retention statement is scoped to open models and the retention \
-         pin is per provider, so pinning one would stretch a `zero` label past \
-         its evidence. \
+         `p` (`glm-5p2`). `fireworks/glm-5.2` (`glm-5p2`) and \
+         `fireworks/qwen3.8-max` (`qwen3p8-max`) are the two whose model \
+         strings differ by more than a prefix. \
+         \
+         QWEN 3.8 MAX IS CLOSED-WEIGHT AND IS HERE ANYWAY, which is the one \
+         Fireworks lane that does not inherit `[retention.fireworks]`. The \
+         vendor's zero-retention statement is scoped to open models, so \
+         inheriting would stretch a `zero` label past its evidence; instead \
+         the tier carries its own complete `standard` retention override — the \
+         first per-tier override in the shipped file. Qwen 3.7 Plus is still \
+         absent, by operator choice rather than by any technical bar. \
          \
          THE BEDROCK LANES ARE 4.5-GENERATION AND THAT IS NOT A TYPO. The two \
          5-generation `bedrock/claude-{{opus,sonnet}}-5` tiers were added the \
@@ -1342,6 +1527,7 @@ async fn a_basis_hike_above_sell_withholds_that_tier_and_nothing_else() {
             "fireworks/glm-5.2",
             "fireworks/kimi-k3",
             "fireworks/minimax-m3",
+            "fireworks/qwen3.8-max",
             "google/gemini-3.1-pro-preview",
             "google/gemini-3.5-flash-lite",
             "google/gemini-3.7-flash",
@@ -1388,12 +1574,12 @@ async fn a_basis_hike_above_sell_withholds_that_tier_and_nothing_else() {
     assert_eq!(sell.output_per_mtok, Some(10.00));
 
     // And the public catalog stops advertising what it cannot serve: the
-    // eighteen surviving pins, one row each. A Bedrock lane is among the survivors and
+    // nineteen surviving pins, one row each. A Bedrock lane is among the survivors and
     // that is the point of naming one — Bedrock lanes are a different account
     // with their own rate card, so a repricing of a first-party Anthropic lane
     // withholds only that first-party lane.
     let listed = listed_model_ids(RouterState::fully_credentialed(path)).await;
-    assert_eq!(listed.len(), 18);
+    assert_eq!(listed.len(), 19);
     assert!(listed.iter().any(|id| id == "bedrock/claude-sonnet-4-5"));
     assert!(listed.iter().any(|id| id == "openai/gpt-5.6-luna"));
     assert!(listed.iter().any(|id| id == "anthropic/claude-haiku-4-5"));
@@ -1419,7 +1605,7 @@ async fn the_shipped_catalog_withholds_no_tier_today() {
         "the shipped catalog withholds {:?}",
         catalog.unavailable.keys().collect::<Vec<_>>()
     );
-    assert_eq!(catalog.tiers.len(), 19);
+    assert_eq!(catalog.tiers.len(), 20);
 }
 
 /// Every conditional rate the shipped catalog declares, transcribed from
@@ -1501,7 +1687,7 @@ async fn every_shipped_conditional_rate_is_the_one_the_vendor_publishes() {
 // rungs across >=2 providers). Every tier is pass-through until a second
 // provider serves a model class again.
 const ROUTED_TIERS: [&str; 0] = [];
-const PASS_THROUGH_TIERS: [&str; 19] = [
+const PASS_THROUGH_TIERS: [&str; 20] = [
     // Model pins, keyed by their OpenRouter-standard {vendor}/{model} ids.
     "openai/gpt-5.6-luna",
     "anthropic/claude-haiku-4-5",
@@ -1538,6 +1724,14 @@ const PASS_THROUGH_TIERS: [&str; 19] = [
     "fireworks/deepseek-v4-pro",
     "fireworks/deepseek-v4-flash",
     "fireworks/minimax-m3",
+    // The closed-weight Fireworks lane (2026-08-20). Pass-through on exactly the
+    // same terms as the five above — its per-tier retention override changes
+    // what the row CLAIMS about data handling and changes nothing about what it
+    // costs. Worth stating because the two are easy to conflate: a `standard`
+    // lane is not a lane ZeroRouter marks up, and the candidate-rates ==
+    // tier-rates assertion below holds it to Fireworks' published $2.00/$0.25/
+    // $6.00 standard-path rate like every other pin.
+    "fireworks/qwen3.8-max",
 ];
 
 #[tokio::test]
