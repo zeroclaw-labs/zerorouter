@@ -220,6 +220,27 @@ jobs:
           subject-name: ${{ steps.image.outputs.registry }}/${{ env.ECR_REPOSITORY }}
           subject-digest: ${{ steps.build.outputs.digest }}
 
+      # The digest is what the attestation names and what the task definition
+      # is pinned to below, so it is resolved unconditionally: from ECR, which
+      # answers identically for a fresh push and for a tag that already
+      # existed. A tag is a movable pointer; everything downstream of here
+      # deploys the immutable digest.
+      - name: Resolve the pushed image digest
+        id: digest
+        shell: bash
+        run: |
+          set -euo pipefail
+          digest="$(aws ecr describe-images \
+            --repository-name "${ECR_REPOSITORY}" \
+            --image-ids "imageTag=${DEPLOY_SHA}" \
+            --query 'imageDetails[0].imageDigest' \
+            --output text)"
+          if [[ ! "${digest}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::ECR returned no usable digest for ${DEPLOY_SHA}: ${digest}"
+            exit 1
+          fi
+          echo "digest=${digest}" >> "${GITHUB_OUTPUT}"
+
       - name: Verify ECS service
         id: service
         shell: bash
@@ -259,6 +280,7 @@ jobs:
         shell: bash
         env:
           IMAGE_URI: ${{ steps.image.outputs.image_uri }}
+          IMAGE_DIGEST: ${{ steps.digest.outputs.digest }}
         run: |
           set -euo pipefail
           current_task_definition="$(aws ecs describe-services \
@@ -300,9 +322,16 @@ jobs:
             exit 1
           fi
 
+          # tag@digest, not the bare tag: the tag is kept for human legibility
+          # in the console, but the DIGEST is what deploys. This closes the
+          # gap between what was attested and what runs — a re-pushed tag can
+          # no longer change the deployed image — and the ECS container
+          # metadata echoes the digest-pinned reference back, which is what
+          # lets /transparency complete its provenance chain (the metadata's
+          # ImageDigest field alone has proven unreliable on Fargate).
           jq \
             --arg container "${ECS_CONTAINER_NAME}" \
-            --arg image "${IMAGE_URI}" \
+            --arg image "${IMAGE_URI}@${IMAGE_DIGEST}" \
             '(.containerDefinitions[] | select(.name == $container).image) = $image
              | del(
                  .compatibilities,
