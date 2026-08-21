@@ -1614,6 +1614,18 @@ async fn retention_drift(args: RetentionDriftArgs) -> Result<()> {
                     found.subject, found.pin.verified
                 );
                 println!("      {}", found.pin.source_url);
+                // A narrowed pin whose anchor could not be located reports the
+                // reason and NO observed digest — there is nothing honest to
+                // copy, and the fix is to re-read the page and repair the
+                // anchor, not to paste a number. Saying so here is what stops
+                // the empty `-` below from reading as a tool malfunction.
+                if let Some(error) = &found.error {
+                    println!("      THE EXTRACT COULD NOT BE TAKEN: {error}");
+                    println!(
+                        "      Re-read the page, then repair `source_extract_anchors` and re-take"
+                    );
+                    println!("      the digest together — an anchor and its digest are one claim.");
+                }
                 println!(
                     "      pinned   source_sha256 = \"{}\"",
                     found.pin.source_sha256

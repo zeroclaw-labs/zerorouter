@@ -409,10 +409,17 @@ async fn model_pricing_matches_zeroclaws_model_pricing_wire_contract() {
             // would have to guess, and the guess a zero-retention brand invites
             // is the favourable one. `source_url` and `source_sha256` stay off
             // the wire: they are the operator's verification trail, not a claim.
+            // `verified` moves whenever a human re-reads the policy page and
+            // re-pins, which is a real change to what customers are told — the
+            // date is on the wire precisely so a stale claim is visible — so it
+            // is pinned here rather than skipped. Bumped 2026-08-21 when the
+            // OpenAI pin was re-verified and narrowed to a bounded extract
+            // (`source_extract_anchors`); the posture and description are
+            // unchanged, only the date this evidence was last read.
             "retention": {
                 "posture": "standard",
                 "description": "OpenAI retains API inputs and outputs in abuse-monitoring logs for up to 30 days, unless longer retention is required by law; API data is not used to train its models.",
-                "verified": "2026-08-20",
+                "verified": "2026-08-21",
             },
         })
     );

@@ -823,6 +823,56 @@ declares a complete `[tiers."<id>".retention]` block. It **replaces** the
 provider pin rather than patching it, so an overriding tier states its own
 evidence and its own date.
 
+### When a page churns: `source_extract_anchors`
+
+Some vendor docs sites render their **entire site navigation** into the page's
+visible text. The digest then moves whenever that vendor publishes anything at
+all: `developers.openai.com` forced three re-pins in about two days, none of
+them touching a word about retention, and roughly 76% of Google's Vertex page
+is its API-reference navigation. Past that rate the false positive *is* the
+failure — an alarm cleared without reading is worse than no alarm, because it
+still looks like one.
+
+The fix is to narrow **what counts as the evidence**, never to lower the bar. A
+pin may declare:
+
+```toml
+source_extract_anchors = ["Your data is your data."]
+```
+
+and the digest is then taken over **2,000 characters of normalized text running
+forward from each anchor**, instead of the whole page. Navigation renders
+*ahead* of the content, so it falls outside the extract by construction and can
+churn without limit. Inside the window nothing is relaxed: a reworded sentence
+moves the digest exactly as it always did.
+
+Rules worth knowing before you write one:
+
+- **Each anchor must appear exactly once**, matched **case-sensitively**. Zero
+  occurrences or more than one is reported as `PAGE CHANGED` with **no observed
+  digest offered**, because an extractor that has lost its anchor knows nothing
+  about the page and a digest printed there would pin the claim to nothing.
+- **Case-sensitive is deliberate.** Vertex's page carries the heading `Training
+  restriction` directly above a quotation of the contractual term `"Training
+  Restriction"` — matched case-insensitively that anchor is ambiguous and the
+  pin reddens on a page nobody edited.
+- **Prefer distinctive prose over short headings**, and prefer anchors with no
+  apostrophes or typographic quotes: a CMS switching `won't` from a straight to
+  a curly quote would redden the pin for a purely typographic change.
+- **Use several anchors when the facts are scattered.** Vertex needs three, one
+  per region its four commitments live in. Every anchor must resolve, or the
+  whole extract fails — a partial extract would silently narrow the evidence
+  further than you declared.
+- **An anchor and its digest are one claim.** Adding, removing or editing an
+  anchor invalidates the digest beside it; re-take both together.
+- **Check what the window actually covers** before pinning. Read the extracted
+  region and confirm every sentence your `description` rests on is inside it. A
+  window that has slipped off the evidence still reports `UNCHANGED` forever.
+
+Pins that declare no anchors keep hashing the whole page, which is right for a
+page whose visible text *is* its policy — there is nothing to narrow, and an
+anchor would add a failure mode for no benefit.
+
 ### What the drift check does and does not mean
 
 `admin retention-drift` fetches each pinned `source_url`, reduces it to visible

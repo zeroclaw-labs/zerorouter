@@ -459,7 +459,39 @@ pub struct RetentionPin {
     /// SHA-256 of the normalized visible text of `source_url` as of `verified`.
     /// `retention-drift` re-fetches and compares; a mismatch means the page
     /// changed and a human must look, never that the posture flipped.
+    ///
+    /// What exactly is hashed depends on [`Self::source_extract_anchors`]: with
+    /// no anchors this is the whole page's normalized text, and with anchors it
+    /// is the bounded extract they select. The two are not comparable, so
+    /// adding, removing, or editing an anchor invalidates the digest beside it
+    /// and both must be re-taken together.
     pub source_sha256: String,
+    /// Phrases that select the BOUNDED REGIONS of the page this pin's evidence
+    /// actually lives in. Empty (the default) hashes the whole page.
+    ///
+    /// The problem this solves is specific and was predicted in
+    /// `[retention.openai]`'s own comment before it was built. A vendor docs
+    /// app renders its entire site navigation into the page's visible text, so
+    /// the whole-page digest moves whenever that vendor publishes ANY unrelated
+    /// document. `developers.openai.com` churned three times in two days on
+    /// deploys that touched nothing about retention, and a check that cries
+    /// wolf that often is one a team stops reading — which is strictly worse
+    /// than no check, because it still looks like one.
+    ///
+    /// Narrowing the evidence is the fix the comment named, and the ONLY safe
+    /// direction: it never lowers the bar for what counts as unchanged inside
+    /// the region, it just stops asking about text that was never evidence.
+    /// Each anchor must appear EXACTLY ONCE in the normalized page, matched
+    /// case-sensitively; zero occurrences or more than one is reported as
+    /// `PAGE CHANGED` rather than hashed around, because an anchor that has
+    /// vanished or gone ambiguous means the extractor no longer knows where the
+    /// evidence is. See [`crate::retention::extract`] for the whole argument.
+    ///
+    /// Opt-in per pin on purpose. A page whose whole visible text is its policy
+    /// is better hashed entire — there is nothing to narrow, and an anchor
+    /// would add a failure mode for no benefit.
+    #[serde(default)]
+    pub source_extract_anchors: Vec<String>,
     /// This provider's slug in OpenRouter's provider directory, when one
     /// corresponds. Advisory only — it feeds the corroboration pass and can
     /// never change an exit code.
@@ -1555,6 +1587,22 @@ fn validate_retention_pin(subject: &str, pin: &RetentionPin) -> Result<(), TierC
         return Err(TierConfigError::InvalidRetentionDigest {
             subject: subject.to_owned(),
             digest: pin.source_sha256.clone(),
+        });
+    }
+    // A blank anchor is refused here rather than left to the extractor. It
+    // would match at every character boundary, so the extractor would report it
+    // as ambiguous and the pin would be permanently red for what is plainly an
+    // authoring accident — and a permanently red pin is one nobody reads. The
+    // rest of this function refuses fields that assert a claim with no evidence
+    // behind them; an anchor pointing nowhere is the same fault.
+    if pin
+        .source_extract_anchors
+        .iter()
+        .any(|anchor| anchor.trim().is_empty())
+    {
+        return Err(TierConfigError::IncompleteRetentionPin {
+            subject: subject.to_owned(),
+            field: "source_extract_anchors",
         });
     }
     Ok(())
