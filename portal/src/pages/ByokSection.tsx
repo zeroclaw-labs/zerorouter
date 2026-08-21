@@ -61,6 +61,14 @@ export function ByokSection() {
   const [attaching, setAttaching] = useState(false)
   const [confirming, setConfirming] = useState<string | null>(null)
   const [removing, setRemoving] = useState<string | null>(null)
+  const [toggling, setToggling] = useState<string | null>(null)
+  // The fallback switch is rendered optimistically and reverted if the server
+  // refuses. It deliberately does NOT `keys.reload()` on success: reload puts
+  // the whole panel back into its loading state, so every toggle would blank
+  // the table the customer is reading — and the one field that changed is the
+  // one they just set. A refusal is the only case where the server knows
+  // something the page does not, and that path puts the switch back.
+  const [fallbackOverride, setFallbackOverride] = useState<Record<string, boolean>>({})
 
   if (offered.length === 0) return null
 
@@ -99,6 +107,11 @@ export function ByokSection() {
     setRemoving(key.provider)
     try {
       await api.removeByokKey(key.provider)
+      setFallbackOverride((current) => {
+        const next = { ...current }
+        delete next[key.provider]
+        return next
+      })
       toast(`${providerLabel(key.provider)} key removed. Those models bill at catalog rates again.`, 'success')
       keys.reload()
     } catch (err) {
@@ -107,6 +120,36 @@ export function ByokSection() {
       setRemoving(null)
       setConfirming(null)
     }
+  }
+
+  async function toggleFallback(key: ByokKey, enabled: boolean) {
+    setToggling(key.provider)
+    setFallbackOverride((current) => ({ ...current, [key.provider]: enabled }))
+    try {
+      await api.setByokFallback(key.provider, enabled)
+      // The confirmation restates the PRICE rather than the state, because the
+      // state is visible in the checkbox and the price is not.
+      toast(
+        enabled
+          ? `If your ${providerLabel(key.provider)} key fails, we will retry on ours and bill those attempts at full catalog price.`
+          : `${providerLabel(key.provider)} requests will now fail rather than fall back to our key.`,
+        'success',
+      )
+    } catch (err) {
+      // Put it back. A switch left showing a setting the server did not accept
+      // would be telling the customer something false about what their next
+      // request costs.
+      setFallbackOverride((current) => ({ ...current, [key.provider]: !enabled }))
+      toast(err instanceof Error ? err.message : 'Could not change the fallback setting.', 'error')
+    } finally {
+      setToggling(null)
+    }
+  }
+
+  /** What the switch shows: the pending local value while one is in flight,
+   * and the server's answer otherwise. */
+  function fallbackFor(key: ByokKey): boolean {
+    return fallbackOverride[key.provider] ?? key.fallback_enabled
   }
 
   return (
@@ -197,6 +240,7 @@ export function ByokSection() {
               <th>Fingerprint</th>
               <th>Attached</th>
               <th>Last used</th>
+              <th>Fallback</th>
               <th className="num" aria-label="Actions" />
             </tr>
           </thead>
@@ -209,6 +253,27 @@ export function ByokSection() {
                 <td className="dim nowrap">{formatTime(k.created_at)}</td>
                 <td className="dim nowrap">
                   {k.last_used_at !== null ? formatTime(k.last_used_at) : <Badge tone="neutral">never</Badge>}
+                </td>
+                <td>
+                  {/* The consequence is stated on the control itself, not only
+                      in the copy above it: this checkbox decides whether a
+                      failed request is re-dispatched at twenty times the price
+                      the rest of this panel is about, and a customer should not
+                      have to scroll to find that out. */}
+                  <label className="byok-fallback">
+                    <input
+                      type="checkbox"
+                      aria-label={`Use ZeroRouter's key if my ${providerLabel(k.provider)} key fails`}
+                      checked={fallbackFor(k)}
+                      disabled={toggling === k.provider}
+                      onChange={(e) => void toggleFallback(k, e.target.checked)}
+                    />{' '}
+                    <span className="dim">
+                      Use ours if mine fails —{' '}
+                      <strong>those attempts bill at full catalog price, not {BYOK_FEE_LABEL}</strong>,
+                      and do not use your monthly allowance.
+                    </span>
+                  </label>
                 </td>
                 <td className="num">
                   {confirming === k.provider ? (

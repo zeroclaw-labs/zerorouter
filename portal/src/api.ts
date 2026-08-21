@@ -72,6 +72,12 @@ export interface ByokKey {
   last4: string
   created_at: string
   last_used_at: string | null
+  /** Whether a failure on this key is retried on ZeroRouter's own credential.
+   * FALSE by default and for every key attached before the option existed.
+   * Those retries bill at the FULL catalog price, not the BYOK fee, and do not
+   * draw on the monthly allowance — which is why the control that sets this
+   * says so on itself. */
+  fallback_enabled: boolean
 }
 
 /** The reset cadences a key's credit limit can use; `null` never resets. */
@@ -304,6 +310,10 @@ export const api = {
     request<ByokKey>('POST', '/api/byok', { provider, api_key: apiKey }),
   removeByokKey: (provider: string) =>
     request<void>('DELETE', `/api/byok/${encodeURIComponent(provider)}`),
+  // Sends the state it wants rather than "flip it", so a retried request lands
+  // on the same setting the customer clicked instead of its opposite.
+  setByokFallback: (provider: string, enabled: boolean) =>
+    request<void>('PATCH', `/api/byok/${encodeURIComponent(provider)}`, { enabled }),
   ledger: (limit: number) =>
     request<{ limit: number; entries: LedgerEntry[] }>(
       'GET',

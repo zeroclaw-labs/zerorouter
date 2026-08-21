@@ -832,6 +832,7 @@ async fn migration_chain_applies_on_a_fresh_database() {
         bool,
         bool,
         bool,
+        bool,
         i64,
     )> = async {
         let pool = PgPoolOptions::new()
@@ -1119,6 +1120,24 @@ async fn migration_chain_applies_on_a_fresh_database() {
         )
         .fetch_one(&pool)
         .await?;
+        // 0028: the per-key fallback opt-in. NOT NULL DEFAULT FALSE is the
+        // whole assertion — a nullable column, or one defaulting TRUE, would
+        // silently revoke #103's no-fallback promise for every credential
+        // attached before this migration and start billing their owners at the
+        // full catalog price without being asked.
+        let byok_fallback_defaults_off = query_scalar::<_, bool>(
+            r#"
+            SELECT EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_name = 'byok_provider_keys'
+                  AND column_name = 'fallback_enabled'
+                  AND is_nullable = 'NO'
+                  AND column_default = 'false'
+            )
+            "#,
+        )
+        .fetch_one(&pool)
+        .await?;
         let version = query_scalar::<_, i64>("SELECT MAX(version) FROM _sqlx_migrations")
             .fetch_one(&pool)
             .await?;
@@ -1145,6 +1164,7 @@ async fn migration_chain_applies_on_a_fresh_database() {
             key_limit_columns_are_nullable_with_no_default,
             byok_keys_exist,
             byok_allowance_exists,
+            byok_fallback_defaults_off,
             version,
         ))
     }
@@ -1260,16 +1280,22 @@ async fn migration_chain_applies_on_a_fresh_database() {
          commitment on usage_reservations — and 0019's accrual function has \
          been replaced with one that actually accrues the new column"
     );
-    // 27, not 23: 0013 (dispute resolution), 0014 (dispatched reservations),
+    assert!(
+        outcome.21,
+        "the 0028 fallback opt-in column exists and is NOT NULL DEFAULT FALSE — \
+         a key attached under #103's no-fallback promise must not have it \
+         revoked by a migration"
+    );
+    // 28, not 24: 0013 (dispute resolution), 0014 (dispatched reservations),
     // 0015 (released reservations), 0016 (deposit fee), 0017 (stripe observed
     // reversals), 0018 (autopay withheld state), 0019 (monthly spend rollup),
     // 0020 (usage gap and real finish reason), 0021 (autopay tax), 0022
     // (checkout intent cleanup), 0023 (key expiry and credit limits), 0024
     // (autopay tax lifecycle), 0025 (redemption tax), 0026 (byok provider
-    // keys) and 0027 (byok monthly allowance) are numbered with a gap so
-    // 0010-0012 stay available to branches in flight. The chain's head is the
-    // highest version applied, not a count of files.
-    assert_eq!(outcome.21, 27, "the chain reaches migration version 27");
+    // keys), 0027 (byok monthly allowance) and 0028 (byok fallback opt in) are
+    // numbered with a gap so 0010-0012 stay available to branches in flight.
+    // The chain's head is the highest version applied, not a count of files.
+    assert_eq!(outcome.22, 28, "the chain reaches migration version 28");
 }
 
 /// Rewrite the database name in a Postgres URL, keeping any query string

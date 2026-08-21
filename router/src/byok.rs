@@ -379,6 +379,15 @@ pub struct StoredKey {
     pub last4: String,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub last_used_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Whether the customer has asked ZeroRouter to retry on its OWN credential
+    /// when this key fails upstream (migration 0028).
+    ///
+    /// `false` is #103's structural no-fallback default and is what every key
+    /// carries until its owner ticks the box. It is displayed rather than
+    /// merely stored because the consequence is a bill: a fallback attempt is a
+    /// house dispatch at the full catalog price, so a customer has to be able
+    /// to see, on the page, which of their keys are in that state.
+    pub fallback_enabled: bool,
 }
 
 /// A stable, non-reversible label for a credential.
@@ -458,8 +467,17 @@ pub async fn attach_key(
     let sealed = keyring.seal(user_id, provider, credential)?;
     let fingerprint = fingerprint(credential);
     let last4 = last4(credential);
-    let (created_at,) = sqlx::query_as::<_, (chrono::DateTime<chrono::Utc>,)>(
-        r#"
+    // `fallback_enabled` is deliberately ABSENT from the DO UPDATE list. Every
+    // other column here describes the credential and is replaced with it;
+    // fallback is a PREFERENCE about what should happen when the credential
+    // fails, and rotating a key is not withdrawing it. A customer who pasted a
+    // replacement and silently lost their opt-in would discover it as an
+    // outage, and the reverse default — carrying an opt-in onto a key attached
+    // by someone who never asked for one — cannot happen either, because a
+    // brand-new row takes the column's FALSE default.
+    let (created_at, fallback_enabled) =
+        sqlx::query_as::<_, (chrono::DateTime<chrono::Utc>, bool)>(
+            r#"
         INSERT INTO byok_provider_keys (
             user_id, provider, sealed_credential, fingerprint, last4
         )
@@ -470,23 +488,47 @@ pub async fn attach_key(
             last4             = EXCLUDED.last4,
             created_at        = NOW(),
             last_used_at      = NULL
-        RETURNING created_at
+        RETURNING created_at, fallback_enabled
         "#,
-    )
-    .bind(user_id)
-    .bind(provider)
-    .bind(&sealed)
-    .bind(&fingerprint)
-    .bind(&last4)
-    .fetch_one(pool)
-    .await?;
+        )
+        .bind(user_id)
+        .bind(provider)
+        .bind(&sealed)
+        .bind(&fingerprint)
+        .bind(&last4)
+        .fetch_one(pool)
+        .await?;
     Ok(StoredKey {
         provider: provider.to_owned(),
         fingerprint,
         last4,
         created_at,
         last_used_at: None,
+        fallback_enabled,
     })
+}
+
+/// Turn the house-credential fallback on or off for one attached key.
+///
+/// Returns whether a row was updated, so a caller can tell "changed" from "this
+/// customer has no key for that provider" without a second query — the same
+/// shape [`remove_key`] uses, and for the same reason.
+pub async fn set_fallback(
+    pool: &PgPool,
+    user_id: Uuid,
+    provider: &str,
+    enabled: bool,
+) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(
+        "UPDATE byok_provider_keys SET fallback_enabled = $3 \
+         WHERE user_id = $1 AND provider = $2",
+    )
+    .bind(user_id)
+    .bind(provider)
+    .bind(enabled)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() > 0)
 }
 
 /// Every credential this user has attached, without opening any of them.
@@ -503,10 +545,11 @@ pub async fn list_keys(pool: &PgPool, user_id: Uuid) -> Result<Vec<StoredKey>, s
             String,
             chrono::DateTime<chrono::Utc>,
             Option<chrono::DateTime<chrono::Utc>>,
+            bool,
         ),
     >(
         r#"
-        SELECT provider, fingerprint, last4, created_at, last_used_at
+        SELECT provider, fingerprint, last4, created_at, last_used_at, fallback_enabled
         FROM byok_provider_keys
         WHERE user_id = $1
         ORDER BY provider
@@ -518,12 +561,15 @@ pub async fn list_keys(pool: &PgPool, user_id: Uuid) -> Result<Vec<StoredKey>, s
     Ok(rows
         .into_iter()
         .map(
-            |(provider, fingerprint, last4, created_at, last_used_at)| StoredKey {
-                provider,
-                fingerprint,
-                last4,
-                created_at,
-                last_used_at,
+            |(provider, fingerprint, last4, created_at, last_used_at, fallback_enabled)| {
+                StoredKey {
+                    provider,
+                    fingerprint,
+                    last4,
+                    created_at,
+                    last_used_at,
+                    fallback_enabled,
+                }
             },
         )
         .collect())
@@ -549,11 +595,35 @@ pub async fn remove_key(pool: &PgPool, user_id: Uuid, provider: &str) -> Result<
 /// Admission needs this and only this: the fee a request reserves against
 /// depends on WHICH providers are covered, not on the credentials themselves.
 /// Keeping the two lookups separate means the reservation path never decrypts.
-pub async fn covered_providers(pool: &PgPool, user_id: Uuid) -> Result<Vec<String>, sqlx::Error> {
-    sqlx::query_scalar::<_, String>("SELECT provider FROM byok_provider_keys WHERE user_id = $1")
-        .bind(user_id)
-        .fetch_all(pool)
-        .await
+/// The fallback opt-in rides along because the RESERVATION depends on it
+/// (migration 0028): a provider whose key may fall back to the house credential
+/// can settle at the full catalog price, so the request has to be sized for
+/// that, and admission must learn it from the same read that tells it the
+/// provider is covered at all. Two reads could disagree; one cannot.
+pub async fn covered_providers(pool: &PgPool, user_id: Uuid) -> Result<Vec<Coverage>, sqlx::Error> {
+    let rows = sqlx::query_as::<_, (String, bool)>(
+        "SELECT provider, fallback_enabled FROM byok_provider_keys WHERE user_id = $1",
+    )
+    .bind(user_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(provider, fallback_enabled)| Coverage {
+            provider,
+            fallback_enabled,
+        })
+        .collect())
+}
+
+/// One provider the customer holds a key for, as admission needs to see it:
+/// which provider, and whether a failure there may be retried on ZeroRouter's
+/// own credential. Never the credential — this is the read that deliberately
+/// does not decrypt.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Coverage {
+    pub provider: String,
+    pub fallback_enabled: bool,
 }
 
 /// Open every credential this user has attached, for one request's dispatch.
@@ -574,17 +644,18 @@ pub async fn open_credentials(
     pool: &PgPool,
     keyring: &Keyring,
     user_id: Uuid,
-) -> Result<Vec<(String, String)>, sqlx::Error> {
-    let rows = sqlx::query_as::<_, (String, Vec<u8>)>(
-        "SELECT provider, sealed_credential FROM byok_provider_keys WHERE user_id = $1",
+) -> Result<Vec<(String, String, bool)>, sqlx::Error> {
+    let rows = sqlx::query_as::<_, (String, Vec<u8>, bool)>(
+        "SELECT provider, sealed_credential, fallback_enabled \
+         FROM byok_provider_keys WHERE user_id = $1",
     )
     .bind(user_id)
     .fetch_all(pool)
     .await?;
     let mut opened = Vec::with_capacity(rows.len());
-    for (provider, sealed) in rows {
+    for (provider, sealed, fallback_enabled) in rows {
         match keyring.open(user_id, &provider, &sealed) {
-            Ok(credential) => opened.push((provider, credential)),
+            Ok(credential) => opened.push((provider, credential, fallback_enabled)),
             Err(_) => {
                 // No credential, no ciphertext, no user id in the event: the
                 // provider and the fact of the failure are the whole

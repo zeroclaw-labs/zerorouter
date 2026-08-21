@@ -127,6 +127,41 @@ impl FailureClass {
         matches!(self, Self::RateLimited | Self::RateLimitedNonRetryable)
     }
 
+    /// Whether a BYOK attempt that failed this way may be retried on
+    /// ZeroRouter's own credential, for a customer who opted in (migration
+    /// 0028).
+    ///
+    /// # Why exactly one class is excluded
+    ///
+    /// The opt-in says "use your key if MINE fails", and every class here is a
+    /// failure of the customer's key at the upstream — a 401 from a revoked
+    /// credential, a 5xx, a timeout, a live 429 — except one.
+    ///
+    /// [`Self::RateLimitedNonRetryable`] is the 429 whose body says the ACCOUNT
+    /// cannot pay: an exhausted quota, an unfunded balance, a plan that
+    /// excludes the model ([`is_non_retryable_rate_limit`]). Falling back there
+    /// would take a customer whose own provider account has run dry and start
+    /// serving them at the full catalog price out of their ZeroRouter balance —
+    /// converting their vendor's spending limit into a ZeroRouter bill, without
+    /// them asking, at exactly the moment their own controls were trying to
+    /// stop them spending. That is the surprise-bill #103's no-fallback rule
+    /// exists to prevent, and an opt-in about reliability is not consent to it.
+    ///
+    /// A customer who wants that behaviour can detach the key. The refusal is
+    /// deliberately not configurable: it is the one case where the customer's
+    /// own cost control is the thing being overridden.
+    ///
+    /// [`Self::RetentionAttestation`] cannot occur on a BYOK attempt at all —
+    /// the house attestation is not asserted on one ([`crate::providers`]) — so
+    /// its value here is unreachable rather than chosen. It is written as
+    /// permitted because the class means "this upstream would not promise what
+    /// ZeroRouter sells", which is precisely a reason to try the house lane
+    /// where that promise IS ZeroRouter's to make and IS checked.
+    #[must_use]
+    pub fn permits_byok_fallback(self) -> bool {
+        !matches!(self, Self::RateLimitedNonRetryable)
+    }
+
     /// The `request_attempts.outcome` for an attempt that failed this way.
     /// Every value is admitted by `request_attempts_outcome_is_known`
     /// (migration 0004) — an unknown string would abort the settle

@@ -512,6 +512,30 @@ test('a provider key can be attached, is shown only by fingerprint, and is never
   expect(String(attached?.fingerprint)).toHaveLength(16)
   expect(attached?.last4).toBe(providerKey.slice(-4))
 
+  // The fallback opt-in renders OFF, and the control states the consequence on
+  // itself. Both halves matter: a customer must be able to see that the default
+  // is no-fallback, and must not have to go looking for what turning it on
+  // costs.
+  const fallback = row.getByRole('checkbox', { name: /use zerorouter's key if my anthropic key fails/i })
+  await expect(fallback).toBeVisible()
+  await expect(fallback).not.toBeChecked()
+  await expect(row).toContainText(/those attempts bill at full catalog price, not 5%/i)
+  await expect(row).toContainText(/do not use your monthly allowance/i)
+
+  // Turning it on persists, and the server is the thing that says so — a
+  // checkbox that only looked checked would be the failure worth catching.
+  await fallback.check()
+  await expect(fallback).toBeChecked()
+  const attachedKeys = await page.evaluate(async () => {
+    const res = await fetch('/api/byok')
+    return (await res.json()) as { keys: Array<Record<string, unknown>> }
+  })
+  expect(attachedKeys.keys.find((k) => k.provider === 'anthropic')?.fallback_enabled).toBe(true)
+
+  // And off again, because an opt-in you cannot withdraw is not one.
+  await fallback.uncheck()
+  await expect(fallback).not.toBeChecked()
+
   // And it can be taken away again, which is the promise that makes attaching
   // one reasonable in the first place.
   await row.getByRole('button', { name: /^remove$/i }).click()

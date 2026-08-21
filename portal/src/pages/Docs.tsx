@@ -661,13 +661,40 @@ export function Docs() {
         your credit ledger.
       </p>
       <p>
-        <strong>There is no fallback to our key.</strong> If a request dispatches to a provider you
-        have attached a key for, it uses that key or it fails with an error naming the reason. We
-        will not quietly serve it on ZeroRouter&rsquo;s credential and bill you the full catalog
-        price for a request you expected to pay 5% on. A walk that fails over to a{' '}
-        <em>different</em> provider — one you have not attached a key for — is served on our
-        credential and billed at catalog, which is the ordinary case and is what the response
-        metadata lets you tell apart.
+        <strong>There is no fallback to our key, unless you ask for one.</strong> By default, if a
+        request dispatches to a provider you have attached a key for, it uses that key or it fails
+        with an error naming the reason. We will not quietly serve it on ZeroRouter&rsquo;s
+        credential and bill you the full catalog price for a request you expected to pay 5% on. A
+        walk that fails over to a <em>different</em> provider — one you have not attached a key for
+        — is served on our credential and billed at catalog, which is the ordinary case and is what
+        the response metadata lets you tell apart.
+      </p>
+      <p>
+        Each attached key has a <strong>&ldquo;use ZeroRouter&rsquo;s key if mine fails&rdquo;</strong>{' '}
+        switch, off until you turn it on. With it on, a request whose dispatch to that provider
+        fails at the upstream — a revoked or mistyped key, a 5xx, a timeout, a rate limit — is
+        retried once on our credential. <strong>Those retries are billed at the full catalog
+        price</strong>, not at 5%, and they do not draw on your monthly allowance: they are ordinary
+        house dispatches that happen to have been preceded by an attempt on your key. The response
+        says which happened — <code>{'"zerorouter": { "byok_fallback": true }'}</code> — and{' '}
+        <code>byok</code> is absent on those responses, because the request did <em>not</em> run on
+        your credential.
+      </p>
+      <p>
+        One failure is deliberately excluded: if your provider refuses the request because{' '}
+        <em>your account cannot pay</em> — an exhausted quota, an unfunded balance, a plan that does
+        not include the model — we do <em>not</em> fall back. Turning your own vendor&rsquo;s
+        spending limit into a ZeroRouter bill is not what &ldquo;if my key fails&rdquo; means, and
+        it would override the cost control you set up on purpose. Those requests fail, as they do
+        with fallback off.
+      </p>
+      <p>
+        Because a fallback attempt is <em>our</em> dispatch, our retention posture applies to it —
+        including the lanes we sell with a per-response zero-retention assertion, which is checked
+        on the fallback attempt and will refuse it if the upstream will not attest. Your own attempt
+        stays exempt, as described below. Turning the switch on also changes what we hold from your
+        balance while a request is in flight: the request could end at the catalog price, so it is
+        reserved at the catalog price, and the difference is released when it settles.
       </p>
       <p>
         <strong>Retention is governed by your agreement, not ours.</strong> This is the part worth

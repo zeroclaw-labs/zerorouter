@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     convert::Infallible,
     path::{Path, PathBuf},
     sync::{
@@ -101,6 +101,23 @@ struct RequestFeatures {
     /// every fallback-chain terminal — prices at catalog, which is correct,
     /// because nothing was dispatched on a customer key.
     byok_served: bool,
+    /// Whether the attempt this settle site is about to record is the
+    /// house-credential FALLBACK for a customer key that failed (migration
+    /// 0028).
+    ///
+    /// Distinct from `byok_served` rather than a third state of it, because the
+    /// two answer different questions and a customer needs both: `byok_served`
+    /// is "whose contract governs this traffic" and is FALSE here — a fallback
+    /// attempt is ZeroRouter's dispatch, under ZeroRouter's agreement, with
+    /// ZeroRouter's retention attestation asserted on it. This flag is "your
+    /// key was tried first and did not answer", which is what explains an
+    /// invoice line at the full catalog price on a request the customer
+    /// expected to pay 5% on.
+    ///
+    /// It is disclosure only. Nothing prices from it — the price follows
+    /// `byok_served`, which is already false — so it cannot drift away from the
+    /// charge it explains.
+    byok_fallback_served: bool,
 }
 
 impl RequestFeatures {
@@ -122,6 +139,7 @@ impl RequestFeatures {
             knob_engaged: priority.engaged,
             estimate,
             byok_served: false,
+            byok_fallback_served: false,
         }
     }
 
@@ -136,6 +154,11 @@ impl RequestFeatures {
     fn on_candidate(self, candidate: &ProviderCandidate) -> Self {
         Self {
             byok_served: candidate.is_byok(),
+            // Read from the same candidate in the same expression as the flag
+            // above, so the price and the explanation always describe one
+            // attempt. A fallback twin is never `is_byok`, so these two are
+            // never both true.
+            byok_fallback_served: candidate.byok_fallback_for().is_some(),
             ..self
         }
     }
@@ -187,20 +210,27 @@ fn zerorouter_block(
     features: RequestFeatures,
     attempts: &WalkLedger,
 ) -> Option<ZeroRouterResponseMetadata> {
-    (features.knob_engaged || features.byok_served).then(|| ZeroRouterResponseMetadata {
-        priority: features.priority,
-        estimate: features.estimate,
-        attempts: attempts
-            .rows()
-            .iter()
-            .map(|row| ZeroRouterAttempt {
-                candidate: row.candidate_id.clone(),
-                outcome: row.outcome.clone(),
-                latency_ms: row.latency_ms,
-            })
-            .collect(),
-        validated: None,
-        byok: features.byok_served,
+    // The fallback is the third reason the block appears, and the most
+    // load-bearing of them: a customer whose key failed is being billed at the
+    // FULL catalog price on a request they expected to pay 5% on, and the
+    // response is the only place they learn that at the time it happens.
+    (features.knob_engaged || features.byok_served || features.byok_fallback_served).then(|| {
+        ZeroRouterResponseMetadata {
+            priority: features.priority,
+            estimate: features.estimate,
+            attempts: attempts
+                .rows()
+                .iter()
+                .map(|row| ZeroRouterAttempt {
+                    candidate: row.candidate_id.clone(),
+                    outcome: row.outcome.clone(),
+                    latency_ms: row.latency_ms,
+                })
+                .collect(),
+            validated: None,
+            byok: features.byok_served,
+            byok_fallback: features.byok_fallback_served,
+        }
     })
 }
 
@@ -992,18 +1022,28 @@ impl RouterServices {
     /// the honest failure direction here is the HOUSE rate: a request that
     /// cannot confirm the customer's coverage must reserve the larger amount,
     /// never the smaller one.
-    async fn byok_covered_providers(&self, user_id: uuid::Uuid) -> BTreeSet<String> {
+    /// Each covered provider maps to that key's fallback opt-in (migration
+    /// 0028), because the reservation depends on it: a key that may fall back
+    /// to the house credential can settle at the FULL catalog price, so the
+    /// request has to be sized for that possibility. Carried on the same read
+    /// rather than fetched separately — two reads could disagree about a key
+    /// that changed between them, and the disagreement would show up as an
+    /// under-reserved house dispatch.
+    async fn byok_covered_providers(&self, user_id: uuid::Uuid) -> BTreeMap<String, bool> {
         if self.byok.is_none() {
-            return BTreeSet::new();
+            return BTreeMap::new();
         }
         match crate::byok::covered_providers(&self.pool, user_id).await {
-            Ok(providers) => providers.into_iter().collect(),
+            Ok(providers) => providers
+                .into_iter()
+                .map(|coverage| (coverage.provider, coverage.fallback_enabled))
+                .collect(),
             Err(error) => {
                 tracing::warn!(
                     error = %error,
                     "could not read BYOK coverage; pricing this request at catalog rates"
                 );
-                BTreeSet::new()
+                BTreeMap::new()
             }
         }
     }
@@ -1015,7 +1055,7 @@ impl RouterServices {
             return ByokCredentials::default();
         };
         match crate::byok::open_credentials(&self.pool, keyring, user_id).await {
-            Ok(pairs) => ByokCredentials::new(pairs),
+            Ok(pairs) => ByokCredentials::with_fallback(pairs),
             Err(error) => {
                 // The house lane is the fallback for a READ failure, which is
                 // not the same as the "no silent fallback" rule: that rule is
@@ -1938,8 +1978,35 @@ async fn run_non_streaming(
     // feeds the health registry — the single funnel, so no terminal can
     // record an outcome health does not see.
     let mut attempts = WalkLedger::new(health.clone());
+    // Which providers' opted-in house fallback this walk has EARNED the right
+    // to use (migration 0028). Empty until a BYOK attempt actually fails in a
+    // way the opt-in covers, so the twin rung is closed by default and a route
+    // that never dispatched the customer's key can never reach it.
+    let mut byok_fallback_armed = BTreeSet::<String>::new();
 
     'walk: for (position, candidate) in candidates.iter().enumerate() {
+        // The opted-in fallback rung, skipped unless its own BYOK twin has run
+        // and failed in a way the opt-in covers. A house dispatch bills at the
+        // FULL catalog price, so reaching this rung without that having
+        // happened would be exactly the surprise bill #103's no-fallback rule
+        // exists to prevent — and `policy_skipped` is the honest ledger word
+        // for a rung a policy declined to dispatch, which is what this is.
+        if let Some(provider) = candidate.byok_fallback_for()
+            && !byok_fallback_armed.contains(provider)
+        {
+            attempts.push(build_attempt(
+                attempts.len() + 1,
+                candidate.definition(),
+                "policy_skipped",
+                false,
+                Instant::now(),
+                AttemptTokens::unknown(),
+                false,
+                None,
+                None,
+            ));
+            continue;
+        }
         // The walk-time health backstop. Since stage 3a, demotion's first
         // line is `order_candidates` sinking a cooling or error-heavy rung
         // to the back of the route, so a demoted rung is normally never
@@ -2154,6 +2221,17 @@ async fn run_non_streaming(
             // was not honoured.
             if matches!(class, retry::FailureClass::RetentionAttestation) {
                 retention_attestation_failed = true;
+            }
+            // The customer's own key just failed at the upstream. If they asked
+            // for a house retry and this failure is one the opt-in covers, arm
+            // the twin rung waiting behind this one
+            // (`FailureClass::permits_byok_fallback` for the single class it is
+            // not). Arming is latched for the rest of the walk, like the
+            // retention flag above: a per-candidate retry that eventually gives
+            // up has still failed, and the twin is what the customer asked for
+            // in that case.
+            if candidate.is_byok() && class.permits_byok_fallback() {
+                byok_fallback_armed.insert(candidate.definition().provider.clone());
             }
             attempts.push(build_attempt(
                 attempt_no,
@@ -2656,8 +2734,30 @@ async fn stream_to_channel(
     // Pushing a row is also what feeds the health registry — the same single
     // funnel the buffered walk records through.
     let mut attempts = WalkLedger::new(health.clone());
+    // The opted-in fallback's arming set, the same rule and the same
+    // default-closed reading as the buffered walk's twin (migration 0028).
+    let mut byok_fallback_armed = BTreeSet::<String>::new();
 
     for (position, candidate) in candidates.iter().enumerate() {
+        // Checked before the client-disconnect arm below because a declined
+        // rung dispatches nothing and consumes nothing: there is no reason for
+        // a skip to depend on whether the customer is still listening.
+        if let Some(provider) = candidate.byok_fallback_for()
+            && !byok_fallback_armed.contains(provider)
+        {
+            attempts.push(build_attempt(
+                attempts.len() + 1,
+                candidate.definition(),
+                "policy_skipped",
+                false,
+                Instant::now(),
+                AttemptTokens::unknown(),
+                false,
+                None,
+                None,
+            ));
+            continue;
+        }
         if sender.is_closed() {
             if let Some(session) = usage_session.take() {
                 // The walk only re-enters this loop after a candidate that
@@ -2845,6 +2945,11 @@ async fn stream_to_channel(
                     if matches!(class, retry::FailureClass::RetentionAttestation) {
                         retention_attestation_failed = true;
                     }
+                    // Arms the opted-in house fallback, same rule as the
+                    // buffered walk (migration 0028).
+                    if candidate.is_byok() && class.permits_byok_fallback() {
+                        byok_fallback_armed.insert(candidate.definition().provider.clone());
+                    }
                     attempts.push(build_attempt(
                         attempt_no,
                         candidate.definition(),
@@ -2921,6 +3026,7 @@ async fn stream_to_channel(
         // Label-only: a broken stream falls through to the next candidate
         // whatever its text said.
         let mut stream_rate_limited = false;
+        let mut stream_account_refused = false;
         // What this candidate actually put out, folded from the deltas
         // themselves. The shape label used to be derived from
         // `usage.completion_tokens`, which is the provider's accounting rather
@@ -3045,6 +3151,13 @@ async fn stream_to_channel(
                         retention_attestation_failed = true;
                     }
                     stream_rate_limited = retry::is_rate_limited(&error);
+                    // The one failure the BYOK fallback opt-in does not cover:
+                    // a 429 whose text says the ACCOUNT cannot pay. Read here
+                    // rather than derived from `stream_rate_limited` below,
+                    // because that flag cannot tell an exhausted quota from an
+                    // ordinary burst limit, and the difference decides whether
+                    // this customer's request moves onto ZeroRouter's bill.
+                    stream_account_refused = retry::is_non_retryable_rate_limit(&error);
                     break;
                 }
             }
@@ -3211,6 +3324,15 @@ async fn stream_to_channel(
         // Nothing delivered and the stream ended without completing: record a
         // non-served failure — as the 429 it was when the failure text says so
         // — and fall through to the next candidate.
+        //
+        // This is a real upstream failure of the customer's own key with
+        // nothing delivered, so it arms the opted-in house fallback (migration
+        // 0028) exactly as the pre-stream classifier above does. Gated on the
+        // account-refusal read rather than on `stream_rate_limited`: an
+        // exhausted vendor quota must not become a ZeroRouter bill.
+        if candidate.is_byok() && !stream_account_refused {
+            byok_fallback_armed.insert(candidate.definition().provider.clone());
+        }
         attempts.push(build_attempt(
             attempt_no,
             candidate.definition(),
@@ -3905,7 +4027,7 @@ fn byok_reservation_posture(
     request: &ChatCompletionRequest,
     resolved: &ResolvedRoute,
     output_bound: u32,
-    covered: &BTreeSet<String>,
+    covered: &BTreeMap<String, bool>,
     byok_rate: Decimal,
 ) -> Result<ByokReservation, ApiError> {
     // Nothing on this route can dispatch on a customer credential, so it
@@ -3914,7 +4036,7 @@ fn byok_reservation_posture(
     if !resolved
         .candidates
         .iter()
-        .any(|candidate| covered.contains(&candidate.provider))
+        .any(|candidate| covered.contains_key(&candidate.provider))
     {
         return Ok(ByokReservation::default());
     }
@@ -3931,12 +4053,30 @@ fn byok_reservation_posture(
     })
 }
 
-fn byok_reservation_rate(resolved: &ResolvedRoute, covered: &BTreeSet<String>) -> Decimal {
+/// # Fallback generalizes "mixed" (migration 0028)
+///
+/// A candidate whose key the customer opted into falling back on is a rung that
+/// may dispatch on the CUSTOMER's credential or on ZeroRouter's, decided by
+/// whether the customer's key answers. That is the same thing a mixed route
+/// already was — two rungs at two prices — folded into one rung, and it takes
+/// the same answer for the same reason: the walk may end at the house price, so
+/// the reservation must cover the house price. Reserving 5% and settling 100%
+/// would exceed the reservation, and the settle debit is clamped to it, so the
+/// excess would not be charged at all.
+///
+/// This composes with the monthly allowance without a second rule. The
+/// allowance's zero-fee reservation requires `wholly_byok`, which is read from
+/// this function's answer — so a fallback-enabled route reports the house rate
+/// here, reports `wholly_byok: false` there, and is never eligible to reserve
+/// nothing. One quantifier, both decisions.
+fn byok_reservation_rate(resolved: &ResolvedRoute, covered: &BTreeMap<String, bool>) -> Decimal {
     if !covered.is_empty()
-        && resolved
-            .candidates
-            .iter()
-            .all(|candidate| covered.contains(&candidate.provider))
+        && resolved.candidates.iter().all(|candidate| {
+            // Covered AND not falling back. `Some(&false)` is the only arm that
+            // keeps the fee rate: an absent provider is a house rung, and a
+            // `Some(&true)` one is a rung that may become a house rung.
+            covered.get(&candidate.provider) == Some(&false)
+        })
     {
         byok::fee_rate()
     } else {
@@ -5284,8 +5424,10 @@ mod tests {
         // (`crate::db`), so a route reserved at 5% that then fails over to a
         // house rung settling at 100% would deliver inference ZeroRouter
         // cannot bill for.
-        let covered = |providers: &[&str]| -> BTreeSet<String> {
-            providers.iter().map(|p| (*p).to_owned()).collect()
+        // Covered with the fallback opt-in OFF, which is migration 0026's
+        // default and what every assertion below is about.
+        let covered = |providers: &[&str]| -> BTreeMap<String, bool> {
+            providers.iter().map(|p| ((*p).to_owned(), false)).collect()
         };
 
         // Every rung covered: the customer's own keys serve whatever the walk
@@ -5322,6 +5464,69 @@ mod tests {
         assert_eq!(
             byok_reservation_rate(&single, &covered(&["anthropic"])),
             byok::fee_rate()
+        );
+    }
+
+    #[test]
+    fn a_fallback_enabled_key_reserves_at_the_house_rate_and_forfeits_the_free_ride() {
+        // Migration 0028's composition with everything above it. A key the
+        // customer opted into falling back on is a rung that may dispatch on
+        // EITHER credential, which is what "mixed" already meant — so it takes
+        // the same answer, and it takes it even on a route where every rung is
+        // covered.
+        let with_fallback = |providers: &[(&str, bool)]| -> BTreeMap<String, bool> {
+            providers
+                .iter()
+                .map(|(provider, fallback)| ((*provider).to_owned(), *fallback))
+                .collect()
+        };
+        let single = walk_route(vec![rung_on("anthropic")]);
+
+        assert_eq!(
+            byok_reservation_rate(&single, &with_fallback(&[("anthropic", false)])),
+            byok::fee_rate(),
+            "no opt-in is #103's behaviour, unchanged"
+        );
+        assert_eq!(
+            byok_reservation_rate(&single, &with_fallback(&[("anthropic", true)])),
+            byok::house_rate(),
+            "an opted-in key can settle at the full catalog price, so it must reserve for it"
+        );
+
+        // One opted-in rung is enough to take the whole route to the house
+        // rate, exactly as one uncovered rung is.
+        let both = walk_route(vec![rung_on("anthropic"), rung_on("openai")]);
+        assert_eq!(
+            byok_reservation_rate(
+                &both,
+                &with_fallback(&[("anthropic", true), ("openai", false)])
+            ),
+            byok::house_rate()
+        );
+
+        // And the allowance's free ride is forfeited with it, because
+        // `wholly_byok` is read from this same answer rather than decided
+        // again. That is the composition the two features have to get right:
+        // a request that may settle at catalog must never reserve nothing.
+        let request = walk_request();
+        let posture = byok_reservation_posture(
+            &request,
+            &both,
+            64,
+            &with_fallback(&[("anthropic", true), ("openai", true)]),
+            byok_reservation_rate(
+                &both,
+                &with_fallback(&[("anthropic", true), ("openai", true)]),
+            ),
+        )
+        .expect("the posture must compute");
+        assert!(
+            !posture.wholly_byok,
+            "a fallback-enabled route is never eligible to reserve a zero fee"
+        );
+        assert!(
+            posture.catalog_basis.is_some(),
+            "it can still SERVE from the customer's key, so it still commits allowance"
         );
     }
 

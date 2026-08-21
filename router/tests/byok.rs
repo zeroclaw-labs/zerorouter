@@ -158,7 +158,9 @@ async fn a_stored_credential_is_not_recoverable_from_the_column() {
         .expect("opening must succeed");
     assert_eq!(
         opened,
-        vec![("anthropic".to_owned(), CUSTOMER_KEY.to_owned())]
+        // `false`: migration 0028's fallback opt-in is off until the customer
+        // asks for it, and a freshly attached key has not.
+        vec![("anthropic".to_owned(), CUSTOMER_KEY.to_owned(), false)]
     );
 }
 
@@ -584,6 +586,21 @@ async fn a_byok_dispatch_carries_the_customers_key_and_never_the_houses() {
     settles_at_five_percent_once_the_allowance_is_spent(&plain_url).await;
     settles_on_only_the_part_above_the_allowance(&plain_url).await;
     concurrent_settles_cannot_both_claim_the_last_of_the_allowance(&plain_url).await;
+
+    // 5. The opt-in fallback (migration 0028), against an upstream that refuses
+    //    the customer's key and serves ZeroRouter's. Same test, same reason:
+    //    every one of these needs the process-global base-URL override.
+    let (refusing_url, refusing_seen) = upstream_refusing_the_customer(false).await;
+    // SAFETY: as above — sequential, single test, single binary.
+    unsafe {
+        std::env::set_var("ZEROROUTER_PROVIDER_BASE_URL_GOOGLE", &refusing_url);
+    }
+    a_refused_key_fails_the_request_without_the_opt_in(&refusing_url, &refusing_seen).await;
+    an_opted_in_key_falls_back_and_is_billed_at_full_catalog(&refusing_url, &refusing_seen).await;
+    // The xai lane, whose house dispatch must attest. The upstream refuses the
+    // customer's key and serves ZeroRouter's WITHOUT the header.
+    let (refusing_unattested_url, _) = upstream_refusing_the_customer(false).await;
+    the_fallback_attempt_carries_the_house_attestation(&refusing_unattested_url).await;
 }
 
 /// The catalog price of one fixture request.
@@ -683,6 +700,100 @@ async fn consumed_allowance(pool: &PgPool, user_id: Uuid) -> Decimal {
     .fetch_one(pool)
     .await
     .expect("the allowance rollup must read")
+}
+
+/// An upstream that REFUSES the customer's key and serves ZeroRouter's.
+///
+/// The shape the fallback opt-in exists for: a customer's credential that has
+/// been revoked, expired, or mistyped. A 401 classifies as non-retryable, so the
+/// walk abandons that rung immediately rather than burning its retries — which
+/// is what makes "did the walk move to the house twin?" the only question the
+/// tests below are asking.
+///
+/// `attest` controls whether the HOUSE response carries the zero-retention
+/// header the `xai` lane is sold under, so the same helper can play both "the
+/// fallback is allowed to serve" and "the fallback must fail closed".
+async fn upstream_refusing_the_customer(attest: bool) -> (String, Arc<Mutex<Vec<Option<String>>>>) {
+    let seen: Arc<Mutex<Vec<Option<String>>>> = Arc::new(Mutex::new(Vec::new()));
+    let recorder = Arc::clone(&seen);
+    let app = axum::Router::new().route(
+        "/v1/chat/completions",
+        axum::routing::post(move |headers: axum::http::HeaderMap| {
+            let recorder = Arc::clone(&recorder);
+            async move {
+                let authorization = headers
+                    .get(axum::http::header::AUTHORIZATION)
+                    .map(|value| value.to_str().unwrap_or("<binary>").to_owned());
+                recorder
+                    .lock()
+                    .expect("recorder lock")
+                    .push(authorization.clone());
+                if authorization.as_deref() == Some(&format!("Bearer {CUSTOMER_KEY}")) {
+                    return (
+                        StatusCode::UNAUTHORIZED,
+                        axum::Json(serde_json::json!({
+                            "error": {"message": "invalid api key", "type": "invalid_request_error"}
+                        })),
+                    )
+                        .into_response();
+                }
+                let body = axum::Json(serde_json::json!({
+                    "choices": [{"message": {"role": "assistant", "content": "hi"}}],
+                    "usage": {"prompt_tokens": 3, "completion_tokens": 1}
+                }));
+                if attest {
+                    ([("x-zero-data-retention", "true")], body).into_response()
+                } else {
+                    body.into_response()
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("refusing upstream should bind");
+    let address = listener
+        .local_addr()
+        .expect("refusing upstream should report its address");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    (format!("http://{address}/v1/chat/completions"), seen)
+}
+
+/// Drive one completion and return whatever came back, refusing nothing.
+async fn attempt_completion(pool: &PgPool, plaintext: &str, model: &str) -> (StatusCode, Value) {
+    let state = RouterState::with_database(fixture("byok_tiers.toml"), pool.clone(), true)
+        .with_byok(Some(Arc::new(test_keyring())));
+    let response = app(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("authorization", format!("Bearer {plaintext}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": model,
+                        "messages": [{"role": "user", "content": "hello"}]
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("the request should complete");
+    let status = response.status();
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .expect("body should read")
+        .to_bytes();
+    (
+        status,
+        serde_json::from_slice(&body).expect("the response should be JSON"),
+    )
 }
 
 /// Drive one completion through the real HTTP path and return the response body.
@@ -927,4 +1038,233 @@ async fn concurrent_settles_cannot_both_claim_the_last_of_the_allowance(upstream
         consumed_allowance(&pool, user_id).await,
         byok::monthly_allowance() + FIXTURE_CATALOG_USD
     );
+}
+
+// ---------------------------------------------------------------------------
+// (5) The opt-in fallback (migration 0028)
+// ---------------------------------------------------------------------------
+
+/// Without the opt-in, a refused customer key fails the request. #103's
+/// structural no-fallback, still true.
+async fn a_refused_key_fails_the_request_without_the_opt_in(
+    upstream_url: &str,
+    seen: &Arc<Mutex<Vec<Option<String>>>>,
+) {
+    let Some((pool, user_id, plaintext)) = byok_customer("fallback-off", upstream_url).await else {
+        return;
+    };
+    seen.lock().expect("recorder lock").clear();
+
+    let (status, body) = attempt_completion(&pool, &plaintext, "zero/byok-plain").await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_GATEWAY,
+        "a refused key with no opt-in must fail rather than serve: {body}"
+    );
+
+    // The assertion that actually means something: ZeroRouter's own credential
+    // never went anywhere. A fallback that fired without being asked for would
+    // show up here as a second request carrying the house key.
+    let calls = seen.lock().expect("recorder lock").clone();
+    assert_eq!(
+        calls,
+        vec![Some(format!("Bearer {CUSTOMER_KEY}"))],
+        "exactly one dispatch, on the customer's key, and never on ZeroRouter's"
+    );
+    assert!(
+        !calls
+            .iter()
+            .any(|call| call.as_deref().is_some_and(|c| c.contains("ZEROROUTER"))),
+        "the house credential must not be presented for a customer who did not opt in"
+    );
+
+    // And nothing was billed, because nothing was served.
+    let settled = query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM usage_events JOIN api_keys ON api_keys.id = usage_events.api_key_id \
+         WHERE api_keys.user_id = $1 AND usage_events.status = 200",
+    )
+    .bind(user_id)
+    .fetch_one(&pool)
+    .await
+    .expect("the settled rows must count");
+    assert_eq!(settled, 0, "a failed walk serves nothing and bills nothing");
+}
+
+/// With the opt-in, the walk retries on ZeroRouter's key — and bills the FULL
+/// catalog price for it.
+async fn an_opted_in_key_falls_back_and_is_billed_at_full_catalog(
+    upstream_url: &str,
+    seen: &Arc<Mutex<Vec<Option<String>>>>,
+) {
+    let Some((pool, user_id, plaintext)) = byok_customer("fallback-on", upstream_url).await else {
+        return;
+    };
+    assert!(
+        byok::set_fallback(&pool, user_id, "google", true)
+            .await
+            .expect("the toggle must apply"),
+        "the customer has a google key to toggle"
+    );
+    seen.lock().expect("recorder lock").clear();
+
+    let (status, body) = attempt_completion(&pool, &plaintext, "zero/byok-plain").await;
+    assert_eq!(status, StatusCode::OK, "the fallback must serve: {body}");
+
+    // Both credentials went out, in that order: the customer's first, then
+    // ZeroRouter's. The order is the product — a fallback that dialled the
+    // house key first would be billing full price without ever trying the key
+    // the customer attached.
+    let calls = seen.lock().expect("recorder lock").clone();
+    assert_eq!(
+        calls,
+        vec![
+            Some(format!("Bearer {CUSTOMER_KEY}")),
+            Some(format!("Bearer {HOUSE_KEY}")),
+        ],
+        "the customer's key is tried first and the house key only after it fails"
+    );
+
+    // The honest metadata shape. `byok` is FALSE — this request was served on
+    // ZeroRouter's credential under ZeroRouter's agreement, and saying
+    // otherwise would tell the customer their own provider contract governed
+    // traffic it did not. `byok_fallback` is what explains the price.
+    assert_eq!(
+        body["zerorouter"]["byok_fallback"],
+        json!(true),
+        "a fallback response must say so: {body}"
+    );
+    assert!(
+        body["zerorouter"].get("byok").is_none(),
+        "a fallback attempt did NOT dispatch on the customer's credential: {body}"
+    );
+
+    // The price: FULL catalog, not the 5% fee and not free.
+    let (cost_usd, byok_flag, catalog) = settled_row(&pool, user_id).await;
+    assert_eq!(
+        cost_usd, FIXTURE_CATALOG_USD,
+        "a fallback attempt is a house dispatch and bills the full catalog price"
+    );
+    assert_ne!(
+        cost_usd,
+        Decimal::new(12, 7),
+        "billing a fallback at the BYOK fee would sell house inference at 5% of cost"
+    );
+    assert_ne!(
+        cost_usd,
+        Decimal::ZERO,
+        "the monthly allowance does not discount a house dispatch"
+    );
+    assert_eq!(
+        byok_flag,
+        Some(false),
+        "the metering row records a house dispatch"
+    );
+    assert_eq!(
+        catalog, None,
+        "a house dispatch records no allowance basis, so it consumes none"
+    );
+    assert_eq!(
+        consumed_allowance(&pool, user_id).await,
+        Decimal::ZERO,
+        "a fallback must not eat into the customer's free allowance"
+    );
+
+    // Exactly one attempt settled, and the walk ledger shows both rungs — the
+    // refused customer attempt and the house one that served.
+    let (attempt_count, served_count) = query_as::<_, (i64, i64)>(
+        "SELECT COUNT(*), COUNT(*) FILTER (WHERE served) FROM request_attempts \
+         WHERE user_id = $1",
+    )
+    .bind(user_id)
+    .fetch_one(&pool)
+    .await
+    .expect("the attempt rows must count");
+    assert_eq!(attempt_count, 2, "both rungs are on the record");
+    assert_eq!(
+        served_count, 1,
+        "exactly one attempt served, so exactly one attempt is priced"
+    );
+
+    // One usage debit, at the full price. No double billing.
+    let debits = query_as::<_, (i64, Decimal)>(
+        "SELECT COUNT(*), COALESCE(SUM(-amount_usd), 0) FROM credit_ledger \
+         WHERE user_id = $1 AND entry_type = 'usage'",
+    )
+    .bind(user_id)
+    .fetch_one(&pool)
+    .await
+    .expect("the ledger must count");
+    assert_eq!(debits, (1, FIXTURE_CATALOG_USD));
+
+    // The customer's key was not marked as having served anything, because it
+    // did not.
+    let listed = byok::list_keys(&pool, user_id).await.expect("list");
+    assert!(
+        listed[0].last_used_at.is_none(),
+        "a key that was refused has not served a request"
+    );
+    assert!(listed[0].fallback_enabled, "the opt-in is reported back");
+}
+
+/// The fallback attempt is a HOUSE dispatch, so the house attestation applies
+/// to it — and fails closed when the upstream will not attest.
+async fn the_fallback_attempt_carries_the_house_attestation(unattested_url: &str) {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let keyring = test_keyring();
+    let user_id = create_user(&pool, "fallback-attested").await;
+    let plaintext = generate_api_key();
+    query(
+        "INSERT INTO api_keys (id, user_id, key_hash, name, spend_cap_usd, \
+         velocity_cap_tokens_per_min) VALUES ($1, $2, $3, 'byok', 20, 1000000)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(user_id)
+    .bind(hash_api_key(&plaintext))
+    .execute(&pool)
+    .await
+    .expect("test API key must insert");
+    grant_promo(&pool, user_id, Decimal::from(50), "byok")
+        .await
+        .expect("funding promo must apply");
+    byok::attach_key(&pool, &keyring, user_id, "xai", CUSTOMER_KEY)
+        .await
+        .expect("attaching must succeed");
+    byok::set_fallback(&pool, user_id, "xai", true)
+        .await
+        .expect("the toggle must apply");
+
+    // SAFETY: sequential, inside the one env-owning test in this binary.
+    unsafe {
+        std::env::set_var("ZEROROUTER_PROVIDER_BASE_URL_XAI", unattested_url);
+    }
+
+    let (status, body) = attempt_completion(&pool, &plaintext, "zero/byok-attested").await;
+    // The customer's own attempt is refused by the upstream (401) and asserts
+    // no retention guarantee — that exemption is #103's and is untouched. The
+    // FALLBACK attempt is ZeroRouter dispatching on ZeroRouter's key, so the
+    // zero-retention guarantee this lane is sold under is ZeroRouter's to make
+    // and is checked. The upstream does not attest, so it must refuse rather
+    // than serve from a lane it cannot vouch for.
+    assert_eq!(
+        status,
+        StatusCode::BAD_GATEWAY,
+        "the fallback must fail closed on a missing house attestation: {body}"
+    );
+    assert_eq!(
+        body["error"]["code"],
+        json!("retention_attestation_failed"),
+        "and it must say WHY, rather than reporting a generic upstream failure: {body}"
+    );
+
+    let settled = query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM usage_events JOIN api_keys ON api_keys.id = usage_events.api_key_id \
+         WHERE api_keys.user_id = $1 AND usage_events.status = 200",
+    )
+    .bind(user_id)
+    .fetch_one(&pool)
+    .await
+    .expect("the settled rows must count");
+    assert_eq!(settled, 0, "nothing was served, so nothing was billed");
 }

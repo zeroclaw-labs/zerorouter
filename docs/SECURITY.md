@@ -42,7 +42,8 @@ The startup contract is: **misconfiguration aborts, absence disables.**
 | A webhook with a bad signature, stale timestamp, or unknown user credits nothing | `router/src/stripe.rs` (HMAC signature verification, tolerance window, user resolution before any ledger write) |
 | Admission under `ZEROROUTER_REQUIRE_CREDITS=true` reads the live balance under a per-**user** advisory lock in the same transaction that reserves — no cached balance exists in the admission path | `router/src/db.rs` (advisory-locked reserve) |
 | A malformed `BYOK_ENCRYPTION_KEY` aborts startup; an absent one disables bring-your-own-key and refuses attach attempts with a named reason | `router/src/byok.rs` (`Keyring::from_env`) — the same "misconfiguration aborts, absence disables" contract as the web plane |
-| A route where the customer holds keys for only SOME rungs reserves at the full catalog price, never the 5% fee: the settle debit is clamped to the reservation, so under-reserving would deliver inference ZeroRouter cannot bill for | `router/src/api.rs` (`byok_reservation_rate`) |
+| A route where the customer holds keys for only SOME rungs — or holds one whose opted-in fallback may retry on ZeroRouter's credential — reserves at the full catalog price, never the 5% fee: the settle debit is clamped to the reservation, so under-reserving would deliver inference ZeroRouter cannot bill for | `router/src/api.rs` (`byok_reservation_rate`) |
+| The monthly BYOK allowance is priced inside the settle transaction, under the same per-user advisory lock admission takes, so two concurrent settles cannot both claim the last dollar of it; a request may reserve nothing only when the allowance still covers it after subtracting what this user's in-flight requests have already committed | `router/src/db.rs` (`settle_once`, `reserves_no_byok_fee`) |
 
 ## The six designed-out failure classes
 
@@ -108,7 +109,8 @@ time, so the plaintext exists only in the claiming response.
 ## Customer-supplied provider credentials (BYOK)
 
 A customer may attach their own upstream provider API key so their traffic
-dispatches on their account and is charged 5% of the catalog price. That key
+dispatches on their account and is charged 5% of the catalog price above a
+free monthly allowance (migration 0027). That key
 is the **only reversibly-stored secret in the database**, and it is the one
 exception to the digests-only rule above. It has to be: a digest answers "is
 this the same string?", and this credential must be presented to Anthropic or

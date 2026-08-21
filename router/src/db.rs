@@ -1125,6 +1125,13 @@ pub async fn migrate(pool: &PgPool) -> Result<()> {
                 )),
                 false,
             ),
+            Migration::new(
+                28,
+                Cow::Borrowed("byok fallback opt in"),
+                MigrationType::Simple,
+                Cow::Borrowed(include_str!("../migrations/0028_byok_fallback_opt_in.sql")),
+                false,
+            ),
         ]),
         ignore_missing: false,
         locking: true,

@@ -102,7 +102,10 @@ pub fn router() -> Router<WebCtx> {
         .route("/api/usage", get(usage))
         .route("/api/billing/ledger", get(ledger))
         .route("/api/byok", get(list_byok).post(attach_byok))
-        .route("/api/byok/{provider}", delete(remove_byok))
+        .route(
+            "/api/byok/{provider}",
+            delete(remove_byok).patch(set_byok_fallback),
+        )
 }
 
 /// Static serving for the built portal SPA: files from `dist_path`, with
@@ -706,6 +709,12 @@ struct ByokKeySummary {
     last4: String,
     created_at: DateTime<Utc>,
     last_used_at: Option<DateTime<Utc>>,
+    /// Whether this key falls back to ZeroRouter's own credential when it fails
+    /// upstream (migration 0028). Returned because the consequence is a bill:
+    /// a fallback attempt is charged at the FULL catalog price, so a customer
+    /// must be able to see which of their keys are in that state without
+    /// guessing from a form control's default.
+    fallback_enabled: bool,
 }
 
 impl From<byok::StoredKey> for ByokKeySummary {
@@ -716,8 +725,18 @@ impl From<byok::StoredKey> for ByokKeySummary {
             last4: key.last4,
             created_at: key.created_at,
             last_used_at: key.last_used_at,
+            fallback_enabled: key.fallback_enabled,
         }
     }
+}
+
+/// The body of the fallback toggle. One field, and it is explicit rather than a
+/// bare toggle endpoint: a request that says which state it wants is idempotent
+/// and cannot be doubled by a retry into the opposite of what the customer
+/// clicked.
+#[derive(Deserialize)]
+struct ByokFallbackRequest {
+    enabled: bool,
 }
 
 #[derive(Serialize)]
@@ -792,6 +811,29 @@ async fn remove_byok(
     // let it be read. Refusing here would leave a sealed third-party key in the
     // database with no way to delete it from the portal.
     if !byok::remove_key(&ctx.pool, user.user_id, provider.trim()).await? {
+        return Err(PortalError::ByokKeyNotFound);
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Turn the house-credential fallback on or off for one attached key
+/// (migration 0028).
+///
+/// Tenant-scoped by the same `user_id` predicate every handler here uses, so a
+/// customer naming another customer's provider gets the same
+/// `ByokKeyNotFound` a nonexistent one gets — the refusal is not an oracle for
+/// what other tenants have attached.
+///
+/// No keyring is required. This changes a preference about what happens when a
+/// credential fails, not the credential, so it stays available on a deployment
+/// that has removed the secret — for the same reason detaching does.
+async fn set_byok_fallback(
+    State(ctx): State<WebCtx>,
+    user: PortalUser,
+    Path(provider): Path<String>,
+    Json(request): Json<ByokFallbackRequest>,
+) -> Result<StatusCode, PortalError> {
+    if !byok::set_fallback(&ctx.pool, user.user_id, provider.trim(), request.enabled).await? {
         return Err(PortalError::ByokKeyNotFound);
     }
     Ok(StatusCode::NO_CONTENT)

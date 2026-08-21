@@ -881,6 +881,31 @@ pub struct ZeroRouterResponseMetadata {
     /// follows: an absent field is the capability signal.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub byok: bool,
+    /// Whether this request was served by the opted-in HOUSE fallback after the
+    /// customer's own credential failed (migration 0028).
+    ///
+    /// # Why a second boolean and not `byok: "fallback"`
+    ///
+    /// Because `byok` already answers a question that still has a correct
+    /// answer here, and that answer is `false`. A fallback attempt dispatches
+    /// on ZeroRouter's credential, under ZeroRouter's agreement with the
+    /// provider, with ZeroRouter's per-response retention attestation asserted
+    /// on it — every consequence `byok: true` exists to warn about is untrue of
+    /// it. Widening `byok` into a three-valued string would make a field that
+    /// every existing client reads as a boolean start carrying a value they
+    /// would coerce to truthy, and they would conclude the exact opposite of
+    /// what happened: that ZeroRouter made no retention claim about traffic on
+    /// which it did.
+    ///
+    /// So `byok` keeps its meaning and its type, and this field carries the new
+    /// fact: your key was tried first and did not answer, which is why this
+    /// request is billed at the full catalog price rather than at 5% — and why
+    /// it did not draw on your monthly allowance.
+    ///
+    /// `skip_serializing_if` on the same rule as its sibling: absent on every
+    /// response that did not fall back, so nothing else changes shape.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub byok_fallback: bool,
 }
 
 /// One walk position as the customer sees it.

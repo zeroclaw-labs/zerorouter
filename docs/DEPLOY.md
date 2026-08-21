@@ -1143,7 +1143,24 @@ AmazonBedrockFoundationModels/current/us-east-1/index.json
 
 BYOK lets a customer attach their own upstream provider API key. Requests
 that dispatch to that provider go out on the customer's credential, and
-ZeroRouter charges 5% of what the usage would have cost at catalog rates.
+ZeroRouter charges 5% of what the usage would have cost at catalog rates —
+above a free allowance of **$5,000 of catalog-equivalent usage per customer
+per UTC calendar month** (migration 0027). A request that straddles the
+boundary is split: the part inside the remaining allowance is free and only
+the part above it is charged.
+
+The allowance figure lives in `router/src/byok.rs` (`monthly_allowance`), NOT
+in configuration — it decides what a customer is charged, so revising it is a
+code change and a deploy rather than an environment variable two routers could
+disagree about.
+
+Each attached key also carries an opt-in **fallback** (migration 0028), off by
+default: with it on, a request whose dispatch to that provider fails at the
+upstream is retried once on ZeroRouter's own credential and billed at the FULL
+catalog price, drawing on no allowance. The one failure it deliberately does
+not cover is the upstream saying the customer's own account cannot pay — an
+exhausted quota or unfunded balance — because falling back there would convert
+the customer's own spending limit into a ZeroRouter bill.
 
 **The feature ships dark.** With `BYOK_ENCRYPTION_KEY` unset — which is every
 deployment until an operator wires it — nothing changes: the portal shows no
