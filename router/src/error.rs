@@ -54,6 +54,21 @@ pub enum ApiError {
     DatabaseUnavailable,
     NoProviderAvailable,
     UpstreamUnavailable,
+    /// An upstream answered without attesting the zero-retention guarantee the
+    /// requested lane is sold under, so the request was refused rather than
+    /// served ([`crate::wire::ResponseAttestation`]).
+    ///
+    /// Its own code rather than a reuse of [`Self::UpstreamUnavailable`], and
+    /// the reason is the same one [`Self::AccountFrozen`] gives for not reusing
+    /// `InsufficientCredits`: the remedy differs and a caller acts on the code.
+    /// "All upstream inference candidates failed" invites a retry, and a retry
+    /// is the one thing that must not happen here — it would deliver the prompt
+    /// again to an upstream that has just declined to say it will not keep it.
+    /// A customer who chose a zero-retention lane deliberately is also owed the
+    /// real reason: this is the router refusing to serve them under a weaker
+    /// guarantee than the one they bought, which is a materially different
+    /// event from an upstream being down.
+    RetentionAttestationFailed,
     UpstreamTimeout,
     ServerShuttingDown,
     MeteringUnavailable,
@@ -247,6 +262,28 @@ impl ApiError {
                 "server_error",
                 None,
                 "upstream_unavailable",
+            ),
+            // 502 and in the `server_error` family: nothing about the caller's
+            // request is wrong, and the fault is upstream of ZeroRouter. The
+            // message says what was not honoured, that nothing was served, and
+            // that retrying will not clear it — because the cause is a setting
+            // on the operator's account with the provider, which only the
+            // operator can put right. It deliberately does NOT name the header
+            // or the provider: a customer is told what guarantee was not met,
+            // not which vendor sits behind the lane or how the check is
+            // implemented. Those are in the operator's log, at ERROR.
+            Self::RetentionAttestationFailed => (
+                StatusCode::BAD_GATEWAY,
+                Cow::Borrowed(
+                    "The upstream serving this model did not confirm the zero-data-retention \
+                     guarantee this lane is sold under, so ZeroRouter refused the request instead \
+                     of serving it. Nothing was sent to you and nothing was billed. This is a \
+                     ZeroRouter provider-configuration fault, not a transient outage — retrying \
+                     will not clear it. Every model on a different provider is unaffected.",
+                ),
+                "server_error",
+                None,
+                "retention_attestation_failed",
             ),
             Self::UpstreamTimeout => (
                 StatusCode::GATEWAY_TIMEOUT,

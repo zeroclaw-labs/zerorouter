@@ -91,6 +91,12 @@ pub enum FailureClass {
     /// LABEL depends on the bit, which is why it rides here instead of
     /// changing the class: see [`Self::outcome`].
     ContextWindow { rate_limited: bool },
+    /// The upstream answered without attesting the data guarantee this lane is
+    /// sold under (`crate::wire::ResponseAttestation`).
+    ///
+    /// The only class here with no pinned counterpart, because the delegated
+    /// walk had no such concept — see the note on [`classify`].
+    RetentionAttestation,
 }
 
 impl FailureClass {
@@ -98,7 +104,10 @@ impl FailureClass {
     /// (`reliable.rs:1811`).
     #[must_use]
     pub fn is_non_retryable(self) -> bool {
-        matches!(self, Self::NonRetryable | Self::RateLimitedNonRetryable)
+        matches!(
+            self,
+            Self::NonRetryable | Self::RateLimitedNonRetryable | Self::RetentionAttestation
+        )
     }
 
     /// Whether the walk should abandon this candidate rather than wait out a
@@ -142,7 +151,18 @@ impl FailureClass {
             | Self::NonRetryable
             | Self::ContextWindow {
                 rate_limited: false,
-            } => "upstream_error",
+            }
+            // `upstream_error` rather than a label of its own, and the choice
+            // is constrained rather than free: migration 0004's
+            // `request_attempts_outcome_is_known` admits nine strings, and a
+            // tenth would abort the settle transaction — i.e. LOSE a
+            // settlement — until a migration widened the CHECK. Of the nine
+            // this is the honest one: the upstream failed to answer usably.
+            // It also feeds the health cooldown, which is the behaviour worth
+            // having here — an upstream whose ZDR toggle went off fails every
+            // request, and cooling the rung is the correct response to a rung
+            // that cannot serve.
+            | Self::RetentionAttestation => "upstream_error",
         }
     }
 }
@@ -178,9 +198,32 @@ impl FailureClass {
 /// `context_window_errors_are_retryable_once_the_prompt_is_already_truncated`.
 #[must_use]
 pub fn classify(err: &anyhow::Error, context_truncated: bool) -> FailureClass {
+    // THE SECOND DEPARTURE FROM THE PINNED WALK, and like `FailureClass::outcome`
+    // it is one by construction rather than by drift: the delegated walk had no
+    // notion of a retention guarantee, so there is no pinned behaviour for this
+    // branch to be faithful to. Everything below this line still reproduces
+    // `reliable.rs:1735 → 1791-1793` exactly.
+    //
+    // It is FIRST, ahead of even the context-window check, and the ordering is
+    // load-bearing in a way the others are not. Every arm below leads either to
+    // a repair or to another dispatch, and both of those send the customer's
+    // prompt to this upstream AGAIN. That is the one response to this failure
+    // that is worse than useless: the guarantee did not hold a moment ago, so a
+    // retry is not a second chance at an answer, it is a second copy of the
+    // prompt delivered to an upstream that just said it may keep it. Reaching
+    // this check first is what makes the walk's response "stop" rather than
+    // "try harder".
+    //
+    // The failure text is the channel because the two dispatch paths deliver it
+    // as different types and both are reduced to a string before arriving here
+    // — see `crate::wire::RETENTION_ATTESTATION_MARKER`.
+    if is_retention_attestation_failure(err) {
+        return FailureClass::RetentionAttestation;
+    }
     // Hoisted only so the context-window arm can carry it; it decides nothing
-    // here. The context check is still the first thing that DECIDES, which is
-    // the ordering `reliable.rs:1735 → 1791-1793` fixes.
+    // here. The context check is still the first thing that DECIDES among the
+    // pinned classes, which is the ordering `reliable.rs:1735 → 1791-1793`
+    // fixes.
     let rate_limited = is_rate_limited(err);
     if !context_truncated && is_context_window_exceeded(err) {
         return FailureClass::ContextWindow { rate_limited };
@@ -192,6 +235,27 @@ pub fn classify(err: &anyhow::Error, context_truncated: bool) -> FailureClass {
         (false, true) => FailureClass::RateLimited,
         (false, false) => FailureClass::Retryable,
     }
+}
+
+/// Whether this failure is an upstream declining to attest a retention
+/// guarantee ([`crate::wire::ResponseAttestation`]).
+///
+/// NOT copied from the pinned walk — there is nothing to copy, this concept did
+/// not exist there. It reads the failure TEXT for the same reason every
+/// predicate in this module does: by the time the walk classifies anything, the
+/// only thing left of an upstream failure is `err.to_string()`. The marker is a
+/// single constant shared with the wire that produces it, so the two cannot
+/// drift apart the way a duplicated literal would.
+///
+/// This must never match anything an ordinary upstream could put in an error
+/// body. A false positive here refuses a servable request and, worse, hides a
+/// real upstream fault behind a retention alarm; the marker is therefore a
+/// specific eight-word phrase rather than a word like "retention" that a
+/// provider's own error prose could plausibly contain.
+#[must_use]
+pub fn is_retention_attestation_failure(err: &anyhow::Error) -> bool {
+    err.to_string()
+        .contains(crate::wire::RETENTION_ATTESTATION_MARKER)
 }
 
 /// Whether an error is a rate-limit (429). Copied verbatim from
@@ -598,6 +662,74 @@ mod tests {
             usage: None,
             reasoning_content: reasoning.map(str::to_owned),
             stop_reason: None,
+        }
+    }
+
+    /// The round trip from the wire's failure text to the walk's decision.
+    ///
+    /// The two halves of this mechanism live in different modules and are
+    /// joined only by a string, so this is the seam where it can silently come
+    /// apart: reword the message in `wire/mod.rs` without touching the constant
+    /// and every retention failure quietly reclassifies as a generic retryable
+    /// upstream error — which would RETRY it, sending the prompt to the
+    /// unattested upstream two more times before moving on.
+    #[test]
+    fn an_attestation_failure_is_classified_as_its_own_class_and_never_retried() {
+        // Built the way the wire builds it, not hand-written, so a change to
+        // the real message is what this test sees.
+        let attestation = crate::wire::ResponseAttestation::new("x-zero-data-retention", "true")
+            .expect("the shipped declaration must be constructible");
+        let failure = attestation
+            .verify(
+                "xai",
+                reqwest::StatusCode::OK,
+                &reqwest::header::HeaderMap::new(),
+            )
+            .expect_err("an empty header map attests nothing");
+        let err = error(&failure);
+
+        assert_eq!(
+            classify(&err, false),
+            FailureClass::RetentionAttestation,
+            "the wire's own failure text must classify as a retention failure"
+        );
+        // And identically once the walk has spent its truncation, because the
+        // check sits ahead of the context-window branch that flag gates.
+        assert_eq!(classify(&err, true), FailureClass::RetentionAttestation);
+
+        let class = FailureClass::RetentionAttestation;
+        assert!(
+            class.is_non_retryable(),
+            "retrying re-delivers the prompt to an upstream that just declined to \
+             say it will not keep it"
+        );
+        assert!(!class.is_rate_limited());
+        // Admitted by migration 0004's `request_attempts_outcome_is_known`. An
+        // unlisted string here aborts the settle transaction, which loses a
+        // settlement rather than mislabelling one.
+        assert_eq!(class.outcome(), "upstream_error");
+    }
+
+    /// The predicate must not fire on ordinary upstream prose.
+    ///
+    /// A false positive is worse than a missed one in an unobvious way: it
+    /// refuses a request that was perfectly servable AND files a real upstream
+    /// fault under a retention alarm, so the operator debugs the wrong thing.
+    #[test]
+    fn ordinary_upstream_failures_are_not_read_as_retention_failures() {
+        for text in [
+            "429 Too Many Requests",
+            "connection reset by peer",
+            "400 Bad Request: data retention policy violation for this org",
+            "500 internal error: zero data retention subsystem unavailable",
+            "the model did not attest anything",
+        ] {
+            let err = error(text);
+            assert!(
+                !is_retention_attestation_failure(&err),
+                "{text:?} is an upstream's own prose, not ZeroRouter's attestation failure"
+            );
+            assert_ne!(classify(&err, false), FailureClass::RetentionAttestation);
         }
     }
 

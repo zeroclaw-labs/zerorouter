@@ -931,6 +931,190 @@ async fn non_streaming_every_candidate_failing_releases_the_reservation_without_
     assert_eq!(open_reservations(&pool, api_key_id).await, 0);
 }
 
+/// The exact failure text the xAI wire produces when an upstream declines to
+/// attest zero data retention, leaked to `'static` so the scripted fake can
+/// report it verbatim.
+///
+/// Built from `ResponseAttestation` rather than hand-written: the whole point
+/// of these two tests is the journey from the wire's message to the customer's
+/// error code, and a hand-copied string would keep passing after the real
+/// message changed underneath it.
+fn attestation_failure_text() -> &'static str {
+    let attestation = zerorouter::wire::ResponseAttestation::new("x-zero-data-retention", "true")
+        .expect("the shipped declaration must be constructible");
+    let failure = attestation
+        .verify(
+            "xai",
+            reqwest::StatusCode::OK,
+            &reqwest::header::HeaderMap::new(),
+        )
+        .expect_err("an empty header map attests nothing");
+    Box::leak(failure.into_boxed_str())
+}
+
+/// An upstream that answers but will not confirm the retention guarantee its
+/// lane is sold under is refused, named as such, and billed for nothing.
+///
+/// This is the whole xAI lane reduced to one assertion. Every other test of
+/// this mechanism proves a piece — the header is read, the text classifies, the
+/// stream yields nothing — and this one proves the pieces are connected: a
+/// customer on a zero-retention lane gets a 502 that says why, an untouched
+/// balance, and a closed reservation.
+#[tokio::test]
+async fn non_streaming_an_unattested_upstream_is_refused_by_name_and_billed_for_nothing() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let (api_key_id, key) = create_funded_key(&pool, "no-attestation").await;
+    // Three scripted failures, but only one may ever be consumed.
+    let solo = FakeModelProvider::new(
+        "solo",
+        vec![
+            FakeOutcome::Failure(attestation_failure_text()),
+            FakeOutcome::Failure(attestation_failure_text()),
+            FakeOutcome::Failure(attestation_failure_text()),
+        ],
+    );
+    let state = router(pool.clone(), vec![solo.clone()]);
+
+    let response = app(state.clone())
+        .oneshot(completion_request(
+            &key,
+            &completion_body("zero/test-solo", false),
+        ))
+        .await
+        .expect("completion request should complete");
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let body = json_body(response).await;
+    state.wait_for_background_tasks().await;
+
+    // Named, not generic. `upstream_unavailable` would invite the retry that
+    // must not happen and would hide the one fact the customer needs.
+    assert_eq!(body["error"]["code"], "retention_attestation_failed");
+    let message = body["error"]["message"]
+        .as_str()
+        .expect("the error carries a message");
+    assert!(
+        message.contains("zero-data-retention"),
+        "the customer must be told which guarantee was not met: {message}"
+    );
+    assert!(
+        !message.contains("x-zero-data-retention") && !message.contains("xai"),
+        "the customer is told the guarantee, not the header or the vendor: {message}"
+    );
+
+    // ONE call. This is the retry-suppression assertion, and it is the reason
+    // the fake was scripted with three failures: on a single-candidate route an
+    // ordinary retryable failure burns all three (see
+    // `non_streaming_rate_limit_on_a_single_candidate_route_burns_the_full_budget`).
+    // A retry here would deliver the customer's prompt to the unattested
+    // upstream two more times.
+    assert_eq!(
+        solo.call_count(),
+        1,
+        "a retention failure must end the candidate immediately, not be retried"
+    );
+
+    assert_eq!(
+        settled_event(&pool, api_key_id).await,
+        (
+            "openai".to_owned(),
+            "upstream/solo".to_owned(),
+            0,
+            0,
+            Decimal::ZERO,
+            502,
+        )
+    );
+    assert_eq!(
+        attempt_rows(&pool, api_key_id).await,
+        [(
+            1,
+            "openai/solo".to_owned(),
+            "upstream_error".to_owned(),
+            false
+        )],
+        "the attempt is ledgered under a status migration 0004 admits, and is not served"
+    );
+    assert_eq!(
+        balance(&pool, user_of(&pool, api_key_id).await)
+            .await
+            .expect("balance must query"),
+        Decimal::from(50),
+        "a refused request must not move the balance"
+    );
+    assert_eq!(open_reservations(&pool, api_key_id).await, 0);
+}
+
+/// The same refusal on the streaming path, where it has to arrive before any
+/// content does.
+#[tokio::test]
+async fn streaming_an_unattested_upstream_is_refused_before_any_content_is_sent() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let (api_key_id, key) = create_funded_key(&pool, "no-attestation-sse").await;
+    // The wire asserts on the initial response headers, so a real xAI stream
+    // that fails attestation produces the error as its FIRST event and never
+    // opens a body. The fake reproduces that shape: an error step with nothing
+    // ahead of it.
+    let solo = FakeModelProvider::new(
+        "solo",
+        vec![FakeOutcome::Stream(vec![FakeStreamStep::Error(
+            attestation_failure_text().to_owned(),
+        )])],
+    );
+    let state = router(pool.clone(), vec![solo.clone()]);
+
+    let response = app(state.clone())
+        .oneshot(completion_request(
+            &key,
+            &completion_body("zero/test-solo", true),
+        ))
+        .await
+        .expect("stream request should complete");
+    // 200 with an error frame is the SSE contract: the response head is
+    // committed before the upstream is dialled, so a streamed failure can only
+    // ever be reported in-band. What matters is that the frame is the FIRST
+    // one carrying anything and that no delta precedes it.
+    assert_eq!(response.status(), StatusCode::OK);
+    let chunks = sse_chunks(response).await;
+    state.wait_for_background_tasks().await;
+
+    assert_eq!(
+        chunks
+            .last()
+            .expect("an error chunk should terminate the stream")["error"]["code"],
+        "retention_attestation_failed"
+    );
+    assert!(
+        chunks
+            .iter()
+            .all(|chunk| chunk["choices"][0]["delta"]["content"].is_null()),
+        "no model output may reach a customer whose lane could not be attested: {chunks:?}"
+    );
+
+    assert_eq!(
+        settled_event(&pool, api_key_id).await,
+        (
+            "openai".to_owned(),
+            "upstream/solo".to_owned(),
+            0,
+            0,
+            Decimal::ZERO,
+            502,
+        )
+    );
+    assert_eq!(
+        balance(&pool, user_of(&pool, api_key_id).await)
+            .await
+            .expect("balance must query"),
+        Decimal::from(50),
+        "a refused stream must not move the balance"
+    );
+    assert_eq!(open_reservations(&pool, api_key_id).await, 0);
+}
+
 /// The 15-minute `UPSTREAM_REQUEST_TIMEOUT` is a compile-time constant, so the
 /// deadline is reached on a paused clock rather than in wall time. The clock is
 /// paused only after the fixtures are in place, since the pool cannot dial out

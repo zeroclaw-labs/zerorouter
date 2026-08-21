@@ -270,15 +270,16 @@ async fn models_are_materialized_from_tiers_toml() {
     // One row per model PIN, keyed by its OpenRouter-standard {vendor}/{model}
     // id. The pre-rename catalog published a `zero/*` alias row AND a concrete
     // candidate row per model (14 rows); each pin now equals its candidate, so
-    // it contributes exactly one row — twenty models, twenty rows (the
-    // four Bedrock classic-runtime zero-retention lanes joined on 2026-08-20,
-    // the five open-weight Fireworks lanes the same day, and the closed-weight
-    // `fireworks/qwen3.8-max` alongside them carrying a per-tier `standard`
-    // retention override; the two Bedrock mantle lanes added with the rest are
-    // commented out in `tiers.toml` because AWS's per-account Sales gate refuses
-    // this account 5-generation Claude, so they could be listed but never
-    // served).
-    assert_eq!(data.len(), 20);
+    // it contributes exactly one row — twenty-two models, twenty-two rows. All
+    // eight arrived on 2026-08-20: the four Bedrock classic-runtime
+    // zero-retention lanes, the five open-weight Fireworks lanes, the
+    // closed-weight `fireworks/qwen3.8-max` carrying a per-tier `standard`
+    // retention override, and the two xAI Grok lanes whose zero-retention claim
+    // is re-attested on every response. (The two Bedrock mantle lanes added with
+    // the rest are commented out in `tiers.toml` because AWS's per-account Sales
+    // gate refuses this account 5-generation Claude, so they could be listed but
+    // never served.)
+    assert_eq!(data.len(), 22);
     assert!(data.iter().all(|model| model["object"] == "model"));
 
     let ids = data
@@ -312,8 +313,10 @@ async fn models_are_materialized_from_tiers_toml() {
             "openai/gpt-5.6-luna",
             "openai/gpt-5.6-sol",
             "openai/gpt-5.6-terra",
+            "xai/grok-4.3",
+            "xai/grok-4.6",
         ]),
-        "exactly the twelve vendor-named pins — no zero/* alias, no gpt-5.3-codex. \
+        "exactly the vendor-named pins — no zero/* alias, no gpt-5.3-codex. \
          The two `bedrock/*` ids serve the same weights as their `anthropic/*` \
          namesakes and are deliberately addressable apart from them: one lane \
          retains under Anthropic's 30-day policy and one retains nothing, which \
@@ -489,7 +492,19 @@ async fn every_shipped_model_publishes_what_it_can_take_and_produce() {
     // a lane that omits metadata must appear here, so the omission is reviewed
     // once, in the diff, by a human. A NEW tier that forgets its metadata is not
     // on these lists and still fails.
-    const NO_MAX_OUTPUT: [&str; 4] = [
+    // The xAI lanes joined both lists on 2026-08-20, and they are the first
+    // entries here whose omission is not about a model being modest. Both are
+    // multimodal frontier models; what they lack is an AGREED number. xAI
+    // publishes no per-model output cap at all (its REST reference documents
+    // only a 128,000 default for `max_completion_tokens`), while models.dev
+    // asserts 500,000 for grok-4.6 — identical to its context window, the same
+    // tell that disqualified MiniMax M3's figure — and 30,000 for grok-4.3,
+    // which no model with a 128,000 default could honour. On modalities the
+    // vendor says text and image, models.dev adds `pdf`, and xAI's documents
+    // path runs through the Files API that ZDR disables, so `pdf` may be true of
+    // the model and false of this lane. `tiers.toml` argues each omission at the
+    // tier.
+    const NO_MAX_OUTPUT: [&str; 6] = [
         "fireworks/deepseek-v4-flash",
         "fireworks/deepseek-v4-pro",
         "fireworks/minimax-m3",
@@ -498,8 +513,10 @@ async fn every_shipped_model_publishes_what_it_can_take_and_produce() {
         // `max_tokens: 4000` — 32x lower, and a statement about an example
         // rather than about the model. Same shape as the DeepSeek pair above.
         "fireworks/qwen3.8-max",
+        "xai/grok-4.3",
+        "xai/grok-4.6",
     ];
-    const NO_IMAGE_INPUT: [&str; 5] = [
+    const NO_IMAGE_INPUT: [&str; 7] = [
         "fireworks/deepseek-v4-flash",
         "fireworks/deepseek-v4-pro",
         "fireworks/glm-5.2",
@@ -513,6 +530,10 @@ async fn every_shipped_model_publishes_what_it_can_take_and_produce() {
         // left unstated — a client that wrongly believes it can send an image
         // builds a request that fails.
         "fireworks/qwen3.8-max",
+        // Likewise omit the list entirely rather than claim they take no images
+        // — both DO take images; the two sources disagree only about `pdf`.
+        "xai/grok-4.3",
+        "xai/grok-4.6",
     ];
 
     for model in listed_models(RouterState::fully_credentialed(tier_config_path())).await {
@@ -691,14 +712,14 @@ async fn every_shipped_lane_publishes_a_retention_posture() {
     }
 
     // The shipped catalog's state, asserted rather than assumed. It was EMPTY
-    // until 2026-08-20 and is now nine lanes — and it is pinned by NAME rather
+    // until 2026-08-20 and is now eleven lanes — and it is pinned by NAME rather
     // than by count, because the thing that must not happen quietly is a lane
     // ACQUIRING this label, not the tally moving. A count would still pass if
     // someone relabelled `anthropic/*` zero and dropped an existing lane.
     //
     // A lane arriving in this list is a legal-adjacent claim about a customer's
-    // data, and it arrives only with evidence behind it. The nine below rest on
-    // TWO DIFFERENT KINDS of evidence, which is the reason to keep reading
+    // data, and it arrives only with evidence behind it. The eleven below rest on
+    // THREE DIFFERENT KINDS of evidence, which is the reason to keep reading
     // rather than to append the next lane by pattern-match:
     //
     //   bedrock/*    an ENFORCED `data_retention_mode: none` on the operator's
@@ -708,6 +729,15 @@ async fn every_shipped_lane_publishes_a_retention_posture() {
     //                from its own security documentation. There is no account
     //                state to re-read, so the pinned page hash is the entire
     //                re-verification loop.
+    //   xai/*        an ENFORCED team-level ZDR setting in the xAI Console —
+    //                the same basis as Bedrock's, with a re-verification loop
+    //                that is different in kind rather than in degree: xAI
+    //                restates the guarantee in an `x-zero-data-retention`
+    //                header on EVERY response, and the dispatch path refuses to
+    //                serve a response that does not attest `true`
+    //                (`crate::wire::ResponseAttestation`). These are the only
+    //                two lanes in the catalog whose posture is checked at
+    //                request time rather than on a date in the past.
     //
     // NOT EVERY `fireworks/*` LANE IS HERE, and the absentee is the point.
     // `fireworks/qwen3.8-max` dispatches the same account on the same key, and
@@ -737,7 +767,9 @@ async fn every_shipped_lane_publishes_a_retention_posture() {
             "fireworks/deepseek-v4-pro",
             "fireworks/glm-5.2",
             "fireworks/kimi-k3",
-            "fireworks/minimax-m3"
+            "fireworks/minimax-m3",
+            "xai/grok-4.3",
+            "xai/grok-4.6"
         ],
         "no lane may claim zero retention without a confirmed arrangement, an \
          enforced account configuration, or the vendor's published default behind it"
@@ -1034,13 +1066,22 @@ async fn bundled_tier_catalog_has_expected_virtual_models() {
             "openai/gpt-5.6-luna",
             "openai/gpt-5.6-sol",
             "openai/gpt-5.6-terra",
+            "xai/grok-4.3",
+            "xai/grok-4.6",
         ],
-        "the twenty vendor-named model pins (Gemini flash + flash-lite added \
+        "the twenty-two vendor-named model pins (Gemini flash + flash-lite added \
          2026-08-18; Gemini Pro joined them once conditional rates could \
          express the 200,000-token boundary Google prices it at; the four \
          Bedrock classic-runtime zero-retention lanes on 2026-08-20, the \
-         five open-weight Fireworks lanes the same day, and closed-weight \
-         Qwen 3.8 Max alongside them under a per-tier retention override). \
+         five open-weight Fireworks lanes the same day, closed-weight \
+         Qwen 3.8 Max alongside them under a per-tier retention override, and \
+         the two xAI Grok lanes the same day again). \
+         \
+         THE XAI IDS ARE THE VENDOR'S IDS, exactly: `grok-4.6` and `grok-4.3` \
+         are what xAI dispatches, so these two pins keep this file's original \
+         promise literally. The `-latest` aliases xAI also publishes are \
+         deliberately NOT pinned — an alias that follows the newest release is \
+         not a pin, and its price would move without an edit. \
          \
          THE FIREWORKS IDS ARE `fireworks/<model>` AND THE DISPATCHED STRINGS \
          ARE NOT: Fireworks addresses models as \
@@ -1089,7 +1130,7 @@ async fn bundled_tier_catalog_has_expected_virtual_models() {
         assert!(
             matches!(
                 provider,
-                "openai" | "anthropic" | "google" | "bedrock" | "fireworks"
+                "openai" | "anthropic" | "google" | "bedrock" | "fireworks" | "xai"
             ),
             "{tier_id} routes to {provider}, which is not in the shipped inventory"
         );
@@ -1534,6 +1575,8 @@ async fn a_basis_hike_above_sell_withholds_that_tier_and_nothing_else() {
             "openai/gpt-5.6-luna",
             "openai/gpt-5.6-sol",
             "openai/gpt-5.6-terra",
+            "xai/grok-4.3",
+            "xai/grok-4.6",
         ]
     );
     for model in [
@@ -1574,12 +1617,12 @@ async fn a_basis_hike_above_sell_withholds_that_tier_and_nothing_else() {
     assert_eq!(sell.output_per_mtok, Some(10.00));
 
     // And the public catalog stops advertising what it cannot serve: the
-    // nineteen surviving pins, one row each. A Bedrock lane is among the survivors and
+    // twenty-one surviving pins, one row each. A Bedrock lane is among the survivors and
     // that is the point of naming one — Bedrock lanes are a different account
     // with their own rate card, so a repricing of a first-party Anthropic lane
     // withholds only that first-party lane.
     let listed = listed_model_ids(RouterState::fully_credentialed(path)).await;
-    assert_eq!(listed.len(), 19);
+    assert_eq!(listed.len(), 21);
     assert!(listed.iter().any(|id| id == "bedrock/claude-sonnet-4-5"));
     assert!(listed.iter().any(|id| id == "openai/gpt-5.6-luna"));
     assert!(listed.iter().any(|id| id == "anthropic/claude-haiku-4-5"));
@@ -1605,22 +1648,33 @@ async fn the_shipped_catalog_withholds_no_tier_today() {
         "the shipped catalog withholds {:?}",
         catalog.unavailable.keys().collect::<Vec<_>>()
     );
-    assert_eq!(catalog.tiers.len(), 20);
+    assert_eq!(catalog.tiers.len(), 22);
 }
 
 /// Every conditional rate the shipped catalog declares, transcribed from
 /// models.dev on 2026-08-18 and asserted here so an edit to `tiers.toml` is
 /// caught by `cargo test` rather than only by the networked drift check.
 ///
-/// `(tier, threshold, input, cached, output)`. The two thresholds are
-/// different on purpose — OpenAI reprices the 5.6 family at 272,000 and Google
-/// reprices Gemini Pro at 200,000 — and a future edit that "tidies" them into
-/// one number is exactly what this table is here to stop.
-const SHIPPED_CONDITIONAL_RATES: [(&str, u64, f64, f64, f64); 4] = [
+/// `(tier, threshold, input, cached, output)`. The thresholds are NOT all the
+/// same on purpose — OpenAI reprices the 5.6 family at 272,000 while Google and
+/// xAI both reprice at 200,000 — and a future edit that "tidies" them into one
+/// number is exactly what this table is here to stop.
+///
+/// The two xAI rows were added on 2026-08-20 and are the only ones whose
+/// boundary the vendor states UNAMBIGUOUSLY: docs.x.ai labels its price rows
+/// `< 200k prompt tokens` and `≥ 200k prompt tokens` and says in prose that
+/// "requests whose prompt reaches 200k tokens are billed at the higher rate for
+/// all tokens in the request". Inclusive, in the vendor's own words, which is
+/// the `>=` this catalog implements — unlike the OpenAI and Google rows, where
+/// `tiers.toml` records that the vendors disagree in writing about that one
+/// token and `>=` was chosen as the markup-not-loss side.
+const SHIPPED_CONDITIONAL_RATES: [(&str, u64, f64, f64, f64); 6] = [
     ("openai/gpt-5.6-luna", 272_000, 0.40, 0.04, 1.80),
     ("openai/gpt-5.6-terra", 272_000, 4.00, 0.40, 18.00),
     ("openai/gpt-5.6-sol", 272_000, 10.00, 1.00, 45.00),
     ("google/gemini-3.1-pro-preview", 200_000, 4.00, 0.40, 18.00),
+    ("xai/grok-4.6", 200_000, 4.00, 1.00, 12.00),
+    ("xai/grok-4.3", 200_000, 2.50, 0.40, 5.00),
 ];
 
 #[tokio::test]
@@ -1687,7 +1741,7 @@ async fn every_shipped_conditional_rate_is_the_one_the_vendor_publishes() {
 // rungs across >=2 providers). Every tier is pass-through until a second
 // provider serves a model class again.
 const ROUTED_TIERS: [&str; 0] = [];
-const PASS_THROUGH_TIERS: [&str; 20] = [
+const PASS_THROUGH_TIERS: [&str; 22] = [
     // Model pins, keyed by their OpenRouter-standard {vendor}/{model} ids.
     "openai/gpt-5.6-luna",
     "anthropic/claude-haiku-4-5",
@@ -1732,6 +1786,17 @@ const PASS_THROUGH_TIERS: [&str; 20] = [
     // tier-rates assertion below holds it to Fireworks' published $2.00/$0.25/
     // $6.00 standard-path rate like every other pin.
     "fireworks/qwen3.8-max",
+    // The xAI runtime-attested zero-retention lanes (2026-08-20). Pass-through
+    // at xAI's published rates on BOTH bands — and the equality the assertion
+    // below checks holds per band, which is what makes it a real guard here:
+    // these are the first lanes in the catalog that are simultaneously
+    // zero-retention AND conditionally repriced, so a candidate that kept the
+    // base rate while the tier gained a band (or the reverse) would be selling
+    // long-context Grok at half its cost. `tiers.toml` refuses that shape at
+    // load as well — thresholds must match exactly — so this is the second of
+    // two independent checks on the same mistake.
+    "xai/grok-4.6",
+    "xai/grok-4.3",
 ];
 
 #[tokio::test]

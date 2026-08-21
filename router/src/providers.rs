@@ -152,6 +152,38 @@ struct ProviderMetadata {
     /// everywhere.
     #[serde(default)]
     source_provider_key: Option<String>,
+    /// The response header this upstream restates a data guarantee in, on every
+    /// answer, and the value that satisfies it. Present together or not at all.
+    ///
+    /// **This is the only runtime-enforced retention check in the repo**, and
+    /// it is declared here rather than hardcoded in the wire for the reason
+    /// everything else about an upstream is declared here: a fact about one
+    /// account belongs in that account's entry, where a reviewer reading the
+    /// inventory can see the whole of what the lane promises. A constant buried
+    /// in `wire/chat_completions.rs` reading `if alias == "xai"` would put a
+    /// customer-facing data claim somewhere nobody looks when they change what
+    /// ZeroRouter sells.
+    ///
+    /// It is deliberately NOT generalized past what one lane needs. One header
+    /// name, one expected value, no negation, no list, no per-model override —
+    /// because the second declaration is where a mechanism like this starts
+    /// growing an escape hatch, and an escape hatch on a fail-closed retention
+    /// check is a way to serve a retaining upstream under a `zero` label. When
+    /// a second vendor publishes a different shape, widen it then, against a
+    /// real example.
+    ///
+    /// Only the `chat_completions` adapter enforces it, and declaring it on any
+    /// other adapter is REFUSED at load rather than ignored
+    /// ([`ProviderMetadata::validate_attestation`]). A silently-ignored
+    /// attestation is the worst available outcome: the inventory would read as
+    /// though the guarantee were being checked on every request while nothing
+    /// checked it at all, which is exactly the false confidence the mechanism
+    /// exists to remove.
+    #[serde(default)]
+    attestation_header: Option<String>,
+    /// The value [`Self::attestation_header`] must carry. See that field.
+    #[serde(default)]
+    attestation_expect: Option<String>,
     /// Additional API planes this same upstream exposes, keyed by the name a
     /// candidate selects with `surface = "..."` in `tiers.toml`.
     ///
@@ -537,6 +569,7 @@ impl ProviderInventory {
             provider.validate_settlement()?;
             provider.validate_region()?;
             provider.validate_reconciliation()?;
+            provider.validate_attestation()?;
             provider.validate_surfaces()?;
             provider.validate_runtime_roots()?;
             if !keys.insert(provider.key.as_str()) {
@@ -934,6 +967,100 @@ impl ProviderMetadata {
     ///   host, so an operator who sets the variable and redeploys gets traffic
     ///   in the old region and no indication of it.
     ///
+    /// Refuse a half-written, unenforceable, or unenforced per-response
+    /// attestation.
+    ///
+    /// Every arm here refuses rather than repairs, and that is the point: this
+    /// declaration is what stands between a customer and being served from a
+    /// retaining upstream under a `zero` label, so any state where it is
+    /// ambiguous whether the check runs must be a startup failure, never a
+    /// default. The three faults, and why each is fatal rather than a warning:
+    ///
+    /// - **Half declared.** A header with no expected value has nothing to
+    ///   compare against; an expected value with no header names nothing to
+    ///   read it from. Neither half can be guessed — inventing `"true"` as a
+    ///   default expectation would be this repo deciding what another company's
+    ///   API means.
+    /// - **Blank.** An empty header name matches no header, so every response
+    ///   would read as absent and the lane would be permanently down; an empty
+    ///   expectation would be satisfied only by an empty header value, which is
+    ///   the same outage wearing a different shape.
+    /// - **Declared on an adapter that cannot enforce it.** Only
+    ///   [`ProviderAdapter::ChatCompletions`] threads a
+    ///   [`ResponseAttestation`] into its wire. On any other adapter the fields
+    ///   would parse, validate, appear in the inventory a reviewer reads — and
+    ///   do nothing. That is strictly worse than not having the fields at all,
+    ///   because the inventory would then assert a guarantee is being checked
+    ///   on every request while no code checked it, and the failure is
+    ///   invisible from every direction: no error, no log line, and a `zero`
+    ///   posture still published to `/v1/models`. Refusing at load turns a
+    ///   silent false claim into a process that will not start.
+    ///
+    /// The surfaces are checked too, for the same reason `validate_region`
+    /// reads them: an entry whose named plane rides a different adapter is
+    /// exactly where an unenforced declaration would hide.
+    fn validate_attestation(&self) -> Result<(), ProviderBuildError> {
+        let header = self.attestation_header.as_deref();
+        let expect = self.attestation_expect.as_deref();
+        if header.is_none() && expect.is_none() {
+            return Ok(());
+        }
+        let (Some(header), Some(expect)) = (header, expect) else {
+            return Err(ProviderBuildError::InvalidInventory {
+                detail: format!(
+                    "provider {} declares half a response attestation; attestation_header names \
+                     the header carrying the guarantee and attestation_expect names the value \
+                     that satisfies it, and neither can be inferred from the other — declare \
+                     both, or neither",
+                    self.key
+                ),
+            });
+        };
+        if header.trim().is_empty() || expect.trim().is_empty() {
+            return Err(ProviderBuildError::InvalidInventory {
+                detail: format!(
+                    "provider {} declares a blank response attestation; a blank header name \
+                     matches no response header and a blank expected value is satisfied by no \
+                     real one, so either would refuse every request on this upstream forever",
+                    self.key
+                ),
+            });
+        }
+        // Parsed here rather than at first use so a name HTTP cannot carry is
+        // a refused inventory instead of a lane that fails closed on every
+        // request with no indication that the cause is a typo.
+        crate::wire::ResponseAttestation::new(header, expect).map_err(|detail| {
+            ProviderBuildError::InvalidInventory {
+                detail: format!(
+                    "provider {} declares an attestation header that is not usable: {detail}",
+                    self.key
+                ),
+            }
+        })?;
+        let unenforced: Vec<&str> = std::iter::once((None, self.adapter))
+            .chain(
+                self.surfaces
+                    .iter()
+                    .map(|(name, surface)| (Some(name.as_str()), surface.adapter)),
+            )
+            .filter(|(_, adapter)| *adapter != ProviderAdapter::ChatCompletions)
+            .map(|(name, _)| name.unwrap_or("<the entry's own plane>"))
+            .collect();
+        if !unenforced.is_empty() {
+            return Err(ProviderBuildError::InvalidInventory {
+                detail: format!(
+                    "provider {} declares a response attestation but {} rides an adapter that \
+                     does not enforce one; only chat_completions does. An attestation that is \
+                     declared and not checked is worse than none, because the inventory then \
+                     claims a per-response guarantee nothing verifies",
+                    self.key,
+                    unenforced.join(", ")
+                ),
+            });
+        }
+        Ok(())
+    }
+
     /// The same present-iff-required shape as
     /// [`ProviderMetadata::validate_credential`], for the same reason: a
     /// half-written declaration is refused rather than half-applied.
@@ -1527,14 +1654,43 @@ fn create_provider(
             // upstream budget, not an adapter default.
             900,
         )),
-        ProviderAdapter::ChatCompletions => Arc::new(ChatCompletionsWire::new(
-            alias,
-            credential,
-            effective_base_url,
-            Some(max_output_tokens),
-            // Same budget note as the arms above.
-            900,
-        )),
+        ProviderAdapter::ChatCompletions => {
+            let wire = ChatCompletionsWire::new(
+                alias,
+                credential,
+                effective_base_url,
+                Some(max_output_tokens),
+                // Same budget note as the arms above.
+                900,
+            );
+            // The declaration reaching the wire is what makes the check run,
+            // so the two failure directions are worth being explicit about.
+            //
+            // A declared attestation that failed to parse here would produce a
+            // wire with NO check — a lane silently serving without the
+            // guarantee it is sold under, which is the one outcome this
+            // mechanism must never produce. `validate_attestation` has already
+            // parsed the same pair at load, so this cannot happen; the `?`
+            // makes the impossible case a refused route rather than an
+            // unchecked one, on the principle that a violated guarantee
+            // becomes a refusal instead of a silent downgrade.
+            match (
+                metadata.attestation_header.as_deref(),
+                metadata.attestation_expect.as_deref(),
+            ) {
+                (Some(header), Some(expect)) => {
+                    let attestation = crate::wire::ResponseAttestation::new(header, expect)
+                        .map_err(|detail| ProviderBuildError::InvalidInventory {
+                            detail: format!(
+                                "provider {alias} declares an attestation header that is not \
+                                 usable: {detail}"
+                            ),
+                        })?;
+                    Arc::new(wire.with_attestation(attestation))
+                }
+                _ => Arc::new(wire),
+            }
+        }
         ProviderAdapter::AnthropicBedrockRuntime => {
             // The only arm that REQUIRES an endpoint rather than accepting
             // `None`: this wire builds `/model/<id>/invoke` onto a host root and
@@ -1591,7 +1747,14 @@ mod tests {
 
     #[test]
     fn supported_provider_check_uses_constructor_table() {
-        for provider in ["anthropic", "openai", "google", "bedrock", "fireworks"] {
+        for provider in [
+            "anthropic",
+            "openai",
+            "google",
+            "bedrock",
+            "fireworks",
+            "xai",
+        ] {
             assert!(is_supported_provider(provider));
         }
         // Retired with the git dependency that supplied their adapters, and
@@ -1649,6 +1812,16 @@ mod tests {
         // endpoint URL, and this adapter — so a fourth chat-completions entry
         // appearing here without a deliberate edit would be the signal that
         // somebody added a vendor without reading what that entails.
+        //
+        // xAI is that fourth entry, added 2026-08-20, and it WAS a deliberate
+        // edit. It is on this adapter for the plain reason — xAI publishes an
+        // OpenAI-compatible `/v1/chat/completions` — but it is also the only
+        // entry in the inventory that declares a per-response attestation, and
+        // this adapter is the only one that enforces one
+        // (`validate_attestation` refuses the declaration anywhere else). So a
+        // FIFTH chat-completions entry is still the signal this comment
+        // describes, and moving the xai entry to another adapter would not
+        // quietly drop its retention check — it would refuse to load.
         assert_eq!(
             adapters,
             [
@@ -1657,6 +1830,7 @@ mod tests {
                 ("google", ProviderAdapter::ChatCompletions),
                 ("bedrock", ProviderAdapter::Anthropic),
                 ("fireworks", ProviderAdapter::ChatCompletions),
+                ("xai", ProviderAdapter::ChatCompletions),
             ]
         );
 
@@ -1870,6 +2044,7 @@ mod tests {
                 "google",
                 "bedrock",
                 "fireworks",
+                "xai",
                 "local-llama"
             ]
         );
@@ -2273,13 +2448,29 @@ mod tests {
                     "GEMINI_API_KEY",
                     "BEDROCK_API_KEY",
                     "BEDROCK_REGION",
+                    "FIREWORKS_API_KEY",
+                    "XAI_API_KEY",
                 ],
             ),
         ];
 
         for (label, present) in environments {
             let read_env = |name: &str| present.contains(&name).then(|| "value".to_owned());
-            for provider in ["anthropic", "openai", "google", "bedrock"] {
+            // Every key in the shipped inventory, and the loop is spelled out
+            // rather than derived from `inventory.providers` so that adding an
+            // upstream is a deliberate edit here — the same rule the adapter
+            // table above follows. `fireworks` and `xai` were both added on
+            // 2026-08-20; `fireworks` had been missing since it shipped, which
+            // left the newest upstream outside the one test that proves the
+            // catalog and the dispatcher cannot disagree about it.
+            for provider in [
+                "anthropic",
+                "openai",
+                "google",
+                "bedrock",
+                "fireworks",
+                "xai",
+            ] {
                 let listed = provider_is_dispatchable_with(provider, read_env);
                 // The route builder's verdict for the same provider and the
                 // same environment: it either keeps the rung or drops it.
@@ -2820,12 +3011,175 @@ mod tests {
             Some("fireworks-ai"),
             "fireworks must join models.dev at the key models.dev actually uses"
         );
-        for provider in ["anthropic", "openai", "google", "bedrock"] {
+        // `xai` is included here deliberately rather than left out of the loop:
+        // models.dev files xAI under `xai`, the same string ZeroRouter uses, so
+        // the join works with no mapping — and a mapping appearing on it later
+        // would be a silent decision to reconcile Grok's rates against whatever
+        // sits at the named key.
+        for provider in ["anthropic", "openai", "google", "bedrock", "xai"] {
             assert!(
                 provider_source_key(provider).is_none(),
                 "{provider} joins on its own key and must not acquire a mapping"
             );
         }
+    }
+
+    /// The shipped attestation declaration, asserted by value.
+    ///
+    /// The whole retention guarantee of the `xai/*` lanes reduces to these two
+    /// strings reaching the wire. A typo in either is not a broken feature that
+    /// fails loudly — `validate_attestation` catches an unusable header name,
+    /// but a VALID name that is simply the wrong one, or an expectation of
+    /// `"false"`, would load cleanly and either take the lane down forever or,
+    /// far worse, pass every response. So the pair is pinned here rather than
+    /// trusted to review.
+    #[test]
+    fn the_xai_entry_declares_the_attestation_its_retention_pin_depends_on() {
+        let inventory = ProviderInventory::load().expect("inventory should load");
+        let xai = inventory
+            .provider("xai")
+            .expect("the shipped inventory carries xai");
+        assert_eq!(
+            xai.attestation_header.as_deref(),
+            Some("x-zero-data-retention"),
+            "the header xAI publishes its ZDR verdict in (docs.x.ai, 2026-08-20)"
+        );
+        assert_eq!(
+            xai.attestation_expect.as_deref(),
+            Some("true"),
+            "only an affirmative attestation may be served"
+        );
+        assert_eq!(xai.adapter, ProviderAdapter::ChatCompletions);
+
+        // And nothing else declares one. This is not tidiness: an attestation
+        // on another upstream would be a claim, published through that
+        // provider's retention pin, that its guarantee is checked per request.
+        for provider in ["anthropic", "openai", "google", "bedrock", "fireworks"] {
+            let metadata = inventory
+                .provider(provider)
+                .expect("shipped provider is addressable");
+            assert!(
+                metadata.attestation_header.is_none() && metadata.attestation_expect.is_none(),
+                "{provider} must not acquire an attestation without a deliberate edit"
+            );
+        }
+    }
+
+    #[test]
+    fn half_an_attestation_is_refused() {
+        // Neither half implies the other. Inferring `"true"` as a default
+        // expectation would be this repo deciding what another company's API
+        // means; inferring the header name is not even possible.
+        for body in [
+            r#"{
+                "key": "halfway",
+                "adapter": "chat_completions",
+                "credential_env": "HALFWAY_API_KEY",
+                "secret_name": "halfway-api-key",
+                "base_url": "https://svc.example.test/v1/chat/completions",
+                "attestation_header": "x-zero-data-retention"
+            }"#,
+            r#"{
+                "key": "halfway",
+                "adapter": "chat_completions",
+                "credential_env": "HALFWAY_API_KEY",
+                "secret_name": "halfway-api-key",
+                "base_url": "https://svc.example.test/v1/chat/completions",
+                "attestation_expect": "true"
+            }"#,
+        ] {
+            let error = assemble(body).expect_err("half a declaration must be refused");
+            let detail = error.to_string();
+            assert!(detail.contains("halfway"), "{detail}");
+            assert!(detail.contains("half a response attestation"), "{detail}");
+        }
+    }
+
+    #[test]
+    fn a_blank_or_unusable_attestation_header_is_refused_at_load() {
+        // Both faults have the same shape in production — a header that can
+        // never match, so every response reads as absent and fails closed — and
+        // that is an indefinite outage whose cause is one mistyped character.
+        // Refusing the inventory is the same news, delivered where it can be
+        // acted on.
+        let blank = assemble(
+            r#"{
+                "key": "blank",
+                "adapter": "chat_completions",
+                "credential_env": "BLANK_API_KEY",
+                "secret_name": "blank-api-key",
+                "base_url": "https://svc.example.test/v1/chat/completions",
+                "attestation_header": "  ",
+                "attestation_expect": "true"
+            }"#,
+        )
+        .expect_err("a blank header name must be refused");
+        assert!(
+            blank.to_string().contains("blank response attestation"),
+            "{blank}"
+        );
+
+        let unusable = assemble(
+            r#"{
+                "key": "unusable",
+                "adapter": "chat_completions",
+                "credential_env": "UNUSABLE_API_KEY",
+                "secret_name": "unusable-api-key",
+                "base_url": "https://svc.example.test/v1/chat/completions",
+                "attestation_header": "x zero data retention",
+                "attestation_expect": "true"
+            }"#,
+        )
+        .expect_err("a header name HTTP cannot carry must be refused");
+        assert!(unusable.to_string().contains("not usable"), "{unusable}");
+    }
+
+    #[test]
+    fn an_attestation_on_an_adapter_that_cannot_enforce_it_is_refused() {
+        // THE WORST AVAILABLE OUTCOME, refused rather than ignored. Only the
+        // chat-completions wire reads the declaration; on any other adapter the
+        // fields would parse, validate, and sit in the inventory looking like a
+        // guarantee that is checked on every request while nothing checked it —
+        // and the lane's retention pin would go on publishing `zero` to
+        // `/v1/models` with no error anywhere to contradict it.
+        let error = assemble(
+            r#"{
+                "key": "unenforced",
+                "adapter": "anthropic",
+                "credential_env": "UNENFORCED_API_KEY",
+                "secret_name": "unenforced-api-key",
+                "attestation_header": "x-zero-data-retention",
+                "attestation_expect": "true"
+            }"#,
+        )
+        .expect_err("an unenforceable attestation must be refused");
+        let detail = error.to_string();
+        assert!(detail.contains("unenforced"), "{detail}");
+        assert!(detail.contains("does not enforce"), "{detail}");
+
+        // And a SURFACE is checked too — the plane a candidate selects with
+        // `surface = "..."` is where an unenforced declaration would hide.
+        let error = assemble(
+            r#"{
+                "key": "twoplane",
+                "adapter": "chat_completions",
+                "credential_env": "TWOPLANE_API_KEY",
+                "secret_name": "twoplane-api-key",
+                "base_url": "https://svc.example.test/v1/chat/completions",
+                "attestation_header": "x-zero-data-retention",
+                "attestation_expect": "true",
+                "surfaces": {
+                    "messages": {
+                        "adapter": "anthropic",
+                        "base_url": "https://svc.example.test/v1/messages"
+                    }
+                }
+            }"#,
+        )
+        .expect_err("a surface that cannot enforce the attestation must be refused");
+        let detail = error.to_string();
+        assert!(detail.contains("messages"), "{detail}");
+        assert!(detail.contains("does not enforce"), "{detail}");
     }
 
     #[test]

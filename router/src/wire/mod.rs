@@ -121,6 +121,184 @@ pub(super) fn believable(usage: TokenUsage) -> Option<TokenUsage> {
     Some(usage)
 }
 
+/// The phrase every retention-attestation failure carries, and the reason it
+/// is a constant rather than a formatting detail.
+///
+/// The check lives in a wire and the decision lives in the walk, and between
+/// them the failure changes type twice: `anyhow::Error` on the buffered path,
+/// [`StreamError::Http`] on the streaming one, and both are reduced to a
+/// STRING before anything classifies them (`crate::retry`). There is no typed
+/// channel from one to the other short of rebuilding both error surfaces, so
+/// the text is the channel — which makes this phrase load-bearing rather than
+/// cosmetic. [`crate::retry::is_retention_attestation_failure`] matches it and
+/// nothing else, and `an_attestation_failure_is_classified_as_its_own_class`
+/// pins the round trip.
+///
+/// Deliberately a phrase a human reads correctly in a log line rather than an
+/// opaque tag: the same string is the operator's first sight of the problem.
+pub const RETENTION_ATTESTATION_MARKER: &str = "did not attest zero data retention";
+
+/// How much of an upstream-supplied header value is quoted back in an error or
+/// a log line. Header values are attacker-controllable up to reqwest's own
+/// header-size ceiling, and this text reaches both a customer-facing walk
+/// terminal and the operator's log sink; a value long enough to matter is
+/// already a value that failed.
+const MAX_QUOTED_ATTESTATION_VALUE: usize = 64;
+
+/// A guarantee the upstream is required to restate on EVERY response, checked
+/// before that response is used for anything.
+///
+/// This exists for one shape of upstream promise: a lane sold under a data
+/// guarantee that the vendor makes machine-checkable per response, where the
+/// guarantee is switched on by configuration the operator holds OUTSIDE this
+/// repo. xAI's Zero Data Retention is that shape — it is a team-level toggle in
+/// the xAI Console, and every API response carries
+/// `x-zero-data-retention: true|false` saying which way the toggle was set when
+/// the request was served (`config/providers.json`, `[retention.xai]` in
+/// `config/tiers.toml`).
+///
+/// WHY A PER-RESPONSE CHECK AND NOT A STARTUP ONE. Every other retention pin in
+/// this repo is re-verified out of band: a page hash on a schedule, or a
+/// credentialed GET a human runs (`admin retention-drift --bedrock-live`). Both
+/// answer "was the guarantee in force when someone last looked". Neither can
+/// answer "was it in force for THIS request", and the gap between those two
+/// questions is exactly the window in which a console toggle gets flipped — by
+/// an admin who does not know what ZeroRouter sells, in an account ZeroRouter
+/// does not otherwise poll. An upstream that hands back a verdict on every
+/// response closes that window completely, and declining to read it would be
+/// choosing not to look at the answer.
+///
+/// FAILING CLOSED IS THE WHOLE POINT. A missing or negative attestation refuses
+/// the request. It does not downgrade the lane, log a warning and serve, or
+/// fall back to a `standard` posture for the response — the customer bought a
+/// zero-retention lane, and serving them from a retaining one while telling
+/// them otherwise is the precise failure the posture mechanism exists to
+/// prevent (`config/tiers.toml`, the retention header: "a wrong `zero` is a
+/// false statement to a customer about their data").
+#[derive(Clone, Debug)]
+pub struct ResponseAttestation {
+    /// The response header carrying the verdict, pre-parsed so a name that
+    /// could never match is a load-time fault rather than a permanent outage.
+    header: reqwest::header::HeaderName,
+    /// The one value that satisfies the guarantee. Compared case-insensitively
+    /// against the received value, after trimming and unquoting — see
+    /// [`Self::satisfied_by`].
+    expected: String,
+}
+
+impl ResponseAttestation {
+    /// Build one from a declared header name and expected value.
+    ///
+    /// Fails on a header name HTTP cannot carry. That check belongs here, at
+    /// load, because the failure direction of this whole mechanism makes a
+    /// typo catastrophic in a way it is not elsewhere: a name no response can
+    /// ever carry reads as "absent" on every response, and absent fails
+    /// closed, so a single mistyped character in `providers.json` would take
+    /// the lane down completely and permanently. Refusing the inventory is the
+    /// loud version of the same news.
+    pub fn new(header: &str, expected: &str) -> Result<Self, String> {
+        let header = header
+            .trim()
+            .parse::<reqwest::header::HeaderName>()
+            .map_err(|error| format!("`{header}` is not a valid HTTP header name: {error}"))?;
+        Ok(Self {
+            header,
+            expected: expected.trim().to_owned(),
+        })
+    }
+
+    /// Whether a received header value satisfies the guarantee.
+    ///
+    /// Three normalizations, each with a reason, and none of them able to turn
+    /// a negative attestation into a passing one — that is the property to
+    /// preserve if this is ever edited. Every rule below only ever admits
+    /// values that ARE the expected token in some presentation; a `false`
+    /// survives all three as `false` and still fails.
+    ///
+    /// - **Trimmed.** Leading and trailing whitespace in a header value is
+    ///   transport noise, not a different claim.
+    /// - **Unquoted.** xAI's documentation renders the values as `"true"` and
+    ///   `"false"` — inside code spans, with the quote characters shown — and
+    ///   does not say whether the quotes are part of the wire value or the
+    ///   docs' own typography (verified 2026-08-20; see `[retention.xai]`).
+    ///   That ambiguity is unresolvable from the documentation, and getting it
+    ///   wrong in the strict direction takes the lane down on a formatting
+    ///   detail, so both presentations are accepted. `"false"` unquotes to
+    ///   `false` and still fails.
+    /// - **Case-insensitive.** `True` is the same claim as `true`. A vendor
+    ///   changing the casing of a boolean is not a retention event, and
+    ///   refusing it would be a self-inflicted outage.
+    fn satisfied_by(&self, value: &str) -> bool {
+        let seen = value.trim();
+        let seen = seen
+            .strip_prefix('"')
+            .and_then(|rest| rest.strip_suffix('"'))
+            .unwrap_or(seen);
+        seen.eq_ignore_ascii_case(&self.expected)
+    }
+
+    /// Assert the guarantee against one upstream response, returning the
+    /// failure text when it does not hold.
+    ///
+    /// `status` is carried into the message rather than gating the check.
+    /// Asserting on EVERY response — not only successful ones — is deliberate
+    /// and is the conservative reading: by the time any response exists the
+    /// prompt has already been delivered to the upstream, so a `false` verdict
+    /// on a 429 reports the same real event as a `false` verdict on a 200. The
+    /// cost of that choice is that an upstream error which omits the header
+    /// (an edge 502, say) is reported as an attestation failure rather than as
+    /// the outage it is, which is why the status travels in the text: the
+    /// operator needs both facts to tell the two apart. See `[retention.xai]`
+    /// for the argument and for the one-line change that would narrow this to
+    /// success responses.
+    pub fn verify(
+        &self,
+        alias: &str,
+        status: reqwest::StatusCode,
+        headers: &reqwest::header::HeaderMap,
+    ) -> Result<(), String> {
+        let raw = headers.get(&self.header);
+        let seen = raw.map(|value| value.to_str().unwrap_or("<non-ascii>"));
+        if seen.is_some_and(|value| self.satisfied_by(value)) {
+            return Ok(());
+        }
+        let observed = seen.map_or_else(
+            || "absent".to_owned(),
+            |value| {
+                let mut quoted: String = value.chars().take(MAX_QUOTED_ATTESTATION_VALUE).collect();
+                if quoted.len() < value.len() {
+                    quoted.push('…');
+                }
+                format!("`{quoted}`")
+            },
+        );
+        // ERROR, and outside the retention boundary on purpose. Every field
+        // here is metadata about the transport — an upstream name, a header
+        // name, a boolean-shaped verdict, a status code — and none of it can
+        // carry prompt or completion text, so this belongs in the operator's
+        // sink rather than under `UPSTREAM_DETAIL_TARGET` where it would be
+        // dropped before reaching one. It is the alarm: the lane is selling a
+        // guarantee the upstream just declined to make, and nobody learns that
+        // from a metric.
+        tracing::error!(
+            upstream_provider = alias,
+            attestation_header = %self.header,
+            attestation_expected = %self.expected,
+            attestation_observed = %observed,
+            upstream_status = status.as_u16(),
+            "upstream did not attest the retention guarantee this lane is sold under"
+        );
+        Err(format!(
+            "{alias} upstream {RETENTION_ATTESTATION_MARKER}: response header `{}` was {observed}, \
+             expected `{}` (upstream status {}). The request was refused rather than served, \
+             because this lane is sold as zero-retention and the upstream declined to confirm it.",
+            self.header,
+            self.expected,
+            status.as_u16(),
+        ))
+    }
+}
+
 /// Shared upstream HTTP clients, keyed by request timeout budget (seconds).
 ///
 /// `reqwest::Client` owns an `Arc`'d connection pool, so a fresh client keeps no
