@@ -28,6 +28,28 @@ export interface Me {
    * test and live Stripe accounts, so a hardcoded key would be wrong for one
    * of them. Publishable by design — Stripe.js sends it from the browser. */
   stripe_publishable_key: string | null
+  /** Upstream providers this deployment will hold your own API key for.
+   * EMPTY when bring-your-own-key is not configured here — which is how the
+   * feature ships dark: the Keys page renders no BYOK section at all rather
+   * than a form whose every submission would be refused. Optional in the type
+   * so an older router cannot crash this page. */
+  byok_providers?: string[]
+}
+
+/** One attached provider key, as the portal is ever allowed to see it.
+ *
+ * There is deliberately no field for the key itself. The server returns the
+ * plaintext at no point — not even in the response to the request that
+ * attached it — so a customer who loses it re-pastes rather than recovers it. */
+export interface ByokKey {
+  provider: string
+  /** A truncated SHA-256 of the key. An identifier for support and for your
+   * own eyes; it cannot be turned back into the key. */
+  fingerprint: string
+  /** The last four characters, matching what the provider's dashboard shows. */
+  last4: string
+  created_at: string
+  last_used_at: string | null
 }
 
 /** The reset cadences a key's credit limit can use; `null` never resets. */
@@ -110,6 +132,10 @@ export interface LedgerEntry {
   amount_usd: string
   balance_after_usd: string
   note: string | null
+  /** True when the request behind a usage entry ran on your own provider key
+   * and was therefore charged the 5% fee rather than the catalog price. Null
+   * on entries that are not usage, and on usage from before BYOK existed. */
+  byok?: boolean | null
 }
 
 /** A Stripe-hosted page to redirect to. Still the shape of the autopay card
@@ -251,6 +277,11 @@ export const api = {
   // customer can see models and prices before signing in.
   models: () => request<{ data: Model[] }>('GET', '/v1/models').then((r) => r.data),
   usage: (days: number) => request<Usage>('GET', `/api/usage?days=${days}`),
+  byokKeys: () => request<{ keys: ByokKey[] }>('GET', '/api/byok').then((r) => r.keys),
+  attachByokKey: (provider: string, apiKey: string) =>
+    request<ByokKey>('POST', '/api/byok', { provider, api_key: apiKey }),
+  removeByokKey: (provider: string) =>
+    request<void>('DELETE', `/api/byok/${encodeURIComponent(provider)}`),
   ledger: (limit: number) =>
     request<{ limit: number; entries: LedgerEntry[] }>(
       'GET',

@@ -41,6 +41,8 @@ The startup contract is: **misconfiguration aborts, absence disables.**
 | A successful upstream call with missing usage settles the reservation at its conservative bound and the request errors with `metering_unavailable` — an unmetered success is never delivered as a success | `router/src/db.rs` + `router/src/api.rs` (settlement paths) |
 | A webhook with a bad signature, stale timestamp, or unknown user credits nothing | `router/src/stripe.rs` (HMAC signature verification, tolerance window, user resolution before any ledger write) |
 | Admission under `ZEROROUTER_REQUIRE_CREDITS=true` reads the live balance under a per-**user** advisory lock in the same transaction that reserves — no cached balance exists in the admission path | `router/src/db.rs` (advisory-locked reserve) |
+| A malformed `BYOK_ENCRYPTION_KEY` aborts startup; an absent one disables bring-your-own-key and refuses attach attempts with a named reason | `router/src/byok.rs` (`Keyring::from_env`) — the same "misconfiguration aborts, absence disables" contract as the web plane |
+| A route where the customer holds keys for only SOME rungs reserves at the full catalog price, never the 5% fee: the settle debit is clamped to the reservation, so under-reserving would deliver inference ZeroRouter cannot bill for | `router/src/api.rs` (`byok_reservation_rate`) |
 
 ## The six designed-out failure classes
 
@@ -87,8 +89,10 @@ any of them is release-blocking.
 
 ## Token namespaces
 
-Three deliberately distinct namespaces; **no plaintext token ever rests in
-the database — only SHA-256 digests are stored.**
+Three deliberately distinct namespaces; **no plaintext token ZeroRouter
+issues ever rests in the database — only SHA-256 digests are stored.** The
+one secret that is stored reversibly is a secret ZeroRouter did not issue and
+must replay; see "Customer-supplied provider credentials" below.
 
 | prefix | what | minted / verified in | stored as |
 |---|---|---|---|
@@ -100,6 +104,40 @@ The distinct prefixes mean a token can never be replayed across surfaces: a
 session cookie fails the inference key's shape check and vice versa. The
 device flow's `access_token` is a freshly minted `zcr_` key created at claim
 time, so the plaintext exists only in the claiming response.
+
+## Customer-supplied provider credentials (BYOK)
+
+A customer may attach their own upstream provider API key so their traffic
+dispatches on their account and is charged 5% of the catalog price. That key
+is the **only reversibly-stored secret in the database**, and it is the one
+exception to the digests-only rule above. It has to be: a digest answers "is
+this the same string?", and this credential must be presented to Anthropic or
+OpenAI on the customer's behalf, so it has to come back out.
+
+| property | where enforced |
+|---|---|
+| Sealed with AES-256-GCM under a per-record data key, which is itself sealed under `BYOK_ENCRYPTION_KEY` — a secret held in the deployment's secret store, never in the database | `router/src/byok.rs` (`Keyring::seal`/`open`), migration `0026` |
+| The envelope binds `(user_id, provider)` as additional authenticated data, so a ciphertext copied into another tenant's row fails to open rather than decrypting into a spendable credential | `router/src/byok.rs` (`aad_bytes`); asserted in `router/tests/byok.rs` |
+| Never returned by any endpoint — including the response to the request that attached it. `ByokKeySummary` has no field that could carry one | `router/src/portal.rs`; asserted in `router/tests/portal.rs` and `router/tests/byok.rs` |
+| Never logged. The attach handler logs only the root cause of a failure, and a credential that cannot be opened is warned about by provider alias alone | `router/src/portal.rs` (`attach_byok`), `router/src/byok.rs` (`open_credentials`) |
+| A minting provider (Vertex) cannot take a customer key at all: its token cache is keyed by ZeroRouter's own environment variable, so a substituted credential would be cached under the house key's name | `router/src/providers.rs` (`ProviderMetadata::accepts_byok`) |
+| Absent `BYOK_ENCRYPTION_KEY` disables the feature and refuses attach attempts; a malformed one aborts startup | `router/src/byok.rs` (`Keyring::from_env`), `router/src/main.rs` |
+
+**What this widens.** Before BYOK, a database dump disclosed no usable
+secret. It now discloses ciphertext, and an attacker holding *both* the dump
+and the deployment's KEK holds customers' vendor credentials — secrets that
+spend money at a third party, outside ZeroRouter's control. Separating the two
+is what the envelope buys; it does not make the risk zero, and it is stated
+here rather than left implicit.
+
+**What a BYOK request does not get.** Retention on that traffic is governed by
+the customer's own agreement with the provider. ZeroRouter's catalog labels
+describe ZeroRouter's contracts, and the per-response retention attestation
+that fails closed on house traffic is deliberately **not** asserted on BYOK
+dispatch — the header would describe the customer's team, and presenting it as
+a ZeroRouter-verified fact would be a claim ZeroRouter cannot make. Those
+responses carry `zerorouter.byok = true` so the caller can tell which contract
+applies. See `router/src/providers.rs` (`create_provider`).
 
 ## What is intentionally not stored or logged
 
@@ -122,7 +160,9 @@ time, so the plaintext exists only in the claiming response.
   anything logged under an unlisted target reaches the sink, which is why the
   boundary is a list to extend rather than a claim to trust.
 - **Secrets in debug output** — `StripeSettings` scrubs its secret fields in
-  its `Debug` impl (`router/src/web.rs`).
+  its `Debug` impl (`router/src/web.rs`), and `byok::Keyring` and
+  `providers::ByokCredentials` do the same for the BYOK key material
+  (`router/src/byok.rs`, `router/src/providers.rs`).
 
 ## Reporting a vulnerability
 

@@ -457,6 +457,24 @@ pub struct LedgerEntry {
     pub amount_usd: Decimal,
     pub balance_after_usd: Decimal,
     pub note: Option<String>,
+    /// Whether the request behind a `usage` entry dispatched on the CUSTOMER's
+    /// own provider credential, and was therefore charged the 5% BYOK fee
+    /// rather than the catalog price (migration 0026).
+    ///
+    /// `None` on every entry that is not a usage debit — a purchase has no
+    /// request behind it — and on usage rows settled before BYOK existed.
+    /// Additive: a client that does not know the field reads exactly the
+    /// ledger it read before.
+    ///
+    /// Read by JOIN rather than from a column on `credit_ledger` itself. The
+    /// obvious alternative — a `byok_usage` entry type — is refused by
+    /// `credit_ledger_usage_references_request` (migration 0002), and widening
+    /// the entry-type vocabulary to carry a display distinction would mean
+    /// reopening the four constraints that together make a settle replay a
+    /// no-op. The ledger row stays exactly what it has always been; the fact
+    /// lives on the metering row, which is where every other "what happened
+    /// upstream" column already lives.
+    pub byok: Option<bool>,
 }
 
 /// Newest-first ledger entries scoped to a single user.
@@ -465,12 +483,34 @@ pub async fn ledger_entries(
     user_id: Uuid,
     limit: i64,
 ) -> Result<Vec<LedgerEntry>, sqlx::Error> {
-    let rows = sqlx::query_as::<_, (i64, DateTime<Utc>, String, Decimal, Decimal, Option<String>)>(
+    let rows = sqlx::query_as::<
+        _,
+        (
+            i64,
+            DateTime<Utc>,
+            String,
+            Decimal,
+            Decimal,
+            Option<String>,
+            Option<bool>,
+        ),
+    >(
+        // LEFT JOIN, so a usage entry whose metering row is somehow absent
+        // still appears with `byok` NULL rather than vanishing from the
+        // customer's ledger. A display field must never be able to hide a
+        // charge.
         r#"
-        SELECT id, created_at, entry_type, amount_usd, balance_after_usd, note
+        SELECT credit_ledger.id,
+               credit_ledger.created_at,
+               credit_ledger.entry_type,
+               credit_ledger.amount_usd,
+               credit_ledger.balance_after_usd,
+               credit_ledger.note,
+               usage_events.byok
         FROM credit_ledger
-        WHERE user_id = $1
-        ORDER BY created_at DESC, id DESC
+        LEFT JOIN usage_events ON usage_events.request_id = credit_ledger.request_id
+        WHERE credit_ledger.user_id = $1
+        ORDER BY credit_ledger.created_at DESC, credit_ledger.id DESC
         LIMIT $2
         "#,
     )
@@ -481,13 +521,14 @@ pub async fn ledger_entries(
     Ok(rows
         .into_iter()
         .map(
-            |(id, created_at, entry_type, amount_usd, balance_after_usd, note)| LedgerEntry {
+            |(id, created_at, entry_type, amount_usd, balance_after_usd, note, byok)| LedgerEntry {
                 id,
                 created_at,
                 entry_type,
                 amount_usd,
                 balance_after_usd,
                 note,
+                byok,
             },
         )
         .collect())

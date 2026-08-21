@@ -250,6 +250,7 @@ export function Docs() {
         <a href="#keys">Keys</a>
         <a href="#errors">Errors worth knowing</a>
         <a href="#billing">How you are charged</a>
+        <a href="#byok">Bring your own key</a>
         <a href="#cli">Command line</a>
       </nav>
 
@@ -629,7 +630,52 @@ export function Docs() {
       <p>
         Prices are the provider’s own list rates with no markup on inference. The only fee
         ZeroRouter charges is the deposit fee when you add credits, and the exact amount is shown
-        before you confirm. See the <Link to="/terms">Terms</Link> for the full statement.
+        before you confirm. See the <Link to="/terms">Terms</Link> for the full statement. If you
+        bring your own provider key, you pay a percentage of catalog instead of the catalog price —
+        see <a href="#byok">Bring your own key</a>.
+      </p>
+
+      {/* ── BYOK ────────────────────────────────────────────────────────── */}
+
+      <h2 id="byok">Bring your own key</h2>
+      <p>
+        You can attach your own API key for a provider from the{' '}
+        <Link to="/keys">Keys</Link> page. When you have, requests that dispatch to that provider
+        go out on <em>your</em> credential: the provider bills you directly for the inference, and
+        ZeroRouter charges <strong>5% of what the same usage would have cost at our catalog
+        rates</strong>, taken from your prepaid balance like any other usage. Everything else is
+        unchanged — the same reserve-then-settle machinery, the same metered-actuals-only rule, and
+        your spend caps and rate limits still apply, measured against the fee rather than the full
+        price.
+      </p>
+      <p>
+        <strong>There is no fallback to our key.</strong> If a request dispatches to a provider you
+        have attached a key for, it uses that key or it fails with an error naming the reason. We
+        will not quietly serve it on ZeroRouter&rsquo;s credential and bill you the full catalog
+        price for a request you expected to pay 5% on. A walk that fails over to a{' '}
+        <em>different</em> provider — one you have not attached a key for — is served on our
+        credential and billed at catalog, which is the ordinary case and is what the response
+        metadata lets you tell apart.
+      </p>
+      <p>
+        <strong>Retention is governed by your agreement, not ours.</strong> This is the part worth
+        reading twice. The retention posture published for each model on{' '}
+        <Link to="/models">Models</Link> describes <em>ZeroRouter&rsquo;s</em> contract with that
+        provider. It does not describe yours. When a request runs on your key, what the provider
+        does with your prompts and completions is whatever your own agreement and account settings
+        say — including whether zero-data-retention applies. For the lanes where ZeroRouter asserts
+        a per-response retention guarantee on its own traffic, we deliberately do <em>not</em>
+        assert it on yours: the header would describe your team&rsquo;s configuration, and
+        presenting that as something ZeroRouter verified would be a claim we are not in a position
+        to make. Requests served on your key carry{' '}
+        <code>{'"zerorouter": { "byok": true }'}</code> in the response so you can tell which
+        contract governs.
+      </p>
+      <p>
+        Keys are stored encrypted, shown once and never again — the portal displays only the
+        provider, a fingerprint, and the last four characters. To rotate, paste the new key over the
+        old one; to stop, remove it and those models bill at catalog rates again. Not every provider
+        can take a customer key: the attach form lists the ones this deployment supports.
       </p>
 
       {/* ── CLI ─────────────────────────────────────────────────────────── */}

@@ -13,7 +13,7 @@ use axum::{
 };
 use http_body_util::BodyExt;
 use rust_decimal::Decimal;
-use serde_json::Value;
+use serde_json::{Value, json};
 use sqlx_core::{query::query, query_scalar::query_scalar};
 use sqlx_postgres::{PgConnectOptions, PgPool, PgPoolOptions};
 use tower::ServiceExt;
@@ -106,6 +106,20 @@ fn decimal_value(value: &Value) -> Decimal {
         }
         other => panic!("expected a decimal value, got {other:?}"),
     }
+}
+
+/// The pool the BYOK tests below share. The tests that predate them open
+/// their own inline, and are left alone.
+async fn connect() -> Option<PgPool> {
+    let database_url = std::env::var("DATABASE_URL").ok()?;
+    let options = PgConnectOptions::from_str(&database_url).expect("test database URL must parse");
+    let pool = PgPoolOptions::new()
+        .max_connections(5)
+        .connect_with(options)
+        .await
+        .expect("test database must connect");
+    migrate(&pool).await.expect("migration must succeed");
+    Some(pool)
 }
 
 async fn seed_user(pool: &PgPool, tag: &str) -> Uuid {
@@ -512,4 +526,257 @@ async fn the_spa_serves_immutable_assets_and_a_revalidating_shell() {
     assert_eq!(cache("/terms").await, "no-cache");
 
     std::fs::remove_dir_all(&dist).ok();
+}
+
+// ---------------------------------------------------------------------------
+// Bring-your-own-key (migration 0026)
+//
+// The HTTP surface, tested where the customer actually meets it: the CSRF gate,
+// the tenancy scoping, and — the one that matters most — that no response body
+// on any of the three endpoints ever carries the credential.
+// ---------------------------------------------------------------------------
+
+/// A portal router that HOLDS a BYOK keyring, i.e. a deployment where the
+/// operator has provisioned `BYOK_ENCRYPTION_KEY`.
+fn byok_portal_app(pool: &PgPool) -> axum::Router {
+    let keyring = zerorouter::byok::Keyring::from_hex_for_tests(&"5e".repeat(32))
+        .expect("the fixture key must build a keyring");
+    portal::router().with_state(
+        WebCtx::new(pool.clone(), test_web_config()).with_byok(Some(std::sync::Arc::new(keyring))),
+    )
+}
+
+async fn send_to(app: axum::Router, request: Request<Body>) -> (StatusCode, String, Value) {
+    let response = app
+        .oneshot(request)
+        .await
+        .expect("portal request should complete");
+    let status = response.status();
+    let bytes = response
+        .into_body()
+        .collect()
+        .await
+        .expect("portal response body should be readable")
+        .to_bytes();
+    let text = String::from_utf8(bytes.to_vec()).expect("portal response should be UTF-8");
+    let json = if text.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_str(&text).expect("portal response should be JSON")
+    };
+    (status, text, json)
+}
+
+fn post_byok(cookie: &str, csrf: bool, body: Value) -> Request<Body> {
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri("/api/byok")
+        .header(header::COOKIE, cookie)
+        .header(header::CONTENT_TYPE, "application/json");
+    if csrf {
+        builder = builder.header(CSRF_HEADER, "1");
+    }
+    builder
+        .body(Body::from(body.to_string()))
+        .expect("POST request should build")
+}
+
+#[tokio::test]
+async fn the_byok_endpoints_are_tenant_scoped_csrf_guarded_and_never_echo_the_key() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    const CUSTOMER_KEY: &str = "sk-portal-OWNKEY-0123456789abcdef";
+
+    let owner = seed_user(&pool, "byok-owner").await;
+    let neighbour = seed_user(&pool, "byok-neighbour").await;
+    let (owner_token, _) = create_session(&pool, owner, Duration::from_secs(3_600))
+        .await
+        .expect("owner session must create");
+    let (neighbour_token, _) = create_session(&pool, neighbour, Duration::from_secs(3_600))
+        .await
+        .expect("neighbour session must create");
+    let owner_cookie = format!("{SESSION_COOKIE}={owner_token}");
+    let neighbour_cookie = format!("{SESSION_COOKIE}={neighbour_token}");
+
+    // Unauthenticated is refused before anything is looked up.
+    let (status, _, json) = send_to(byok_portal_app(&pool), get("/api/byok", None)).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(json["error"]["code"], "session_required");
+
+    // A mutation without the portal header is refused — a cross-site form post
+    // cannot set it, and attaching a provider key is exactly the kind of thing
+    // that must not be reachable that way.
+    let (status, _, json) = send_to(
+        byok_portal_app(&pool),
+        post_byok(
+            &owner_cookie,
+            false,
+            json!({"provider": "anthropic", "api_key": CUSTOMER_KEY}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(json["error"]["code"], "csrf_rejected");
+
+    // A provider that cannot take a customer key is refused before sealing.
+    let (status, _, json) = send_to(
+        byok_portal_app(&pool),
+        post_byok(
+            &owner_cookie,
+            true,
+            json!({"provider": "vertex", "api_key": CUSTOMER_KEY}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(json["error"]["code"], "byok_provider_unsupported");
+
+    // A paste that caught a newline is answered here rather than as an
+    // undiagnosable upstream 401 later.
+    let (status, _, json) = send_to(
+        byok_portal_app(&pool),
+        post_byok(
+            &owner_cookie,
+            true,
+            json!({"provider": "anthropic", "api_key": format!("{CUSTOMER_KEY}\n")}),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "a trailing newline is trimmed, not refused: {json}"
+    );
+
+    // The attach response — the ONE moment the server has ever held the
+    // plaintext — must not contain it.
+    let (status, attach_text, attach) = send_to(
+        byok_portal_app(&pool),
+        post_byok(
+            &owner_cookie,
+            true,
+            json!({"provider": "anthropic", "api_key": CUSTOMER_KEY}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert!(
+        !attach_text.contains(CUSTOMER_KEY) && !attach_text.contains("OWNKEY"),
+        "the attach response must not carry the credential: {attach_text}"
+    );
+    assert_eq!(attach["provider"], "anthropic");
+    assert_eq!(attach["last4"], "cdef");
+    assert!(
+        attach["api_key"].is_null(),
+        "there is no api_key field to fill"
+    );
+
+    // Neither must the listing, ever again.
+    let (status, list_text, list) = send_to(
+        byok_portal_app(&pool),
+        get("/api/byok", Some(&owner_cookie)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        !list_text.contains(CUSTOMER_KEY) && !list_text.contains("OWNKEY"),
+        "the listing must not carry the credential: {list_text}"
+    );
+    assert_eq!(list["keys"].as_array().expect("keys array").len(), 1);
+    assert_eq!(
+        list["keys"][0]["fingerprint"].as_str().map(str::len),
+        Some(16)
+    );
+
+    // The neighbour sees nothing and cannot detach it.
+    let (status, _, list) = send_to(
+        byok_portal_app(&pool),
+        get("/api/byok", Some(&neighbour_cookie)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(list["keys"].as_array().expect("keys array").is_empty());
+    let (status, _, json) = send_to(
+        byok_portal_app(&pool),
+        Request::builder()
+            .method("DELETE")
+            .uri("/api/byok/anthropic")
+            .header(header::COOKIE, &neighbour_cookie)
+            .header(CSRF_HEADER, "1")
+            .body(Body::empty())
+            .expect("DELETE should build"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(json["error"]["code"], "byok_key_not_found");
+
+    // The owner can, and afterwards ZeroRouter holds nothing.
+    let (status, _, _) = send_to(
+        byok_portal_app(&pool),
+        Request::builder()
+            .method("DELETE")
+            .uri("/api/byok/anthropic")
+            .header(header::COOKIE, &owner_cookie)
+            .header(CSRF_HEADER, "1")
+            .body(Body::empty())
+            .expect("DELETE should build"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (_, _, list) = send_to(
+        byok_portal_app(&pool),
+        get("/api/byok", Some(&owner_cookie)),
+    )
+    .await;
+    assert!(list["keys"].as_array().expect("keys array").is_empty());
+}
+
+#[tokio::test]
+async fn byok_ships_dark_when_the_deployment_has_no_encryption_key() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let user_id = seed_user(&pool, "byok-dark").await;
+    let (token, _) = create_session(&pool, user_id, Duration::from_secs(3_600))
+        .await
+        .expect("session must create");
+    let cookie = format!("{SESSION_COOKIE}={token}");
+
+    // `portal_app` is a deployment with no keyring — the shipping default.
+    // `/api/me` reports the capability as absent, which is what makes the SPA
+    // render no BYOK section rather than a form that could only ever fail.
+    let (status, _, me) = send(&pool, get("/api/me", Some(&cookie))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        me["byok_providers"],
+        json!([]),
+        "an unconfigured deployment offers no providers"
+    );
+
+    // The listing answers "nothing" rather than erroring: a GET is the SPA
+    // asking what exists, and nothing is the true answer.
+    let (status, _, list) = send(&pool, get("/api/byok", Some(&cookie))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(list["keys"].as_array().expect("keys array").is_empty());
+
+    // An attach is refused CLEANLY — named reason, no partial write.
+    let (status, _, json) = send(
+        &pool,
+        post_byok(
+            &cookie,
+            true,
+            json!({"provider": "anthropic", "api_key": "sk-anything-0123456789abcdef"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(json["error"]["code"], "byok_unavailable");
+    let stored =
+        query_scalar::<_, i64>("SELECT COUNT(*) FROM byok_provider_keys WHERE user_id = $1")
+            .bind(user_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count must query");
+    assert_eq!(stored, 0, "a refused attach must store nothing");
 }

@@ -3,6 +3,7 @@ import type { FormEvent } from 'react'
 import { api } from '../api'
 import type { ApiKey, CreatedKey, CreditLimitWindow, NewKey } from '../api'
 import { Link } from 'react-router-dom'
+import { ByokSection } from './ByokSection'
 import { EXAMPLE_MODEL } from './Docs'
 import {
   Badge,
@@ -160,7 +161,9 @@ export function Keys() {
     <div className="page">
       <header className="page-head">
         <h1>API keys</h1>
-        <p className="page-sub">Keys authenticate requests to the inference API and bill this account</p>
+        <p className="page-sub">
+          Keys authenticate requests to the inference API and bill this account
+        </p>
       </header>
 
       <section className="panel">
@@ -299,6 +302,13 @@ export function Keys() {
           </table>
         )}
       </section>
+
+      {/* Bring-your-own-key lives on this page rather than one of its own: both
+          sections are "the credentials this account uses", and a customer
+          attaching a provider key has almost always just been looking at their
+          ZeroRouter keys. It renders nothing at all when the deployment does
+          not offer BYOK. */}
+      <ByokSection />
 
       {created !== null && (
         <Modal title="API key created">

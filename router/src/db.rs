@@ -311,6 +311,17 @@ pub struct RequestTelemetry {
     // exactly migration 0004's "NULL = row predates the knob". The live path
     // always resolves one, `balanced` being the default.
     pub priority: Option<Priority>,
+    /// Whether the served attempt dispatched on the CUSTOMER's own provider
+    /// credential and was therefore charged the BYOK fee rather than the
+    /// catalog price (migration 0026).
+    ///
+    /// `None` means the row predates BYOK — the same reading migration 0026
+    /// gives the nullable column, and the same reading `priority` above has for
+    /// its own era. It is deliberately not `bool`: `usage_events` rejects
+    /// UPDATE, so a `false` written here for a settlement intent persisted
+    /// before this field existed could never be corrected, and it would assert
+    /// something nobody recorded.
+    pub byok: Option<bool>,
 }
 
 impl RequestTelemetry {
@@ -1038,6 +1049,13 @@ pub async fn migrate(pool: &PgPool) -> Result<()> {
                 Cow::Borrowed("redemption tax"),
                 MigrationType::Simple,
                 Cow::Borrowed(include_str!("../migrations/0025_redemption_tax.sql")),
+                false,
+            ),
+            Migration::new(
+                26,
+                Cow::Borrowed("byok provider keys"),
+                MigrationType::Simple,
+                Cow::Borrowed(include_str!("../migrations/0026_byok_provider_keys.sql")),
                 false,
             ),
         ]),
@@ -2021,6 +2039,7 @@ impl UsageSession {
     /// every one of those steps is expressed in terms of a [`Reservation`]
     /// that does not exist.
     pub async fn record(&self, record: &UsageRecord) -> Result<(), sqlx::Error> {
+        self.stamp_byok_use(record);
         let Some(reservation) = &self.reservation else {
             self.observe_free_usage(record);
             return Ok(());
@@ -2056,6 +2075,37 @@ impl UsageSession {
             }
         }
         settle_with_retry(&self.pool, self.request_id, self.api_key_id, &intent).await
+    }
+
+    /// Stamp `last_used_at` on the customer's own provider credential, when
+    /// this request dispatched on one (migration 0026).
+    ///
+    /// Fire-and-forget, off the settle path, and on BOTH lanes — the metered
+    /// one and the free one — because "this credential served a request" is
+    /// true either way. It is a display field on a settings page, so a failure
+    /// is warned about and dropped: making a customer's inference depend on a
+    /// timestamp write would be an absurd trade, and the settle transaction
+    /// below must not grow a reason to abort that has nothing to do with money.
+    ///
+    /// Keyed on the SERVED row's provider rather than on what the request set
+    /// out to use, so a walk that failed over to a house candidate does not
+    /// mark the customer's key as having served something it did not.
+    fn stamp_byok_use(&self, record: &UsageRecord) {
+        if record.telemetry.byok != Some(true) {
+            return;
+        }
+        let pool = self.pool.clone();
+        let user_id = self.user_id;
+        let provider = record.upstream_provider.clone();
+        tokio::spawn(async move {
+            if let Err(error) = crate::byok::mark_used(&pool, user_id, &provider).await {
+                tracing::warn!(
+                    provider = %provider,
+                    error = %error,
+                    "could not stamp last_used_at on a BYOK credential"
+                );
+            }
+        });
     }
 
     /// Write the settle payload onto the reservation row that carries it.
@@ -2244,12 +2294,13 @@ impl UsageSession {
                     attempt_count,
                     shape_ok,
                     priority,
-                    usage_gap
+                    usage_gap,
+                    byok
                 )
                 VALUES (
                     $1, $2, $3, $4, $5, $6, $7, $8, 0, $9, $10,
                     $11, $12, $13::JSONB, $14::JSONB, $15, $16, $17, $18, $19,
-                    $20, $21, $22, $23, $24, $25
+                    $20, $21, $22, $23, $24, $25, $26
                 )
                 "#,
                 )
@@ -2278,6 +2329,12 @@ impl UsageSession {
                 .bind(telemetry.shape_ok)
                 .bind(telemetry.priority.map(Priority::as_str))
                 .bind(usage_gap)
+                // Recorded on the free lane too, even though the fee arithmetic
+                // is moot at a zero sell rate: the row is the only record that
+                // this request ran on the customer's credential, and a
+                // dashboard counting BYOK traffic must not silently omit the
+                // lane that skips metering.
+                .bind(telemetry.byok)
                 .execute(&mut *transaction)
                 .await?;
                 transaction.commit().await
@@ -2616,12 +2673,14 @@ async fn settle_once(
                 task_signature_scheme,
                 tool_names_sha256,
                 priority,
-                usage_gap
+                usage_gap,
+                byok
             )
             VALUES (
                 $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
                 $12, $13, $14, $15::JSONB, $16::JSONB, $17, $18, $19, $20, $21,
-                $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34
+                $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34,
+                $35
             )
             "#,
     )
@@ -2663,6 +2722,7 @@ async fn settle_once(
     .bind(intent.tool_names_sha256.as_deref())
     .bind(telemetry.priority.map(Priority::as_str))
     .bind(telemetry.usage_gap)
+    .bind(telemetry.byok)
     .execute(&mut *transaction)
     .await;
     if let Err(error) = settled {
@@ -3512,6 +3572,23 @@ struct TelemetryPayload {
     /// knob", never a guessed `balanced`.
     #[serde(default)]
     priority: Option<String>,
+    /// Whether the served attempt dispatched on the customer's own provider
+    /// credential (migration 0026).
+    ///
+    /// `#[serde(default)]` on the same contract as `priority` above, and the
+    /// `Option` matters more here than anywhere else in this payload: an
+    /// intent written before BYOK existed settles with a NULL `byok`, which is
+    /// the ledger's word for "predates the distinction". Defaulting it to
+    /// `false` would have the recovery sweep assert about every replayed
+    /// pre-BYOK request that it was known NOT to be BYOK — a claim nobody
+    /// recorded, written into a table that rejects UPDATE and so could never
+    /// be corrected.
+    ///
+    /// The CHARGE is unaffected either way: `cost_usd` was computed at the
+    /// original settle and is replayed verbatim, so this field is provenance,
+    /// not arithmetic. A replayed intent cannot be re-priced by it.
+    #[serde(default)]
+    byok: Option<bool>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -3583,6 +3660,7 @@ impl SettlementIntent {
                     .telemetry
                     .priority
                     .map(|priority| priority.as_str().to_owned()),
+                byok: record.telemetry.byok,
             },
             attempts: record
                 .attempts
@@ -3694,6 +3772,7 @@ impl SettlementIntent {
                     .priority
                     .as_deref()
                     .and_then(Priority::from_keyword),
+                byok: self.telemetry.byok,
             },
             attempts,
         })

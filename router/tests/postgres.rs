@@ -62,6 +62,10 @@ fn sentinel_telemetry() -> RequestTelemetry {
         usage_gap: None,
         shape_ok: None,
         priority: Some(Priority::Balanced),
+        // `None`, not `Some(false)`: these fixtures describe requests from before
+        // BYOK existed, so they keep pinning the pre-BYOK settled row exactly, and
+        // they exercise the NULL arm of the new column while they are at it.
+        byok: None,
     }
 }
 
@@ -391,6 +395,10 @@ async fn settled_row_carries_estimate_and_select_telemetry() {
         usage_gap: None,
         shape_ok: Some(true),
         priority: Some(Priority::Success),
+        // `None`, not `Some(false)`: these fixtures describe requests from before
+        // BYOK existed, so they keep pinning the pre-BYOK settled row exactly, and
+        // they exercise the NULL arm of the new column while they are at it.
+        byok: None,
     };
     session
         .record(&UsageRecord {
@@ -810,6 +818,7 @@ async fn migration_chain_applies_on_a_fresh_database() {
         bool,
         bool,
         bool,
+        bool,
         i64,
     )> = async {
         let pool = PgPoolOptions::new()
@@ -1039,6 +1048,29 @@ async fn migration_chain_applies_on_a_fresh_database() {
         )
         .fetch_one(&pool)
         .await?;
+        // 0026, both halves in one probe because they are one feature: the
+        // table that holds sealed customer credentials, and the metering
+        // column that records which requests were served on one. The
+        // nullable-with-no-default assertion is the compatibility story —
+        // `usage_events` rejects UPDATE, so a DEFAULT FALSE appearing here
+        // could never be corrected and would permanently claim that every
+        // historical request was known not to be BYOK.
+        let byok_keys_exist = query_scalar::<_, bool>(
+            r#"
+            SELECT EXISTS (
+                SELECT 1 FROM information_schema.tables
+                WHERE table_name = 'byok_provider_keys'
+            ) AND EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_name = 'usage_events'
+                  AND column_name = 'byok'
+                  AND is_nullable = 'YES'
+                  AND column_default IS NULL
+            )
+            "#,
+        )
+        .fetch_one(&pool)
+        .await?;
         let version = query_scalar::<_, i64>("SELECT MAX(version) FROM _sqlx_migrations")
             .fetch_one(&pool)
             .await?;
@@ -1063,6 +1095,7 @@ async fn migration_chain_applies_on_a_fresh_database() {
             checkout_intent_delete_is_guarded,
             key_limits_exist,
             key_limit_columns_are_nullable_with_no_default,
+            byok_keys_exist,
             version,
         ))
     }
@@ -1164,15 +1197,23 @@ async fn migration_chain_applies_on_a_fresh_database() {
         "the 0023 key columns are nullable with no default, so every key that \
          predates them reads NULL: never expires, unlimited"
     );
-    // 25, not 21: 0013 (dispute resolution), 0014 (dispatched reservations),
+    assert!(
+        outcome.19,
+        "the 0026 byok_provider_keys table exists after the chain, and \
+         usage_events.byok is nullable with no default — every row settled \
+         before BYOK existed must read NULL rather than a FALSE asserting \
+         something nobody recorded"
+    );
+    // 26, not 22: 0013 (dispute resolution), 0014 (dispatched reservations),
     // 0015 (released reservations), 0016 (deposit fee), 0017 (stripe observed
     // reversals), 0018 (autopay withheld state), 0019 (monthly spend rollup),
     // 0020 (usage gap and real finish reason), 0021 (autopay tax), 0022
     // (checkout intent cleanup), 0023 (key expiry and credit limits), 0024
-    // (autopay tax lifecycle) and 0025 (redemption tax) are numbered with a
-    // gap so 0010-0012 stay available to branches in flight. The chain's head
-    // is the highest version applied, not a count of files.
-    assert_eq!(outcome.19, 25, "the chain reaches migration version 25");
+    // (autopay tax lifecycle), 0025 (redemption tax) and 0026 (byok provider
+    // keys) are numbered with a gap so 0010-0012 stay available to branches in
+    // flight. The chain's head is the highest version applied, not a count of
+    // files.
+    assert_eq!(outcome.20, 26, "the chain reaches migration version 26");
 }
 
 /// Rewrite the database name in a Postgres URL, keeping any query string

@@ -30,8 +30,10 @@ use uuid::Uuid;
 use crate::{
     auth::{generate_api_key, hash_api_key},
     billing::{self, LedgerEntry},
+    byok,
     db::{CreditLimitWindow, KeyMintAdmission, admit_key_mint},
     priority::Priority,
+    providers,
     session::PortalUser,
     sqlx,
     web::WebCtx,
@@ -99,6 +101,8 @@ pub fn router() -> Router<WebCtx> {
         .route("/api/keys/{id}", delete(disable_key).patch(update_key))
         .route("/api/usage", get(usage))
         .route("/api/billing/ledger", get(ledger))
+        .route("/api/byok", get(list_byok).post(attach_byok))
+        .route("/api/byok/{provider}", delete(remove_byok))
 }
 
 /// Static serving for the built portal SPA: files from `dist_path`, with
@@ -148,6 +152,13 @@ enum PortalError {
     /// ledger and usage — the freeze blocks spend, not visibility.
     AccountFrozen,
     KeyNotFound,
+    /// This deployment has no `BYOK_ENCRYPTION_KEY`, so it cannot seal a
+    /// customer credential and must not accept one.
+    ByokUnavailable,
+    /// The named upstream does not exist here, or cannot take a customer's own
+    /// credential (see [`crate::providers::provider_accepts_byok`]).
+    ByokProviderUnsupported,
+    ByokKeyNotFound,
     Database,
 }
 
@@ -180,6 +191,28 @@ impl IntoResponse for PortalError {
                 StatusCode::NOT_FOUND,
                 "The API key was not found.",
                 "key_not_found",
+            ),
+            // 501 rather than 404: the endpoint exists and the request was
+            // well-formed, but this deployment has not been given the secret
+            // that would let it hold a customer credential. A 404 would read
+            // as "you asked for the wrong thing" and send someone checking
+            // their URL instead of their configuration.
+            Self::ByokUnavailable => (
+                StatusCode::NOT_IMPLEMENTED,
+                "This ZeroRouter deployment is not configured to hold your own provider keys. \
+                 Contact the operator if you expected bring-your-own-key to be available.",
+                "byok_unavailable",
+            ),
+            Self::ByokProviderUnsupported => (
+                StatusCode::BAD_REQUEST,
+                "That provider cannot take your own API key on this deployment. Only providers \
+                 listed as bring-your-own-key capable accept one.",
+                "byok_provider_unsupported",
+            ),
+            Self::ByokKeyNotFound => (
+                StatusCode::NOT_FOUND,
+                "No key is attached for that provider.",
+                "byok_key_not_found",
             ),
             Self::Database => (
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -219,6 +252,19 @@ struct MeResponse {
     /// its existing "billing is not enabled" notice rather than mounting a
     /// checkout that could never complete.
     stripe_publishable_key: Option<String>,
+    /// Which upstream providers this deployment will accept a customer's own
+    /// API key for, or an EMPTY list when BYOK is not configured here.
+    ///
+    /// Same shape of signal as `stripe_publishable_key` above and for the same
+    /// reason: the SPA cannot know from its own bundle whether a feature the
+    /// operator has to provision is live, and rendering an attach form that
+    /// could only ever fail is worse than rendering nothing. An empty list is
+    /// how BYOK ships dark — the portal shows no BYOK section at all.
+    ///
+    /// It is the provider LIST rather than a boolean because the form needs it
+    /// anyway, and one field that answers both "is this on?" and "on for
+    /// what?" cannot drift out of agreement with itself.
+    byok_providers: Vec<String>,
 }
 
 async fn me(State(ctx): State<WebCtx>, user: PortalUser) -> Result<Json<MeResponse>, PortalError> {
@@ -238,6 +284,14 @@ async fn me(State(ctx): State<WebCtx>, user: PortalUser) -> Result<Json<MeRespon
             .stripe
             .as_ref()
             .map(|stripe| stripe.publishable_key.clone()),
+        // Both halves must hold: a keyring to seal with, and a provider that
+        // can take a customer key. Either one missing means there is nothing
+        // to offer.
+        byok_providers: if ctx.byok.is_some() {
+            providers::byok_capable_providers()
+        } else {
+            Vec::new()
+        },
     }))
 }
 
@@ -608,6 +662,121 @@ async fn create_key(
             last_used_at: None,
         }),
     ))
+}
+
+// ---------------------------------------------------------------------------
+// Bring-your-own-key (migration 0026)
+//
+// Three handlers, and the shape of the response is the security control: a
+// stored credential is never returned by any of them, at any time, including
+// the moment it is attached. `ByokKeySummary` has no field that could carry
+// one — which is a stronger guarantee than remembering not to populate one,
+// because there is nothing to populate. The attach handler answers with the
+// same summary the listing does, so "what the customer sees after saving" and
+// "what the customer sees later" are one type with one definition.
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize)]
+struct ByokKeySummary {
+    provider: String,
+    /// A truncated SHA-256 of the credential — an identifier for support and
+    /// for the customer's own eyes, never an authenticator, and not reversible
+    /// into the key.
+    fingerprint: String,
+    /// The trailing four characters, matching what the provider's own
+    /// dashboard shows so a customer can tell which of their keys this is.
+    last4: String,
+    created_at: DateTime<Utc>,
+    last_used_at: Option<DateTime<Utc>>,
+}
+
+impl From<byok::StoredKey> for ByokKeySummary {
+    fn from(key: byok::StoredKey) -> Self {
+        Self {
+            provider: key.provider,
+            fingerprint: key.fingerprint,
+            last4: key.last4,
+            created_at: key.created_at,
+            last_used_at: key.last_used_at,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct ByokKeysResponse {
+    keys: Vec<ByokKeySummary>,
+}
+
+#[derive(Deserialize)]
+struct AttachByokRequest {
+    provider: String,
+    /// The customer's own provider credential. Read once, sealed, and dropped:
+    /// it is never echoed back, never logged, and never stored in plaintext.
+    api_key: String,
+}
+
+async fn list_byok(
+    State(ctx): State<WebCtx>,
+    user: PortalUser,
+) -> Result<Json<ByokKeysResponse>, PortalError> {
+    // An unconfigured deployment lists nothing rather than erroring: a GET is
+    // the SPA asking "what do I have", and "nothing" is the true answer
+    // whether the reason is no keys or no keyring.
+    if ctx.byok.is_none() {
+        return Ok(Json(ByokKeysResponse { keys: Vec::new() }));
+    }
+    let keys = byok::list_keys(&ctx.pool, user.user_id).await?;
+    Ok(Json(ByokKeysResponse {
+        keys: keys.into_iter().map(ByokKeySummary::from).collect(),
+    }))
+}
+
+async fn attach_byok(
+    State(ctx): State<WebCtx>,
+    user: PortalUser,
+    Json(request): Json<AttachByokRequest>,
+) -> Result<(StatusCode, Json<ByokKeySummary>), PortalError> {
+    let Some(keyring) = ctx.byok.as_deref() else {
+        return Err(PortalError::ByokUnavailable);
+    };
+    let provider = request.provider.trim();
+    if !providers::provider_accepts_byok(provider) {
+        return Err(PortalError::ByokProviderUnsupported);
+    }
+    // Shape-checked before it is sealed, so the common paste mistakes (a
+    // trailing newline, a truncated copy) are answered here rather than as an
+    // undiagnosable upstream 401 on the customer's next request.
+    let credential = request.api_key.trim();
+    byok::validate_credential(credential).map_err(PortalError::InvalidRequest)?;
+
+    let stored = byok::attach_key(&ctx.pool, keyring, user.user_id, provider, credential)
+        .await
+        .map_err(|error| {
+            // The error is logged WITHOUT its context chain and the credential
+            // is not in scope for the message. `anyhow`'s Display would carry
+            // whatever the sealing or database layer attached, and this is the
+            // one handler in the module where a stray value in an error string
+            // would be a third party's API key.
+            tracing::error!(provider = %provider, "attaching a BYOK credential failed: {}", error.root_cause());
+            PortalError::Database
+        })?;
+    Ok((StatusCode::CREATED, Json(ByokKeySummary::from(stored))))
+}
+
+async fn remove_byok(
+    State(ctx): State<WebCtx>,
+    user: PortalUser,
+    Path(provider): Path<String>,
+) -> Result<StatusCode, PortalError> {
+    // Detach works even with no keyring configured, deliberately: a customer
+    // asking ZeroRouter to stop holding their vendor credential must always be
+    // able to, including after an operator has removed the secret that would
+    // let it be read. Refusing here would leave a sealed third-party key in the
+    // database with no way to delete it from the portal.
+    if !byok::remove_key(&ctx.pool, user.user_id, provider.trim()).await? {
+        return Err(PortalError::ByokKeyNotFound);
+    }
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn disable_key(

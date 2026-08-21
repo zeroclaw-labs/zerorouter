@@ -281,6 +281,23 @@ fn warn_cap_only_opt_out(required: bool) {
 pub struct WebCtx {
     pub pool: PgPool,
     pub config: Arc<WebConfig>,
+    /// The key BYOK credentials are sealed under, or `None` when this
+    /// deployment has not provisioned one (see
+    /// [`crate::byok::Keyring::from_env`]).
+    ///
+    /// Carried on the context rather than in [`WebConfig`] because BYOK is not
+    /// a web-plane feature that happens to need a secret — it is a DISPATCH
+    /// feature whose management surface is the portal, so the inference plane
+    /// ([`crate::api::RouterState`]) holds the same keyring from the same
+    /// read. Putting it in `WebConfig` would make the inference side reach
+    /// through the web plane's configuration for something the web plane does
+    /// not own.
+    ///
+    /// `None` is the whole ship-dark contract on this surface: the attach
+    /// endpoint refuses with a clear reason, the listing is empty, and
+    /// `/api/me` reports the capability as off so the SPA renders no BYOK
+    /// section at all.
+    pub byok: Option<Arc<crate::byok::Keyring>>,
 }
 
 impl WebCtx {
@@ -289,7 +306,22 @@ impl WebCtx {
         Self {
             pool,
             config: Arc::new(config),
+            byok: None,
         }
+    }
+
+    /// Attach the BYOK keyring this deployment read from the environment.
+    ///
+    /// A builder rather than a fourth argument to [`Self::new`] so that every
+    /// existing construction site — including the test harnesses — keeps
+    /// describing a deployment WITHOUT BYOK, which is what they are. A test
+    /// that means to describe a BYOK deployment has to say so, the same
+    /// discipline [`crate::api::RouterState::fully_credentialed`] enforces for
+    /// provider credentials.
+    #[must_use]
+    pub fn with_byok(mut self, byok: Option<Arc<crate::byok::Keyring>>) -> Self {
+        self.byok = byok;
+        self
     }
 }
 

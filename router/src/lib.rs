@@ -2,6 +2,7 @@ pub mod admin;
 pub mod api;
 pub mod auth;
 pub mod billing;
+pub mod byok;
 pub mod config;
 pub mod corroborate;
 pub mod db;
