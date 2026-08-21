@@ -1110,7 +1110,7 @@ mod tests {
     /// this asserts the two things it reads rather than the bytes it emits:
     /// the posture on the overridden row, and `posture_count`, which is the
     /// footnote's arithmetic. Both move if the override stops being honoured —
-    /// deleting the block flips this lane to `zero` and turns 9/11 into 10/10.
+    /// deleting the block flips this lane to `zero` and turns 11/11 into 12/10.
     #[tokio::test]
     async fn the_cli_reads_a_tier_override_rather_than_its_providers_pin() {
         let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("config/tiers.toml");
@@ -1137,11 +1137,17 @@ mod tests {
         assert_eq!(posture("fireworks/kimi-k3"), "zero");
 
         // The footnote's counts. Stated as literals on purpose: this is the
-        // arithmetic a customer reads as "9 lane(s) zero-retention", and an
+        // arithmetic a customer reads as "11 lane(s) zero-retention", and an
         // override silently stopping working would show up here as a lane
         // moving from one side of the sentence to the other.
-        assert_eq!(posture_count(rows, "zero"), 9);
+        //
+        // The two sides became equal when the xAI lanes landed, which is a
+        // coincidence of tallies rather than anything meaningful — do not read
+        // the symmetry as a check. Zero: four Bedrock, five open-weight
+        // Fireworks, two xAI. Standard: four Anthropic, three Google, three
+        // OpenAI, and the one overridden Fireworks lane this test is about.
+        assert_eq!(posture_count(rows, "zero"), 11);
         assert_eq!(posture_count(rows, "standard"), 11);
-        assert_eq!(rows.len(), 20, "every shipped lane is counted exactly once");
+        assert_eq!(rows.len(), 22, "every shipped lane is counted exactly once");
     }
 }

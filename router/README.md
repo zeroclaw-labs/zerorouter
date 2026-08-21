@@ -31,8 +31,18 @@ Provider candidates become available when their corresponding variables are pres
 ANTHROPIC_API_KEY
 OPENAI_API_KEY
 GEMINI_API_KEY
-BEDROCK_API_KEY   (+ BEDROCK_REGION, see below)
+BEDROCK_API_KEY     (+ BEDROCK_REGION, see below)
+FIREWORKS_API_KEY
+XAI_API_KEY         (the team it belongs to must have ZDR enabled — see below)
 ```
+
+`XAI_API_KEY` carries one requirement no other key here does. The `xai/*` lanes
+are sold as zero-retention on the strength of xAI's team-level Zero Data
+Retention setting, and every response is checked for the
+`x-zero-data-retention: true` header that confirms it. A key from a team without
+ZDR enabled will authenticate and then have every request refused with a 502
+`retention_attestation_failed`. That is the guard working, not a fault — but
+enable ZDR in the xAI Console for that team before provisioning the key.
 
 Do not commit these values or place them in Terraform variables. The list above
 is whatever `config/providers.json` entries name in `credential_env`; that file

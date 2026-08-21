@@ -75,6 +75,19 @@ export default async function globalSetup() {
       // Bedrock four supplied it. The per-tier override test below is the first
       // thing that names a Fireworks lane, and it could not pass without this.
       FIREWORKS_API_KEY: 'not-a-real-key',
+      // Added 2026-08-20 with the two xAI Grok lanes, for exactly the reason
+      // the paragraph above records — an upstream that ships without its key in
+      // this list makes the "fully credentialed" claim false again and hides
+      // its own rows from every assertion below.
+      //
+      // Note this key is a placeholder in a stronger sense than the others. The
+      // xai lanes are the only ones whose dispatch asserts a per-response
+      // retention attestation, so a real key from a team without ZDR enabled
+      // would fail every request closed. Nothing here dials an upstream — the
+      // catalog route is the whole surface under test — so the distinction does
+      // not bite in this harness, but it is why this value must stay
+      // implausible rather than becoming a real key someone pastes in.
+      XAI_API_KEY: 'not-a-real-key',
       OIDC_ISSUER_URL: `http://127.0.0.1:${IDP_PORT}`,
       OIDC_CLIENT_ID: 'e2e-portal',
       OIDC_CLIENT_SECRET: 'e2e-secret',

@@ -40,7 +40,8 @@ defines it:
   task-definition `secrets`, never plain env in Terraform or the task
   definition. The set the shipped `providers.json` can consume is whatever
   its entries' `credential_env` name — today `ANTHROPIC_API_KEY`,
-  `OPENAI_API_KEY`, `GEMINI_API_KEY`, and `BEDROCK_API_KEY`. A provider whose
+  `OPENAI_API_KEY`, `GEMINI_API_KEY`, `BEDROCK_API_KEY`, `FIREWORKS_API_KEY`,
+  and `XAI_API_KEY`. A provider whose
   key is absent is simply not a candidate — set only what the catalog actually
   routes to.
 - **`BEDROCK_REGION`** — plain env, not a secret; a region is not a credential.
@@ -528,14 +529,18 @@ The labels are pinned in `router/config/tiers.toml` under `[retention.<provider>
 and are never written by any tool — the same rule prices follow, for a sharper
 reason: a retention label is a claim to a customer about their own data.
 
-**Today nine lanes are `zero` and the rest are `standard`.** `anthropic`,
+**Today eleven lanes are `zero` and the rest are `standard`.** `anthropic`,
 `openai`, and `google` are ordinary API accounts. `bedrock` — the four
 `bedrock/claude-*` lanes, added 2026-08-20 — was the first zero-retention
 upstream, and it got there by configuration rather than by contract.
 `fireworks` — the five open-weight `fireworks/*` lanes, added the same day —
 got there a third way again: neither a contract nor a setting, but the vendor's
-published default for every customer. The two sections below on enforced
-configuration and on published defaults are why each counts.
+published default for every customer. `xai` — the two `xai/grok-*` lanes, added
+the same day again — rests on the same basis as Bedrock, an enforced account
+setting, but is verified in a way nothing else here is: xAI restates the
+guarantee in a response header on **every** response, and ZeroRouter asserts it
+before serving. The three sections below on enforced configuration, published
+defaults, and per-response attestation are why each counts.
 
 The posture is pinned per PROVIDER, and that is what lets one `[retention.bedrock]`
 block cover both of Bedrock's API planes (see the next section):
@@ -592,8 +597,12 @@ load-bearing:
 
 1. **The setting must be verified live, not assumed.** A contract cannot be
    turned off by someone clicking through a console; a setting can. That is what
-   `--bedrock-live` below exists for, and it is why the Bedrock pin is the only
-   one with two re-verification steps instead of one.
+   `--bedrock-live` below exists for. Both configuration-backed pins therefore
+   carry two re-verification steps rather than one — the page hash that catches
+   a reworded guarantee, and a live check of the setting itself — but the live
+   halves are not alike, and the difference is the subject of the third section
+   below: Bedrock's is a credentialed GET a human remembers to run, while xAI's
+   runs on every request and can refuse one.
 2. **The published semantics must be pinned like any other evidence.** The
    `source_url` for a configuration-backed pin is the page defining what the
    value means, so `retention-drift` catches AWS *rewording* the guarantee. It
@@ -646,6 +655,63 @@ arrangement is expected to look like a disagreement. A published default governs
 every account alike, so OpenRouter reading the same policy and reaching the same
 answer is genuine second-party agreement rather than an accident. It is still
 advisory and still cannot change an exit code.
+
+#### Per-response attestation, and why it is the strongest evidence here
+
+Added 2026-08-20 for xAI. This is **not a fourth basis** — the `xai` pin rests
+on basis 2, an enforced account setting, exactly as Bedrock's does. What is
+different is the re-verification, and the difference is large enough to be worth
+its own section because it changes what a `zero` label *means* for these lanes.
+
+xAI's Zero Data Retention is a team-level toggle in the xAI Console. Its
+published semantics are specific: API request inputs and outputs "are never
+persisted to disk", and the default 30-day encrypted audit retention "does not
+apply to ZDR-enabled teams". That satisfies basis 2 on its own. But the toggle
+is **self-serve**, team-wide, and reversible by any team admin in four clicks —
+so of the three bases, this is the one whose evidence can evaporate fastest and
+most quietly. Without ZDR the same account stores every prompt and completion
+for 30 days.
+
+What closes that gap is that xAI publishes the verdict on every response:
+
+> every API response includes an `x-zero-data-retention` header set to `"true"`
+> or `"false"`, so your application can programmatically confirm whether ZDR is
+> active
+
+**ZeroRouter asserts it and fails closed.** `attestation_header` and
+`attestation_expect` in `router/config/providers.json` declare the pair; the
+dispatch path reads it off every response from that upstream and refuses the
+request unless it reads `true`. A missing header fails exactly as a `false` one
+does — "the upstream did not say" and "the upstream said no" are the same state
+as far as a customer's data is concerned. The customer gets a 502
+`retention_attestation_failed` naming the guarantee, nothing is billed (the walk
+settles the reservation at zero like any other failed upstream), and the
+operator gets an ERROR log line carrying the provider, the header, what it
+actually said, and the upstream status.
+
+Three things to know before pinning another vendor this way:
+
+1. **It is asserted before anything is forwarded, streaming included.** The
+   header arrives in the initial HTTP response headers, ahead of the SSE body,
+   so the check sits between the request and the first chunk. Note that xAI's
+   documentation says "every API response" and does not discuss streaming
+   specifically; if a streamed response ever omits the header this lane fails
+   closed on every streamed request, which is the correct direction for an
+   assumption the vendor has not confirmed in writing.
+2. **A retention failure is never retried.** Retrying would deliver the prompt
+   to the unattested upstream again. It ends the candidate immediately.
+3. **Provisioning the key is not enough.** The key must belong to a team with
+   ZDR *enabled*, and the Console refuses to enable it while the team holds any
+   Files or Collections. A key from a non-ZDR team authenticates fine and then
+   fails every request closed — correctly, but it reads as an outage rather than
+   as a step nobody took.
+
+Corroboration behaves the opposite way here from the Fireworks case, and that is
+expected rather than alarming: OpenRouter's directory reports `xai` as
+`retainsPrompts: true, retentionDays: 30`, because that is xAI's default and
+OpenRouter cannot see a toggle on somebody else's team. `--corroborate` will
+therefore flag this pin as appearing to disagree. The slug is `xai`; note that
+OpenRouter namespaces xAI's *models* `x-ai/*`, which is a different string.
 
 The one exception that needs no vendor at all: a **local rung on your own
 hardware** (see `examples/edge/tiers.toml`). Even there, confirm your inference

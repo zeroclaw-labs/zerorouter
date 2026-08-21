@@ -53,8 +53,8 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::{
-    MAX_OPEN_TOOL_BLOCKS, MAX_RESPONSE_BYTES, MAX_TOOL_ARGUMENT_BYTES, believable, bounded_body,
-    drain_sse_payloads, shared_upstream_clients,
+    MAX_OPEN_TOOL_BLOCKS, MAX_RESPONSE_BYTES, MAX_TOOL_ARGUMENT_BYTES, ResponseAttestation,
+    believable, bounded_body, drain_sse_payloads, shared_upstream_clients,
 };
 
 /// Default endpoint for the OpenAI Chat Completions API. Overridden per
@@ -104,6 +104,17 @@ pub struct ChatCompletionsWire {
     http: reqwest::Client,
     /// Same budget plus an idle ceiling; used only by `stream_chat`.
     stream_http: reqwest::Client,
+    /// A per-response guarantee this upstream must restate on every answer,
+    /// when its inventory entry declares one ([`ResponseAttestation`]).
+    ///
+    /// `None` for every upstream that declares nothing, which is all of them
+    /// but `xai` — so this is additive and no existing lane changes behaviour.
+    /// It rides on the WIRE rather than being checked by the walk because the
+    /// only place the guarantee exists is the upstream's own response headers,
+    /// and this is the one layer that holds them: by the time a response
+    /// reaches the walk it is a `ChatResponse` or a stream of events, and the
+    /// headers are gone.
+    attestation: Option<ResponseAttestation>,
 }
 
 impl ChatCompletionsWire {
@@ -125,6 +136,35 @@ impl ChatCompletionsWire {
             max_tokens,
             http,
             stream_http,
+            attestation: None,
+        }
+    }
+
+    /// Require this upstream to restate a per-response guarantee on every
+    /// answer it gives.
+    ///
+    /// A builder rather than a sixth constructor argument: every other caller
+    /// of [`Self::new`] — four adapters' worth of local inference servers, the
+    /// hosted-ZeroRouter rung, and this module's own tests — declares nothing,
+    /// and threading a `None` through all of them would put the mechanism in
+    /// front of readers who have no use for it while changing no behaviour.
+    #[must_use]
+    pub fn with_attestation(mut self, attestation: ResponseAttestation) -> Self {
+        self.attestation = Some(attestation);
+        self
+    }
+
+    /// Assert the declared guarantee, if this upstream declared one.
+    ///
+    /// Both dispatch paths call this at the same point — the instant response
+    /// headers exist and before the body is touched — and that placement is
+    /// the streaming half of the contract. See [`Self::stream_chat`].
+    fn attest(&self, response: &reqwest::Response) -> Result<(), String> {
+        match &self.attestation {
+            Some(attestation) => {
+                attestation.verify(&self.alias, response.status(), response.headers())
+            }
+            None => Ok(()),
         }
     }
 
@@ -922,6 +962,11 @@ impl ModelProvider for ChatCompletionsWire {
             .json(&body)
             .send()
             .await?;
+        // BEFORE the status is consulted and before a byte of the body is
+        // read. A response that cannot attest the guarantee is not a response
+        // this lane may use for anything — not to serve, not to classify, not
+        // to meter — so nothing downstream of here should ever see one.
+        self.attest(&response).map_err(|failure| anyhow!(failure))?;
         let status = response.status();
         // Same rule as both sibling wires: the status is already known, so a
         // failed body read must not erase it into a retryable-looking
@@ -958,6 +1003,7 @@ impl ModelProvider for ChatCompletionsWire {
         let api_url = self.api_url.clone();
         let credential = self.credential.clone();
         let alias = self.alias.clone();
+        let attestation = self.attestation.clone();
         let count_tokens = options.count_tokens;
 
         let stream = async_stream::try_stream! {
@@ -966,6 +1012,36 @@ impl ModelProvider for ChatCompletionsWire {
                 .send()
                 .await
                 .map_err(|error| StreamError::Http(error.to_string()))?;
+            // THE STREAMING HALF OF THE CONTRACT, and the reason it is
+            // satisfied structurally rather than by a rule someone has to
+            // remember.
+            //
+            // A streaming answer is delivered in pieces, so "refuse rather
+            // than serve" has a deadline: once the first chunk has left for
+            // the customer, the request has been served under a guarantee
+            // nobody checked, and there is no taking it back. The header this
+            // reads arrives in the INITIAL HTTP response headers — the same
+            // headers a non-streaming call gets — which land before the SSE
+            // body opens. So the assertion sits here, between `send()` and
+            // `bytes_stream()`, where no chunk can have been yielded yet: the
+            // only `yield` statements in this function are downstream of this
+            // line, which makes "assert before forwarding any chunk" a
+            // property of the control flow rather than a convention.
+            //
+            // Worth recording what is NOT established: xAI documents the
+            // header as present on "every API response" and says nothing
+            // anywhere about streaming, SSE, or trailers (docs.x.ai, verified
+            // 2026-08-20). If a streaming response ever omits it, this lane
+            // fails closed on every streamed request — loudly, immediately,
+            // and in the safe direction. That is the correct behaviour for an
+            // unverified assumption, not a gap to paper over with a special
+            // case for streams.
+            if let Some(attestation) = &attestation
+                && let Err(failure) = attestation.verify(&alias, response.status(), response.headers())
+            {
+                Err(StreamError::Http(failure))?;
+                return;
+            }
             let status = response.status();
             if !status.is_success() {
                 let (text, _) = bounded_body(response).await;
@@ -1149,6 +1225,307 @@ mod keyless_tests {
             vec![None, Some("Bearer zr-secret".to_owned())],
             "keyless must send no Authorization header, and a credential must still be sent"
         );
+    }
+}
+
+/// The per-response retention attestation, driven over real HTTP.
+///
+/// These tests are the reason the mechanism can be trusted, so they are written
+/// against a real socket rather than against [`ResponseAttestation::verify`]
+/// directly. Verifying the predicate in isolation would prove the comparison
+/// works while proving nothing about the property that actually matters — that
+/// a response failing it never reaches a customer — and the two are separable:
+/// every way this feature could regress (the call site deleted, moved after the
+/// body read, moved after the first streamed chunk) leaves the predicate
+/// perfectly correct and the guarantee broken.
+#[cfg(test)]
+mod attestation_tests {
+    use super::*;
+    use axum::http::HeaderMap;
+
+    fn xai_attestation() -> ResponseAttestation {
+        ResponseAttestation::new("x-zero-data-retention", "true")
+            .expect("the shipped declaration must be constructible")
+    }
+
+    /// An upstream that answers one completion, stamping `header` on the
+    /// response when `Some`. `None` scripts an upstream that says nothing.
+    async fn upstream_attesting(header: Option<&'static str>) -> String {
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(move || async move {
+                let mut headers = HeaderMap::new();
+                if let Some(value) = header {
+                    headers.insert(
+                        "x-zero-data-retention",
+                        value.parse().expect("a test header value must parse"),
+                    );
+                }
+                (
+                    headers,
+                    axum::Json(serde_json::json!({
+                        "choices": [{
+                            "message": {"role": "assistant", "content": "the answer"},
+                            "finish_reason": "stop"
+                        }],
+                        "usage": {"prompt_tokens": 11, "completion_tokens": 7}
+                    })),
+                )
+            }),
+        );
+        serve(app).await
+    }
+
+    /// The same, for a STREAMING upstream: SSE deltas that a customer would see
+    /// if anything forwarded them.
+    async fn streaming_upstream_attesting(header: Option<&'static str>) -> String {
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(move || async move {
+                let mut headers = HeaderMap::new();
+                headers.insert(
+                    axum::http::header::CONTENT_TYPE,
+                    "text/event-stream".parse().expect("static content type"),
+                );
+                if let Some(value) = header {
+                    headers.insert(
+                        "x-zero-data-retention",
+                        value.parse().expect("a test header value must parse"),
+                    );
+                }
+                let body = concat!(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"leaked\"}}]}\n\n",
+                    "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                    "data: [DONE]\n\n"
+                );
+                (headers, body)
+            }),
+        );
+        serve(app).await
+    }
+
+    async fn serve(app: axum::Router) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("attestation upstream should bind");
+        let address = listener
+            .local_addr()
+            .expect("attestation upstream should report its address");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://{address}/v1/chat/completions")
+    }
+
+    fn wire(url: &str, attestation: Option<ResponseAttestation>) -> ChatCompletionsWire {
+        let wire = ChatCompletionsWire::new("xai", "k", Some(url), Some(64), 30);
+        match attestation {
+            Some(attestation) => wire.with_attestation(attestation),
+            None => wire,
+        }
+    }
+
+    async fn chat_against(
+        url: &str,
+        attestation: Option<ResponseAttestation>,
+    ) -> anyhow::Result<ChatResponse> {
+        let messages = vec![ChatMessage::user("hello")];
+        wire(url, attestation)
+            .chat(
+                ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                },
+                "grok-4.6",
+                None,
+            )
+            .await
+    }
+
+    #[tokio::test]
+    async fn a_response_attesting_zero_retention_is_served() {
+        // The control. Without this the three refusal tests below would all
+        // still pass against a wire that refused unconditionally, which is a
+        // fail-closed check that has stopped being a check.
+        let url = upstream_attesting(Some("true")).await;
+        let response = chat_against(&url, Some(xai_attestation()))
+            .await
+            .expect("an attested response must be served");
+        assert_eq!(response.text.as_deref(), Some("the answer"));
+        assert_eq!(
+            response
+                .usage
+                .expect("usage rides the response")
+                .input_tokens,
+            Some(11)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_response_denying_zero_retention_is_refused() {
+        // THE CENTRAL TEST. The upstream returns a perfectly good 200 with a
+        // usable completion in it and says it is NOT operating under zero data
+        // retention. Serving that completion is the failure this whole lane
+        // exists to prevent: the customer bought a zero-retention model and
+        // their prompt is now sitting in a 30-day audit log.
+        let url = upstream_attesting(Some("false")).await;
+        let error = chat_against(&url, Some(xai_attestation()))
+            .await
+            .expect_err("a response denying the guarantee must not be served");
+        let text = error.to_string();
+        assert!(
+            text.contains(super::super::RETENTION_ATTESTATION_MARKER),
+            "the failure must carry the marker the walk classifies on: {text}"
+        );
+        assert!(
+            text.contains("x-zero-data-retention") && text.contains("`false`"),
+            "the failure must name the header and what it actually said: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_response_with_no_attestation_header_is_refused() {
+        // Absent and `false` are the SAME state as far as a customer's data is
+        // concerned: in neither case has anyone said the prompt will not be
+        // kept. Treating absence as consent is the single most tempting way to
+        // weaken this check — it makes the lane resilient to a vendor who stops
+        // sending the header — and it would silently convert every request into
+        // an unguaranteed one.
+        let url = upstream_attesting(None).await;
+        let error = chat_against(&url, Some(xai_attestation()))
+            .await
+            .expect_err("a response that attests nothing must not be served");
+        let text = error.to_string();
+        assert!(
+            text.contains(super::super::RETENTION_ATTESTATION_MARKER),
+            "{text}"
+        );
+        assert!(
+            text.contains("absent"),
+            "the failure must distinguish silence from denial: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn presentation_is_normalized_but_a_denial_survives_every_normalization() {
+        // xAI's own documentation renders the values as `"true"` and `"false"`
+        // WITH the quote marks, and does not say whether the quotes are on the
+        // wire or are the docs' typography. Both presentations are accepted, and
+        // so is a casing change, because refusing either would take the lane
+        // down over formatting. The property that must hold through all of it:
+        // no normalization can turn a denial into a pass.
+        for accepted in ["true", "\"true\"", "TRUE", "True", " true "] {
+            let url = upstream_attesting(Some(accepted)).await;
+            assert!(
+                chat_against(&url, Some(xai_attestation())).await.is_ok(),
+                "{accepted:?} is the guarantee in a different hat and must be accepted"
+            );
+        }
+        for refused in [
+            "false",
+            "\"false\"",
+            "FALSE",
+            "",
+            "\"\"",
+            "1",
+            "yes",
+            "truthy",
+        ] {
+            let url = upstream_attesting(Some(refused)).await;
+            assert!(
+                chat_against(&url, Some(xai_attestation())).await.is_err(),
+                "{refused:?} is not the guarantee and must be refused"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_upstream_declaring_no_attestation_is_unaffected() {
+        // Additivity, stated as a test rather than as a comment. Every other
+        // upstream on this wire — llama.cpp, Ollama, vLLM, a hosted ZeroRouter,
+        // Gemini, Fireworks — declares nothing and must keep being served
+        // whatever headers it happens to send, including a `false` one it means
+        // nothing by.
+        let url = upstream_attesting(Some("false")).await;
+        let response = chat_against(&url, None)
+            .await
+            .expect("an upstream that declares no attestation is not checked");
+        assert_eq!(response.text.as_deref(), Some("the answer"));
+    }
+
+    #[tokio::test]
+    async fn a_streaming_response_denying_retention_forwards_no_chunk() {
+        // THE STREAMING CONTRACT, and the reason it needs its own test: on this
+        // path "refuse rather than serve" has a deadline. The scripted upstream
+        // below sends a delta reading "leaked", so if the assertion ran anywhere
+        // downstream of the first chunk this test sees it. What must arrive is
+        // one error and nothing else — no role primer, no delta, no usage.
+        let url = streaming_upstream_attesting(Some("false")).await;
+        let messages = vec![ChatMessage::user("hello")];
+        let mut stream = wire(&url, Some(xai_attestation())).stream_chat(
+            ChatRequest {
+                messages: &messages,
+                tools: None,
+            },
+            "grok-4.6",
+            None,
+            StreamOptions {
+                enabled: true,
+                count_tokens: true,
+            },
+        );
+
+        let mut events = Vec::new();
+        while let Some(event) = stream.next().await {
+            events.push(event);
+        }
+        assert_eq!(
+            events.len(),
+            1,
+            "a stream that failed attestation must yield exactly one event, the error"
+        );
+        let error = events
+            .remove(0)
+            .expect_err("the single event must be the refusal");
+        let StreamError::Http(text) = error else {
+            panic!("the refusal should arrive as an Http stream error: {error:?}");
+        };
+        assert!(
+            text.contains(super::super::RETENTION_ATTESTATION_MARKER),
+            "{text}"
+        );
+        assert!(
+            !text.contains("leaked"),
+            "no model output may appear anywhere in the failure: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_streaming_response_attesting_zero_retention_streams_normally() {
+        // The streaming control, for the same reason the buffered one exists.
+        let url = streaming_upstream_attesting(Some("true")).await;
+        let messages = vec![ChatMessage::user("hello")];
+        let mut stream = wire(&url, Some(xai_attestation())).stream_chat(
+            ChatRequest {
+                messages: &messages,
+                tools: None,
+            },
+            "grok-4.6",
+            None,
+            StreamOptions {
+                enabled: true,
+                count_tokens: true,
+            },
+        );
+
+        let mut text = String::new();
+        while let Some(event) = stream.next().await {
+            if let StreamEvent::TextDelta(chunk) = event.expect("an attested stream must not error")
+            {
+                text.push_str(&chunk.delta);
+            }
+        }
+        assert_eq!(text, "leaked", "the attested stream delivers its content");
     }
 }
 

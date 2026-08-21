@@ -41,6 +41,15 @@
       "secret_name": "fireworks-api-key",
       "base_url": "https://api.fireworks.ai/inference/v1/chat/completions",
       "source_provider_key": "fireworks-ai"
+    },
+    {
+      "key": "xai",
+      "adapter": "chat_completions",
+      "credential_env": "XAI_API_KEY",
+      "secret_name": "xai-api-key",
+      "base_url": "https://api.x.ai/v1/chat/completions",
+      "attestation_header": "x-zero-data-retention",
+      "attestation_expect": "true"
     }
   ]
 }

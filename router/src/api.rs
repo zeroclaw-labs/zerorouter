@@ -1674,6 +1674,11 @@ async fn run_non_streaming(
     // available is a resilience change with no baseline to measure it against.
     let mut effective_messages = request.provider_messages();
     let mut context_truncated = false;
+    // Whether any candidate on this walk refused to attest the retention
+    // guarantee its lane is sold under. Chooses the terminal's customer-facing
+    // error and nothing else — the ledger, the settle path, and the status are
+    // identical either way.
+    let mut retention_attestation_failed = false;
     // The last candidate this walk dispatched to, which is what a terminal
     // names instead of the `fallback-chain` sentinel. The sentinel means "no
     // candidate had been selected", and after the unroll that is only true
@@ -1888,6 +1893,16 @@ async fn run_non_streaming(
             // below instead of moving on, buying a third upstream call on a
             // rung the provider has already refused.
             let class = retry::classify(&err, context_truncated);
+            // Latched, never cleared. A walk that met a retention failure on
+            // ANY candidate reports that at its terminal even if a later
+            // candidate failed for some ordinary reason afterwards: the
+            // stronger, more specific fact is the one the customer needs, and
+            // the alternative — last-failure-wins — would let a transient 500
+            // on a second rung bury the one failure that says a data guarantee
+            // was not honoured.
+            if matches!(class, retry::FailureClass::RetentionAttestation) {
+                retention_attestation_failed = true;
+            }
             attempts.push(build_attempt(
                 attempt_no,
                 candidate.definition(),
@@ -1999,7 +2014,11 @@ async fn run_non_streaming(
         features,
         attempts.into_rows(),
         started,
-        WalkTerminal::Exhausted,
+        if retention_attestation_failed {
+            WalkTerminal::RetentionAttestation
+        } else {
+            WalkTerminal::Exhausted
+        },
     )
     .await)
 }
@@ -2014,6 +2033,17 @@ async fn run_non_streaming(
 enum WalkTerminal {
     /// Every candidate failed.
     Exhausted,
+    /// Every candidate failed and at least one of them failed by declining to
+    /// attest the retention guarantee its lane is sold under.
+    ///
+    /// A REFINEMENT of [`Self::Exhausted`] rather than a state beside it: the
+    /// walk really did exhaust, the ledger records the same 502, and the
+    /// reservation settles at zero by the same path. All that differs is what
+    /// the customer is told, and that difference is worth a variant because
+    /// "every upstream failed" and "we would not serve you under a weaker data
+    /// guarantee than you bought" are not the same message, and only one of
+    /// them tells the customer their prompt was withheld on purpose.
+    RetentionAttestation,
     /// The request's shared upstream deadline elapsed.
     Timeout,
     /// The router is draining.
@@ -2023,7 +2053,9 @@ enum WalkTerminal {
 impl WalkTerminal {
     fn status(self) -> i16 {
         match self {
-            Self::Exhausted => 502,
+            // Same 502 as `Exhausted`, deliberately: the ledger records what
+            // the customer was sent, and both terminals send a 502.
+            Self::Exhausted | Self::RetentionAttestation => 502,
             Self::Timeout => 504,
             Self::Shutdown => 503,
         }
@@ -2032,6 +2064,7 @@ impl WalkTerminal {
     fn api_error(self) -> ApiError {
         match self {
             Self::Exhausted => ApiError::UpstreamUnavailable,
+            Self::RetentionAttestation => ApiError::RetentionAttestationFailed,
             Self::Timeout => ApiError::UpstreamTimeout,
             Self::Shutdown => ApiError::ServerShuttingDown,
         }
@@ -2040,6 +2073,7 @@ impl WalkTerminal {
     fn label(self) -> &'static str {
         match self {
             Self::Exhausted => "all upstream candidates failed",
+            Self::RetentionAttestation => "upstream did not attest zero data retention",
             Self::Timeout => "upstream inference deadline exceeded",
             Self::Shutdown => "router draining",
         }
@@ -2356,6 +2390,14 @@ async fn stream_to_channel(
     let dispatch_marker = usage_session.dispatch_marker();
     let mut usage_session = Some(usage_session);
     let mut client_connected = true;
+    // The streaming twin of the buffered walk's flag, latched the same way and
+    // for the same reason. It can only ever be set BEFORE any model output has
+    // been sent: the attestation is asserted on the upstream's initial response
+    // headers, so a candidate that fails it yields no chunk at all
+    // (`crate::wire::ChatCompletionsWire::stream_chat`). That is what makes it
+    // safe to convert into a customer-facing error here — there is no
+    // half-delivered stream to reason about.
+    let mut retention_attestation_failed = false;
     let mut delivery = StreamDelivery::default();
     // The router-owned walk ledger: one row per walk position, drained into
     // the settle transaction at whichever terminal settles this request.
@@ -2535,10 +2577,18 @@ async fn stream_to_channel(
                     // would hide this rung's state from the thing that has to
                     // notice it. `false`: this walk has no truncation repair,
                     // so no truncation has ever been spent.
+                    let class = retry::classify(&err, false);
+                    // A non-streaming upstream reached through the STREAMING
+                    // handler (a candidate whose wire cannot stream, answered
+                    // as one synthetic stream). The retention rule does not
+                    // care which handler dispatched it.
+                    if matches!(class, retry::FailureClass::RetentionAttestation) {
+                        retention_attestation_failed = true;
+                    }
                     attempts.push(build_attempt(
                         attempt_no,
                         candidate.definition(),
-                        retry::classify(&err, false).outcome(),
+                        class.outcome(),
                         false,
                         attempt_started,
                         AttemptTokens::unknown(),
@@ -2725,7 +2775,16 @@ async fn stream_to_channel(
                     break;
                 }
                 Err(error) => {
-                    stream_rate_limited = retry::is_rate_limited(&anyhow::Error::new(error));
+                    // One `anyhow` wrap, read by both predicates. The
+                    // attestation check runs before the stream body opens, so
+                    // this arm is where a streamed retention failure surfaces —
+                    // as the FIRST event of the stream, with nothing delivered
+                    // ahead of it.
+                    let error = anyhow::Error::new(error);
+                    if retry::is_retention_attestation_failure(&error) {
+                        retention_attestation_failed = true;
+                    }
+                    stream_rate_limited = retry::is_rate_limited(&error);
                     break;
                 }
             }
@@ -2875,7 +2934,11 @@ async fn stream_to_channel(
             )
             .await;
             let error = if metering.is_ok() {
-                ApiError::UpstreamUnavailable
+                if retention_attestation_failed {
+                    ApiError::RetentionAttestationFailed
+                } else {
+                    ApiError::UpstreamUnavailable
+                }
             } else {
                 ApiError::MeteringUnavailable
             };
@@ -2926,6 +2989,7 @@ async fn stream_to_channel(
         )
         .await
         {
+            Ok(()) if retention_attestation_failed => ApiError::RetentionAttestationFailed,
             Ok(()) => ApiError::UpstreamUnavailable,
             Err(_) => ApiError::MeteringUnavailable,
         }
