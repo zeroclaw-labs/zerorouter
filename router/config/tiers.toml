@@ -133,22 +133,38 @@ schema_version = 1
 # on EVERY row and sorts zero-retention lanes first; the portal and the CLI show
 # the same label from the same source.
 #
-# THE CURRENT STATE IS HONEST AND UNFLATTERING: all three upstreams are
-# ORDINARY API ACCOUNTS and every lane below is `standard`. The zero-retention
-# section of the catalog is EMPTY. That is correct and deliberate — ZDR
-# arrangements with these providers are being negotiated and none is in force,
-# so no lane may carry the label yet.
+# THE CURRENT STATE (2026-08-20, corrected the same day the Fireworks lanes
+# landed — this paragraph still claimed an empty zero-retention section after
+# the Bedrock lanes shipped, which was a stale sentence making a false claim
+# about the product): `anthropic`, `openai`, and `google` are ORDINARY API
+# ACCOUNTS and every lane on them is `standard`. `bedrock` and `fireworks` are
+# `zero`, on two different bases — see each pin.
 #
-# THE RULE FOR `posture = "zero"`, and it is not a style preference:
+# THE RULE FOR `posture = "zero"`, and it is not a style preference. A lane may
+# be pinned zero-retention only on one of THREE bases, and the third was added
+# on 2026-08-20 for Fireworks:
 #
-#   A lane may be pinned zero-retention ONLY when a signed or confirmed
-#   zero-data-retention arrangement exists with that provider, covering that
-#   account. Not because the vendor offers ZDR to someone; not because a
-#   marketing page says data is not used for training — training and retention
-#   are different claims, and every provider below disclaims training while
-#   still retaining. When in doubt the answer is `standard`. A wrong `standard`
-#   costs a little marketing; a wrong `zero` is a false statement to a customer
-#   about their data.
+#   1. A signed or confirmed zero-data-retention ARRANGEMENT is in force with
+#      that provider, covering the account that lane dispatches on.
+#   2. The provider ENFORCES zero retention as a setting on that account, with
+#      published semantics for what the setting means — and the setting is
+#      verified live, not assumed (`bedrock`, via `data_retention_mode: none`).
+#   3. The provider's own security documentation states zero retention as the
+#      PUBLISHED DEFAULT for all customers on the API surface this lane
+#      dispatches on (`fireworks`).
+#
+#   Not because the vendor offers ZDR to someone else; not because a marketing
+#   page says data is not used for training — training and retention are
+#   different claims, and every `standard` provider below disclaims training
+#   while still retaining. Basis 3 in particular is NOT "a page says something
+#   reassuring": it requires a specific, quotable retention statement in the
+#   vendor's own security or data-handling documentation, scoped to the surface
+#   being dispatched, with the page hash pinned — because for a published
+#   default the hash is the only re-verification loop that exists.
+#
+#   When in doubt the answer is `standard`. A wrong `standard` costs a little
+#   marketing; a wrong `zero` is a false statement to a customer about their
+#   data. docs/DEPLOY.md carries the full argument for each basis.
 #
 # Retention is declared per PROVIDER because it is a property of the operator's
 # ACCOUNT with that provider — one API key, one arrangement, every model on it.
@@ -273,6 +289,82 @@ source_url = "https://docs.aws.amazon.com/bedrock/latest/userguide/data-retentio
 verified = "2026-08-20"
 source_sha256 = "7cb04795622b5f7cac43a5d7a216e699f045da24dfbb84de7998cc5204d0cedf"
 openrouter_slug = "amazon-bedrock"
+
+# THE THIRD BASIS FOR A `zero` PIN (2026-08-20): the vendor's PUBLISHED DEFAULT.
+#
+# The rule in docs/DEPLOY.md named two ways a lane earns this label — a signed
+# or confirmed ZDR arrangement, and an enforced setting on the account. Neither
+# describes Fireworks, and the gap is not a loophole in the rule but a shape the
+# rule had not met: Fireworks does not sell zero retention, negotiate it, or
+# expose a switch for it. It is what the platform does for everybody, stated in
+# its own security documentation. The rule has been widened to name this third
+# basis explicitly; read that section before pinning another vendor this way.
+#
+# WHAT THE PAGE SAYS, verbatim (docs.fireworks.ai/guides/security_compliance/
+# data_handling, read 2026-08-20):
+#
+#   "Fireworks has Zero Data Retention by default."
+#   "Fireworks does not log or store prompt or generation data for any open
+#    models, without explicit user opt-in."
+#   "Prompt and generation data exist only in volatile memory for the duration
+#    of the request."
+#   "If prompt caching is active, some prompt data (and associated KV caches)
+#    can be stored in volatile memory for several minutes." ... "In either case,
+#    prompt and generation data are not logged into any persistent storage."
+#   "Fireworks logs metadata (e.g. number of tokens in a request) as required to
+#    deliver the service."
+#
+# The KV-cache sentence is quoted rather than elided because it is the one that
+# could be read as a carve-out and is not: it widens the window in VOLATILE
+# memory and explicitly re-states that nothing reaches persistent storage.
+# Metadata logging is likewise not retention of prompt content — ZeroRouter
+# itself keeps token counts, because billing is impossible without them.
+#
+# WHY THE PAGE HASH IS THE WHOLE SAFEGUARD, and it carries more weight here than
+# on any other pin. A contract cannot be revoked silently; an account setting can
+# be re-read live (that is `--bedrock-live`). A published default can change for
+# everyone with one documentation edit and no notice to anybody — and there is
+# nothing to query, because no endpoint reports "this account's retention mode":
+# there is no per-account mode. So `admin retention-drift` is not a supplementary
+# check for this lane the way it is for Bedrock, it is the ONLY check, and a
+# PAGE CHANGED verdict here must be read by a human before it is re-pinned. The
+# temptation this pin creates is to paste a fresh digest and move on; doing that
+# converts the sole evidence for a customer-facing data claim into a rubber
+# stamp.
+#
+# TWO SCOPE LIMITS THAT BOUND WHAT THIS PIN COVERS, both load-bearing:
+#
+#   1. "for any open MODELS". The sentence is scoped to open models, and every
+#      Fireworks lane below is deliberately an open-weights one for exactly that
+#      reason. Fireworks also serves closed-weight flagships (Qwen 3.7 Plus,
+#      Qwen 3.8 Max) — those are NOT pinned, because a provider-level `zero`
+#      posture would then cover a lane this sentence does not reach. See the
+#      note above the Fireworks tiers.
+#   2. THE RESPONSE API IS EXCLUDED, and it is the one real carve-out on the
+#      page: it stores conversation data when `store=True`, which is its
+#      DEFAULT, with 30-day deletion. ZeroRouter never dials it. These lanes ride
+#      the `chat_completions` adapter against /inference/v1/chat/completions
+#      (see config/providers.json), which the quoted zero-retention sentences
+#      cover. Do not add a Responses-shaped surface to this provider entry
+#      without revisiting this pin — it would put a retaining plane under a
+#      `zero` label, which is the exact failure the posture mechanism exists to
+#      prevent.
+#
+# THE CORROBORATION IS MEANINGFUL HERE, unlike on the Bedrock pin. OpenRouter's
+# directory reports `fireworks` with `retainsPrompts: false`, and because this
+# claim is about a DEFAULT that applies to every customer, OpenRouter's account
+# and ZeroRouter's are governed by the same statement — so a second party
+# reading the same policy and reaching the same answer is genuine agreement. On
+# Bedrock the same field describes a different account's private configuration
+# and was explicitly discounted. Still advisory, still unable to change an exit
+# code; it just means something this time.
+[retention.fireworks]
+posture = "zero"
+description = "Fireworks has zero data retention by default: prompt and generation data exist only in volatile memory for the duration of the request and are never written to persistent storage. Only metadata such as token counts is logged."
+source_url = "https://docs.fireworks.ai/guides/security_compliance/data_handling"
+verified = "2026-08-20"
+source_sha256 = "9ba1f724b75de399bc3ff239e52007ee7e9df602063532867e733202128918e7"
+openrouter_slug = "fireworks"
 
 # ---------------------------------------------------------------------------
 # PINS — you get this model, at cost, and it does not change.
@@ -1066,3 +1158,296 @@ tool_call = true
 input_per_mtok = 1.10
 cached_input_per_mtok = 0.11
 output_per_mtok = 5.50
+
+# ---------------------------------------------------------------------------
+# FIREWORKS (added 2026-08-20) — THE OPEN-WEIGHT ZERO-RETENTION LANES.
+#
+# Five open-weights flagships nothing else in this catalog carries, reached over
+# Fireworks' OpenAI-compatible chat-completions endpoint, on an account whose
+# provider pin is `zero` by Fireworks' PUBLISHED DEFAULT rather than by contract
+# or by account setting (`[retention.fireworks]` above, basis 3 of the rule in
+# this file's header). They are the first zero-retention lanes that are not
+# Claude, and the first that are not also purchasable from another lane here at
+# a different price.
+#
+# THIS LANE SHIPS DARK. As of the commit that added it the operator holds no
+# Fireworks account and `FIREWORKS_API_KEY` is unset, so #89's dispatchability
+# filter hides every tier below from `/v1/models` and from route construction.
+# That is the intended state: the lane merges and deploys inert and lights up
+# when the key is provisioned. Nothing here needs editing at that point — but
+# the infrastructure repo does, because a secret CONTAINER is created from
+# config/providers.json automatically while INJECTION into the task is opt-in
+# per key (`enabled_provider_keys` in the zerorouter-beta tfvars). A key that
+# exists in Secrets Manager but is not in that list leaves these lanes dark with
+# no error anywhere.
+#
+# WHY THE IDS ARE `fireworks/<model>` AND NOT THE VENDOR'S STRING. This file's
+# header says the public id IS the vendor's id, and these are the second set of
+# lanes where that cannot hold literally — the Bedrock lanes were the first.
+# Fireworks' dispatch id is `accounts/fireworks/models/kimi-k3`: it carries two
+# slashes, so it cannot be a `{vendor}/{model}` id at all, and it names an
+# account path rather than a model. The rule behind the promise still holds:
+# the id names the account that actually serves the request, and the vendor's
+# exact dispatch string is on the candidate's `model` line, unaltered.
+#
+# THE ID TRAP, and it is a money one. Fireworks publishes THREE serving paths at
+# three different prices, and two of them are reached by a DIFFERENT MODEL ID
+# under `accounts/fireworks/routers/` rather than by a parameter:
+#
+#   Standard  accounts/fireworks/models/<slug>          <- pinned below
+#   Fast      accounts/fireworks/routers/<slug>-fast    ~1.5x standard
+#   US-only   accounts/fireworks/routers/<slug>-us      ~1.1x standard
+#
+# (Priority is the exception: same id, `service_tier: "priority"` in the body,
+# ~1.25x. Nothing here sends it.) Every rate below is the STANDARD one. Changing
+# a candidate's `model` to a `routers/` id without changing its rates sells that
+# lane 10-50% below cost on every token, and neither the load-time validator nor
+# `catalog-drift` would catch it: the file would still agree with itself, and
+# the id it reconciled against would still be the standard one.
+#
+# PRICING IS PASS-THROUGH, basis == sell, transcribed from Fireworks' own
+# serverless price list (https://docs.fireworks.ai/serverless/pricing, read
+# 2026-08-20) and independently confirmed on each model's page. No conditional
+# bands: Fireworks prices these flat at every prompt size, so there is no
+# boundary to declare. Note also that Fireworks' size-band fallback pricing
+# ("more than 16B parameters", $0.90/M) does NOT apply to any lane here — every
+# one of these has its own per-model row, and the bands cover only models not
+# listed individually.
+#
+# `admin catalog-drift` DOES RECONCILE THESE, unlike the Bedrock lanes. models.dev
+# carries Fireworks — under `fireworks-ai`, which is why the provider entry
+# declares `source_provider_key` — and it files each model under the SAME full
+# `accounts/fireworks/models/<slug>` string this file dispatches, so the join is
+# exact with no undated-snapshot fallback in play. Every price below was checked
+# against both the vendor's price list and that source and all three agree to
+# the cent, so these lanes have a real automated margin check.
+#
+# METADATA RULE FOR THIS SECTION, and it differs from the rest of the file
+# because the evidence does. Elsewhere every value was read from models.dev.
+# Here two sources exist — Fireworks' own model pages and models.dev — and they
+# do not always agree. The rule applied below: DECLARE a field when the vendor
+# and models.dev agree, or when the vendor is merely less precise than models.dev
+# (the pages render "1M tokens" where models.dev gives the exact integer); OMIT
+# it when the two genuinely contradict each other. An omitted field is read as
+# UNKNOWN, which is a true statement and which `catalog-drift` reports as a
+# non-actionable `undeclared` gap; a declared-but-wrong one is a false claim
+# every client acts on. Each omission below says which two numbers disagreed, so
+# a later reader can close it with one probe rather than re-deriving the
+# conflict.
+#
+# WHAT IS DELIBERATELY NOT HERE:
+#
+# - GLM-5.3. Not served. https://fireworks.ai/models/fireworks/glm-5p3 is a 404
+#   and there is no 5.3 row in the price list (checked 2026-08-20, six days after
+#   Z.ai's 2026-08-14 launch). GLM 5.2 is Fireworks' newest GLM and is pinned.
+# - QWEN 3.7 PLUS AND QWEN 3.8 MAX, and this is a retention decision rather than
+#   a catalog one. Both are CLOSED-WEIGHT (Qwen 3.7 Plus is Alibaba's proprietary
+#   flagship, served outside Alibaba's own infrastructure only by Fireworks), and
+#   the zero-retention sentence this provider's pin rests on is scoped: "does not
+#   log or store prompt or generation data for any open MODELS". A retention pin
+#   is per PROVIDER — one posture covering every lane on the key — so adding a
+#   closed-weight lane would extend a `zero` label over a model the evidence for
+#   that label does not reach. The house rule is that when in doubt the answer is
+#   `standard`, and there is no way to say `standard` for one lane on a `zero`
+#   provider except by giving that tier its own complete `[tiers."<id>".retention]`
+#   override. That is a deliberate product decision about what ZeroRouter sells
+#   under its own brand, not a config detail, so it is left for the operator.
+#   Qwen 3.8 Max has a second, independent blocker: its id is rendered
+#   `accounts/fireworks/models/qwen3p8-max` on app.fireworks.ai and
+#   `accounts/fireworks/models/qwen3p8-2p4t-a95b` on fireworks.ai, the latter
+#   URL 404s, and with no API key there is no way to settle which string
+#   dispatches. Resolve with `GET /inference/v1/models` once the key exists.
+# - `accounts/fireworks/models/deepseek-v4-pro-0813`. See the note on the
+#   DeepSeek V4 Pro tier below; its price is genuinely unresolved.
+
+[tiers."fireworks/kimi-k3"]
+
+[tiers."fireworks/kimi-k3".rates]
+input_per_mtok = 3.00
+cached_input_per_mtok = 0.30
+output_per_mtok = 15.00
+
+[[tiers."fireworks/kimi-k3".candidates]]
+id = "fireworks/kimi-k3"
+provider = "fireworks"
+model = "accounts/fireworks/models/kimi-k3"
+
+# 1,048,576 is models.dev's exact figure. Fireworks' own pages say "1M tokens"
+# (app.fireworks.ai) and "1040k tokens" (fireworks.ai) — the first agrees, the
+# second is a rounded marketing rendering that matches no exact power-of-two
+# figure and is not treated as a competing claim. If a long request ever fails
+# near the top of the window, that "1040k" is the number to go and re-read.
+# max_output_tokens matches the vendor's own documented request example exactly.
+[tiers."fireworks/kimi-k3".candidates.metadata]
+context_window = 1048576
+max_output_tokens = 131072
+input_modalities = ["text", "image"]
+tool_call = true
+
+[tiers."fireworks/kimi-k3".candidates.rates]
+input_per_mtok = 3.00
+cached_input_per_mtok = 0.30
+output_per_mtok = 15.00
+
+# GLM 5.2, not 5.3 — see the section header. Text only: both Fireworks pages and
+# models.dev agree this model takes no image input, which is worth stating
+# rather than omitting, because the neighbouring Kimi lane does.
+[tiers."fireworks/glm-5.2"]
+
+[tiers."fireworks/glm-5.2".rates]
+input_per_mtok = 1.40
+cached_input_per_mtok = 0.14
+output_per_mtok = 4.40
+
+[[tiers."fireworks/glm-5.2".candidates]]
+id = "fireworks/glm-5.2"
+provider = "fireworks"
+# `glm-5p2`, not `glm-5.2`. Fireworks writes a decimal point as `p` in every
+# slug (`qwen3p7-plus`, `deepseek-v4-flash-0731`), so the tier id and the
+# dispatched string differ by more than a prefix here. Do not "fix" either to
+# match the other.
+model = "accounts/fireworks/models/glm-5p2"
+
+# 1048575 — one token short of a round 1M — is models.dev's figure verbatim, and
+# the oddness is why it is trusted: it is the shape of a number read off an API
+# rather than typed by a person. Fireworks' page says "1M tokens", which does not
+# contradict it.
+[tiers."fireworks/glm-5.2".candidates.metadata]
+context_window = 1048575
+max_output_tokens = 131072
+input_modalities = ["text"]
+tool_call = true
+
+[tiers."fireworks/glm-5.2".candidates.rates]
+input_per_mtok = 1.40
+cached_input_per_mtok = 0.14
+output_per_mtok = 4.40
+
+# THE UNDATED `deepseek-v4-pro` ID IS PINNED DELIBERATELY, AND THERE IS AN OPEN
+# QUESTION BEHIND IT — read this before "upgrading" it to the 0813 snapshot.
+#
+# Fireworks serves both `deepseek-v4-pro` and `deepseek-v4-pro-0813`, and its own
+# sources disagree about them. The serverless PRICE LIST carries exactly one row,
+# "DeepSeek V4 Pro", at the 1.74/0.145/3.48 pinned here, and models.dev files the
+# undated id at those same three numbers. The 0813 model page describes itself as
+# "the official release ... superseding the preview version", has NO row in the
+# price list at all, and publishes 1.32/0.044/3.96 — cheaper input, DEARER
+# output, so it is not a discount and the difference does not net out.
+#
+# Pinning the id whose price the vendor actually publishes is the conservative
+# call: a pin at the 0813 rates would record a basis with no price-list
+# authority behind it, on a money path, from a page that could be describing a
+# promotional or preview rate. models.dev also marks 0813 closed-weight, which
+# if true would put it outside the retention sentence this provider's `zero` pin
+# rests on — a second reason not to reach for it casually.
+#
+# TO RESOLVE: once a key exists, send one real request to each id and read the
+# billing line. If 0813 is the surviving model and the price list catches up,
+# this tier moves to it with its own rates and its own re-verification date. If
+# the undated id is retired first, `catalog-drift` reports it NOT IN SOURCE and
+# fails, which is the correct alarm.
+[tiers."fireworks/deepseek-v4-pro"]
+
+[tiers."fireworks/deepseek-v4-pro".rates]
+input_per_mtok = 1.74
+cached_input_per_mtok = 0.145
+output_per_mtok = 3.48
+
+[[tiers."fireworks/deepseek-v4-pro".candidates]]
+id = "fireworks/deepseek-v4-pro"
+provider = "fireworks"
+model = "accounts/fireworks/models/deepseek-v4-pro"
+
+# max_output_tokens IS OMITTED, and the omission is the honest answer rather than
+# an oversight. models.dev publishes 384000; Fireworks' model page shows 131072,
+# but only as the value in a sample request, which states what an example asks
+# for and not what the model will grant. Two numbers, neither of them a
+# documented limit, differing by 3x — so nothing is claimed. Close it by asking
+# for a 200,000-token completion once a key exists.
+[tiers."fireworks/deepseek-v4-pro".candidates.metadata]
+context_window = 1000000
+input_modalities = ["text"]
+tool_call = true
+
+[tiers."fireworks/deepseek-v4-pro".candidates.rates]
+input_per_mtok = 1.74
+cached_input_per_mtok = 0.145
+output_per_mtok = 3.48
+
+# Flash is pinned at the DATED id while Pro is pinned undated, and the asymmetry
+# is deliberate: the rule applied to both was "pin the id whose price Fireworks
+# publishes". The price list's row reads "DeepSeek V4 Flash (0731)", naming the
+# snapshot, and the 0731 page says it supersedes the preview. models.dev carries
+# the dated and undated ids at identical rates, so this join is exact either way
+# and the dated id is the one with an argument behind it.
+[tiers."fireworks/deepseek-v4-flash"]
+
+[tiers."fireworks/deepseek-v4-flash".rates]
+input_per_mtok = 0.14
+cached_input_per_mtok = 0.028
+output_per_mtok = 0.28
+
+[[tiers."fireworks/deepseek-v4-flash".candidates]]
+id = "fireworks/deepseek-v4-flash"
+provider = "fireworks"
+# Note `-0731` is a four-digit MMDD, not the eight-digit `-YYYYMMDD` snapshot
+# suffix `drift.rs` strips for Anthropic. Nothing is stripped here; the source
+# carries this exact string.
+model = "accounts/fireworks/models/deepseek-v4-flash-0731"
+
+# max_output_tokens omitted for the same reason as Pro's: models.dev says 384000
+# against a 131072 sample-request value, and neither is a stated cap.
+[tiers."fireworks/deepseek-v4-flash".candidates.metadata]
+context_window = 1000000
+input_modalities = ["text"]
+tool_call = true
+
+[tiers."fireworks/deepseek-v4-flash".candidates.rates]
+input_per_mtok = 0.14
+cached_input_per_mtok = 0.028
+output_per_mtok = 0.28
+
+# THE CHEAPEST LANE IN THE WHOLE CATALOG, and the one whose metadata Fireworks
+# most plainly contradicts itself about — two fields are omitted below.
+#
+# The cached rate is 0.06, from the serverless price list and models.dev, both
+# exactly 20% of the input rate. The model page renders $0.059/M. 0.06 is taken
+# because the price list is the published rate card and because it is the figure
+# `catalog-drift` reconciles against; the difference is 1/1000 of a cent per
+# million cached tokens and errs toward ZeroRouter rather than the customer.
+[tiers."fireworks/minimax-m3"]
+
+[tiers."fireworks/minimax-m3".rates]
+input_per_mtok = 0.30
+cached_input_per_mtok = 0.06
+output_per_mtok = 1.20
+
+[[tiers."fireworks/minimax-m3".candidates]]
+id = "fireworks/minimax-m3"
+provider = "fireworks"
+model = "accounts/fireworks/models/minimax-m3"
+
+# TWO FIELDS OMITTED, both because Fireworks' own two pages disagree with each
+# other:
+#
+# - input_modalities. fireworks.ai lists image input "Supported" and describes
+#   "native multimodality ... across text, image, and video"; app.fireworks.ai
+#   lists "Image Input: Not supported" for the same id. models.dev sides with the
+#   first (text, image, video). A wrong modality list is not a cosmetic error —
+#   a client that believes it can send an image builds a request that fails — and
+#   there is no reading of these pages that settles it. Send one image request
+#   once a key exists and declare what actually answers.
+# - max_output_tokens. models.dev publishes 512000, which is identical to the
+#   context window and therefore suspect on its face; app.fireworks.ai states
+#   64000. Nothing is claimed until one of them is confirmed.
+#
+# context_window IS declared: 512000 and "512k tokens" are the same claim, and
+# both pages agree on it.
+[tiers."fireworks/minimax-m3".candidates.metadata]
+context_window = 512000
+tool_call = true
+
+[tiers."fireworks/minimax-m3".candidates.rates]
+input_per_mtok = 0.30
+cached_input_per_mtok = 0.06
+output_per_mtok = 1.20

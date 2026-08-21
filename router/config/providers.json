@@ -33,6 +33,14 @@
         }
       },
       "unreconcilable_reason": "models.dev files Bedrock under `amazon-bedrock` and prices the bare model ids at the GLOBAL cross-region rate. Neither plane ZeroRouter dials meters that class: the mantle endpoint is in-region only, and the classic-runtime lanes dispatch `us.`-prefixed GEOGRAPHIC inference profiles, which AWS's cross-region-inference doc prices as \"Standard pricing\" against global's \"approximately 10% savings\". Reconciling against that source would report `ok` while the recorded basis was ~10% under what AWS invoices. The authority for these rates is the AWS Price List API, offer AmazonBedrockFoundationModels. NOTE THE USAGETYPE NAMING DIFFERS BY MODEL GENERATION and neither form is guessable from the other: 5-generation SKUs read `USE1_{input,output,cache_read}_tokens_standard-Units` (global: `_global_standard-Units`), while 4.5-generation SKUs read `USE1-MP:USE1_{Input,Output,CacheReadInput}TokenCount-Units` with priceDimension descriptions ending \"Regional\" (global: `..._Global-Units`, \"Global\"). Take the non-global member of the pair in both. Re-verify with: curl -s --compressed https://pricing.us-east-1.amazonaws.com/offers/v1.0/aws/AmazonBedrockFoundationModels/current/us-east-1/index.json"
+    },
+    {
+      "key": "fireworks",
+      "adapter": "chat_completions",
+      "credential_env": "FIREWORKS_API_KEY",
+      "secret_name": "fireworks-api-key",
+      "base_url": "https://api.fireworks.ai/inference/v1/chat/completions",
+      "source_provider_key": "fireworks-ai"
     }
   ]
 }

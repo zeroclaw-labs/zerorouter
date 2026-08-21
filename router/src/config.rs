@@ -367,11 +367,19 @@ pub enum RetentionPosture {
     /// The upstream retains nothing: prompts and completions are not written
     /// to durable storage on their side, including for abuse monitoring.
     ///
-    /// **Only pinnable against a signed or confirmed zero-retention
-    /// arrangement with that provider.** Every major vendor offers ZDR by
-    /// negotiated agreement rather than by default, so the posture is a fact
-    /// about the operator's contract, never about the vendor's marketing. See
-    /// `docs/DEPLOY.md`, "Changing a retention posture".
+    /// **Pinnable on exactly three bases, and no others**: a signed or
+    /// confirmed zero-retention arrangement covering the account; an enforced
+    /// account SETTING with published semantics, verified live (Bedrock's
+    /// `data_retention_mode: none`); or the vendor's PUBLISHED DEFAULT for all
+    /// customers, stated in its own security documentation and scoped to the
+    /// surface and models the lane dispatches (Fireworks).
+    ///
+    /// Never about the vendor's marketing, and never inferred from a
+    /// no-training claim — training and retention are different statements, and
+    /// every `standard` provider disclaims training while still retaining. The
+    /// third basis is the newest and the most easily abused, so it carries the
+    /// tightest conditions; see `docs/DEPLOY.md`, "Changing a retention
+    /// posture", before reaching for it.
     Zero,
     /// The upstream retains prompts and completions for some period — commonly
     /// for abuse monitoring, whether or not it trains on them.

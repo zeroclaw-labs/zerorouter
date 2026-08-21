@@ -625,6 +625,7 @@ pub fn reconcile(catalog: &TierCatalog, source: &str) -> Vec<CandidateDrift> {
         source,
         &|candidate| crate::providers::provider_settles_free(&candidate.provider),
         &crate::providers::provider_unreconcilable_reason,
+        &crate::providers::provider_source_key,
     )
 }
 
@@ -649,6 +650,7 @@ pub(crate) fn reconcile_with(
     source: &str,
     settles_free: &dyn Fn(&crate::config::TierCandidate) -> bool,
     unreconcilable_reason: &dyn Fn(&str) -> Option<String>,
+    source_provider_key: &dyn Fn(&str) -> Option<String>,
 ) -> Vec<CandidateDrift> {
     let providers: BTreeMap<String, SourceProvider> =
         serde_json::from_str(source).unwrap_or_default();
@@ -663,7 +665,17 @@ pub(crate) fn reconcile_with(
 
     for (tier_id, definition) in definitions {
         for candidate in &definition.candidates {
-            let models = providers.get(&candidate.provider).map(|p| &p.models);
+            // The provider key is the join UNLESS the inventory declares
+            // otherwise. ZeroRouter's key and the source's agree for
+            // `anthropic`, `openai`, and `google` and that is a coincidence of
+            // naming, not a rule — models.dev files Fireworks under
+            // `fireworks-ai`. Falling back to the provider key keeps every
+            // pre-existing entry reconciling exactly as it did.
+            let declared_source_key = source_provider_key(&candidate.provider);
+            let source_key = declared_source_key
+                .as_deref()
+                .unwrap_or(&candidate.provider);
+            let models = providers.get(source_key).map(|p| &p.models);
             let (entry, matched_as) = match models {
                 Some(models) => match models.get(&candidate.model) {
                     Some(entry) => (Some(entry), None),
@@ -1487,7 +1499,7 @@ mod tests {
         // there is no metadata noise to go with it: the source has nothing to
         // say about this model, and silence upstream is never disagreement.
         let catalog = catalog_on("local-llama", free());
-        let found = reconcile_with(&catalog, SOURCE, &|_| true, &|_| None);
+        let found = reconcile_with(&catalog, SOURCE, &|_| true, &|_| None, &|_| None);
 
         assert_eq!(found[0].verdict, Verdict::Unreconcilable);
         assert!(!found[0].verdict.is_actionable());
@@ -1504,7 +1516,7 @@ mod tests {
         // failing. (`validate_zero_price` refuses such a file outright since
         // stage 2; this does not depend on that.)
         let shipped_but_free = catalog_on("anthropic", free());
-        let found = reconcile_with(&shipped_but_free, SOURCE, &|_| false, &|_| None);
+        let found = reconcile_with(&shipped_but_free, SOURCE, &|_| false, &|_| None, &|_| None);
         assert_eq!(found[0].verdict, Verdict::Missing);
         assert!(found[0].verdict.is_actionable());
 
@@ -1512,7 +1524,9 @@ mod tests {
         // gets a real answer even though that answer is `NOT IN SOURCE`. Only
         // the intersection is exempt.
         let operator_but_priced = catalog_on("local-llama", rates(1.0, 0.1, 5.0));
-        let found = reconcile_with(&operator_but_priced, SOURCE, &|_| true, &|_| None);
+        let found = reconcile_with(&operator_but_priced, SOURCE, &|_| true, &|_| None, &|_| {
+            None
+        });
         assert_eq!(found[0].verdict, Verdict::Missing);
         assert!(found[0].verdict.is_actionable());
     }
@@ -1559,15 +1573,22 @@ mod tests {
         // direction that reads as our file being wrong — 2.2 recorded against
         // 2.0 published. An operator "fixing" that would move the basis 10%
         // BELOW what AWS invoices. This is the row the exemption removes.
-        let unguarded = reconcile_with(&catalog, GLOBAL_RATE_SOURCE, &|_| false, &|_| None);
+        let unguarded =
+            reconcile_with(&catalog, GLOBAL_RATE_SOURCE, &|_| false, &|_| None, &|_| {
+                None
+            });
         assert_eq!(unguarded[0].verdict, Verdict::BasisDrift);
         assert!(unguarded[0].verdict.is_actionable());
 
         // WITH it the verdict is the declared gap, it is not actionable, and
         // the reason travels on the finding so the report can argue the case.
-        let guarded = reconcile_with(&catalog, GLOBAL_RATE_SOURCE, &|_| false, &|provider| {
-            (provider == "bedrock").then(|| "global rate, we pay in-region".to_owned())
-        });
+        let guarded = reconcile_with(
+            &catalog,
+            GLOBAL_RATE_SOURCE,
+            &|_| false,
+            &|provider| (provider == "bedrock").then(|| "global rate, we pay in-region".to_owned()),
+            &|_| None,
+        );
         assert_eq!(guarded[0].verdict, Verdict::NotCoveredBySource);
         assert!(!guarded[0].verdict.is_actionable());
         assert_eq!(guarded[0].verdict.label(), "source cannot price");
@@ -1575,6 +1596,127 @@ mod tests {
             guarded[0].unreconcilable_reason.as_deref(),
             Some("global rate, we pay in-region")
         );
+    }
+
+    /// The reconciliation source files some upstreams under a key that is not
+    /// ZeroRouter's, and Fireworks is the first: models.dev calls it
+    /// `fireworks-ai`. The whole join is one `BTreeMap::get`, so without a
+    /// declared key every candidate on such an upstream reports `NOT IN
+    /// SOURCE` — actionable, permanently, on rates that are in fact published
+    /// and checkable.
+    ///
+    /// Both halves are asserted in one test on purpose: the value of the
+    /// mechanism is the DIFFERENCE between them, and a pair of tests in
+    /// different places would let someone "fix" the first by deleting the
+    /// second's premise.
+    #[test]
+    fn a_declared_source_key_joins_an_upstream_the_source_files_under_another_name() {
+        const RENAMED_SOURCE: &str = r#"{
+            "fireworks-ai": {"models": {"accounts/fireworks/models/kimi-k3": {
+                "cost": {"input": 3.0, "output": 15.0, "cache_read": 0.3}
+            }}}
+        }"#;
+        let mut tiers = BTreeMap::new();
+        tiers.insert(
+            "fireworks/kimi-k3".to_owned(),
+            TierDefinition {
+                rates: RateSchedule::flat(rates(3.0, 0.3, 15.0)),
+                retention: None,
+                candidates: vec![TierCandidate {
+                    id: "fireworks/kimi-k3".to_owned(),
+                    provider: "fireworks".to_owned(),
+                    model: "accounts/fireworks/models/kimi-k3".to_owned(),
+                    surface: None,
+                    rates: RateSchedule::flat(rates(3.0, 0.3, 15.0)),
+                    metadata: ModelMetadata::default(),
+                }],
+            },
+        );
+        let catalog = TierCatalog {
+            schema_version: 1,
+            tiers,
+            retention: BTreeMap::new(),
+            unavailable: BTreeMap::new(),
+        };
+
+        // WITHOUT the declaration: the row exists, at a key one character off,
+        // and the report says the model is not in the source at all. This is
+        // the state the shipped inventory would have been in.
+        let unmapped = reconcile_with(&catalog, RENAMED_SOURCE, &|_| false, &|_| None, &|_| None);
+        assert_eq!(unmapped[0].verdict, Verdict::Missing);
+        assert!(unmapped[0].verdict.is_actionable());
+
+        // WITH it: an ordinary rate comparison, and it agrees.
+        let mapped = reconcile_with(
+            &catalog,
+            RENAMED_SOURCE,
+            &|_| false,
+            &|_| None,
+            &|provider| (provider == "fireworks").then(|| "fireworks-ai".to_owned()),
+        );
+        assert_eq!(mapped[0].verdict, Verdict::Match);
+        assert!(!mapped[0].verdict.is_actionable());
+    }
+
+    /// The mapping redirects the join; it does not weaken it. A declared key
+    /// pointing at a real row whose prices differ must still report drift —
+    /// otherwise the field would be a quiet way to make an upstream stop being
+    /// checked, which is what `unreconcilable_reason` is for and what this
+    /// field must never become.
+    #[test]
+    fn a_declared_source_key_still_reports_drift_at_the_key_it_names() {
+        const RENAMED_SOURCE: &str = r#"{
+            "fireworks-ai": {"models": {"accounts/fireworks/models/kimi-k3": {
+                "cost": {"input": 9.0, "output": 15.0, "cache_read": 0.3}
+            }}}
+        }"#;
+        let mut tiers = BTreeMap::new();
+        tiers.insert(
+            "fireworks/kimi-k3".to_owned(),
+            TierDefinition {
+                rates: RateSchedule::flat(rates(3.0, 0.3, 15.0)),
+                retention: None,
+                candidates: vec![TierCandidate {
+                    id: "fireworks/kimi-k3".to_owned(),
+                    provider: "fireworks".to_owned(),
+                    model: "accounts/fireworks/models/kimi-k3".to_owned(),
+                    surface: None,
+                    rates: RateSchedule::flat(rates(3.0, 0.3, 15.0)),
+                    metadata: ModelMetadata::default(),
+                }],
+            },
+        );
+        let catalog = TierCatalog {
+            schema_version: 1,
+            tiers,
+            retention: BTreeMap::new(),
+            unavailable: BTreeMap::new(),
+        };
+
+        let found = reconcile_with(
+            &catalog,
+            RENAMED_SOURCE,
+            &|_| false,
+            &|_| None,
+            &|provider| (provider == "fireworks").then(|| "fireworks-ai".to_owned()),
+        );
+        assert_eq!(found[0].verdict, Verdict::BasisDrift);
+        assert!(found[0].verdict.is_actionable());
+    }
+
+    /// An upstream that declares no source key joins on its own key, which is
+    /// what every entry did before the field existed. Pinned so that adding
+    /// the mapping cannot quietly change the three providers that never needed
+    /// one.
+    #[test]
+    fn an_undeclared_source_key_still_joins_on_the_provider_key() {
+        let catalog = catalog_with(
+            "claude-sonnet-5",
+            rates(2.0, 0.2, 10.0),
+            rates(2.0, 0.2, 10.0),
+        );
+        let found = reconcile_with(&catalog, SOURCE, &|_| false, &|_| None, &|_| None);
+        assert_eq!(found[0].verdict, Verdict::Match);
     }
 
     #[test]
@@ -1587,9 +1729,13 @@ mod tests {
             rates(9.0, 0.9, 9.0),
             rates(9.0, 0.9, 9.0),
         );
-        let found = reconcile_with(&catalog, SOURCE, &|_| false, &|provider| {
-            (provider == "bedrock").then(|| "declared elsewhere".to_owned())
-        });
+        let found = reconcile_with(
+            &catalog,
+            SOURCE,
+            &|_| false,
+            &|provider| (provider == "bedrock").then(|| "declared elsewhere".to_owned()),
+            &|_| None,
+        );
         assert_eq!(found[0].verdict, Verdict::BasisDrift);
         assert!(found[0].verdict.is_actionable());
         assert_eq!(found[0].unreconcilable_reason, None);

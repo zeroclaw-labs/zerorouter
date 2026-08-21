@@ -1154,7 +1154,7 @@ mod tests {
             retention: BTreeMap::new(),
             unavailable: BTreeMap::new(),
         };
-        let found = crate::drift::reconcile_with(&edge, PRIMARY, &|_| true, &|_| None);
+        let found = crate::drift::reconcile_with(&edge, PRIMARY, &|_| true, &|_| None, &|_| None);
         assert_eq!(found[0].verdict, Verdict::Unreconcilable);
 
         let report = corroborate(&found, SECOND).expect("a well-formed second source is readable");

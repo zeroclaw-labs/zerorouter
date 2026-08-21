@@ -93,6 +93,12 @@ async fn start_router(database_url: &str) -> Router {
         .env("GEMINI_API_KEY", "not-a-real-key")
         .env("BEDROCK_API_KEY", "not-a-real-key")
         .env("BEDROCK_REGION", "us-east-1")
+        // Present so the CLI renders a lane whose metadata is deliberately
+        // PARTIAL: three Fireworks lanes state no max output and one states no
+        // modalities at all, because the vendor's own pages contradict each
+        // other there. Rendering a full table is the easy case; rendering one
+        // with holes in it is where a formatter reaches into a missing key.
+        .env("FIREWORKS_API_KEY", "not-a-real-key")
         .env("RUST_LOG", "warn")
         .stdout(Stdio::null())
         .stderr(Stdio::null())

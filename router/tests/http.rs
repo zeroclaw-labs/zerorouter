@@ -270,12 +270,13 @@ async fn models_are_materialized_from_tiers_toml() {
     // One row per model PIN, keyed by its OpenRouter-standard {vendor}/{model}
     // id. The pre-rename catalog published a `zero/*` alias row AND a concrete
     // candidate row per model (14 rows); each pin now equals its candidate, so
-    // it contributes exactly one row — fourteen models, fourteen rows (the
-    // four Bedrock classic-runtime zero-retention lanes joined on 2026-08-20;
-    // the two mantle lanes added the same day are commented out in
-    // `tiers.toml` because AWS's per-account Sales gate refuses this account
-    // 5-generation Claude, so they could be listed but never served).
-    assert_eq!(data.len(), 14);
+    // it contributes exactly one row — nineteen models, nineteen rows (the
+    // four Bedrock classic-runtime zero-retention lanes joined on 2026-08-20,
+    // and the five open-weight Fireworks lanes the same day; the two Bedrock
+    // mantle lanes added alongside them are commented out in `tiers.toml`
+    // because AWS's per-account Sales gate refuses this account 5-generation
+    // Claude, so they could be listed but never served).
+    assert_eq!(data.len(), 19);
     assert!(data.iter().all(|model| model["object"] == "model"));
 
     let ids = data
@@ -297,6 +298,11 @@ async fn models_are_materialized_from_tiers_toml() {
             "bedrock/claude-opus-4-5",
             "bedrock/claude-opus-4-6",
             "bedrock/claude-sonnet-4-5",
+            "fireworks/deepseek-v4-flash",
+            "fireworks/deepseek-v4-pro",
+            "fireworks/glm-5.2",
+            "fireworks/kimi-k3",
+            "fireworks/minimax-m3",
             "google/gemini-3.1-pro-preview",
             "google/gemini-3.5-flash-lite",
             "google/gemini-3.7-flash",
@@ -462,44 +468,101 @@ async fn every_shipped_model_publishes_what_it_can_take_and_produce() {
     // exactly the long-context work someone reached for the big model to do.
     // A new tier has to come back and satisfy this test rather than discover
     // it in an agent transcript.
+    // THE TWO EXCEPTION LISTS BELOW ARE THE GUARD, not holes in it, and they
+    // arrived with the Fireworks lanes on 2026-08-20.
+    //
+    // Until then every shipped model was a multimodal frontier model that
+    // published every limit, so "assert it of all of them" and "assert it of
+    // each of them deliberately" were the same test. The open-weight lineup
+    // breaks that honestly: GLM 5.2 and both DeepSeek V4 lanes genuinely take
+    // no images, and Fireworks documents no max-output figure that agrees with
+    // models.dev for the DeepSeek pair or MiniMax M3, so `tiers.toml` states
+    // nothing rather than guessing (each omission argues itself there).
+    //
+    // Loosening the assertion to "text-only is fine, absent is fine" would have
+    // deleted the guard, because the bug it was written for — a new tier
+    // shipping with no window at all, and every ZeroClaw agent silently
+    // assuming 32,000 — would then pass. Naming the exceptions keeps the teeth:
+    // a lane that omits metadata must appear here, so the omission is reviewed
+    // once, in the diff, by a human. A NEW tier that forgets its metadata is not
+    // on these lists and still fails.
+    const NO_MAX_OUTPUT: [&str; 3] = [
+        "fireworks/deepseek-v4-flash",
+        "fireworks/deepseek-v4-pro",
+        "fireworks/minimax-m3",
+    ];
+    const NO_IMAGE_INPUT: [&str; 4] = [
+        "fireworks/deepseek-v4-flash",
+        "fireworks/deepseek-v4-pro",
+        "fireworks/glm-5.2",
+        // Omits the modality list entirely: Fireworks' own two pages contradict
+        // each other about whether this model takes images.
+        "fireworks/minimax-m3",
+    ];
+
     for model in listed_models(RouterState::fully_credentialed(tier_config_path())).await {
         let id = model["id"].as_str().expect("every model carries an id");
-        // The shipped catalog's real floor is haiku's 200k. The assertion is a
-        // sanity bound, not a spec: it catches a unit slip (200 for 200k) or a
-        // field that silently went missing, which are the ways this regresses.
+        // The shipped catalog's real floor is MiniMax M3's 512k, then haiku's
+        // 200k. The assertion is a sanity bound, not a spec: it catches a unit
+        // slip (200 for 200k) or a field that silently went missing, which are
+        // the ways this regresses. NO lane is exempt from this one — a context
+        // window is the single claim whose absence caused the original bug.
         let window = model["context_length"].as_u64();
         assert!(
             window.is_some_and(|window| window >= 200_000),
             "{id} ships without a plausible context window: {}",
             model["context_length"]
         );
-        assert!(
-            model["max_output_tokens"]
-                .as_u64()
-                .is_some_and(|output| output >= 64_000),
-            "{id} ships without a plausible max output: {}",
-            model["max_output_tokens"]
-        );
-        // Every model in the inventory is multimodal and tool-calling. The
-        // floor is asserted rather than the exact set: until Google arrived on
-        // 2026-08-18 every rung took precisely text/image/pdf, and pinning that
-        // literal was the stricter guard. Gemini genuinely takes video and
-        // audio as well, and this table's job is to report what a model is (the
-        // same kind of claim a rate is), not to flatten vendors to a common
-        // denominator — `admin catalog-drift` reconciles each set against
-        // models.dev, which is the check that would catch an invented modality.
-        // A rung that cannot take text and images is still a real change and
-        // still has to come back and edit this.
-        let modalities = model["input_modalities"]
-            .as_array()
-            .expect("every model declares what it can take");
-        for required in ["text", "image"] {
+        if NO_MAX_OUTPUT.contains(&id) {
             assert!(
-                modalities.iter().any(|modality| modality == required),
-                "{id} does not take {required}: {:?}",
-                model["input_modalities"]
+                model["max_output_tokens"].is_null(),
+                "{id} is listed as declining to state a max output; it now states one, so \
+                 remove it from NO_MAX_OUTPUT rather than leaving a stale exemption"
+            );
+        } else {
+            assert!(
+                model["max_output_tokens"]
+                    .as_u64()
+                    .is_some_and(|output| output >= 64_000),
+                "{id} ships without a plausible max output: {}",
+                model["max_output_tokens"]
             );
         }
+        // Modalities: the floor is asserted rather than the exact set, because
+        // this table's job is to report what a model IS (the same kind of claim
+        // a rate is), not to flatten vendors to a common denominator — `admin
+        // catalog-drift` reconciles each set against models.dev, which is the
+        // check that would catch an invented modality. Text is required of
+        // every lane that declares anything at all; images only of the lanes
+        // that actually take them.
+        if NO_IMAGE_INPUT.contains(&id) {
+            if let Some(modalities) = model["input_modalities"].as_array() {
+                assert!(
+                    modalities.iter().any(|modality| modality == "text"),
+                    "{id} declares modalities without text: {:?}",
+                    model["input_modalities"]
+                );
+                assert!(
+                    !modalities.iter().any(|modality| modality == "image"),
+                    "{id} is listed as taking no images and now claims to; remove it from \
+                     NO_IMAGE_INPUT rather than leaving a stale exemption: {:?}",
+                    model["input_modalities"]
+                );
+            }
+        } else {
+            let modalities = model["input_modalities"]
+                .as_array()
+                .expect("every model declares what it can take");
+            for required in ["text", "image"] {
+                assert!(
+                    modalities.iter().any(|modality| modality == required),
+                    "{id} does not take {required}: {:?}",
+                    model["input_modalities"]
+                );
+            }
+        }
+        // No exemption here, and there should not be one: every model this
+        // catalog sells is bought to drive an agent.
         assert_eq!(model["tool_call"], true, "{id} should support tool calling");
     }
 }
@@ -613,15 +676,26 @@ async fn every_shipped_lane_publishes_a_retention_posture() {
     }
 
     // The shipped catalog's state, asserted rather than assumed. It was EMPTY
-    // until 2026-08-20 and is now exactly two lanes — and it is pinned by NAME
-    // rather than by count, because the thing that must not happen quietly is a
-    // lane ACQUIRING this label, not the tally moving. A count of two would
-    // still pass if someone relabelled `anthropic/*` zero and dropped Bedrock.
+    // until 2026-08-20 and is now nine lanes — and it is pinned by NAME rather
+    // than by count, because the thing that must not happen quietly is a lane
+    // ACQUIRING this label, not the tally moving. A count would still pass if
+    // someone relabelled `anthropic/*` zero and dropped an existing lane.
     //
     // A lane arriving in this list is a legal-adjacent claim about a customer's
-    // data. It arrives only with evidence behind it — for these two, an enforced
-    // `data_retention_mode: none` on the operator's AWS account plus AWS's
-    // published semantics for that value. See docs/DEPLOY.md.
+    // data, and it arrives only with evidence behind it. The nine below rest on
+    // TWO DIFFERENT KINDS of evidence, which is the reason to keep reading
+    // rather than to append the next lane by pattern-match:
+    //
+    //   bedrock/*    an ENFORCED `data_retention_mode: none` on the operator's
+    //                own AWS account, plus AWS's published semantics for that
+    //                value — re-verifiable live against the account.
+    //   fireworks/*  Fireworks' PUBLISHED DEFAULT for every customer, quoted
+    //                from its own security documentation. There is no account
+    //                state to re-read, so the pinned page hash is the entire
+    //                re-verification loop.
+    //
+    // See docs/DEPLOY.md, "The rule for `posture = zero`", which names three
+    // admissible bases and the conditions on each.
     let zero: Vec<&str> = data
         .iter()
         .filter(|model| model["retention"]["posture"] == "zero")
@@ -633,10 +707,15 @@ async fn every_shipped_lane_publishes_a_retention_posture() {
             "bedrock/claude-haiku-4-5",
             "bedrock/claude-opus-4-5",
             "bedrock/claude-opus-4-6",
-            "bedrock/claude-sonnet-4-5"
+            "bedrock/claude-sonnet-4-5",
+            "fireworks/deepseek-v4-flash",
+            "fireworks/deepseek-v4-pro",
+            "fireworks/glm-5.2",
+            "fireworks/kimi-k3",
+            "fireworks/minimax-m3"
         ],
-        "no lane may claim zero retention without a confirmed arrangement or an \
-         enforced account configuration behind it"
+        "no lane may claim zero retention without a confirmed arrangement, an \
+         enforced account configuration, or the vendor's published default behind it"
     );
 }
 
@@ -698,9 +777,11 @@ async fn a_lane_whose_credential_is_absent_is_not_advertised() {
         "an uncredentialed lane must not appear in /v1/models: {ids:?}"
     );
     // And the rest of the catalog is untouched — a missing key removes its own
-    // lanes and nothing else. The count is the shipped fourteen minus Bedrock's
-    // four; asserting the survivors by name would just restate the catalog,
-    // but asserting that the ONLY difference is the Bedrock lanes is the claim.
+    // lanes and nothing else. The count is the shipped nineteen minus Bedrock's
+    // four AND minus Fireworks' five, because this deployment names only three
+    // providers and so holds neither key. Asserting the survivors by name would
+    // just restate the catalog; asserting that the ONLY lanes lost are the ones
+    // whose credentials are absent is the claim.
     assert_eq!(ids.len(), 10, "{ids:?}");
     assert!(ids.iter().any(|id| id == "anthropic/claude-sonnet-5"));
 }
@@ -711,7 +792,7 @@ async fn a_lane_whose_credential_is_absent_is_not_advertised() {
 /// been present in production. Each is dropped in turn.
 #[tokio::test]
 async fn every_provider_hides_its_own_lanes_when_its_key_is_absent() {
-    const ALL: [&str; 4] = ["anthropic", "openai", "google", "bedrock"];
+    const ALL: [&str; 5] = ["anthropic", "openai", "google", "bedrock", "fireworks"];
     for missing in ALL {
         let credentialed: Vec<&str> = ALL.into_iter().filter(|name| *name != missing).collect();
         let ids = listed_model_ids(RouterState::credentialed_for(
@@ -763,6 +844,11 @@ async fn bundled_tier_catalog_has_expected_virtual_models() {
             "bedrock/claude-opus-4-5",
             "bedrock/claude-opus-4-6",
             "bedrock/claude-sonnet-4-5",
+            "fireworks/deepseek-v4-flash",
+            "fireworks/deepseek-v4-pro",
+            "fireworks/glm-5.2",
+            "fireworks/kimi-k3",
+            "fireworks/minimax-m3",
             "google/gemini-3.1-pro-preview",
             "google/gemini-3.5-flash-lite",
             "google/gemini-3.7-flash",
@@ -770,10 +856,22 @@ async fn bundled_tier_catalog_has_expected_virtual_models() {
             "openai/gpt-5.6-sol",
             "openai/gpt-5.6-terra",
         ],
-        "the fourteen vendor-named model pins (Gemini flash + flash-lite added \
+        "the nineteen vendor-named model pins (Gemini flash + flash-lite added \
          2026-08-18; Gemini Pro joined them once conditional rates could \
          express the 200,000-token boundary Google prices it at; the four \
-         Bedrock classic-runtime zero-retention lanes on 2026-08-20). \
+         Bedrock classic-runtime zero-retention lanes on 2026-08-20, and the \
+         five open-weight Fireworks lanes the same day). \
+         \
+         THE FIREWORKS IDS ARE `fireworks/<model>` AND THE DISPATCHED STRINGS \
+         ARE NOT: Fireworks addresses models as \
+         `accounts/fireworks/models/<slug>`, which carries two slashes and so \
+         cannot be a {{vendor}}/{{model}} id at all, and it writes decimals as \
+         `p` (`glm-5p2`). Only `fireworks/glm-5.2` and its `glm-5p2` model \
+         string are expected to differ by more than a prefix. Fireworks' \
+         closed-weight Qwen lanes are deliberately absent — the vendor's \
+         zero-retention statement is scoped to open models and the retention \
+         pin is per provider, so pinning one would stretch a `zero` label past \
+         its evidence. \
          \
          THE BEDROCK LANES ARE 4.5-GENERATION AND THAT IS NOT A TYPO. The two \
          5-generation `bedrock/claude-{{opus,sonnet}}-5` tiers were added the \
@@ -804,7 +902,10 @@ async fn bundled_tier_catalog_has_expected_virtual_models() {
         );
         let provider = tier.candidates[0].provider.as_str();
         assert!(
-            matches!(provider, "openai" | "anthropic" | "google" | "bedrock"),
+            matches!(
+                provider,
+                "openai" | "anthropic" | "google" | "bedrock" | "fireworks"
+            ),
             "{tier_id} routes to {provider}, which is not in the shipped inventory"
         );
     }
@@ -1236,6 +1337,11 @@ async fn a_basis_hike_above_sell_withholds_that_tier_and_nothing_else() {
             "bedrock/claude-opus-4-5",
             "bedrock/claude-opus-4-6",
             "bedrock/claude-sonnet-4-5",
+            "fireworks/deepseek-v4-flash",
+            "fireworks/deepseek-v4-pro",
+            "fireworks/glm-5.2",
+            "fireworks/kimi-k3",
+            "fireworks/minimax-m3",
             "google/gemini-3.1-pro-preview",
             "google/gemini-3.5-flash-lite",
             "google/gemini-3.7-flash",
@@ -1281,13 +1387,13 @@ async fn a_basis_hike_above_sell_withholds_that_tier_and_nothing_else() {
     assert_eq!(sell.input_per_mtok, Some(2.00));
     assert_eq!(sell.output_per_mtok, Some(10.00));
 
-    // And the public catalog stops advertising what it cannot serve: the twelve
-    // surviving pins, one row each. A Bedrock lane is among the survivors and
+    // And the public catalog stops advertising what it cannot serve: the
+    // eighteen surviving pins, one row each. A Bedrock lane is among the survivors and
     // that is the point of naming one — Bedrock lanes are a different account
     // with their own rate card, so a repricing of a first-party Anthropic lane
     // withholds only that first-party lane.
     let listed = listed_model_ids(RouterState::fully_credentialed(path)).await;
-    assert_eq!(listed.len(), 13);
+    assert_eq!(listed.len(), 18);
     assert!(listed.iter().any(|id| id == "bedrock/claude-sonnet-4-5"));
     assert!(listed.iter().any(|id| id == "openai/gpt-5.6-luna"));
     assert!(listed.iter().any(|id| id == "anthropic/claude-haiku-4-5"));
@@ -1313,7 +1419,7 @@ async fn the_shipped_catalog_withholds_no_tier_today() {
         "the shipped catalog withholds {:?}",
         catalog.unavailable.keys().collect::<Vec<_>>()
     );
-    assert_eq!(catalog.tiers.len(), 14);
+    assert_eq!(catalog.tiers.len(), 19);
 }
 
 /// Every conditional rate the shipped catalog declares, transcribed from
@@ -1395,7 +1501,7 @@ async fn every_shipped_conditional_rate_is_the_one_the_vendor_publishes() {
 // rungs across >=2 providers). Every tier is pass-through until a second
 // provider serves a model class again.
 const ROUTED_TIERS: [&str; 0] = [];
-const PASS_THROUGH_TIERS: [&str; 14] = [
+const PASS_THROUGH_TIERS: [&str; 19] = [
     // Model pins, keyed by their OpenRouter-standard {vendor}/{model} ids.
     "openai/gpt-5.6-luna",
     "anthropic/claude-haiku-4-5",
@@ -1420,6 +1526,18 @@ const PASS_THROUGH_TIERS: [&str; 14] = [
     "bedrock/claude-opus-4-5",
     "bedrock/claude-sonnet-4-5",
     "bedrock/claude-haiku-4-5",
+    // The Fireworks open-weight zero-retention lanes (2026-08-20). Pass-through
+    // like every other pin, and here that is the plain reading for once: these
+    // sell at Fireworks' published standard-path rate with nothing added. The
+    // assertion below (candidate rates == tier rates) is what holds it, and it
+    // is the guard that would catch someone repointing a candidate at a
+    // `routers/`-prefixed Fast or US id — which costs 10-50% more — without
+    // moving the rates to match.
+    "fireworks/kimi-k3",
+    "fireworks/glm-5.2",
+    "fireworks/deepseek-v4-pro",
+    "fireworks/deepseek-v4-flash",
+    "fireworks/minimax-m3",
 ];
 
 #[tokio::test]

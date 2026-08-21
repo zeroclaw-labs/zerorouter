@@ -124,6 +124,34 @@ struct ProviderMetadata {
     /// verdict, with this text printed beside them on every run.
     #[serde(default)]
     unreconcilable_reason: Option<String>,
+    /// The key this upstream is filed under in the reconciliation source, when
+    /// that differs from ZeroRouter's own provider key.
+    ///
+    /// **Declared, never inferred**, and the argument is the one
+    /// [`crate::config::RetentionPin::openrouter_slug`] makes for the other
+    /// third-party join in this repo: the keys look mechanical and are not.
+    /// models.dev files Fireworks under `fireworks-ai` and Together under
+    /// `togetherai`, while its `google` is ZeroRouter's `google` and its
+    /// `amazon-bedrock` is a lane ZeroRouter deliberately does NOT join. There
+    /// is no rule that turns one into the other, and a guess that lands on a
+    /// real-but-wrong key is the failure mode that matters: a row that answers
+    /// with somebody else's prices reconciles green over a basis nobody checked.
+    ///
+    /// `None` — every entry that had this field's absence baked in before it
+    /// existed — means the join is on the provider key itself, which is what
+    /// [`crate::drift::reconcile_with`] did unconditionally until Fireworks
+    /// arrived. So this is additive: no existing entry changes meaning.
+    ///
+    /// It is NOT the sibling of [`Self::unreconcilable_reason`] but its
+    /// opposite. That field says "the source has a row and it is the wrong
+    /// one, so trust nothing"; this one says "the source has the right row,
+    /// under a different name". Declaring both on one entry would be
+    /// contradictory and is refused at load
+    /// ([`ProviderMetadata::validate_reconciliation`]) — an upstream cannot
+    /// simultaneously be reconcilable at a named key and unreconcilable
+    /// everywhere.
+    #[serde(default)]
+    source_provider_key: Option<String>,
     /// Additional API planes this same upstream exposes, keyed by the name a
     /// candidate selects with `surface = "..."` in `tiers.toml`.
     ///
@@ -852,6 +880,42 @@ impl ProviderMetadata {
                 ),
             });
         }
+        // A blank source key is refused for the mirror-image reason. Absent
+        // means "join on the provider key", which is a real and common answer;
+        // present-but-blank would join on the empty string, match nothing, and
+        // report every candidate on this upstream `NOT IN SOURCE` — an alarm
+        // that fires forever on a fault nobody can fix, which is how a report
+        // stops being read.
+        if self
+            .source_provider_key
+            .as_deref()
+            .is_some_and(|key| key.trim().is_empty())
+        {
+            return Err(ProviderBuildError::InvalidInventory {
+                detail: format!(
+                    "provider {} declares an empty source_provider_key; omit the field to join the \
+                     reconciliation source on the provider key itself, or name the key this \
+                     upstream is actually filed under",
+                    self.key
+                ),
+            });
+        }
+        // Declaring both is a contradiction rather than a redundancy: one says
+        // the source's row is authoritative under a different name, the other
+        // says no row of the source's may be trusted at all. Whichever won
+        // silently would decide whether this upstream's margin is checked,
+        // which is not a thing to settle by field order in a struct.
+        if self.source_provider_key.is_some() && self.unreconcilable_reason.is_some() {
+            return Err(ProviderBuildError::InvalidInventory {
+                detail: format!(
+                    "provider {} declares both source_provider_key and unreconcilable_reason; the \
+                     first says the reconciliation source prices this upstream correctly under \
+                     another key and the second says it cannot price it at all — keep the one that \
+                     is true",
+                    self.key
+                ),
+            });
+        }
         Ok(())
     }
 
@@ -1069,6 +1133,26 @@ pub fn provider_unreconcilable_reason(provider: &str) -> Option<String> {
         inventory
             .provider(provider)
             .and_then(|metadata| metadata.unreconcilable_reason.clone())
+    })
+}
+
+/// The key this upstream is filed under in the reconciliation source, when it
+/// declares one.
+///
+/// `None` means join on the provider key itself — the behaviour every entry had
+/// before this existed, and still the right answer for `anthropic`, `openai`,
+/// and `google`, whose keys models.dev happens to share.
+///
+/// Read from the inventory for the reason [`provider_unreconcilable_reason`]
+/// gives: per-upstream facts live in one place, and a mapping table inside
+/// `drift.rs` would be a second list to drift — the more dangerous kind, since
+/// its failure is a silently wrong price rather than a compile error.
+#[must_use]
+pub fn provider_source_key(provider: &str) -> Option<String> {
+    ProviderInventory::load().ok().and_then(|inventory| {
+        inventory
+            .provider(provider)
+            .and_then(|metadata| metadata.source_provider_key.clone())
     })
 }
 
@@ -1507,14 +1591,18 @@ mod tests {
 
     #[test]
     fn supported_provider_check_uses_constructor_table() {
-        for provider in ["anthropic", "openai", "google", "bedrock"] {
+        for provider in ["anthropic", "openai", "google", "bedrock", "fireworks"] {
             assert!(is_supported_provider(provider));
         }
         // Retired with the git dependency that supplied their adapters, and
-        // still gone. `bedrock` used to sit in this list; it came BACK on
-        // 2026-08-20 as the zero-retention lane, on ZeroRouter's own Messages
-        // wire rather than the pinned Converse adapter that once served it.
-        for provider in ["deepinfra", "fireworks", "together", "minimax"] {
+        // still gone. Two names have now left this list rather than joined it:
+        // `bedrock` came BACK on 2026-08-20 as the zero-retention lane, on
+        // ZeroRouter's own Messages wire rather than the pinned Converse
+        // adapter that once served it, and `fireworks` came back the same day
+        // on the generic chat-completions wire. Neither is the old pinned
+        // adapter returning — both are entries in `config/providers.json`
+        // speaking a wire this repo owns.
+        for provider in ["deepinfra", "together", "minimax"] {
             assert!(
                 !is_supported_provider(provider),
                 "{provider} is no longer in the inventory"
@@ -1552,6 +1640,15 @@ mod tests {
         // Completions and Responses unsupported and Messages supported, so the
         // lane rides the Messages wire — which already sends the `x-api-key`
         // and `anthropic-version` headers that endpoint takes.
+        //
+        // Fireworks joined on 2026-08-20 as the SECOND entry on the
+        // chat-completions adapter, and it is the unsurprising half: Fireworks
+        // publishes an OpenAI-compatible endpoint and nothing else, so the
+        // generic wire is simply correct. Worth pinning anyway, because it is
+        // the shape every planned open-weight vendor takes — a key, a full
+        // endpoint URL, and this adapter — so a fourth chat-completions entry
+        // appearing here without a deliberate edit would be the signal that
+        // somebody added a vendor without reading what that entails.
         assert_eq!(
             adapters,
             [
@@ -1559,6 +1656,7 @@ mod tests {
                 ("openai", ProviderAdapter::OpenAiResponses),
                 ("google", ProviderAdapter::ChatCompletions),
                 ("bedrock", ProviderAdapter::Anthropic),
+                ("fireworks", ProviderAdapter::ChatCompletions),
             ]
         );
 
@@ -1766,7 +1864,14 @@ mod tests {
             .collect();
         assert_eq!(
             keys,
-            ["anthropic", "openai", "google", "bedrock", "local-llama"]
+            [
+                "anthropic",
+                "openai",
+                "google",
+                "bedrock",
+                "fireworks",
+                "local-llama"
+            ]
         );
 
         let local = inventory
@@ -2657,6 +2762,70 @@ mod tests {
         let detail = error.to_string();
         assert!(detail.contains("silent"), "{detail}");
         assert!(detail.contains("unreconcilable_reason"), "{detail}");
+    }
+
+    #[test]
+    fn a_blank_source_provider_key_is_refused_rather_than_joined_on_nothing() {
+        // Absent means "join on the provider key", which is a true and common
+        // answer. Present-but-blank would join on "", match nothing, and report
+        // every candidate on this upstream NOT IN SOURCE forever — an alarm
+        // that cannot be silenced by fixing anything.
+        let error = assemble(
+            r#"{
+                "key": "renamed",
+                "adapter": "chat_completions",
+                "credential_env": "RENAMED_API_KEY",
+                "secret_name": "renamed-api-key",
+                "base_url": "https://svc.example.test/v1/chat/completions",
+                "source_provider_key": "   "
+            }"#,
+        )
+        .expect_err("a blank source key must be refused");
+        let detail = error.to_string();
+        assert!(detail.contains("renamed"), "{detail}");
+        assert!(detail.contains("source_provider_key"), "{detail}");
+    }
+
+    #[test]
+    fn an_upstream_cannot_be_both_reconcilable_elsewhere_and_unreconcilable() {
+        // The two fields make opposite claims about whether this upstream's
+        // margin is checked at all. Letting one win silently would decide that
+        // by field order in a struct.
+        let error = assemble(
+            r#"{
+                "key": "confused",
+                "adapter": "chat_completions",
+                "credential_env": "CONFUSED_API_KEY",
+                "secret_name": "confused-api-key",
+                "base_url": "https://svc.example.test/v1/chat/completions",
+                "source_provider_key": "confused-ai",
+                "unreconcilable_reason": "the source prices a different SKU class"
+            }"#,
+        )
+        .expect_err("declaring both must be refused");
+        let detail = error.to_string();
+        assert!(detail.contains("confused"), "{detail}");
+        assert!(detail.contains("source_provider_key"), "{detail}");
+        assert!(detail.contains("unreconcilable_reason"), "{detail}");
+    }
+
+    #[test]
+    fn only_fireworks_declares_a_source_key_and_it_is_the_one_models_dev_uses() {
+        // The shipped mapping, asserted by name. models.dev files Fireworks
+        // under `fireworks-ai`; the other providers' keys happen to match and
+        // must stay unmapped, because a mapping that appeared on one of them by
+        // accident would silently reconcile it against another vendor's prices.
+        assert_eq!(
+            provider_source_key("fireworks").as_deref(),
+            Some("fireworks-ai"),
+            "fireworks must join models.dev at the key models.dev actually uses"
+        );
+        for provider in ["anthropic", "openai", "google", "bedrock"] {
+            assert!(
+                provider_source_key(provider).is_none(),
+                "{provider} joins on its own key and must not acquire a mapping"
+            );
+        }
     }
 
     #[test]

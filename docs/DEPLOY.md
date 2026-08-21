@@ -528,11 +528,14 @@ The labels are pinned in `router/config/tiers.toml` under `[retention.<provider>
 and are never written by any tool — the same rule prices follow, for a sharper
 reason: a retention label is a claim to a customer about their own data.
 
-**Today four lanes are `zero` and the rest are `standard`.** `anthropic`,
+**Today nine lanes are `zero` and the rest are `standard`.** `anthropic`,
 `openai`, and `google` are ordinary API accounts. `bedrock` — the four
-`bedrock/claude-*` lanes, added 2026-08-20 — is the first zero-retention
-upstream, and it got there by configuration rather than by contract. The section
-below on enforced configuration is why that counts.
+`bedrock/claude-*` lanes, added 2026-08-20 — was the first zero-retention
+upstream, and it got there by configuration rather than by contract.
+`fireworks` — the five open-weight `fireworks/*` lanes, added the same day —
+got there a third way again: neither a contract nor a setting, but the vendor's
+published default for every customer. The two sections below on enforced
+configuration and on published defaults are why each counts.
 
 The posture is pinned per PROVIDER, and that is what lets one `[retention.bedrock]`
 block cover both of Bedrock's API planes (see the next section):
@@ -541,11 +544,15 @@ endpoint, so one setting governs every request made on that key.
 
 ### The rule for `posture = "zero"`
 
-> A lane may be labelled zero-retention **only when a signed or confirmed
-> zero-data-retention arrangement is in force with that provider, covering the
-> account that lane dispatches on** — or when the provider **enforces** zero
-> retention as a setting on that account, with published semantics for what the
-> setting means.
+> A lane may be labelled zero-retention **only** on one of three bases:
+>
+> 1. a signed or confirmed zero-data-retention **arrangement** is in force with
+>    that provider, covering the account that lane dispatches on; or
+> 2. the provider **enforces** zero retention as a setting on that account, with
+>    published semantics for what the setting means; or
+> 3. the provider's own security documentation states zero retention as the
+>    **published default** for all customers, on the API surface that lane
+>    dispatches on.
 
 Not because the vendor *offers* ZDR to somebody. Not because a policy page says
 data is not used for training — **training and retention are different claims**,
@@ -594,6 +601,51 @@ load-bearing:
 
 `inherit`, not `default`, is the value a never-configured AWS account reports —
 it means "no opinion at this scope". Only a literal `none` backs a `zero` label.
+
+#### Published defaults, and the narrow door they come through
+
+The third basis was added on 2026-08-20 for Fireworks, and it is the weakest of
+the three in one specific respect, so it comes with the tightest conditions.
+
+Fireworks does not sell, negotiate, or expose a switch for zero retention. Its
+security documentation states it as what the platform does for everyone:
+"Fireworks has Zero Data Retention by default", and "prompt and generation data
+exist only in volatile memory for the duration of the request". There is no
+arrangement to confirm and no setting to read back — so bases 1 and 2 cannot be
+satisfied, while the claim itself is public, specific, and quotable.
+
+Four conditions, and none of them is optional:
+
+1. **A specific retention statement, not a reassuring page.** "We do not train
+   on your data" is not this. The documentation must say what happens to prompt
+   and generation data, in terms that distinguish retention from training.
+2. **Scoped to the surface you dispatch on.** Fireworks' own page carves out its
+   Response API, which *does* store conversations by default for 30 days.
+   ZeroRouter's lanes ride chat completions, which the zero-retention sentences
+   cover. A pin is only as wide as the surface the sentence names — adding a
+   differently-shaped surface to a provider entry means re-reading the pin.
+3. **Scoped to the models you pin.** Fireworks' sentence says "for any open
+   models". The five shipped lanes are all open-weights for exactly that
+   reason; its closed-weight models are deliberately not pinned, because a
+   provider-level posture would extend the label past its evidence.
+4. **The page hash is the entire re-verification loop, and must be treated as
+   such.** This is where the basis is weaker than the other two. A contract
+   cannot be revoked silently. An account setting can be re-read live, which is
+   what `--bedrock-live` does. A published default can change for everybody with
+   one documentation edit and no notification, and there is nothing to query,
+   because there is no per-account state to query. So `retention-drift` is not a
+   supplement for these lanes — it is the only check there is, and a `PAGE
+   CHANGED` verdict must be read by a human before the digest is re-pinned.
+   Pasting a fresh digest without reading turns the sole evidence for a
+   customer-facing data claim into a rubber stamp.
+
+Corroboration is worth more here than elsewhere, and for a reason specific to
+this basis: `--corroborate` reports what OpenRouter believes about *its own*
+account with a provider, which is why a `zero` pin backed by a private
+arrangement is expected to look like a disagreement. A published default governs
+every account alike, so OpenRouter reading the same policy and reaching the same
+answer is genuine second-party agreement rather than an accident. It is still
+advisory and still cannot change an exit code.
 
 The one exception that needs no vendor at all: a **local rung on your own
 hardware** (see `examples/edge/tiers.toml`). Even there, confirm your inference
