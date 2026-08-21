@@ -786,9 +786,11 @@ async fn every_shipped_lane_publishes_a_retention_posture() {
             "fireworks/glm-5.2",
             "fireworks/kimi-k3",
             "fireworks/minimax-m3",
-            "vertex/gemini-3.1-pro-preview",
-            "vertex/gemini-3.5-flash-lite",
-            "vertex/gemini-3.7-flash",
+            // The three vertex lanes are DELIBERATELY absent: their provider
+            // pin sits at `standard` while Google's abuse-monitoring exception
+            // (filed 2026-08-21) is pending — see the pin's comment in
+            // tiers.toml. When approval lands and the pin flips back to zero,
+            // they rejoin this list. Do not add them here before that.
             "xai/grok-4.3",
             "xai/grok-4.6"
         ],
