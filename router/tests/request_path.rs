@@ -5745,3 +5745,277 @@ async fn a_metered_stream_records_no_usage_gap() {
         "a live stream's terminal reason is the upstream's own"
     );
 }
+
+// ---------------------------------------------------------------------------
+// MULTIMODAL ADMISSION (2026-08-21)
+//
+// The catalog advertised `image` on most lanes while the compat surface 400'd
+// every structured content array, so the advertised capability was
+// unreachable. These pin the admission half of closing that: what is accepted,
+// what is refused, and — the part that moves money — that a refusal happens
+// before any reservation is taken, and that an accepted image is HELD FOR
+// against the worst case the upstream may meter for it.
+// ---------------------------------------------------------------------------
+
+/// The OpenAI-shape multimodal body, as the official SDKs emit it.
+fn multimodal_body(model: &str, stream: bool, image_url: &str) -> Value {
+    let mut body = completion_body(model, stream);
+    body["messages"] = json!([{
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "what is in this image?"},
+            {"type": "image_url", "image_url": {"url": image_url}},
+        ],
+    }]);
+    body
+}
+
+#[tokio::test]
+async fn an_image_sent_to_a_text_only_lane_is_refused_before_anything_is_reserved() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let (api_key_id, key) = create_funded_key(&pool, "modality-gate").await;
+    let textonly = FakeModelProvider::new("textonly", vec![]);
+    let state = router_matching_aliases(pool.clone(), vec![textonly.clone()]);
+
+    let response = app(state.clone())
+        .oneshot(completion_request(
+            &key,
+            &multimodal_body("zero/test-text-only", false, "https://example.com/x.jpg"),
+        ))
+        .await
+        .expect("completion request should complete");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = json_body(response).await;
+    assert_eq!(body["error"]["code"], "modality_unsupported");
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+    assert_eq!(body["error"]["param"], "messages");
+    // The message must name the lane and what it DOES take: a caller acts on
+    // this by choosing another model, and cannot without both.
+    let message = body["error"]["message"].as_str().expect("a message");
+    assert!(
+        message.contains("zero/test-text-only"),
+        "the refusal must name the model: {message}"
+    );
+    assert!(
+        message.contains("text"),
+        "the refusal must say what the lane accepts: {message}"
+    );
+
+    // The money assertions, which are the point of gating at admission rather
+    // than discovering the mismatch as an upstream 400.
+    assert_eq!(textonly.call_count(), 0, "no upstream may be dialled");
+    assert_eq!(open_reservations(&pool, api_key_id).await, 0);
+    assert_eq!(settled_count(&pool, api_key_id).await, 0);
+}
+
+#[tokio::test]
+async fn a_lane_that_declares_image_serves_it_and_one_that_declares_nothing_is_not_refused() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let (_, key) = create_funded_key(&pool, "modality-served").await;
+
+    // Declared `image`: served.
+    let vision = FakeModelProvider::new("vision", vec![FakeOutcome::chat("a cat", served_usage())]);
+    let state = router_matching_aliases(pool.clone(), vec![vision.clone()]);
+    let response = app(state.clone())
+        .oneshot(completion_request(
+            &key,
+            &multimodal_body("zero/test-vision", false, "https://example.com/x.jpg"),
+        ))
+        .await
+        .expect("completion request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    state.wait_for_background_tasks().await;
+    assert_eq!(vision.call_count(), 1);
+
+    // Declares NO metadata at all: also served. "Unknown is never a refusal"
+    // is not a nicety — several shipped lanes omit `input_modalities` because
+    // their two sources contradict each other, and every one of them takes
+    // images in reality. Turning silence into a 400 would break them.
+    let solo = FakeModelProvider::new("solo", vec![FakeOutcome::chat("a dog", served_usage())]);
+    let state = router_matching_aliases(pool.clone(), vec![solo.clone()]);
+    let response = app(state.clone())
+        .oneshot(completion_request(
+            &key,
+            &multimodal_body("zero/test-solo", false, "https://example.com/x.jpg"),
+        ))
+        .await
+        .expect("completion request should complete");
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "a lane that declares nothing must keep serving everything"
+    );
+    state.wait_for_background_tasks().await;
+    assert_eq!(solo.call_count(), 1);
+}
+
+#[tokio::test]
+async fn a_text_only_content_array_is_the_same_request_as_the_joined_string() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let (_, key) = create_funded_key(&pool, "modality-text-array").await;
+    let textonly =
+        FakeModelProvider::new("textonly", vec![FakeOutcome::chat("hello", served_usage())]);
+    let state = router_matching_aliases(pool.clone(), vec![textonly.clone()]);
+
+    let mut body = completion_body("zero/test-text-only", false);
+    body["messages"] = json!([{
+        "role": "user",
+        "content": [{"type": "text", "text": "hello"}],
+    }]);
+    let response = app(state.clone())
+        .oneshot(completion_request(&key, &body))
+        .await
+        .expect("completion request should complete");
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "an array carrying only text asks a lane for nothing a string does not"
+    );
+    state.wait_for_background_tasks().await;
+    assert_eq!(textonly.call_count(), 1);
+}
+
+#[tokio::test]
+async fn an_image_is_reserved_for_at_its_worst_case_not_its_url_length() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let (api_key_id, key) = create_funded_key(&pool, "modality-reserve").await;
+
+    // A text-only request through the same lane, as the control.
+    let vision = FakeModelProvider::new("vision", vec![FakeOutcome::chat("plain", served_usage())]);
+    let state = router_matching_aliases(pool.clone(), vec![vision.clone()]);
+    let mut plain = completion_body("zero/test-vision", false);
+    plain["messages"] = json!([{"role": "user", "content": "what is in this image?"}]);
+    app(state.clone())
+        .oneshot(completion_request(&key, &plain))
+        .await
+        .expect("completion request should complete");
+    state.wait_for_background_tasks().await;
+    let (_, _, plain_reserved, _) = settled_reservation(&pool, api_key_id).await;
+    let plain_reserved = plain_reserved.expect("a reserved cost is recorded");
+
+    // The same prompt with an image appended by URL. On the wire that adds
+    // ~40 bytes; at the upstream it adds thousands of metered tokens, and the
+    // reservation has to hold for the second number.
+    let vision = FakeModelProvider::new("vision", vec![FakeOutcome::chat("a cat", served_usage())]);
+    let state = router_matching_aliases(pool.clone(), vec![vision.clone()]);
+    app(state.clone())
+        .oneshot(completion_request(
+            &key,
+            &multimodal_body("zero/test-vision", false, "https://example.com/x.jpg"),
+        ))
+        .await
+        .expect("completion request should complete");
+    state.wait_for_background_tasks().await;
+    let (_, _, imaged_reserved, imaged_cost) = settled_reservation(&pool, api_key_id).await;
+    let imaged_reserved = imaged_reserved.expect("a reserved cost is recorded");
+
+    assert!(
+        imaged_reserved > plain_reserved * Decimal::from(2),
+        "an image must move the reservation by its worst case, not by the length of its URL: \
+         plain reserved {plain_reserved}, imaged reserved {imaged_reserved}"
+    );
+    // And settlement is untouched: metered actuals only, exactly as for text.
+    assert_eq!(
+        imaged_cost,
+        served_sell_cost(),
+        "the hold grew; the CHARGE is still whatever the upstream metered"
+    );
+}
+
+#[tokio::test]
+async fn streaming_carries_a_multimodal_request_end_to_end() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let (api_key_id, key) = create_funded_key(&pool, "modality-stream").await;
+    let vision = FakeModelProvider::new(
+        "vision",
+        vec![FakeOutcome::Stream(vec![
+            FakeStreamStep::text("a "),
+            FakeStreamStep::text("cat"),
+            FakeStreamStep::Usage(served_usage()),
+            FakeStreamStep::Final,
+        ])],
+    );
+    let state = router_matching_aliases(pool.clone(), vec![vision.clone()]);
+
+    let response = app(state.clone())
+        .oneshot(completion_request(
+            &key,
+            &multimodal_body(
+                "zero/test-vision",
+                true,
+                "data:image/png;base64,iVBORw0KGgo=",
+            ),
+        ))
+        .await
+        .expect("stream request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    let payloads = sse_payloads(response).await;
+    state.wait_for_background_tasks().await;
+
+    assert_eq!(payloads.last().map(String::as_str), Some("[DONE]"));
+    let chunks = payloads
+        .iter()
+        .filter(|payload| payload.as_str() != "[DONE]")
+        .map(|payload| serde_json::from_str::<Value>(payload).expect("chunk should be JSON"))
+        .collect::<Vec<_>>();
+    // Byte-identical framing to the text-only happy path: role primer, two
+    // content deltas, the finish delta, the usage chunk. Multimodal input
+    // changes what goes UP, and nothing about what comes back.
+    assert_eq!(chunks.len(), 5);
+    assert_eq!(chunks[0]["choices"][0]["delta"]["role"], "assistant");
+    assert_eq!(chunks[1]["choices"][0]["delta"]["content"], "a ");
+    assert_eq!(chunks[2]["choices"][0]["delta"]["content"], "cat");
+    assert_eq!(chunks[3]["choices"][0]["finish_reason"], "stop");
+    assert_eq!(chunks[4]["usage"]["completion_tokens"], 20);
+
+    let call = vision.calls().remove(0);
+    assert!(call.streaming, "the multimodal request streamed");
+    assert_eq!(
+        settled_count(&pool, api_key_id).await,
+        1,
+        "a streamed multimodal request settles exactly like a text one"
+    );
+}
+
+#[tokio::test]
+async fn a_file_part_is_refused_because_no_lane_can_carry_one() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let (api_key_id, key) = create_funded_key(&pool, "modality-file").await;
+    let vision = FakeModelProvider::new("vision", vec![]);
+    let state = router_matching_aliases(pool.clone(), vec![vision.clone()]);
+
+    // Sent to the lane with the WIDEST declared modalities, so the refusal is
+    // unambiguously about the part and not about the lane. No upstream this
+    // router dials accepts an OpenAI-shape file part on the endpoint it
+    // dials, which is why `pdf` was removed from the catalog rather than
+    // mapped.
+    let mut body = completion_body("zero/test-vision", false);
+    body["messages"] = json!([{
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "summarise this"},
+            {"type": "file", "file": {"filename": "a.pdf", "file_data": "JVBERi0="}},
+        ],
+    }]);
+    let response = app(state.clone())
+        .oneshot(completion_request(&key, &body))
+        .await
+        .expect("completion request should complete");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = json_body(response).await;
+    assert_eq!(body["error"]["code"], "unsupported_request_fields");
+    assert_eq!(vision.call_count(), 0);
+    assert_eq!(open_reservations(&pool, api_key_id).await, 0);
+}

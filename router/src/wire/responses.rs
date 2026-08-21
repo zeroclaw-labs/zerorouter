@@ -112,7 +112,7 @@ fn build_responses_input(messages: &[ChatMessage]) -> (String, Vec<Value>) {
     for message in messages {
         match message.role.as_str() {
             "system" => system_parts.push(&message.content),
-            "user" => input.push(message_item("user", "input_text", &message.content)),
+            "user" => input.push(user_item(&message.content)),
             "assistant" => {
                 // ZR packs assistant turns that carry tool calls or
                 // reasoning as a JSON envelope; a plain string is a plain
@@ -189,6 +189,47 @@ fn message_item(role: &str, content_type: &str, text: &str) -> Value {
         "role": role,
         "content": [{ "type": content_type, "text": text }],
     })
+}
+
+/// One user turn, with any `[IMAGE:<url>]` markers decoded into this
+/// dialect's image parts.
+///
+/// The Responses API does NOT reuse chat-completions' image shape, and the
+/// difference is easy to get wrong in both directions: here the part is
+/// `input_image` and `image_url` is a BARE STRING ("a fully qualified URL or
+/// base64 encoded image in a data URL"), not the `{"url":…}` object
+/// chat-completions takes. `detail` is a REQUIRED field on this part
+/// (openai/openai-openapi, `InputImageContent`, read 2026-08-21), so it is
+/// sent explicitly as `auto` — the schema's own default — rather than
+/// omitted and left to the server.
+///
+/// A turn with no image keeps exactly the single `input_text` item it built
+/// before, so every existing pin in this module is untouched.
+fn user_item(packed: &str) -> Value {
+    let parts = super::split_image_markers(packed);
+    if !parts
+        .iter()
+        .any(|part| !matches!(part, super::UserPart::Text(_)))
+    {
+        return message_item("user", "input_text", packed);
+    }
+    let content: Vec<Value> = parts
+        .into_iter()
+        .map(|part| match part {
+            super::UserPart::Text(text) => json!({ "type": "input_text", "text": text }),
+            super::UserPart::Base64Image { media_type, data } => json!({
+                "type": "input_image",
+                "image_url": format!("data:{media_type};base64,{data}"),
+                "detail": "auto",
+            }),
+            super::UserPart::UrlImage(url) => json!({
+                "type": "input_image",
+                "image_url": url,
+                "detail": "auto",
+            }),
+        })
+        .collect();
+    json!({ "type": "message", "role": "user", "content": content })
 }
 
 /// The Responses envelope fields billing needs. Everything else on the
@@ -354,7 +395,10 @@ impl ModelProvider for OpenAiResponsesWire {
     fn capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities {
             native_tool_calling: true,
-            vision: false,
+            // ZR packs OpenAI image parts as `[IMAGE:<url>]` markers; this
+            // wire decodes them into `input_image` parts (the Responses
+            // dialect's own shape, not chat-completions').
+            vision: true,
             prompt_caching: true,
         }
     }
@@ -789,6 +833,43 @@ mod review_fix_tests {
         assert_eq!(response.text.as_deref(), Some("clipped"));
         let usage = response.usage.expect("clipped output still meters");
         assert_eq!(usage.output_tokens, Some(64));
+    }
+
+    /// The byte pin for this dialect's image parts, and the reason it is a
+    /// SEPARATE pin from the chat-completions one: the Responses API does not
+    /// reuse that shape. Here the part is `input_image`, `image_url` is a
+    /// BARE STRING rather than a `{"url":…}` object, and `detail` is a
+    /// REQUIRED field (openai/openai-openapi, `InputImageContent`). Sending
+    /// chat-completions' shape here, or this shape there, is the specific
+    /// mistake this pin and its twin exist to catch.
+    #[test]
+    fn image_markers_become_responses_input_image_parts_byte_for_byte() {
+        let messages = vec![ChatMessage::user(
+            "what is this? [IMAGE:data:image/png;base64,AAAA] and this? [IMAGE:https://example.com/x.jpg]",
+        )];
+        let (_, input) = build_responses_input(&messages);
+        assert_eq!(
+            serde_json::to_string(&input).unwrap(),
+            concat!(
+                r#"[{"content":["#,
+                r#"{"text":"what is this? ","type":"input_text"},"#,
+                r#"{"detail":"auto","image_url":"data:image/png;base64,AAAA","type":"input_image"},"#,
+                r#"{"text":" and this? ","type":"input_text"},"#,
+                r#"{"detail":"auto","image_url":"https://example.com/x.jpg","type":"input_image"}"#,
+                r#"],"role":"user","type":"message"}]"#,
+            )
+        );
+    }
+
+    /// A turn with no image builds exactly the single `input_text` item it
+    /// always did, so every other pin in this module is untouched.
+    #[test]
+    fn a_text_only_turn_keeps_its_single_input_text_item() {
+        let (_, input) = build_responses_input(&[ChatMessage::user("plain question")]);
+        assert_eq!(
+            serde_json::to_string(&input).unwrap(),
+            r#"[{"content":[{"text":"plain question","type":"input_text"}],"role":"user","type":"message"}]"#
+        );
     }
 
     #[test]

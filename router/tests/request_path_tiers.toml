@@ -84,6 +84,55 @@ input_per_mtok = 1.00
 cached_input_per_mtok = 0.20
 output_per_mtok = 2.00
 
+# Multimodal admission fixtures (2026-08-21). Three lanes, because the
+# capability gate has three outcomes and each needs a lane that isolates it:
+# a lane that DECLARES text only (refused), a lane that declares image
+# (served), and a lane that declares NOTHING (served — "unknown is never a
+# refusal", the rule `ModelMetadata::can_serve` has always followed and the
+# one several shipped lanes depend on because their sources disagree).
+#
+# `zero/test-solo` above is the third case already, so only two are added.
+
+[tiers."zero/test-text-only"]
+
+[tiers."zero/test-text-only".rates]
+input_per_mtok = 3.00
+cached_input_per_mtok = 0.60
+output_per_mtok = 6.00
+
+[[tiers."zero/test-text-only".candidates]]
+id = "openai/textonly"
+provider = "openai"
+model = "upstream/textonly"
+
+[tiers."zero/test-text-only".candidates.metadata]
+input_modalities = ["text"]
+
+[tiers."zero/test-text-only".candidates.rates]
+input_per_mtok = 1.00
+cached_input_per_mtok = 0.20
+output_per_mtok = 2.00
+
+[tiers."zero/test-vision"]
+
+[tiers."zero/test-vision".rates]
+input_per_mtok = 3.00
+cached_input_per_mtok = 0.60
+output_per_mtok = 6.00
+
+[[tiers."zero/test-vision".candidates]]
+id = "openai/vision"
+provider = "openai"
+model = "upstream/vision"
+
+[tiers."zero/test-vision".candidates.metadata]
+input_modalities = ["text", "image"]
+
+[tiers."zero/test-vision".candidates.rates]
+input_per_mtok = 1.00
+cached_input_per_mtok = 0.20
+output_per_mtok = 2.00
+
 # ---------------------------------------------------------------------------
 # RETENTION POSTURE — required: `validate_tier_catalog` refuses a catalog in
 # which any candidate's provider has no resolvable posture, so a fixture must

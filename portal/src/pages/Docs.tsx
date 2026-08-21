@@ -114,7 +114,7 @@ const MODELS_ROW = `{
   },
   "context_length": 200000,
   "max_output_tokens": 64000,
-  "input_modalities": ["text", "image", "pdf"],
+  "input_modalities": ["text", "image"],
   "tool_call": true,
   "retention": {
     "posture": "standard",
@@ -201,6 +201,12 @@ const ERROR_ROWS: ReadonlyArray<ErrorRow> = [
     status: '400 · invalid_request_error',
     meaning:
       'The body carried a field or a structured content block the compat surface does not preserve. See “What a request body may contain”.',
+  },
+  {
+    code: 'modality_unsupported',
+    status: '400 · invalid_request_error',
+    meaning:
+      'The content is a shape ZeroRouter carries, but this model does not take it — an image sent to a text-only lane. Distinct from unsupported_request_fields because the fix is a different model, not a different body: the message names what this one accepts, and GET /v1/models lists what every lane takes. Nothing was reserved and no upstream was contacted.',
   },
   {
     code: 'request_too_large',
@@ -308,9 +314,35 @@ export function Docs() {
           <span className="mono">content</span> as a <em>string</em> —{' '}
           <span className="mono">tool_calls</span>, <span className="mono">tool_call_id</span>,{' '}
           <span className="mono">name</span>, and <span className="mono">reasoning_content</span>{' '}
-          come along for multi-turn tool use. Structured content arrays are not accepted yet, so
-          image and file parts are a 400 today even on lanes whose catalog row advertises those
-          modalities.
+          come along for multi-turn tool use.
+        </li>
+        <li>
+          <strong>Images.</strong> <span className="mono">content</span> may also be an array of
+          parts, in the shape the official OpenAI SDKs emit:{' '}
+          <span className="mono">{'{"type":"text","text":…}'}</span> on any role, and{' '}
+          <span className="mono">{'{"type":"image_url","image_url":{"url":…}}'}</span> on{' '}
+          <span className="mono">user</span> messages, where the URL is either an{' '}
+          <span className="mono">https://</span> link or a{' '}
+          <span className="mono">data:</span> URI. An array carrying only text parts is treated as
+          the string it is equivalent to. Send an image to a lane whose{' '}
+          <span className="mono">input_modalities</span> lack{' '}
+          <span className="mono">image</span> and you get{' '}
+          <span className="mono">400 modality_unsupported</span> naming that lane and what it does
+          take — before anything is reserved, so nothing is held and nothing is charged.
+        </li>
+        <li>
+          <strong>What is not carried, and is refused rather than dropped:</strong>{' '}
+          <span className="mono">file</span> parts (so no PDFs),{' '}
+          <span className="mono">input_audio</span> parts, and{' '}
+          <span className="mono">image_url.detail</span>. The first two are refused because no
+          upstream ZeroRouter dials accepts an OpenAI-shape file or audio part on the endpoint it
+          is dialled on; <span className="mono">detail</span> is refused because it cannot be
+          carried to every lane, and silently ignoring a fidelity knob you set is exactly the
+          failure this surface exists to avoid. Accordingly no catalog row advertises{' '}
+          <span className="mono">pdf</span>, <span className="mono">audio</span>, or{' '}
+          <span className="mono">video</span> input — <span className="mono">/v1/models</span>{' '}
+          lists what the router will actually carry, not what the underlying model could do on its
+          vendor&apos;s own API.
         </li>
         <li>
           <strong>Anything else at the top level</strong> — <span className="mono">top_p</span>,{' '}

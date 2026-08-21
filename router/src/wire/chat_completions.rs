@@ -238,12 +238,55 @@ impl ChatCompletionsWire {
 /// the Responses and Anthropic wires must (their APIs carry a single system
 /// field). Preserving position is the faithful transform for a dialect that
 /// has no such constraint, and it is what the customer's own request said.
+/// A user turn's `content`, as this dialect wants it.
+///
+/// A turn with no image marker stays a PLAIN STRING rather than becoming a
+/// one-element `[{"type":"text",…}]` array. That is not a cosmetic choice: a
+/// text-only array and a string are semantically identical here, every
+/// existing byte-stability pin in this module was written against the string,
+/// and an upstream that is merely OpenAI-*compatible* is likelier to have
+/// been tested against the string form. Only a turn that actually carries an
+/// image pays the array.
+///
+/// The image part is OpenAI's documented shape — `{"type":"image_url",
+/// "image_url":{"url":…}}`, where `url` is "either a URL of the image or the
+/// base64 encoded image data" (openai/openai-openapi,
+/// `ChatCompletionRequestMessageContentPartImage`, read 2026-08-21). A base64
+/// marker is re-assembled into the `data:` URI it arrived as, because that is
+/// the one form every upstream on this wire documents.
+fn user_content(packed: &str) -> Value {
+    let parts = super::split_image_markers(packed);
+    if !parts
+        .iter()
+        .any(|part| !matches!(part, super::UserPart::Text(_)))
+    {
+        return json!(packed);
+    }
+    let parts: Vec<Value> = parts
+        .into_iter()
+        .map(|part| match part {
+            super::UserPart::Text(text) => json!({ "type": "text", "text": text }),
+            super::UserPart::Base64Image { media_type, data } => json!({
+                "type": "image_url",
+                "image_url": { "url": format!("data:{media_type};base64,{data}") },
+            }),
+            super::UserPart::UrlImage(url) => json!({
+                "type": "image_url",
+                "image_url": { "url": url },
+            }),
+        })
+        .collect();
+    json!(parts)
+}
+
 fn build_chat_completions_messages(messages: &[ChatMessage]) -> Vec<Value> {
     let mut out = Vec::with_capacity(messages.len());
     for message in messages {
         match message.role.as_str() {
             "system" => out.push(json!({ "role": "system", "content": message.content })),
-            "user" => out.push(json!({ "role": "user", "content": message.content })),
+            "user" => {
+                out.push(json!({ "role": "user", "content": user_content(&message.content) }))
+            }
             "assistant" => {
                 // Same envelope rule as both sibling wires: only ZR's own
                 // packing markers make an envelope, so a model that merely
@@ -933,13 +976,13 @@ impl ModelProvider for ChatCompletionsWire {
     fn capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities {
             native_tool_calling: true,
-            // ZR packs OpenAI image parts as `[IMAGE:<url>]` markers. This
-            // wire does not decode them back into `image_url` content parts,
-            // so it reports no vision — the same position the Responses wire
-            // takes, and honest about what it actually sends. Nothing in the
-            // router reads this field today; stage 2's per-candidate
-            // capability config is where a local vision model gets declared.
-            vision: false,
+            // ZR packs OpenAI image parts as `[IMAGE:<url>]` markers and this
+            // wire decodes them back into `image_url` content parts, so it
+            // carries vision. Verified per upstream on this wire (Fireworks,
+            // xAI, Google AI Studio, Vertex openapi) rather than assumed —
+            // `tiers.toml` records what each lane may actually be sent, and
+            // the Vertex shape caveat is written up there.
+            vision: true,
             // The dialect carries `prompt_tokens_details.cached_tokens` and
             // this wire lifts it, but no upstream on it takes cache-control
             // directives from the request.
@@ -1637,6 +1680,57 @@ mod chat_completions_tests {
         let turns = build_chat_completions_messages(&messages);
         assert_eq!(turns.len(), 1);
         assert_eq!(turns[0]["role"], "user");
+    }
+
+    /// The byte pin for this dialect's image parts.
+    ///
+    /// Written against OpenAI's own schema
+    /// (`ChatCompletionRequestMessageContentPartImage`): the part is
+    /// `image_url` and `image_url` is an OBJECT with a `url` key — NOT the
+    /// bare string the Responses dialect uses, which is the mistake this pin
+    /// exists to catch. A base64 marker is re-assembled into the `data:` URI
+    /// it arrived as, because "either a URL of the image or the base64
+    /// encoded image data" is what that `url` field takes.
+    ///
+    /// Keys serialize alphabetically (`serde_json` without `preserve_order`),
+    /// which is why `image_url` precedes `type` below.
+    #[test]
+    fn image_markers_become_openai_image_parts_byte_for_byte() {
+        let messages = vec![ChatMessage::user(
+            "what is this? [IMAGE:data:image/png;base64,AAAA] and this? [IMAGE:https://example.com/x.jpg]",
+        )];
+        let built = build_chat_completions_messages(&messages);
+        assert_eq!(
+            serde_json::to_string(&built).unwrap(),
+            concat!(
+                r#"[{"content":["#,
+                r#"{"text":"what is this? ","type":"text"},"#,
+                r#"{"image_url":{"url":"data:image/png;base64,AAAA"},"type":"image_url"},"#,
+                r#"{"text":" and this? ","type":"text"},"#,
+                r#"{"image_url":{"url":"https://example.com/x.jpg"},"type":"image_url"}"#,
+                r#"],"role":"user"}]"#,
+            )
+        );
+    }
+
+    /// A turn with no image keeps `content` as a PLAIN STRING. This is what
+    /// keeps every other byte pin in this module valid, and it matters on the
+    /// wire too: an upstream that is merely OpenAI-compatible is likelier to
+    /// have been tested against the string than against a one-element array.
+    #[test]
+    fn a_text_only_turn_stays_a_string_rather_than_becoming_an_array() {
+        let built = build_chat_completions_messages(&[ChatMessage::user("plain question")]);
+        assert_eq!(
+            serde_json::to_string(&built).unwrap(),
+            r#"[{"content":"plain question","role":"user"}]"#
+        );
+        // Including one whose text merely mentions the marker without closing
+        // it — a wire is the wrong place to refuse a customer's prose.
+        let built = build_chat_completions_messages(&[ChatMessage::user("broken [IMAGE:no-close")]);
+        assert_eq!(
+            serde_json::to_string(&built).unwrap(),
+            r#"[{"content":"broken [IMAGE:no-close","role":"user"}]"#
+        );
     }
 
     #[test]

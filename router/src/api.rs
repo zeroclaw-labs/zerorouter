@@ -1172,6 +1172,15 @@ async fn chat_completions(
             .or(suffix_priority)
             .or(authenticated.default_priority),
     );
+    // Capability gate. A request carrying an image that NO rung of the
+    // resolved route can take is refused here — after resolution, because the
+    // answer names the model, and before `sized_reservation` (below),
+    // `provider_route` (which mints Vertex OAuth) and `admit_usage` (which
+    // takes the money), because a request that cannot be served must not move
+    // any of them first. Same placement principle as `priority_conflict`.
+    if let Some(refusal) = unservable_modality(&request, &resolved) {
+        return Err(refusal);
+    }
     let max_output_tokens = *request.max_tokens.get_or_insert(BASELINE_MAX_TOKENS);
     let reservation_usage = request.reservation_usage(max_output_tokens);
     // The user-scoped segmentation key (design: Engine "Task signature"),
@@ -1400,6 +1409,68 @@ fn model_unresolvable(catalog: &TierCatalog, requested_model: &str) -> ApiError 
                 tier: withheld.tier.clone(),
             }
         })
+}
+
+/// Refuse a request whose input modalities NO rung of the resolved route
+/// declares it can take.
+///
+/// Three rules, and each one is load-bearing:
+///
+/// - **Unknown is never a refusal.** A candidate that declares no
+///   `input_modalities` serves everything, exactly as
+///   [`crate::config::ModelMetadata::can_serve`] has it. Several shipped
+///   lanes omit the field deliberately because their two sources disagree
+///   (`tiers.toml` argues each one at the tier), and those lanes take images
+///   in reality — turning silence into a refusal would break working requests
+///   to buy a nicer error for hypothetical ones.
+/// - **Any rung that can serve saves the route.** The check is over the whole
+///   candidate list, not the tier's narrowed intersection, because the walk
+///   will reach a later rung. Every shipped tier is one candidate today, so
+///   this reduces to the obvious case; it is written for the mixed tier.
+/// - **Only the modality is judged here.** `can_serve` also weighs the prompt
+///   bound against the context window, and that comparison is BYTES against
+///   TOKENS — fine for sinking a candidate down an ordering, a false refusal
+///   if it were promoted into a 400.
+fn unservable_modality(
+    request: &ChatCompletionRequest,
+    resolved: &ResolvedRoute,
+) -> Option<ApiError> {
+    // `text` is not gated: every lane that declares anything declares it, and
+    // a lane that somehow did not would be refusing plain text.
+    let needs_image = request
+        .needs(0)
+        .modalities
+        .contains(crate::openai::IMAGE_MODALITY);
+    if !needs_image {
+        return None;
+    }
+    let takes_image = |candidate: &crate::config::TierCandidate| {
+        candidate
+            .metadata
+            .input_modalities
+            .as_ref()
+            .is_none_or(|declared| {
+                declared
+                    .iter()
+                    .any(|modality| modality == crate::openai::IMAGE_MODALITY)
+            })
+    };
+    if resolved.candidates.iter().any(takes_image) {
+        return None;
+    }
+    // Every rung declared a list and none of them had `image`. Report what
+    // the FIRST rung accepts: with one candidate it is exactly the truth, and
+    // with several it is the one the request would have been served by.
+    let accepted = resolved
+        .candidates
+        .first()
+        .and_then(|candidate| candidate.metadata.input_modalities.as_ref())
+        .map_or_else(|| "text".to_owned(), |declared| declared.join(", "));
+    Some(ApiError::ModalityUnsupported {
+        model: resolved.requested_model.clone(),
+        modality: crate::openai::IMAGE_MODALITY,
+        accepted,
+    })
 }
 
 /// Selection policy (design doc: Engine "Selection policy"), applied to the
