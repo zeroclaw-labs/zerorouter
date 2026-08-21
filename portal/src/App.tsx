@@ -8,6 +8,7 @@ import type { Auth, ToastKind } from './ui'
 import { Activate } from './pages/Activate'
 import { Credits } from './pages/Credits'
 import { CreditsReturn } from './pages/CreditsReturn'
+import { Docs } from './pages/Docs'
 import { Keys } from './pages/Keys'
 import { Models } from './pages/Models'
 import { Overview } from './pages/Overview'
@@ -117,20 +118,38 @@ function Shell() {
   if (auth.status === 'signed-out') {
     if (location.pathname.startsWith('/activate')) return <SignedOutActivate />
     // The catalog is a storefront: viewable before signing in.
-    if (location.pathname.startsWith('/models')) return <PublicModels />
+    if (location.pathname.startsWith('/models')) {
+      return (
+        <PublicPage>
+          <Models />
+        </PublicPage>
+      )
+    }
+    // The API reference is public for the same reason the catalog is, and one
+    // stronger: someone deciding whether to sign up is exactly the person who
+    // needs to know the base URL is OpenAI-compatible and what a request costs.
+    // Putting it behind the login would hide the answer from the only audience
+    // that has not already found it.
+    if (location.pathname.startsWith('/docs')) {
+      return (
+        <PublicPage>
+          <Docs />
+        </PublicPage>
+      )
+    }
     // Legal pages are public: readable without an account.
     if (location.pathname.startsWith('/terms')) {
       return (
-        <PublicLegal>
+        <PublicPage>
           <Terms />
-        </PublicLegal>
+        </PublicPage>
       )
     }
     if (location.pathname.startsWith('/privacy')) {
       return (
-        <PublicLegal>
+        <PublicPage>
           <Privacy />
-        </PublicLegal>
+        </PublicPage>
       )
     }
     return <Landing reason={auth.reason} />
@@ -151,6 +170,7 @@ function SignedInLayout({ user }: { user: Me }) {
               CHECKOUT_RETURN_PATH in router/src/stripe.rs. */}
           <Route path="/credits/return" element={<CreditsReturn />} />
           <Route path="/keys" element={<Keys />} />
+          <Route path="/docs" element={<Docs />} />
           <Route path="/activate" element={<Activate />} />
           <Route path="/terms" element={<Terms />} />
           <Route path="/privacy" element={<Privacy />} />
@@ -179,6 +199,9 @@ function Sidebar({ user }: { user: Me }) {
         </NavLink>
         <NavLink to="/keys" className={link}>
           Keys
+        </NavLink>
+        <NavLink to="/docs" className={link}>
+          Docs
         </NavLink>
       </nav>
       <div className="sidebar-foot">
@@ -220,6 +243,14 @@ function Landing({ reason }: { reason?: string }) {
         <a className="btn btn-primary btn-lg" href="/auth/login">
           Sign in with SSO
         </a>
+        {/* Beside the CTA, not buried in the footer. Someone landing here is
+            deciding whether to sign up at all, and the answer to "what is this,
+            concretely" is a base URL and a curl — which used to be reachable
+            only by signing in first. */}
+        <p className="landing-secondary">
+          OpenAI-compatible — <a href="/docs">read the API docs</a> or{' '}
+          <a href="/models">browse the models</a> before you sign in.
+        </p>
         <nav className="landing-foot" aria-label="Legal">
           <a href="/terms">Terms</a>
           <span className="landing-foot-sep" aria-hidden="true">
@@ -232,31 +263,28 @@ function Landing({ reason }: { reason?: string }) {
   )
 }
 
-// The catalog before sign-in: a slim top bar with the wordmark and a sign-in
-// CTA, then the same Models page the signed-in portal renders.
-function PublicModels() {
+// Any page readable before sign-in: a slim top bar with the wordmark, links to
+// the other public pages, and a sign-in CTA, then the same page component the
+// signed-in portal renders.
+//
+// One wrapper for all of them rather than one per page. The catalog and the
+// legal pages had identical copies of this bar, and the docs page would have
+// made three — at which point adding a link to the bar means remembering to add
+// it three times, and a public page that cannot reach the other public pages is
+// a dead end for the only reader who arrives without a session.
+function PublicPage({ children }: { children: ReactNode }) {
   return (
     <div className="public">
       <header className="public-top">
         <Wordmark />
-        <a className="btn btn-primary btn-sm" href="/auth/login">
-          Sign in
-        </a>
-      </header>
-      <main className="main">
-        <Models />
-      </main>
-    </div>
-  )
-}
-
-// Legal pages before sign-in: the same slim top bar as the public catalog,
-// then the requested legal page.
-function PublicLegal({ children }: { children: ReactNode }) {
-  return (
-    <div className="public">
-      <header className="public-top">
-        <Wordmark />
+        <nav className="public-nav" aria-label="Public">
+          <NavLink to="/models" className={publicLink}>
+            Models
+          </NavLink>
+          <NavLink to="/docs" className={publicLink}>
+            Docs
+          </NavLink>
+        </nav>
         <a className="btn btn-primary btn-sm" href="/auth/login">
           Sign in
         </a>
@@ -264,6 +292,10 @@ function PublicLegal({ children }: { children: ReactNode }) {
       <main className="main">{children}</main>
     </div>
   )
+}
+
+function publicLink({ isActive }: { isActive: boolean }): string {
+  return `public-nav-link${isActive ? ' active' : ''}`
 }
 
 function SignedOutActivate() {
