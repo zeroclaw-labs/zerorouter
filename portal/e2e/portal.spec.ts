@@ -23,15 +23,52 @@ test('login lands in the portal via the multi-audience OIDC flow', async ({ page
   await expect(page.getByRole('heading', { name: /overview/i })).toBeVisible()
 })
 
-test('keys page lists, creates, and reveals a key exactly once', async ({ page }) => {
+test('keys page creates a key, reveals it once, and hands over a runnable request', async ({
+  page,
+}) => {
   await signIn(page)
   await page.getByRole('link', { name: /keys/i }).click()
   const keyName = `e2e-${Date.now()}`
   await page.getByPlaceholder(/key name/i).fill(keyName)
   await page.getByRole('button', { name: /create key/i }).click()
-  // The plaintext is shown exactly once, prefixed like a real key.
-  await expect(page.getByText(/zcr_[a-f0-9]{16}/)).toBeVisible()
+  // The plaintext is revealed once, in the one-shot panel, prefixed like a real
+  // key. Scoped to the key box rather than matched loose across the page: the
+  // same panel now also prints the key inside a ready-to-run curl, so a bare
+  // text match would find two elements and fail on strictness rather than on
+  // anything about the key.
+  await expect(page.locator('.keybox')).toHaveText(/^zcr_[a-f0-9]{64}$/)
   await expect(page.getByText(keyName)).toBeVisible()
+
+  // The snippet, asserted in the SAME test rather than a new one on purpose: a
+  // user may mint only 20 keys per 24 hours (`MAX_KEYS_CREATED_PER_WINDOW`) and
+  // this suite reuses one account, so every additional test that mints a key
+  // shortens how many times the suite can run against a given database before
+  // creation starts failing. Nothing is lost by asserting here — it is the same
+  // dialog, at the same moment.
+  //
+  // The gap this closes: the dialog used to hand over a secret and leave the
+  // customer to guess the base URL and the auth scheme.
+  const snippet = page.locator('.keybox-curl .code-body')
+  await expect(snippet).toBeVisible()
+  const command = (await snippet.innerText()).trim()
+  expect(command).toContain('/v1/chat/completions')
+  expect(command).toMatch(/Authorization: Bearer zcr_[a-f0-9]{64}/)
+
+  // The example model must exist in the catalog this deployment serves. A
+  // snippet naming a lane that has since been retired would 404 on the very
+  // first request a customer ever makes, which is worse than shipping no
+  // snippet at all — and it would fail silently, because nothing else on this
+  // page reads the catalog.
+  const named = /"model": "([^"]+)"/.exec(command)
+  expect(named, `the snippet must name a model: ${command}`).not.toBeNull()
+  const listed = await page.evaluate(async () => {
+    const catalog = await (await fetch('/v1/models')).json()
+    return (catalog.data as Array<{ id: string }>).map((model) => model.id)
+  })
+  expect(listed).toContain(named?.[1])
+
+  // And it points at the reference for everything the snippet does not cover.
+  await expect(page.getByRole('link', { name: /api docs/i })).toBeVisible()
 })
 
 test('a key can be minted with an expiry and a credit limit', async ({ page }) => {
@@ -53,7 +90,7 @@ test('a key can be minted with an expiry and a credit limit', async ({ page }) =
   await page.getByLabel(/credit limit in dollars/i).fill('25')
   await page.getByLabel(/reset limit every/i).selectOption({ label: 'Weekly' })
   await page.getByRole('button', { name: /create key/i }).click()
-  await expect(page.getByText(/zcr_[a-f0-9]{16}/)).toBeVisible()
+  await expect(page.locator('.keybox')).toHaveText(/^zcr_[a-f0-9]{64}$/)
   await page.getByRole('button', { name: /stored it/i }).click()
 
   // The row carries both, and the usage half starts at zero.
@@ -68,6 +105,71 @@ test('a key can be minted with an expiry and a credit limit', async ({ page }) =
   await page.getByLabel(/reset limit every/i).selectOption({ label: 'Daily' })
   await page.getByRole('button', { name: /create key/i }).click()
   await expect(page.getByText(/set a credit limit/i)).toBeVisible()
+})
+
+test('the api documentation is readable without an account', async ({ page }) => {
+  // Public like the catalog, and for a stronger reason: someone deciding
+  // whether to sign up is exactly the reader who does not yet know the base URL
+  // is OpenAI-compatible. If the signed-out shell stops giving /docs its public
+  // treatment, this route falls through to the landing screen — so the absence
+  // of the landing CTA is asserted, not merely the presence of the page.
+  await page.goto('/docs')
+
+  await expect(page.getByRole('heading', { name: /api documentation/i })).toBeVisible({
+    timeout: 15_000,
+  })
+  await expect(page.getByRole('link', { name: /sign in with sso/i })).toHaveCount(0)
+  // The public top bar, with its links to the other pages a reader without a
+  // session can reach.
+  await expect(page.getByRole('link', { name: /^sign in$/i })).toBeVisible()
+  await expect(
+    page.getByRole('navigation', { name: 'Public' }).getByRole('link', { name: 'Models' }),
+  ).toBeVisible()
+
+  // The three facts a customer previously had to guess, and the one claim the
+  // whole page rests on.
+  const curl = page.locator('.code-body').first()
+  await expect(curl).toContainText('/v1/chat/completions')
+  await expect(curl).toContainText('Authorization: Bearer')
+  await expect(page.getByText(/OpenAI chat-completions wire/i)).toBeVisible()
+
+  // Same catalog check as the Keys snippet: an example model id that has left
+  // the catalog is a 404 on the reader's first attempt.
+  const named = /"model": "([^"]+)"/.exec((await curl.innerText()).trim())
+  expect(named).not.toBeNull()
+  const listed = await page.evaluate(async () => {
+    const catalog = await (await fetch('/v1/models')).json()
+    return (catalog.data as Array<{ id: string }>).map((model) => model.id)
+  })
+  expect(listed).toContain(named?.[1])
+
+  // The error codes are the reason an agent reads this page at all, and the two
+  // 402s have to be distinguishable — "rotate the key" and "top up the account"
+  // are different actions.
+  const codes = page.locator('.docs-table-wrap .table tbody tr td:first-child')
+  const rendered = (await codes.allTextContents()).map((text) => text.trim())
+  for (const code of [
+    'invalid_api_key',
+    'insufficient_credits',
+    'key_credit_limit_exceeded',
+    'velocity_cap_exceeded',
+    'model_unavailable',
+    'retention_attestation_failed',
+  ]) {
+    expect(rendered).toContain(code)
+  }
+})
+
+test('the docs page is in the signed-in navigation', async ({ page }) => {
+  await signIn(page)
+  const docs = page.getByRole('navigation', { name: 'Portal' }).getByRole('link', { name: 'Docs' })
+  await expect(docs).toBeVisible()
+  await docs.click()
+  await expect(page).toHaveURL(/\/docs$/)
+  await expect(page.getByRole('heading', { name: /api documentation/i })).toBeVisible()
+  // Rendered inside the portal shell, not the public one: a signed-in reader
+  // keeps their sidebar.
+  await expect(page.getByText(E2E_EMAIL)).toBeVisible()
 })
 
 test('credits page renders balance, promo ledger, and the autopay panel', async ({ page }) => {

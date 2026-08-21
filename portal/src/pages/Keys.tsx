@@ -2,9 +2,12 @@ import { useState } from 'react'
 import type { FormEvent } from 'react'
 import { api } from '../api'
 import type { ApiKey, CreatedKey, CreditLimitWindow, NewKey } from '../api'
+import { Link } from 'react-router-dom'
+import { EXAMPLE_MODEL } from './Docs'
 import {
   Badge,
   Banner,
+  CodeBlock,
   CopyButton,
   EmptyState,
   Loading,
@@ -40,6 +43,28 @@ const RESET_WINDOWS: ReadonlyArray<{ label: string; value: CreditLimitWindow | '
 
 function expiryFromPreset(minutes: number | null): Date | null {
   return minutes === null ? null : new Date(Date.now() + minutes * 60_000)
+}
+
+/** The request this key is for, ready to paste.
+ *
+ * The moment a key exists is the moment its owner wants to try it, and until
+ * now this dialog handed over a secret and left them to guess the base URL and
+ * the auth scheme. The key is inlined rather than referenced by an environment
+ * variable on purpose: this panel is the only time the plaintext is ever shown,
+ * so a command that needs it exported first is a command that cannot be run
+ * from here.
+ *
+ * The origin comes from the browser rather than a constant, so a self-hosted
+ * deployment gets its own hostname instead of ours. */
+function curlFor(apiKey: string): string {
+  const origin = typeof window === 'undefined' ? '' : window.location.origin
+  return `curl ${origin}/v1/chat/completions \\
+  -H "Authorization: Bearer ${apiKey}" \\
+  -H "Content-Type: application/json" \\
+  -d '{
+    "model": "${EXAMPLE_MODEL}",
+    "messages": [{"role": "user", "content": "Say hello in five words."}]
+  }'`
 }
 
 /** How a key's expiry reads in the table: the date, or how it ended. */
@@ -281,6 +306,13 @@ export function Keys() {
             This is the only time the full key is shown. Store it now — the server keeps only a hash.
           </p>
           <div className="keybox mono">{created.api_key}</div>
+          <div className="keybox-curl">
+            <CodeBlock label="Try it">{curlFor(created.api_key)}</CodeBlock>
+          </div>
+          <p className="field-hint">
+            Any OpenAI-compatible client works the same way — see the{' '}
+            <Link to="/docs">API docs</Link> for the SDK examples, streaming, and the error codes.
+          </p>
           <div className="modal-actions">
             <CopyButton text={created.api_key} label="Copy key" />
             <button type="button" className="btn btn-primary" onClick={() => setCreated(null)}>

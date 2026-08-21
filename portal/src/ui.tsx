@@ -262,6 +262,30 @@ export function Modal({
   )
 }
 
+/**
+ * A labelled, copyable code sample.
+ *
+ * Shared by the docs page and the one-shot "key created" panel on purpose: the
+ * curl a customer is handed with a new key and the curl on the docs page are
+ * the same command, and two renderers would eventually disagree about it.
+ *
+ * `children` is the literal text — copied verbatim by the button, so it must be
+ * exactly what a reader would paste, not a prettified version of it.
+ */
+export function CodeBlock({ label, children }: { label: string; children: string }) {
+  return (
+    <div className="code">
+      <div className="code-head">
+        <span className="code-label">{label}</span>
+        <CopyButton text={children} />
+      </div>
+      <pre className="code-body">
+        <code>{children}</code>
+      </pre>
+    </div>
+  )
+}
+
 export function CopyButton({ text, label = 'Copy' }: { text: string; label?: string }) {
   const [copied, setCopied] = useState(false)
 

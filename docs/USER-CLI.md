@@ -219,14 +219,14 @@ openai/gpt-5.6-luna                    0.20          1.20     1050000  standard
 
 4 model(s) reprice above a prompt-size threshold; the rates above are the base band. Use --json for the full schedule.
 
-Retention: 0 lane(s) zero-retention, listed first; 10 where the provider retains data.
+Retention: 11 lane(s) zero-retention, listed first; 14 where the provider retains data.
 Use --json for each lane's full retention statement and the date it was verified.
 ```
 
 Rows arrive in the server's order, which lists **zero-retention lanes first**,
-then alphabetically within each posture. The shipped catalog has none today —
-every lane runs on a standard API account — so the table reads alphabetically
-and the footnote says so rather than leaving the column unexplained.
+then alphabetically within each posture. The counts in the footnote track the
+live catalog, so treat the numbers in this example as a snapshot rather than a
+promise — the split moves as lanes are added and as postures are re-verified.
 
 ## Credential file
 
