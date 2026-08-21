@@ -636,9 +636,18 @@ openrouter_slug = "xai"
 # OPENROUTER's project configuration, which knows nothing about this one — the
 # Bedrock caveat, not the Fireworks one. The evidence for this pin is the page
 # below plus the operator's own project.
+# INTERIM POSTURE — flips back to "zero" when Google approves the
+# abuse-monitoring exception (filed 2026-08-21 for zerorouter-vertex-prod;
+# the approval email is the evidence that re-pins it). Every other zero
+# precondition is already enforced and verified: cacheConfig.disableCache=true
+# read back on 2026-08-21, request-response logging off, no training. The one
+# open item is abuse-monitoring scope, and until Google grants the exception a
+# flagged prompt CAN be logged on their side for up to 90 days — so the label
+# says so. This is also what the operator's exception filing told Google the
+# catalog says.
 [retention.vertex]
-posture = "zero"
-description = "Vertex AI on ZeroRouter's own Google Cloud project, configured for zero data retention: in-memory caching disabled at the project level, no request-response logging, no grounding, and an account not in scope for abuse-monitoring prompt logging. Google does not train on customer data on this platform, and the stateless chat-completions surface these lanes dispatch on stores nothing between requests."
+posture = "standard"
+description = "Vertex AI on ZeroRouter's dedicated Google Cloud project: in-memory caching disabled, no request-response logging, and Google does not train on customer data. Pending Google's approval of the project's abuse-monitoring exception, prompts flagged by Google's abuse systems can be retained by Google for up to 90 days — until that approval lands this lane is labelled as subject to provider retention."
 source_url = "https://docs.cloud.google.com/vertex-ai/generative-ai/docs/data-governance"
 verified = "2026-08-21"
 source_sha256 = "af2eeb047bd207573da072b70489442daf66dc15cb08a984adaf4b389c0d5cdc"

@@ -1141,21 +1141,21 @@ mod tests {
         // override silently stopping working would show up here as a lane
         // moving from one side of the sentence to the other.
         //
-        // The two sides were briefly equal when the xAI lanes landed; the
-        // three Vertex lanes broke the tie on 2026-08-21, which is worth
-        // saying only because someone might otherwise read the old symmetry as
-        // a check rather than the coincidence of tallies it was. Zero: four
-        // Bedrock, five open-weight Fireworks, two xAI, three Vertex.
-        // Standard: four Anthropic, three Google, three OpenAI, and the one
-        // overridden Fireworks lane this test is about.
+        // Zero: four Bedrock, five open-weight Fireworks, two xAI. Standard:
+        // four Anthropic, three Google, three OpenAI, three Vertex, and the
+        // one overridden Fireworks lane this test is about.
         //
-        // Note the three Google lanes and the three Vertex lanes are the SAME
-        // MODELS on opposite sides of this sentence. That is the product
-        // working as intended rather than a double count: two Google products
-        // under two different data policies, and a customer picks which one
-        // they are buying.
-        assert_eq!(posture_count(rows, "zero"), 14);
-        assert_eq!(posture_count(rows, "standard"), 11);
+        // The three Vertex lanes sit on the STANDARD side as an interim
+        // posture: their zero pin flips back when Google approves the
+        // abuse-monitoring exception filed 2026-08-21 (see the pin's comment
+        // in tiers.toml). When that lands, these tallies become 14/11 again.
+        // Until then the three Google lanes and three Vertex lanes are the
+        // same models under two data-policy configurations, both currently
+        // labelled standard — the Vertex ones because one precondition of
+        // their zero posture awaits Google's approval, not because the
+        // configurations are equivalent.
+        assert_eq!(posture_count(rows, "zero"), 11);
+        assert_eq!(posture_count(rows, "standard"), 14);
         assert_eq!(rows.len(), 25, "every shipped lane is counted exactly once");
     }
 }
