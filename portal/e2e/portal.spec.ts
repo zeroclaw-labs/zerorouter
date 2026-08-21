@@ -458,10 +458,28 @@ test('a provider key can be attached, is shown only by fingerprint, and is never
   // router/tests/portal.rs for the other half of that contract.
   await expect(page.getByRole('heading', { name: /your own provider keys/i })).toBeVisible()
 
-  // The two things the copy must say, because they are what a customer is
-  // agreeing to: what the fee is, and whose retention agreement governs.
+  // The three things the copy must say, because they are what a customer is
+  // agreeing to: what is free, what the fee is beyond it, and whose retention
+  // agreement governs.
+  await expect(page.getByText(/of catalog-equivalent usage each month is free/i)).toBeVisible()
   await expect(page.getByText(/5% of what the same usage would have cost/i)).toBeVisible()
   await expect(page.getByText(/governed by your agreement with that provider/i)).toBeVisible()
+
+  // The allowance meter. A fresh e2e user has run no BYOK traffic, so the whole
+  // $5,000 is still there — and the figures come from `/api/me` rather than
+  // from the bundle, which is what this assertion is really pinning: a portal
+  // that hardcoded the allowance would keep rendering it after the server
+  // changed the number, and this panel is where a customer reads what they will
+  // be billed.
+  await expect(page.getByText(/of this month.s \$5,000\.00 allowance remaining/i)).toBeVisible()
+  await expect(page.getByText(/Usage within the allowance is not charged at all/i)).toBeVisible()
+  const allowance = await page.evaluate(async () => {
+    const res = await fetch('/api/me')
+    return (await res.json()) as { byok_allowance?: Record<string, string> }
+  })
+  expect(allowance.byok_allowance, 'the allowance must be reported').toBeTruthy()
+  expect(allowance.byok_allowance?.allowance_usd).toBe('5000')
+  expect(Number(allowance.byok_allowance?.remaining_usd)).toBe(5000)
 
   const providerKey = `sk-ant-e2e-${Date.now()}-0123456789abcdef`
   await page.getByLabel(/^provider$/i).selectOption({ label: 'Anthropic' })

@@ -265,6 +265,16 @@ struct MeResponse {
     /// anyway, and one field that answers both "is this on?" and "on for
     /// what?" cannot drift out of agreement with itself.
     byok_providers: Vec<String>,
+    /// Where this customer stands against the monthly free BYOK allowance
+    /// (migration 0027), or `None` when BYOK is not configured here.
+    ///
+    /// `None` rather than a zeroed struct, on the same contract as the empty
+    /// list above: a deployment without BYOK has no allowance, and reporting
+    /// "$5,000 remaining" on one would be advertising a feature it cannot
+    /// serve. `skip_serializing_if` keeps the field off those responses
+    /// entirely rather than sending an explicit null.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    byok_allowance: Option<byok::AllowanceStatus>,
 }
 
 async fn me(State(ctx): State<WebCtx>, user: PortalUser) -> Result<Json<MeResponse>, PortalError> {
@@ -274,6 +284,13 @@ async fn me(State(ctx): State<WebCtx>, user: PortalUser) -> Result<Json<MeRespon
             .fetch_one(&ctx.pool)
             .await?;
     let credit_balance_usd = billing::balance(&ctx.pool, user.user_id).await?;
+    // Read only where the feature is live, so a deployment without BYOK pays no
+    // query for it and this endpoint stays exactly what it was there.
+    let byok_allowance = if ctx.byok.is_some() {
+        Some(byok::allowance_status(&ctx.pool, user.user_id).await?)
+    } else {
+        None
+    };
     Ok(Json(MeResponse {
         user_id: user.user_id,
         email: user.email,
@@ -292,6 +309,7 @@ async fn me(State(ctx): State<WebCtx>, user: PortalUser) -> Result<Json<MeRespon
         } else {
             Vec::new()
         },
+        byok_allowance,
     }))
 }
 

@@ -2,7 +2,17 @@ import { useState } from 'react'
 import type { FormEvent } from 'react'
 import { api } from '../api'
 import type { ByokKey } from '../api'
-import { Badge, Banner, EmptyState, Loading, formatTime, useLoad, useToast, useUser } from '../ui'
+import {
+  Badge,
+  Banner,
+  EmptyState,
+  Loading,
+  formatTime,
+  formatUsd,
+  useLoad,
+  useToast,
+  useUser,
+} from '../ui'
 
 /** The fee ZeroRouter charges on traffic dispatched with your own key, written
  * as a string rather than computed: the number belongs to the server (it is
@@ -41,6 +51,10 @@ export function ByokSection() {
   const toast = useToast()
   const user = useUser()
   const offered = user?.byok_providers ?? []
+  // Absent on a router that predates the allowance, so the panel renders
+  // exactly as it did before rather than showing "—" where a promise should be.
+  const allowance = user?.byok_allowance
+  const isSpent = allowance !== undefined && Number(allowance.remaining_usd) <= 0
   const keys = useLoad(() => api.byokKeys(), [])
   const [provider, setProvider] = useState('')
   const [apiKey, setApiKey] = useState('')
@@ -104,11 +118,25 @@ export function ByokSection() {
       <div className="panel-body">
         <p className="page-sub">
           Attach your own API key for a provider and ZeroRouter will dispatch on it instead of ours.
-          You pay the provider directly for the inference, and ZeroRouter charges{' '}
+          You pay the provider directly for the inference, and the first{' '}
+          <strong>{formatUsd(allowance?.allowance_usd)} of catalog-equivalent usage each month is
+          free</strong>. Beyond that ZeroRouter charges{' '}
           <strong>{BYOK_FEE_LABEL} of what the same usage would have cost at our catalog rates</strong>,
           taken from your prepaid balance. Your spend caps and rate limits still apply, measured
           against that fee.
         </p>
+        {allowance ? (
+          <div className="byok-allowance">
+            <p className="page-sub">
+              <strong>{formatUsd(allowance.remaining_usd)}</strong> of this month&rsquo;s{' '}
+              {formatUsd(allowance.allowance_usd)} allowance remaining — you have used{' '}
+              {formatUsd(allowance.consumed_usd)} of catalog-equivalent usage on your own keys
+              since the 1st (UTC). {isSpent
+                ? 'Further usage this month is charged at ' + BYOK_FEE_LABEL + ' of catalog.'
+                : 'Usage within the allowance is not charged at all.'}
+            </p>
+          </div>
+        ) : null}
         <Banner kind="info">
           Requests served on your key are governed by <strong>your</strong> agreement with that
           provider — not by ZeroRouter&rsquo;s. The retention labels on our model list describe our

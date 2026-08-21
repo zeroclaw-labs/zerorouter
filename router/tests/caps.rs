@@ -29,9 +29,9 @@ use zerorouter::provider::ModelRates;
 use zerorouter::{
     auth::{AuthenticatedKey, generate_api_key, hash_api_key},
     db::{
-        KEY_CREATION_WINDOW_HOURS, MAX_KEYS_CREATED_PER_WINDOW, MeteringLane, RequestTelemetry,
-        ReservationSize, ReservationSizing, UsageAdmission, UsageRecord, begin_usage_session,
-        migrate,
+        ByokReservation, KEY_CREATION_WINDOW_HOURS, MAX_KEYS_CREATED_PER_WINDOW, MeteringLane,
+        RequestTelemetry, ReservationSize, ReservationSizing, UsageAdmission, UsageRecord,
+        begin_usage_session, migrate,
     },
     device,
     openai::{
@@ -145,6 +145,7 @@ fn usage_record(cost_usd: Decimal) -> UsageRecord {
             prompt_tokens_details: None,
         },
         cost_usd,
+        byok_catalog_usd: None,
         latency_ms: 10,
         status: 200,
         telemetry: RequestTelemetry {
@@ -191,6 +192,7 @@ async fn admit(
         pool,
         key,
         cold_sizing(reserved_tokens, reserved_tokens.min(64), reserved_cost_usd),
+        ByokReservation::default(),
         test_signature(),
         false,
         MeteringLane::Reserved,

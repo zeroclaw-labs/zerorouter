@@ -649,6 +649,18 @@ export function Docs() {
         price.
       </p>
       <p>
+        <strong>The first $5,000 each month is free.</strong> The fee applies only above that:
+        every calendar month you get $5,000 of BYOK usage — measured at what it <em>would</em> have
+        cost at our catalog rates, not at what you pay your provider — with no ZeroRouter fee at
+        all, and the 5% applies to the part above it. A request that crosses the line is split: the
+        portion inside your remaining allowance is free and only the remainder is charged, so
+        nothing jumps at the boundary. The month is the UTC calendar month, the same one your spend
+        caps use, and it resets at midnight UTC on the 1st. The Keys page shows what you have used
+        and what is left. A request that costs nothing writes no ledger entry — the ledger records
+        money moving, and none did — so free BYOK usage shows up on the Keys page rather than on
+        your credit ledger.
+      </p>
+      <p>
         <strong>There is no fallback to our key.</strong> If a request dispatches to a provider you
         have attached a key for, it uses that key or it fails with an error naming the reason. We
         will not quietly serve it on ZeroRouter&rsquo;s credential and bill you the full catalog

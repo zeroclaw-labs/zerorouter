@@ -575,17 +575,32 @@ async fn a_byok_dispatch_carries_the_customers_key_and_never_the_houses() {
     // the arithmetic tests above pin `apply_fee`, and `apply_fee` would still
     // be correct if `persist_usage` simply stopped calling it with the BYOK
     // rate.
-    settles_a_byok_request_at_five_percent(&plain_url).await;
+    //
+    // Three prices, because the monthly allowance (migration 0027) made one
+    // request's price depend on what the customer has already run this month:
+    // wholly inside the allowance is free, wholly outside is 5%, and the
+    // request that straddles the boundary pays 5% of only the part above it.
+    settles_free_inside_the_monthly_allowance(&plain_url).await;
+    settles_at_five_percent_once_the_allowance_is_spent(&plain_url).await;
+    settles_on_only_the_part_above_the_allowance(&plain_url).await;
+    concurrent_settles_cannot_both_claim_the_last_of_the_allowance(&plain_url).await;
 }
 
-/// Drive one real request on a customer's own credential and read what the
-/// ledger says it cost.
-async fn settles_a_byok_request_at_five_percent(upstream_url: &str) {
-    let Some(pool) = connect().await else {
-        return;
-    };
+/// The catalog price of one fixture request.
+///
+/// The fixture tier sells at $3.00/Mtok in and $15.00/Mtok out, and the
+/// recording upstream reports 3 prompt tokens and 1 completion token, so the
+/// catalog price is (3 x 3.00 + 1 x 15.00) / 1e6 = $0.000024. Named because
+/// every assertion below is arithmetic on it and a bare `Decimal::new(24, 6)`
+/// repeated six times is six chances to typo the number the test is about.
+const FIXTURE_CATALOG_USD: Decimal = Decimal::from_parts(24, 0, 0, false, 6);
+
+/// One BYOK customer, funded, with a key attached and the fixture upstream
+/// wired up. Returns the pool, the user, and the plaintext API key.
+async fn byok_customer(label: &str, upstream_url: &str) -> Option<(PgPool, Uuid, String)> {
+    let pool = connect().await?;
     let keyring = test_keyring();
-    let user_id = create_user(&pool, "settle").await;
+    let user_id = create_user(&pool, label).await;
     let plaintext = generate_api_key();
     query(
         "INSERT INTO api_keys (id, user_id, key_hash, name, spend_cap_usd, \
@@ -608,7 +623,70 @@ async fn settles_a_byok_request_at_five_percent(upstream_url: &str) {
     unsafe {
         std::env::set_var("ZEROROUTER_PROVIDER_BASE_URL_GOOGLE", upstream_url);
     }
+    Some((pool, user_id, plaintext))
+}
 
+/// Put `catalog_usd` of BYOK usage into this user's month WITHOUT going through
+/// the request path.
+///
+/// It writes a `usage_events` row and lets migration 0019's accrual trigger do
+/// the rest, which is the only way a test may move this number: the rollup
+/// refuses direct writes (`usage_key_month_spend_reject_direct_mutation`), and
+/// that refusal is a property worth not working around — a test that reached
+/// past the trigger would be seeding a state the production path cannot produce.
+///
+/// `cost_usd` is bound to zero rather than to the fee. What this row seeds is
+/// the ALLOWANCE basis, and leaving the spend total alone keeps the seeding
+/// from also consuming the key's spend cap and changing what admission decides.
+async fn seed_byok_month(pool: &PgPool, user_id: Uuid, catalog_usd: Decimal) {
+    let api_key_id = query_scalar::<_, Uuid>("SELECT id FROM api_keys WHERE user_id = $1 LIMIT 1")
+        .bind(user_id)
+        .fetch_one(pool)
+        .await
+        .expect("the seeded user must own a key");
+    query(
+        "INSERT INTO usage_events (request_id, api_key_id, tier, upstream_provider, \
+         upstream_model, input_tokens, cached_input_tokens, output_tokens, cost_usd, \
+         latency_ms, status, byok, byok_catalog_usd) \
+         VALUES ($1, $2, 'zero/byok-plain', 'google', 'seed', 0, 0, 0, 0, 0, 200, TRUE, $3)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(api_key_id)
+    .bind(catalog_usd)
+    .execute(pool)
+    .await
+    .expect("the seed usage row must insert");
+
+    // The trigger, not the test, is what made the number true. Asserted here so
+    // a seeding helper that silently stopped working cannot make every test
+    // below pass for the wrong reason.
+    assert_eq!(
+        consumed_allowance(pool, user_id).await,
+        catalog_usd,
+        "seeding must accrue through the 0019 trigger"
+    );
+}
+
+/// This user's month-to-date BYOK catalog consumption, read the way admission
+/// and the settle transaction read it.
+async fn consumed_allowance(pool: &PgPool, user_id: Uuid) -> Decimal {
+    query_scalar::<_, Decimal>(
+        r#"
+        SELECT COALESCE(SUM(rollup.byok_catalog_usd), 0)
+        FROM usage_key_month_spend AS rollup
+        INNER JOIN api_keys ON api_keys.id = rollup.api_key_id
+        WHERE api_keys.user_id = $1
+          AND rollup.month >= usage_event_utc_month(NOW())
+        "#,
+    )
+    .bind(user_id)
+    .fetch_one(pool)
+    .await
+    .expect("the allowance rollup must read")
+}
+
+/// Drive one completion through the real HTTP path and return the response body.
+async fn one_completion(pool: &PgPool, plaintext: &str) -> Value {
     let state = RouterState::with_database(fixture("byok_tiers.toml"), pool.clone(), true)
         .with_byok(Some(Arc::new(test_keyring())));
     let response = app(state)
@@ -638,47 +716,96 @@ async fn settles_a_byok_request_at_five_percent(upstream_url: &str) {
         .to_bytes();
     let body: Value = serde_json::from_slice(&body).expect("the response should be JSON");
     assert_eq!(status, StatusCode::OK, "the request should serve: {body}");
+    body
+}
 
-    // The disclosure. A BYOK request carries the block even though this request
-    // never engaged the priority knob, because the customer has to be told
-    // whose agreement governs their traffic.
+/// What the settled row says this user was charged, and on what basis.
+async fn settled_row(pool: &PgPool, user_id: Uuid) -> (Decimal, Option<bool>, Option<Decimal>) {
+    query_as::<_, (Decimal, Option<bool>, Option<Decimal>)>(
+        "SELECT usage_events.cost_usd, usage_events.byok, usage_events.byok_catalog_usd \
+         FROM usage_events JOIN api_keys ON api_keys.id = usage_events.api_key_id \
+         WHERE api_keys.user_id = $1 AND usage_events.upstream_model <> 'seed'",
+    )
+    .bind(user_id)
+    .fetch_one(pool)
+    .await
+    .expect("a settled usage row must exist")
+}
+
+/// A customer whose month is untouched pays NOTHING for a BYOK request.
+async fn settles_free_inside_the_monthly_allowance(upstream_url: &str) {
+    let Some((pool, user_id, plaintext)) = byok_customer("allowance-free", upstream_url).await
+    else {
+        return;
+    };
+
+    let body = one_completion(&pool, &plaintext).await;
+    // The disclosure still fires. A free BYOK request is still a BYOK request,
+    // and the customer still has to be told whose agreement governs it — the
+    // block is about the contract, not about the price.
     assert_eq!(
         body["zerorouter"]["byok"],
         json!(true),
-        "a BYOK response must say so: {body}"
+        "a BYOK response must say so even when it costs nothing: {body}"
     );
 
-    // The price. The fixture tier sells at $3.00/Mtok in and $15.00/Mtok out,
-    // and the recording upstream reports 3 prompt tokens and 1 completion
-    // token, so the catalog price is (3 x 3.00 + 1 x 15.00) / 1e6 = $0.000024.
-    // Five percent of that is $0.0000012, and it is written exactly.
-    let (cost_usd, byok_flag) = query_as::<_, (Decimal, Option<bool>)>(
-        "SELECT usage_events.cost_usd, usage_events.byok FROM usage_events \
-         JOIN api_keys ON api_keys.id = usage_events.api_key_id WHERE api_keys.user_id = $1",
+    let (cost_usd, byok_flag, catalog) = settled_row(&pool, user_id).await;
+    assert_eq!(
+        cost_usd,
+        Decimal::ZERO,
+        "a request wholly inside the ${} monthly allowance is free",
+        byok::monthly_allowance()
+    );
+    assert_eq!(byok_flag, Some(true), "it was still a BYOK request");
+    assert_eq!(
+        catalog,
+        Some(FIXTURE_CATALOG_USD),
+        "the catalog basis must be recorded even when nothing is charged — it is \
+         what consumes the allowance"
+    );
+
+    // A zero charge writes NO ledger row: the ledger forbids zero amounts, and
+    // a $0.00 debit would be a line item for something that did not happen.
+    let debits = query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM credit_ledger WHERE user_id = $1 AND entry_type = 'usage'",
     )
     .bind(user_id)
     .fetch_one(&pool)
     .await
-    .expect("a settled usage row must exist");
+    .expect("the ledger must count");
+    assert_eq!(debits, 0, "a free request debits nothing");
 
-    let catalog = Decimal::new(24, 6);
+    // And the allowance moved by the catalog price, not by the fee.
+    assert_eq!(
+        consumed_allowance(&pool, user_id).await,
+        FIXTURE_CATALOG_USD,
+        "the allowance is consumed in catalog dollars"
+    );
+}
+
+/// Once the month's allowance is spent, BYOK prices exactly as #103 priced it.
+async fn settles_at_five_percent_once_the_allowance_is_spent(upstream_url: &str) {
+    let Some((pool, user_id, plaintext)) = byok_customer("allowance-spent", upstream_url).await
+    else {
+        return;
+    };
+    seed_byok_month(&pool, user_id, byok::monthly_allowance()).await;
+
+    one_completion(&pool, &plaintext).await;
+
+    let (cost_usd, _, catalog) = settled_row(&pool, user_id).await;
     assert_eq!(
         cost_usd,
         Decimal::new(12, 7),
-        "a BYOK request must settle at 5% of the ${catalog} catalog price, not at it"
+        "with the allowance spent, a ${FIXTURE_CATALOG_USD} catalog request settles at 5%"
     );
+    assert_eq!(catalog, Some(FIXTURE_CATALOG_USD));
     assert_ne!(
-        cost_usd, catalog,
-        "settling at the catalog price would charge the customer twenty times the fee"
-    );
-    assert_eq!(
-        byok_flag,
-        Some(true),
-        "the metering row must record that this was a BYOK request"
+        cost_usd, FIXTURE_CATALOG_USD,
+        "settling at the catalog price would charge twenty times the fee"
     );
 
-    // And the ledger debit matches the settled row, so the customer's balance
-    // moved by the fee rather than by the catalog price.
+    // The debit matches the settled row, so the balance moved by the fee.
     let debit = query_scalar::<_, Decimal>(
         "SELECT amount_usd FROM credit_ledger WHERE user_id = $1 AND entry_type = 'usage'",
     )
@@ -693,5 +820,111 @@ async fn settles_a_byok_request_at_five_percent(upstream_url: &str) {
     assert!(
         listed[0].last_used_at.is_some(),
         "dispatching on the credential must record that it was used"
+    );
+}
+
+/// THE straddle, end to end: the request that crosses the boundary is billed on
+/// the part above it and free on the part below.
+async fn settles_on_only_the_part_above_the_allowance(upstream_url: &str) {
+    let Some((pool, user_id, plaintext)) = byok_customer("allowance-straddle", upstream_url).await
+    else {
+        return;
+    };
+    // Leave exactly $0.00001 of allowance — less than one fixture request's
+    // $0.000024 catalog cost, so this request lands on BOTH sides of the line.
+    let remaining = Decimal::new(1, 5);
+    seed_byok_month(&pool, user_id, byok::monthly_allowance() - remaining).await;
+
+    one_completion(&pool, &plaintext).await;
+
+    // $0.000024 catalog, $0.00001 of it free, so $0.000014 is billable and the
+    // fee is 5% of that = $0.0000007. Written as the literal it is, because the
+    // whole point of the straddle is that this is neither of the two numbers a
+    // simpler implementation would produce.
+    let (cost_usd, _, catalog) = settled_row(&pool, user_id).await;
+    assert_eq!(
+        cost_usd,
+        Decimal::new(7, 7),
+        "only the ${} above the allowance is charged, at 5%",
+        FIXTURE_CATALOG_USD - remaining
+    );
+    assert_ne!(
+        cost_usd,
+        Decimal::ZERO,
+        "a straddling request must NOT ride free on its remaining allowance"
+    );
+    assert_ne!(
+        cost_usd,
+        Decimal::new(12, 7),
+        "a straddling request must NOT be billed as though it had no allowance left"
+    );
+    assert_eq!(catalog, Some(FIXTURE_CATALOG_USD));
+
+    // The accumulator takes the WHOLE catalog cost, not just the billed part:
+    // it is the honest month-to-date figure, and clamping it at the boundary
+    // would make the next request's arithmetic wrong.
+    assert_eq!(
+        consumed_allowance(&pool, user_id).await,
+        byok::monthly_allowance() - remaining + FIXTURE_CATALOG_USD
+    );
+}
+
+/// Two settles racing for the last of the allowance must not both win it.
+async fn concurrent_settles_cannot_both_claim_the_last_of_the_allowance(upstream_url: &str) {
+    let Some((pool, user_id, plaintext)) = byok_customer("allowance-race", upstream_url).await
+    else {
+        return;
+    };
+    // Leave room for EXACTLY one of the two requests below.
+    seed_byok_month(
+        &pool,
+        user_id,
+        byok::monthly_allowance() - FIXTURE_CATALOG_USD,
+    )
+    .await;
+
+    // Both in flight at once. Whichever settles first consumes the remaining
+    // allowance and pays nothing; the second finds none left and pays the full
+    // 5%. Which of them is which is a race and the test does not care — what it
+    // asserts is the SUM, which is the same either way and is what a lost
+    // update would change.
+    let (first, second) = tokio::join!(
+        one_completion(&pool, &plaintext),
+        one_completion(&pool, &plaintext)
+    );
+    assert_eq!(first["zerorouter"]["byok"], json!(true));
+    assert_eq!(second["zerorouter"]["byok"], json!(true));
+
+    let charged = query_scalar::<_, Decimal>(
+        "SELECT COALESCE(SUM(usage_events.cost_usd), 0) FROM usage_events \
+         JOIN api_keys ON api_keys.id = usage_events.api_key_id \
+         WHERE api_keys.user_id = $1 AND usage_events.upstream_model <> 'seed'",
+    )
+    .bind(user_id)
+    .fetch_one(&pool)
+    .await
+    .expect("the settled rows must sum");
+
+    // If both settles read the same "one request's worth remaining" and both
+    // treated themselves as covered, this would be $0. The advisory lock the
+    // settle transaction takes is what makes it $0.0000012 instead: the second
+    // settle cannot read the accumulator until the first has committed to it.
+    assert_eq!(
+        charged,
+        Decimal::new(12, 7),
+        "exactly one of two concurrent requests may claim the last of the allowance"
+    );
+    assert_ne!(
+        charged,
+        Decimal::ZERO,
+        "both requests claiming the same last dollar of allowance is the lost update \
+         this test exists to catch"
+    );
+
+    // Both requests consumed allowance, so the month is now past it by one
+    // request's catalog cost.
+    assert_eq!(
+        consumed_allowance(&pool, user_id).await,
+        byok::monthly_allowance() + FIXTURE_CATALOG_USD
     );
 }

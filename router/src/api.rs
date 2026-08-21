@@ -36,10 +36,10 @@ use crate::{
     byok,
     config::{RequestNeeds, ResolvedRoute, TierCandidate, TierCatalog, load_tier_catalog},
     db::{
-        AttemptRecord, AttemptTokens, MeteringLane, RequestTelemetry, ReservationSize,
-        ReservationSizing, SegmentClampStats, SettlementRecovery, UsageAdmission, UsageRecord,
-        UsageSession, begin_usage_session, output_token_percentiles, recover_owed_settlements,
-        segment_clamp_stats, segment_user, user_clamp_loss,
+        AttemptRecord, AttemptTokens, ByokReservation, MeteringLane, RequestTelemetry,
+        ReservationSize, ReservationSizing, SegmentClampStats, SettlementRecovery, UsageAdmission,
+        UsageRecord, UsageSession, begin_usage_session, output_token_percentiles,
+        recover_owed_settlements, segment_clamp_stats, segment_user, user_clamp_loss,
     },
     error::{ApiError, streaming_error_json},
     estimator::{
@@ -1412,6 +1412,16 @@ async fn chat_completions(
     let learned_sizing = learned_bound
         .map(|bound| sized_reservation(&request, &resolved, bound, byok_rate))
         .transpose()?;
+    // What admission needs to price this request against the customer's monthly
+    // allowance (migration 0027). Measured here, decided under the lock — see
+    // [`ByokReservation`].
+    let byok_posture = byok_reservation_posture(
+        &request,
+        &resolved,
+        max_output_tokens,
+        &byok_covered,
+        byok_rate,
+    )?;
     // Route construction and ordering read the FULL byte-bound usage: the
     // generation limit sent upstream is untouched by sizing, and the cost
     // ordering prices a walk rather than a reservation.
@@ -1452,6 +1462,7 @@ async fn chat_completions(
             learned: learned_sizing,
             full: full_sizing,
         },
+        byok_posture,
         signature,
         services.require_credits,
         lane,
@@ -3864,6 +3875,62 @@ fn sized_reservation(
 /// absent. A candidate that gets dropped cannot serve, so counting it can only
 /// raise the rate to the house one — over-reserving, which is free — never
 /// lower it.
+/// What admission needs to know to price this request against the customer's
+/// monthly BYOK allowance (migration 0027): the catalog basis it may consume,
+/// and whether it could only ever settle at the fee rate.
+///
+/// # Why the basis is priced at the HOUSE rate
+///
+/// It is a CATALOG figure by definition — the allowance is denominated in what
+/// the usage would have cost at list price, which is what
+/// [`byok::house_rate`] leaves untouched. Pricing it at `byok_rate` would
+/// measure the allowance in fees and make $5,000 of allowance mean $100,000 of
+/// traffic.
+///
+/// # Why the FULL bound and not the learned one
+///
+/// Admission may end up reserving from either sizing, and this figure has to
+/// bound whichever it picks. The full requested ceiling is the larger of the
+/// two, so measuring it here can only over-state what this request will
+/// consume — which delays a zero reservation and never permits one that should
+/// not have happened. It is also the only one of the two that always exists.
+///
+/// # Why `catalog_basis` is offered on a MIXED route
+///
+/// A mixed route reserves at the house rate and is not eligible to reserve
+/// nothing, but it can still SERVE from its BYOK rung, and if it does it
+/// settles as BYOK and consumes allowance. The commitment it records is what
+/// keeps a later request from being told that allowance is still free.
+fn byok_reservation_posture(
+    request: &ChatCompletionRequest,
+    resolved: &ResolvedRoute,
+    output_bound: u32,
+    covered: &BTreeSet<String>,
+    byok_rate: Decimal,
+) -> Result<ByokReservation, ApiError> {
+    // Nothing on this route can dispatch on a customer credential, so it
+    // consumes no allowance and commits none. This is the arm every request on
+    // a deployment without BYOK takes, and it reaches no further code.
+    if !resolved
+        .candidates
+        .iter()
+        .any(|candidate| covered.contains(&candidate.provider))
+    {
+        return Ok(ByokReservation::default());
+    }
+    Ok(ByokReservation {
+        catalog_basis: Some(
+            sized_reservation(request, resolved, output_bound, byok::house_rate())?.cost_usd,
+        ),
+        // Read from the rate the reservation was sized at rather than
+        // re-deciding it, so "every rung is covered" has ONE definition. Two
+        // copies of that quantifier could disagree, and the disagreement would
+        // show up as a request reserving nothing on a route that can settle at
+        // catalog.
+        wholly_byok: byok_rate == byok::fee_rate(),
+    })
+}
+
 fn byok_reservation_rate(resolved: &ResolvedRoute, covered: &BTreeSet<String>) -> Decimal {
     if !covered.is_empty()
         && resolved
@@ -3881,13 +3948,22 @@ async fn admit_usage(
     pool: &PgPool,
     key: &AuthenticatedKey,
     sizing: ReservationSizing,
+    byok: ByokReservation,
     task_signature: TaskSignature,
     require_credits: bool,
     lane: MeteringLane,
 ) -> Result<UsageSession, ApiError> {
-    match begin_usage_session(pool, key, sizing, task_signature, require_credits, lane)
-        .await
-        .map_err(|_| ApiError::DatabaseUnavailable)?
+    match begin_usage_session(
+        pool,
+        key,
+        sizing,
+        byok,
+        task_signature,
+        require_credits,
+        lane,
+    )
+    .await
+    .map_err(|_| ApiError::DatabaseUnavailable)?
     {
         UsageAdmission::Allowed(session) => Ok(session),
         UsageAdmission::Unauthorized => Err(ApiError::Unauthorized),
@@ -3943,8 +4019,20 @@ async fn persist_usage(
     // Metered actuals throughout: this is 5% of the true measured cost at the
     // band that applied, not 5% of the reservation. Same rule as the house
     // lane, one multiplication apart.
+    //
+    // This is the PRE-ALLOWANCE figure. The monthly allowance (migration 0027)
+    // is applied by `crate::db::settle_once`, under the per-user advisory lock,
+    // because it is a read-then-write against a running total and this seam
+    // holds no lock — two of a customer's requests settling at once would each
+    // see the same allowance remaining and each spend it. What travels from
+    // here is the ceiling and the basis; what decides the charge is the settle.
     let cost_usd = byok::apply_fee(catalog_cost_usd, features.byok_rate())
         .ok_or(ApiError::MeteringUnavailable)?;
+    // The basis the allowance is consumed in, on the rows that consume it. Tied
+    // to the same `byok_served` flag that chose the rate above, so a row can
+    // never claim to have been billed as BYOK while consuming no allowance, or
+    // the reverse.
+    let byok_catalog_usd = features.byok_served.then_some(catalog_cost_usd);
     let telemetry = RequestTelemetry {
         requested_max_tokens: features.requested_max_tokens,
         stream: features.stream,
@@ -3978,6 +4066,7 @@ async fn persist_usage(
             upstream_model: upstream_model.to_owned(),
             usage,
             cost_usd,
+            byok_catalog_usd,
             latency_ms,
             status,
             telemetry,
@@ -5291,6 +5380,7 @@ mod tests {
                 cost_usd: usage_cost(resolved.sell_rates.worst_case(), reservation_usage)
                     .expect("sell rates must price"),
             }),
+            ByokReservation::default(),
             task_signature("walk-user", &[], 1, 128, true, 64),
             false,
             MeteringLane::Reserved,

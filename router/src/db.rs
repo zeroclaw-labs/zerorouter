@@ -260,7 +260,25 @@ pub struct UsageRecord {
     pub upstream_provider: String,
     pub upstream_model: String,
     pub usage: OpenAiUsage,
+    /// What this request costs BEFORE the monthly BYOK allowance is applied:
+    /// the catalog price on the house lane, and 5% of it on a BYOK attempt.
+    ///
+    /// On the house lane this is the final charge and nothing below touches it.
+    /// On a BYOK attempt it is a CEILING — [`settle_once`] recomputes the charge
+    /// under the per-user advisory lock, where the month's consumed allowance
+    /// can be read without a race, and the recomputed figure is never larger
+    /// than this one because the allowance can only ever reduce a fee. That
+    /// ordering matters: the reservation was sized against this ceiling, so a
+    /// settle can only come in under what admission verified.
     pub cost_usd: Decimal,
+    /// What the same usage would have cost at catalog rates, on a request that
+    /// dispatched on the customer's own credential (migration 0027).
+    ///
+    /// `Some` exactly when `telemetry.byok` is `Some(true)`. It is the basis the
+    /// monthly allowance is consumed in, and it is carried separately from
+    /// `cost_usd` because `cost_usd` has already had the fee rate applied and
+    /// the allowance is denominated in list price, not in fees.
+    pub byok_catalog_usd: Option<Decimal>,
     pub latency_ms: i32,
     pub status: i16,
     pub telemetry: RequestTelemetry,
@@ -742,6 +760,46 @@ impl ReservationSizing {
     }
 }
 
+/// What admission needs to know about a request's bring-your-own-key posture to
+/// decide what it must encumber (migration 0027).
+///
+/// # Why this decision is made under the lock and not at the call site
+///
+/// Exactly the argument [`ReservationSizing`] makes for learned sizing, applied
+/// to a second quantity. The caller can measure this request — what it would
+/// cost at catalog, and whether every rung would dispatch on a customer
+/// credential — because those are pure facts about the route. What it cannot
+/// measure is how much of the user's monthly allowance is left, because that
+/// depends on rows other requests are writing right now, and the answer is only
+/// trustworthy under the per-user advisory lock that admission holds and the
+/// caller does not.
+///
+/// So the caller supplies the measurements and admission makes the decision,
+/// which keeps the gates, the ordering, and the INSERT exactly where they were.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ByokReservation {
+    /// This request's worst-case cost at CATALOG rates, when the route holds at
+    /// least one candidate that would dispatch on a customer credential.
+    ///
+    /// `None` means the request cannot settle as BYOK at all, so it consumes no
+    /// allowance and commits none. Present on any route with a covered
+    /// candidate — not only a wholly-covered one — because a mixed route can
+    /// still serve from its BYOK rung and consume allowance if it does. Being
+    /// wrong in that direction only over-commits, which delays a zero
+    /// reservation and never permits one that should not happen.
+    pub catalog_basis: Option<Decimal>,
+    /// Whether every rung of this route would dispatch on a customer credential
+    /// with no path to a house one, so the settle can only ever price at the
+    /// fee rate.
+    ///
+    /// This is the precondition for reserving nothing. A route that could serve
+    /// from ZeroRouter's own credential — a mixed route, or one whose BYOK key
+    /// may fall back — can settle at the full catalog price, which the
+    /// allowance does not touch, so it must encumber for that possibility no
+    /// matter how much allowance is left.
+    pub wholly_byok: bool,
+}
+
 const DATABASE_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
 const RESERVATION_TTL: Duration = Duration::from_secs(20 * 60);
 
@@ -1058,6 +1116,15 @@ pub async fn migrate(pool: &PgPool) -> Result<()> {
                 Cow::Borrowed(include_str!("../migrations/0026_byok_provider_keys.sql")),
                 false,
             ),
+            Migration::new(
+                27,
+                Cow::Borrowed("byok monthly allowance"),
+                MigrationType::Simple,
+                Cow::Borrowed(include_str!(
+                    "../migrations/0027_byok_monthly_allowance.sql"
+                )),
+                false,
+            ),
         ]),
         ignore_missing: false,
         locking: true,
@@ -1130,6 +1197,7 @@ pub async fn begin_usage_session(
     pool: &PgPool,
     key: &AuthenticatedKey,
     sizing: ReservationSizing,
+    byok: ByokReservation,
     task_signature: TaskSignature,
     require_credits: bool,
     lane: MeteringLane,
@@ -1529,7 +1597,8 @@ pub async fn begin_usage_session(
         recent_tokens,
         window_day_spend,
         window_total_spend,
-    ) = sqlx::query_as::<_, (Decimal, i64, Decimal, i64, Decimal, Decimal)>(
+        user_monthly_byok_catalog,
+    ) = sqlx::query_as::<_, (Decimal, i64, Decimal, i64, Decimal, Decimal, Decimal)>(
         r#"
         SELECT
             COALESCE(spend.user_monthly_spend, 0) AS user_monthly_spend,
@@ -1537,7 +1606,8 @@ pub async fn begin_usage_session(
             COALESCE(spend.monthly_spend, 0) AS monthly_spend,
             COALESCE(velocity.recent_tokens, 0)::BIGINT AS recent_tokens,
             COALESCE(window_day.day_spend, 0) AS window_day_spend,
-            COALESCE(window_total.total_spend, 0) AS window_total_spend
+            COALESCE(window_total.total_spend, 0) AS window_total_spend,
+            COALESCE(spend.user_monthly_byok_catalog, 0) AS user_monthly_byok_catalog
         FROM
             (
                 SELECT
@@ -1547,7 +1617,16 @@ pub async fn begin_usage_session(
                             WHERE rollup.api_key_id = $2
                         ),
                         0
-                    ) AS monthly_spend
+                    ) AS monthly_spend,
+                    -- The monthly BYOK allowance's consumed side (migration
+                    -- 0027). Free: this subquery was already aggregating
+                    -- exactly the rows it is summed over, so the allowance
+                    -- costs admission one more column in a select list rather
+                    -- than a table, a join, or a round trip. Per USER and not
+                    -- per key — the allowance is the customer's, and a user who
+                    -- minted a second key must not get a second $5,000.
+                    COALESCE(SUM(rollup.byok_catalog_usd), 0)
+                        AS user_monthly_byok_catalog
                 FROM usage_key_month_spend AS rollup
                 INNER JOIN api_keys ON api_keys.id = rollup.api_key_id
                 WHERE api_keys.user_id = $1
@@ -1619,7 +1698,8 @@ pub async fn begin_usage_session(
         active_reserved_cost,
         active_reserved_tokens,
         user_live_reservations,
-    ) = sqlx::query_as::<_, (Decimal, i64, Decimal, i64, i64)>(
+        user_committed_byok_catalog,
+    ) = sqlx::query_as::<_, (Decimal, i64, Decimal, i64, i64, Decimal)>(
         r#"
         SELECT
             COALESCE(SUM(usage_reservations.reserved_cost_usd), 0),
@@ -1644,7 +1724,22 @@ pub async fn begin_usage_session(
             -- on encumbering the balance through the sum above; it must not
             -- also make every later request of that user reserve full ceiling
             -- forever.
-            COUNT(*) FILTER (WHERE usage_reservations.expires_at > NOW())::BIGINT
+            COUNT(*) FILTER (WHERE usage_reservations.expires_at > NOW())::BIGINT,
+            -- Allowance this user has already committed to requests that are
+            -- still in flight (migration 0027), read off the same scan as the
+            -- encumbrance sums for the same reason the count above is.
+            --
+            -- It is what stops k simultaneous requests from each observing the
+            -- same remaining allowance and each reserving nothing against it.
+            -- The whole set is counted, not just the unexpired arm: unlike the
+            -- concurrency count above, a reservation that outlived its TTL
+            -- while still owing has NOT stopped being a request that may yet
+            -- settle as BYOK and consume allowance, so releasing its commitment
+            -- early is exactly the double-claim this column exists to prevent.
+            -- The `released_at IS NULL` and intent-carrying filters in the WHERE
+            -- clause below still apply, which is correct: a row an operator has
+            -- resolved will never settle, so it commits nothing.
+            COALESCE(SUM(usage_reservations.byok_catalog_basis_usd), 0)
         FROM usage_reservations
         INNER JOIN api_keys ON api_keys.id = usage_reservations.api_key_id
         WHERE api_keys.user_id = $1
@@ -1719,6 +1814,32 @@ pub async fn begin_usage_session(
                 sizing.full.cost_usd,
                 ReservationBasis::Cold,
             ),
+        };
+
+    // The monthly BYOK allowance's reservation arm (migration 0027), decided
+    // here for the same reason the learned sizing above is: it needs a figure
+    // that is only trustworthy under the advisory lock this transaction holds.
+    //
+    // # Why this sits BEFORE the gates rather than after them
+    //
+    // Because it changes what this request COSTS, and every gate below is about
+    // cost. A request that will be billed nothing has not spent any of the
+    // customer's spend cap, has not drawn on their credit limit, and does not
+    // need a funded balance — refusing it on any of those grounds would be
+    // refusing a free request for lack of money to pay for it, which is the
+    // exact friction the allowance exists to remove. The velocity cap is
+    // unaffected either way: it is denominated in tokens, and this changes no
+    // token count.
+    //
+    // Being wrong here can only ever have encumbered a customer briefly for a
+    // request that turned out to be free; it cannot admit a billable request
+    // with nothing held against it, because `reserves_no_byok_fee` requires the
+    // route to be one that can only settle at the fee rate.
+    let reserved_cost_usd =
+        if reserves_no_byok_fee(byok, user_monthly_byok_catalog, user_committed_byok_catalog) {
+            Decimal::ZERO
+        } else {
+            reserved_cost_usd
         };
 
     // Both ceilings are enforced and the tighter one wins: a request is
@@ -1881,9 +2002,10 @@ pub async fn begin_usage_session(
             api_key_id,
             expires_at,
             reserved_tokens,
-            reserved_cost_usd
+            reserved_cost_usd,
+            byok_catalog_basis_usd
         )
-        VALUES ($1, $2, NOW() + ($3 * INTERVAL '1 second'), $4, $5)
+        VALUES ($1, $2, NOW() + ($3 * INTERVAL '1 second'), $4, $5, $6)
         "#,
             )
             .bind(request_id)
@@ -1891,6 +2013,13 @@ pub async fn begin_usage_session(
             .bind(reservation_ttl_seconds)
             .bind(reserved_tokens)
             .bind(reserved_cost_usd)
+            // Written on EVERY route that could dispatch BYOK, including the
+            // ones that just reserved a full fee — the commitment is about what
+            // allowance this request may consume when it settles, which is the
+            // same whether or not its own reservation was waived. Recording it
+            // only on the waived ones would let a fee-reserving request consume
+            // allowance that a later request had already been told was free.
+            .bind(byok.catalog_basis)
             .execute(&mut *transaction)
             .await?;
             Some(Reservation {
@@ -2616,6 +2745,74 @@ async fn settle_once(
     let record = &record;
     let telemetry = &record.telemetry;
     let cost_basis_usd = telemetry.cost_basis(record);
+    // The monthly BYOK allowance (migration 0027), applied HERE and nowhere
+    // else.
+    //
+    // # Why the fee is priced inside the settle transaction
+    //
+    // Every other figure on this row was computed by the request path before
+    // the intent was written. This one cannot be, and the reason is a race
+    // rather than a preference. The allowance is a per-user running total, so
+    // pricing against it is a read-then-write, and the read is only trustworthy
+    // where nothing else can be writing: two of a user's requests settling at
+    // the same moment would each read the same "$10 remaining", each treat $10
+    // of their own cost as free, and $10 of allowance would be spent twice.
+    //
+    // This transaction already holds `pg_advisory_xact_lock` on the user — the
+    // same lock admission takes — so the read below and the accrual that
+    // follows it are serialized against every other settle for this user. The
+    // accrual is not a statement here: it is 0019's AFTER INSERT trigger firing
+    // on the `usage_events` INSERT below, inside this same transaction. So the
+    // read, the price, and the consumption commit together or not at all, and
+    // request N+1 necessarily observes request N's consumption.
+    //
+    // # The direction this can move a charge
+    //
+    // Only down. `billable_above_allowance` subtracts before `apply_fee`
+    // multiplies, so the recomputed fee is at most the fee the request path
+    // already computed, which is what admission sized the reservation against.
+    // A settle can therefore come in under what was verified against the
+    // balance, never over it, and the `min` below states that as an assertion
+    // rather than leaving it as an argument.
+    let (cost_usd, byok_catalog_usd) = match record.byok_catalog_usd {
+        // A house-credential request. Not eligible for the allowance — the
+        // allowance is a discount on ZeroRouter's own routing fee, and a house
+        // request is paying the provider's price through ZeroRouter, not a fee
+        // on top of a price it paid elsewhere. Its charge is untouched, and so
+        // is every line of what this function did before 0027.
+        None => (record.cost_usd, None),
+        Some(catalog) => {
+            // Read from the same rollup and over the same range admission reads
+            // (`begin_usage_session`), so "what the customer has consumed" is
+            // one definition rather than two that can disagree. The `>=` is
+            // 0019's: a row whose ts landed in a later month must still count.
+            let consumed = sqlx::query_scalar::<_, Decimal>(
+                r#"
+                SELECT COALESCE(SUM(rollup.byok_catalog_usd), 0)
+                FROM usage_key_month_spend AS rollup
+                INNER JOIN api_keys ON api_keys.id = rollup.api_key_id
+                WHERE api_keys.user_id = $1
+                  AND rollup.month >= usage_event_utc_month(NOW())
+                "#,
+            )
+            .bind(intent.user_id)
+            .fetch_one(&mut *transaction)
+            .await?;
+            let billable = crate::byok::billable_above_allowance(catalog, consumed);
+            let fee =
+                crate::byok::apply_fee(billable, crate::byok::fee_rate()).ok_or_else(|| {
+                    // An overflow is a metering failure, never a wrapped charge —
+                    // the rule `apply_fee` exists to enforce. Returning an error
+                    // rolls this transaction back, which puts the reservation back
+                    // and leaves the durable intent for the recovery sweep.
+                    sqlx::Error::Protocol(
+                        "BYOK fee overflowed while pricing against the monthly allowance"
+                            .to_owned(),
+                    )
+                })?;
+            (fee.min(record.cost_usd), Some(catalog))
+        }
+    };
     // The losing attempts, summed — and flagged when that sum is only a lower
     // bound. The sum used to be a `filter_map(...).sum()`, which silently
     // dropped every attempt whose COGS was unknown and reported the remainder
@@ -2674,13 +2871,14 @@ async fn settle_once(
                 tool_names_sha256,
                 priority,
                 usage_gap,
-                byok
+                byok,
+                byok_catalog_usd
             )
             VALUES (
                 $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
                 $12, $13, $14, $15::JSONB, $16::JSONB, $17, $18, $19, $20, $21,
                 $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34,
-                $35
+                $35, $36
             )
             "#,
     )
@@ -2692,7 +2890,10 @@ async fn settle_once(
     .bind(input_tokens)
     .bind(cached_input_tokens.min(input_tokens))
     .bind(output_tokens)
-    .bind(record.cost_usd)
+    // The allowance-adjusted charge, not the pre-allowance ceiling the request
+    // path computed. `usage_events.cost_usd` is what the customer was billed,
+    // so it has to be the number the debit below moves.
+    .bind(cost_usd)
     .bind(record.latency_ms)
     .bind(record.status)
     .bind(telemetry.candidate_id.as_deref())
@@ -2723,6 +2924,11 @@ async fn settle_once(
     .bind(telemetry.priority.map(Priority::as_str))
     .bind(telemetry.usage_gap)
     .bind(telemetry.byok)
+    // The basis the allowance was consumed in, and the value 0019's accrual
+    // trigger folds into `usage_key_month_spend.byok_catalog_usd` as this row
+    // lands. Writing it is what makes the next request's allowance read
+    // correct, so it is not telemetry — it is the other half of the charge.
+    .bind(byok_catalog_usd)
     .execute(&mut *transaction)
     .await;
     if let Err(error) = settled {
@@ -2819,7 +3025,11 @@ async fn settle_once(
     // deployments record usage_events for metering without moving money.
     // Zero-cost debits write no ledger row (the ledger forbids zero amounts).
     if intent.require_credits {
-        let debit = record.cost_usd.min(reserved_cost_usd);
+        // `cost_usd`, not `record.cost_usd`: the allowance has already been
+        // applied above, and the balance must move by what the settled row
+        // says was charged. Reading the pre-allowance ceiling here would debit
+        // a customer for usage the row records as free.
+        let debit = cost_usd.min(reserved_cost_usd);
         if debit > Decimal::ZERO {
             let balance_after = sqlx::query_scalar::<_, Decimal>(
                 r#"
@@ -3526,6 +3736,39 @@ struct SettlementIntent {
     upstream_model: String,
     usage: UsagePayload,
     cost_usd: String,
+    /// The catalog-equivalent cost of a BYOK request, carried so the settle
+    /// transaction can price it against the month's remaining allowance
+    /// (migration 0027).
+    ///
+    /// `#[serde(default)]` on the same contract as `byok` below: an intent
+    /// written before the allowance existed has no such field, and `None` is
+    /// the truthful reading — that request was priced by #103's flat 5% and
+    /// replaying it must reproduce that price, not retroactively grant it an
+    /// allowance it was never told about.
+    ///
+    /// # This is the one field of this payload that CAN re-price a replay
+    ///
+    /// Every other figure here is replayed verbatim. This one is not: when it
+    /// is `Some`, [`settle_once`] recomputes `cost_usd` from it and the
+    /// month-to-date accumulator, under the per-user advisory lock. That is not
+    /// a weakening of the replay contract but the only place the allowance can
+    /// be applied without a race — the accumulator is accrued by a trigger
+    /// inside the settle transaction, so reading it anywhere earlier reads a
+    /// snapshot a concurrent settle can invalidate, and two requests would both
+    /// claim the same last dollar.
+    ///
+    /// It is safe to replay because the recomputation and the accrual are the
+    /// same transaction: a settle that did not commit consumed no allowance, so
+    /// the retry recomputes against the same state and reaches the same number.
+    /// A retry that lands after OTHER requests have settled prices against the
+    /// allowance they left, which is the correct answer — the allowance is
+    /// consumed in settle order, and this request settled later.
+    ///
+    /// The recomputation can only ever REDUCE the charge (the allowance
+    /// subtracts before the rate multiplies), so it can never exceed the
+    /// reservation admission verified against the balance.
+    #[serde(default)]
+    byok_catalog_usd: Option<String>,
     latency_ms: i32,
     status: i16,
     telemetry: TelemetryPayload,
@@ -3641,6 +3884,7 @@ impl SettlementIntent {
             upstream_model: record.upstream_model.clone(),
             usage: UsagePayload::new(record.usage),
             cost_usd: record.cost_usd.to_string(),
+            byok_catalog_usd: record.byok_catalog_usd.map(|catalog| catalog.to_string()),
             latency_ms: record.latency_ms,
             status: record.status,
             telemetry: TelemetryPayload {
@@ -3725,6 +3969,11 @@ impl SettlementIntent {
             upstream_model: self.upstream_model.clone(),
             usage: self.usage.to_usage(),
             cost_usd: settlement_decimal(&self.cost_usd, "cost_usd")?,
+            byok_catalog_usd: self
+                .byok_catalog_usd
+                .as_deref()
+                .map(|catalog| settlement_decimal(catalog, "byok_catalog_usd"))
+                .transpose()?,
             latency_ms: self.latency_ms,
             status: self.status,
             telemetry: RequestTelemetry {
@@ -3829,6 +4078,45 @@ fn settlement_decimal(value: &str, field: &'static str) -> Result<Decimal, sqlx:
             "settlement payload field {field} is not a decimal number"
         ))
     })
+}
+
+/// Whether this request may encumber NOTHING for the BYOK fee, because the
+/// whole of it provably lands inside the customer's remaining monthly allowance
+/// (migration 0027).
+///
+/// # The three conditions, and why each is necessary
+///
+/// 1. **The route can dispatch BYOK at all** (`catalog_basis` is `Some`). A
+///    house-only route is priced at catalog and the allowance does not touch
+///    it.
+/// 2. **Every rung is BYOK** (`wholly_byok`). This is the same quantifier
+///    `crate::api::byok_reservation_rate` uses and it is necessary for the same
+///    reason: a route that could serve from ZeroRouter's own credential can
+///    settle at the FULL catalog price, which the allowance does not discount.
+///    Reserving zero for one of those would deliver priced inference with no
+///    encumbrance at all.
+/// 3. **The worst case fits in what is left** — where "what is left" subtracts
+///    both what has settled this month and what this user's in-flight requests
+///    have already committed. The committed term is the one that makes this
+///    safe under concurrency: without it, k simultaneous requests each read the
+///    same remaining allowance, each fit inside it individually, and together
+///    overrun it, with every one of them holding a zero reservation that the
+///    settle debit is then clamped to.
+///
+/// # Why the worst case and not the expected case
+///
+/// `catalog_basis` is priced from the reservation's byte-bound usage at the
+/// worst-case rate table, exactly like the reservation it replaces, so the
+/// figure compared here can never be below what the request actually settles
+/// at. The direction is the same one `sized_reservation` argues for: being
+/// wrong here must mean encumbering a customer briefly for a request that turns
+/// out to be free, never delivering a billable request with nothing held
+/// against it.
+fn reserves_no_byok_fee(byok: ByokReservation, consumed: Decimal, committed: Decimal) -> bool {
+    let Some(basis) = byok.catalog_basis else {
+        return false;
+    };
+    byok.wholly_byok && basis <= crate::byok::remaining_allowance(consumed + committed)
 }
 
 /// Whether one spend ceiling still admits `additional` on top of what is

@@ -91,6 +91,74 @@ pub fn house_rate() -> Decimal {
     Decimal::ONE
 }
 
+/// The catalog-equivalent BYOK usage a customer may run in one UTC calendar
+/// month before [`fee_rate`] applies to any of it.
+///
+/// # Why this number, and why it is a constant
+///
+/// $5,000/month of list-price traffic is an adoption lever, not a cost
+/// recovery: BYOK inference costs ZeroRouter nothing upstream — the customer
+/// pays their own vendor — so the fee is a charge for routing, failover,
+/// metering and the ledger, and the competing gateways that resell on a
+/// customer's key charge nothing at this volume. A customer evaluating
+/// ZeroRouter against them has to be able to run a real workload, not a demo,
+/// before any invoice appears. Beyond it the 5% applies, which is where the
+/// customers big enough to pay for the routing start paying for it.
+///
+/// It is a CONSTANT rather than an env var deliberately, and the reason is the
+/// same one migration 0026 gives for keeping the 5% out of the schema: a figure
+/// that decides what a customer is charged must not be a value an operator can
+/// change without a review and a deploy. An env var would make the allowance a
+/// property of one machine's configuration, so two routers serving the same
+/// customer could disagree about what that customer owes, and nothing in the
+/// ledger would record which one answered. Revising it is a code change, a
+/// commit message, and a release — which is exactly the weight a pricing change
+/// should carry.
+///
+/// A `Decimal` from integers for the same reason as [`fee_rate`]: this number
+/// is compared against money and subtracted from it, and it must be exactly
+/// 5000 rather than the nearest `f64` to it.
+#[must_use]
+pub fn monthly_allowance() -> Decimal {
+    Decimal::new(5_000, 0)
+}
+
+/// What is left of this month's allowance after `consumed` of catalog-equivalent
+/// BYOK usage.
+///
+/// Clamped at zero rather than going negative: `consumed` is a running total
+/// that keeps growing after the allowance is exhausted (it is the honest
+/// month-to-date figure the portal shows), so past the boundary this is the
+/// only sensible reading, and a negative "remaining" leaking into
+/// [`billable_above_allowance`] would ADD to what a customer is billed.
+#[must_use]
+pub fn remaining_allowance(consumed: Decimal) -> Decimal {
+    (monthly_allowance() - consumed).max(Decimal::ZERO)
+}
+
+/// The portion of one request's catalog-equivalent cost that lies ABOVE the
+/// remaining allowance, and is therefore what [`fee_rate`] is charged on.
+///
+/// # The straddling request
+///
+/// This is the whole of the allowance's arithmetic, and the case it exists for
+/// is the request that crosses the boundary. With $10 of allowance left and a
+/// request whose catalog cost is $30, $10 of it is free and $20 is billable, so
+/// the fee is $1.00 — not $1.50 (ignoring the allowance) and not $0.00
+/// (letting the request that happens to straddle carry the whole remainder for
+/// free). Both of those wrong answers are a single `if` away from this one,
+/// which is why the boundary is pinned by its own test at the exact dollar.
+///
+/// Saturating at both ends. A request wholly inside the allowance returns zero
+/// — charged nothing — and a request arriving with the allowance already spent
+/// returns its whole catalog cost, which is exactly the pre-allowance behaviour
+/// from #103. Neither end is a special case in the code; they are the two
+/// limits of the same subtraction.
+#[must_use]
+pub fn billable_above_allowance(catalog_cost: Decimal, consumed: Decimal) -> Decimal {
+    (catalog_cost - remaining_allowance(consumed)).max(Decimal::ZERO)
+}
+
 /// Apply a fee rate to a catalog-priced amount.
 ///
 /// Deliberately does NOT round. Nothing in ZeroRouter's money path rounds —
@@ -532,6 +600,56 @@ pub async fn open_credentials(
     Ok(opened)
 }
 
+/// Where a customer stands against this month's free allowance.
+///
+/// All three figures are carried rather than leaving the portal to subtract,
+/// because the allowance is a number ZeroRouter chose and may revise: a client
+/// that computed `remaining` from a hardcoded $5,000 of its own would keep
+/// showing the old figure after a change, and the customer would be reading a
+/// promise the router is no longer making.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct AllowanceStatus {
+    /// This month's allowance in full — [`monthly_allowance`].
+    pub allowance_usd: Decimal,
+    /// Catalog-equivalent BYOK usage settled so far this UTC month. Keeps
+    /// growing past the allowance; it is a usage figure, not a countdown.
+    pub consumed_usd: Decimal,
+    /// What is left, floored at zero.
+    pub remaining_usd: Decimal,
+}
+
+/// Read this user's month-to-date allowance position (migration 0027).
+///
+/// The same rollup, the same `>=` range, and therefore the same number the
+/// settle transaction prices against — a display that read the month a
+/// different way would eventually tell a customer something the ledger
+/// contradicts. It is deliberately NOT read under the per-user advisory lock:
+/// this is a page, not a charge, and a figure that is one in-flight request
+/// stale is the correct trade against serializing a dashboard load behind the
+/// money path.
+pub async fn allowance_status(
+    pool: &PgPool,
+    user_id: Uuid,
+) -> Result<AllowanceStatus, sqlx::Error> {
+    let consumed_usd = sqlx::query_scalar::<_, Decimal>(
+        r#"
+        SELECT COALESCE(SUM(rollup.byok_catalog_usd), 0)
+        FROM usage_key_month_spend AS rollup
+        INNER JOIN api_keys ON api_keys.id = rollup.api_key_id
+        WHERE api_keys.user_id = $1
+          AND rollup.month >= usage_event_utc_month(NOW())
+        "#,
+    )
+    .bind(user_id)
+    .fetch_one(pool)
+    .await?;
+    Ok(AllowanceStatus {
+        allowance_usd: monthly_allowance(),
+        consumed_usd,
+        remaining_usd: remaining_allowance(consumed_usd),
+    })
+}
+
 /// Record that a credential was dispatched on.
 ///
 /// Best-effort and off the request's critical path by design: this is a display
@@ -702,6 +820,116 @@ mod tests {
             );
             assert!(fee >= Decimal::ZERO, "the BYOK fee must never be negative");
         }
+    }
+
+    #[test]
+    fn the_allowance_is_five_thousand_dollars_exactly() {
+        // The operator's number, pinned. A test that read the constant back
+        // through the same function under test would assert nothing, so the
+        // literal is written out.
+        assert_eq!(monthly_allowance(), Decimal::from(5_000));
+        // And it is exact, not the nearest float to five thousand.
+        assert_eq!(monthly_allowance().to_string(), "5000");
+    }
+
+    #[test]
+    fn a_request_wholly_inside_the_allowance_is_billable_for_nothing() {
+        // $100 of catalog usage with the month untouched: entirely free.
+        assert_eq!(
+            billable_above_allowance(Decimal::from(100), Decimal::ZERO),
+            Decimal::ZERO
+        );
+        // And still free with $4,000 already consumed — $1,000 remains.
+        assert_eq!(
+            billable_above_allowance(Decimal::from(100), Decimal::from(4_000)),
+            Decimal::ZERO
+        );
+    }
+
+    #[test]
+    fn a_straddling_request_is_billable_only_for_the_part_above_the_allowance() {
+        // THE case this feature is about. $4,990 consumed leaves $10; a request
+        // costing $30 at catalog is $10 free and $20 billable, so the fee is
+        // $1.00. The two wrong answers are each one `if` away and are both
+        // named here so a regression cannot pass by accident:
+        //   - ignoring the allowance entirely would bill $30 -> $1.50
+        //   - letting the straddling request ride free would bill $0 -> $0.00
+        let consumed = Decimal::from(4_990);
+        let catalog = Decimal::from(30);
+        let billable = billable_above_allowance(catalog, consumed);
+        assert_eq!(billable, Decimal::from(20), "only the part above $5,000");
+        assert_eq!(
+            apply_fee(billable, fee_rate()).expect("the fee must compute"),
+            Decimal::new(100, 2),
+            "$20 above the allowance at 5% is exactly $1.00"
+        );
+        assert_ne!(
+            billable, catalog,
+            "billing the whole request ignores the allowance"
+        );
+        assert_ne!(
+            billable,
+            Decimal::ZERO,
+            "letting the straddling request ride free gives away the excess"
+        );
+    }
+
+    #[test]
+    fn the_boundary_is_exact_at_the_last_dollar_of_allowance() {
+        // The two sides of the exact dollar, and the dollar itself. A request
+        // that lands EXACTLY on $5,000 is wholly free; one cent more and only
+        // that cent is billable.
+        assert_eq!(
+            billable_above_allowance(Decimal::from(5_000), Decimal::ZERO),
+            Decimal::ZERO,
+            "a request that exactly exhausts the allowance is still wholly free"
+        );
+        assert_eq!(
+            billable_above_allowance(Decimal::new(500_001, 2), Decimal::ZERO),
+            Decimal::new(1, 2),
+            "one cent past the allowance is one cent billable"
+        );
+        // Approached from the other side: consumed sits one cent short of the
+        // allowance, so a $1 request is billable for $0.99.
+        assert_eq!(
+            billable_above_allowance(Decimal::ONE, Decimal::new(499_999, 2)),
+            Decimal::new(99, 2)
+        );
+    }
+
+    #[test]
+    fn past_the_allowance_every_dollar_is_billable_exactly_as_before() {
+        // Once the month is spent, BYOK prices exactly as #103 priced it, so
+        // the allowance cannot have changed the arithmetic for the customers
+        // who were already past it.
+        let catalog = Decimal::new(4_800_000, 6); // $4.80
+        for consumed in [Decimal::from(5_000), Decimal::from(9_999)] {
+            assert_eq!(
+                billable_above_allowance(catalog, consumed),
+                catalog,
+                "with the allowance spent the whole catalog cost is billable"
+            );
+            assert_eq!(
+                apply_fee(billable_above_allowance(catalog, consumed), fee_rate())
+                    .expect("the fee must compute"),
+                Decimal::new(240_000, 6),
+                "$4.80 at 5% is $0.24, exactly as it was before the allowance"
+            );
+        }
+    }
+
+    #[test]
+    fn a_consumed_total_past_the_allowance_never_adds_to_the_bill() {
+        // `consumed` keeps growing past $5,000 — it is the honest month-to-date
+        // figure, not a counter that stops. A negative "remaining" leaking into
+        // the subtraction would ADD to what the customer is charged, which is
+        // the one direction that must be impossible.
+        assert_eq!(remaining_allowance(Decimal::from(1_000_000)), Decimal::ZERO);
+        assert_eq!(
+            billable_above_allowance(Decimal::from(10), Decimal::from(1_000_000)),
+            Decimal::from(10),
+            "an enormous consumed total bills the request, never more than it"
+        );
     }
 
     #[test]

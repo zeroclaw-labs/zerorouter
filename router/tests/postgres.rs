@@ -11,9 +11,10 @@ use zerorouter::{
         AuthenticatedKey, AuthenticationError, KeyAuthenticator, generate_api_key, hash_api_key,
     },
     db::{
-        AttemptRecord, AttemptTokens, MeteringLane, RequestTelemetry, ReservationSize,
-        ReservationSizing, UsageAdmission, UsageRecord, UsageSession, begin_usage_session, migrate,
-        output_token_percentiles, provider_cogs, segment_clamp_stats, user_clamp_loss,
+        AttemptRecord, AttemptTokens, ByokReservation, MeteringLane, RequestTelemetry,
+        ReservationSize, ReservationSizing, UsageAdmission, UsageRecord, UsageSession,
+        begin_usage_session, migrate, output_token_percentiles, provider_cogs, segment_clamp_stats,
+        user_clamp_loss,
     },
     openai::{OpenAiUsage, TASK_SIGNATURE_SCHEME, TaskSignature, tool_names_digest, usage_cost},
     priority::Priority,
@@ -120,6 +121,7 @@ async fn postgres_enforces_reservations_revocation_and_append_only_usage() {
         &pool,
         &key,
         cold_sizing(1_000, 500, Decimal::ONE),
+        ByokReservation::default(),
         test_signature("0123456789abcdef"),
         false,
         MeteringLane::Reserved,
@@ -135,6 +137,7 @@ async fn postgres_enforces_reservations_revocation_and_append_only_usage() {
             &pool,
             &key,
             cold_sizing(1_000, 500, Decimal::from(20)),
+            ByokReservation::default(),
             test_signature("0123456789abcdef"),
             false,
             MeteringLane::Reserved
@@ -156,6 +159,7 @@ async fn postgres_enforces_reservations_revocation_and_append_only_usage() {
                 prompt_tokens_details: None,
             },
             cost_usd: Decimal::ONE,
+            byok_catalog_usd: None,
             latency_ms: 10,
             status: 200,
             telemetry: sentinel_telemetry(),
@@ -189,6 +193,7 @@ async fn postgres_enforces_reservations_revocation_and_append_only_usage() {
             &pool,
             &key,
             cold_sizing(800, 400, Decimal::ZERO),
+            ByokReservation::default(),
             test_signature("0123456789abcdef"),
             false,
             MeteringLane::Reserved
@@ -197,6 +202,7 @@ async fn postgres_enforces_reservations_revocation_and_append_only_usage() {
             &pool,
             &key,
             cold_sizing(800, 400, Decimal::ZERO),
+            ByokReservation::default(),
             test_signature("0123456789abcdef"),
             false,
             MeteringLane::Reserved
@@ -215,6 +221,7 @@ async fn postgres_enforces_reservations_revocation_and_append_only_usage() {
                         upstream_model: "test/model".to_owned(),
                         usage: OpenAiUsage::default(),
                         cost_usd: Decimal::ZERO,
+                        byok_catalog_usd: None,
                         latency_ms: 0,
                         status: 499,
                         telemetry: sentinel_telemetry(),
@@ -250,6 +257,7 @@ async fn postgres_enforces_reservations_revocation_and_append_only_usage() {
             &pool,
             &cached_key,
             cold_sizing(1, 1, Decimal::ZERO),
+            ByokReservation::default(),
             test_signature("0123456789abcdef"),
             false,
             MeteringLane::Reserved
@@ -306,6 +314,7 @@ async fn admit(pool: &PgPool, key: &AuthenticatedKey) -> UsageSession {
         pool,
         key,
         cold_sizing(4_596, 500, Decimal::ONE),
+        ByokReservation::default(),
         test_signature("00112233aabbccdd"),
         false,
         MeteringLane::Reserved,
@@ -407,6 +416,7 @@ async fn settled_row_carries_estimate_and_select_telemetry() {
             upstream_model: "winner-model".to_owned(),
             usage: served_usage,
             cost_usd: usage_cost(sell, served_usage).expect("sell rates must price"),
+            byok_catalog_usd: None,
             latency_ms: 42,
             status: 200,
             telemetry,
@@ -617,6 +627,7 @@ async fn a_partly_unknown_attempt_cogs_sum_reports_itself_as_a_lower_bound() {
                 upstream_model: "winner-model".to_owned(),
                 usage: OpenAiUsage::default(),
                 cost_usd: Decimal::ZERO,
+                byok_catalog_usd: None,
                 latency_ms: 42,
                 status: 502,
                 telemetry,
@@ -715,6 +726,7 @@ async fn request_attempts_are_append_only_and_one_served_per_request() {
                 prompt_tokens_details: None,
             },
             cost_usd: Decimal::ZERO,
+            byok_catalog_usd: None,
             latency_ms: 5,
             status: 200,
             telemetry: sentinel_telemetry(),
@@ -799,6 +811,7 @@ async fn migration_chain_applies_on_a_fresh_database() {
     // a probe; the tuple grows in one place and the assertions name the facts.
     #[allow(clippy::type_complexity)]
     let outcome: anyhow::Result<(
+        bool,
         bool,
         bool,
         bool,
@@ -1071,6 +1084,41 @@ async fn migration_chain_applies_on_a_fresh_database() {
         )
         .fetch_one(&pool)
         .await?;
+        // 0027: the monthly BYOK allowance. Three columns and one replaced
+        // trigger function. The `byok_catalog_usd` column on the ROLLUP is the
+        // one worth probing by name — it is what makes the allowance readable
+        // in one indexed probe instead of a scan of the customer's month — and
+        // the accrual function is checked for actually mentioning it, because a
+        // migration that added the column and left 0019's original function in
+        // place would leave every bucket permanently at zero and silently give
+        // the allowance away to everyone forever.
+        let byok_allowance_exists = query_scalar::<_, bool>(
+            r#"
+            SELECT EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_name = 'usage_key_month_spend'
+                  AND column_name = 'byok_catalog_usd'
+                  AND is_nullable = 'NO'
+            ) AND EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_name = 'usage_events'
+                  AND column_name = 'byok_catalog_usd'
+                  AND is_nullable = 'YES'
+                  AND column_default IS NULL
+            ) AND EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_name = 'usage_reservations'
+                  AND column_name = 'byok_catalog_basis_usd'
+                  AND is_nullable = 'YES'
+            ) AND EXISTS (
+                SELECT 1 FROM pg_proc
+                WHERE proname = 'accrue_usage_key_month_spend'
+                  AND prosrc LIKE '%byok_catalog_usd%'
+            )
+            "#,
+        )
+        .fetch_one(&pool)
+        .await?;
         let version = query_scalar::<_, i64>("SELECT MAX(version) FROM _sqlx_migrations")
             .fetch_one(&pool)
             .await?;
@@ -1096,6 +1144,7 @@ async fn migration_chain_applies_on_a_fresh_database() {
             key_limits_exist,
             key_limit_columns_are_nullable_with_no_default,
             byok_keys_exist,
+            byok_allowance_exists,
             version,
         ))
     }
@@ -1204,16 +1253,23 @@ async fn migration_chain_applies_on_a_fresh_database() {
          before BYOK existed must read NULL rather than a FALSE asserting \
          something nobody recorded"
     );
-    // 26, not 22: 0013 (dispute resolution), 0014 (dispatched reservations),
+    assert!(
+        outcome.20,
+        "the 0027 allowance columns exist after the chain — the rollup's \
+         accumulator, the catalog basis on usage_events, and the in-flight \
+         commitment on usage_reservations — and 0019's accrual function has \
+         been replaced with one that actually accrues the new column"
+    );
+    // 27, not 23: 0013 (dispute resolution), 0014 (dispatched reservations),
     // 0015 (released reservations), 0016 (deposit fee), 0017 (stripe observed
     // reversals), 0018 (autopay withheld state), 0019 (monthly spend rollup),
     // 0020 (usage gap and real finish reason), 0021 (autopay tax), 0022
     // (checkout intent cleanup), 0023 (key expiry and credit limits), 0024
-    // (autopay tax lifecycle), 0025 (redemption tax) and 0026 (byok provider
-    // keys) are numbered with a gap so 0010-0012 stay available to branches in
-    // flight. The chain's head is the highest version applied, not a count of
-    // files.
-    assert_eq!(outcome.20, 26, "the chain reaches migration version 26");
+    // (autopay tax lifecycle), 0025 (redemption tax), 0026 (byok provider
+    // keys) and 0027 (byok monthly allowance) are numbered with a gap so
+    // 0010-0012 stay available to branches in flight. The chain's head is the
+    // highest version applied, not a count of files.
+    assert_eq!(outcome.21, 27, "the chain reaches migration version 27");
 }
 
 /// Rewrite the database name in a Postgres URL, keeping any query string

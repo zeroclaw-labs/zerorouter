@@ -34,6 +34,28 @@ export interface Me {
    * than a form whose every submission would be refused. Optional in the type
    * so an older router cannot crash this page. */
   byok_providers?: string[]
+  /** Where you stand against this month's free BYOK allowance. ABSENT when
+   * bring-your-own-key is not configured here, on the same contract as the
+   * empty provider list above.
+   *
+   * All three figures come from the server rather than being derived here. The
+   * allowance is a number ZeroRouter chose and may revise, so a portal that
+   * subtracted against its own hardcoded copy would keep showing the old
+   * promise after a change — and this panel is where a customer reads what
+   * they will be billed. */
+  byok_allowance?: ByokAllowance
+}
+
+/** This month's free BYOK allowance, as `/api/me` reports it. Amounts are
+ * decimal strings for the same reason every other money field here is: a
+ * JavaScript number cannot hold the router's exact `Decimal`. */
+export interface ByokAllowance {
+  allowance_usd: string
+  /** Catalog-equivalent BYOK usage settled this UTC month. Keeps growing past
+   * the allowance — it is a usage figure, not a countdown. */
+  consumed_usd: string
+  /** What is left, floored at zero. */
+  remaining_usd: string
 }
 
 /** One attached provider key, as the portal is ever allowed to see it.
