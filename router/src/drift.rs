@@ -300,6 +300,36 @@ pub enum MetadataDriftKind {
     /// omits the field and each client substitutes its own default (ZeroClaw:
     /// 32,000 tokens and no vision). Worth closing, but not a lie.
     Undeclared,
+    /// The file claims LESS than the source does, on a field where claiming
+    /// less is a true statement.
+    ///
+    /// **models.dev describes the MODEL; `tiers.toml` describes the LANE**, and
+    /// a lane may carry less than the model it dispatches to. The catalog
+    /// advertised `pdf`, `video` and `audio` on rows whose wire had no mapping
+    /// for any of them, so a client that believed the row built a request that
+    /// 400'd; `#102` removed those claims from the lanes rather than teaching
+    /// the wire to carry them, and recorded the reasoning in `tiers.toml`'s own
+    /// header. That left thirteen rows where the file is deliberately, honestly
+    /// narrower than the source — and reporting them as `Disagrees` made the
+    /// command permanently red on the state the project had just decided was
+    /// correct.
+    ///
+    /// **The relaxation is strictly one-directional and that is the whole
+    /// safety argument.** A lane claiming a subset of what the model can take
+    /// under-promises, and the request path enforces it: a modality the lane
+    /// does not declare is refused at the capability gate before any reserve or
+    /// dial. A lane claiming a SUPERSET is the false advertisement that broke
+    /// clients, so extra modalities remain [`Self::Disagrees`] and remain
+    /// actionable. Widening this to a set-difference in both directions would
+    /// re-open exactly the defect `#102` closed.
+    ///
+    /// It PRINTS on every run rather than passing silently, for the reason
+    /// [`Verdict::NotCoveredBySource`] prints its reason: this is a place the
+    /// reconciliation is deliberately not asking a question, and an exemption
+    /// nobody re-reads is indistinguishable from a lane somebody forgot. The
+    /// row shows what the lane declines to carry, so the day a wire learns to
+    /// carry it, the gap to close is already on screen.
+    Narrowed,
 }
 
 impl MetadataDriftKind {
@@ -308,6 +338,7 @@ impl MetadataDriftKind {
         match self {
             Self::Disagrees => "METADATA DRIFT",
             Self::Undeclared => "undeclared",
+            Self::Narrowed => "lane narrower",
         }
     }
 
@@ -318,6 +349,11 @@ impl MetadataDriftKind {
     /// silent — absence means "unknown", which is a true statement — and
     /// failing CI on a legal, honest omission is how an alarm gets ignored.
     /// It still prints, because the omission has a real cost downstream.
+    ///
+    /// Neither does `Narrowed`, and for a stronger reason than either: it is
+    /// not a defect at all. A lane that carries less than its model is the
+    /// catalog telling the truth about the wire, which is the state `#102`
+    /// worked to reach — see that variant.
     #[must_use]
     pub const fn is_actionable(&self) -> bool {
         matches!(self, Self::Disagrees)
@@ -574,71 +610,108 @@ fn rates_agree(recorded: ModelRates, upstream: ModelRates) -> bool {
 /// its own default — but it is a gap rather than a false claim, which is why
 /// [`MetadataDriftKind`] keeps the two apart.
 ///
-/// Modalities compare as sets. The two catalogs have no reason to agree on
-/// ordering, and a reordered list is not drift.
+/// Modalities compare as sets, and ASYMMETRICALLY. Ordering is never drift —
+/// the two catalogs have no reason to agree on it — and neither is the file
+/// claiming a subset of what the source publishes, because the two are
+/// describing different things: models.dev describes the model, `tiers.toml`
+/// describes the lane, and a lane may carry less than the model it dispatches
+/// to. A lane claiming MORE than the model still is drift. See
+/// [`MetadataDriftKind::Narrowed`].
 #[must_use]
 fn metadata_drift(recorded: &ModelMetadata, upstream: &ModelMetadata) -> Vec<MetadataDrift> {
     let mut out = Vec::new();
 
-    let mut compare =
-        |field: &'static str, recorded: Option<String>, upstream: Option<String>, agree: bool| {
-            let Some(upstream) = upstream else {
-                return;
-            };
-            match recorded {
-                None => out.push(MetadataDrift {
-                    field,
-                    kind: MetadataDriftKind::Undeclared,
-                    recorded: "-".to_owned(),
-                    upstream,
-                }),
-                Some(recorded) if !agree => out.push(MetadataDrift {
-                    field,
-                    kind: MetadataDriftKind::Disagrees,
-                    recorded,
-                    upstream,
-                }),
-                Some(_) => {}
-            }
-        };
+    // A free function rather than a closure capturing `out`: the modality arm
+    // below pushes to `out` too, and a capturing closure would hold the only
+    // mutable borrow for the whole body — forcing modalities to be compared
+    // last and silently reordering the report.
+    fn compare(
+        field: &'static str,
+        recorded: Option<String>,
+        upstream: Option<String>,
+        agree: bool,
+    ) -> Option<MetadataDrift> {
+        let upstream = upstream?;
+        match recorded {
+            None => Some(MetadataDrift {
+                field,
+                kind: MetadataDriftKind::Undeclared,
+                recorded: "-".to_owned(),
+                upstream,
+            }),
+            Some(recorded) if !agree => Some(MetadataDrift {
+                field,
+                kind: MetadataDriftKind::Disagrees,
+                recorded,
+                upstream,
+            }),
+            Some(_) => None,
+        }
+    }
 
-    compare(
+    out.extend(compare(
         "context_window",
         recorded.context_window.map(|v| v.to_string()),
         upstream.context_window.map(|v| v.to_string()),
         recorded.context_window == upstream.context_window,
-    );
-    compare(
+    ));
+    out.extend(compare(
         "max_output_tokens",
         recorded.max_output_tokens.map(|v| v.to_string()),
         upstream.max_output_tokens.map(|v| v.to_string()),
         recorded.max_output_tokens == upstream.max_output_tokens,
-    );
-    let sorted = |modalities: &Option<Vec<String>>| {
-        modalities.as_ref().map(|modalities| {
-            let mut modalities = modalities.clone();
-            modalities.sort();
-            modalities
-        })
-    };
-    compare(
-        "input_modalities",
-        recorded
-            .input_modalities
-            .as_ref()
-            .map(|modalities| modalities.join(",")),
-        upstream
-            .input_modalities
-            .as_ref()
-            .map(|modalities| modalities.join(",")),
-        sorted(&recorded.input_modalities) == sorted(&upstream.input_modalities),
-    );
-    compare(
+    ));
+    // Modalities are the one field where the two catalogs are not making the
+    // same KIND of claim, so they cannot be compared for equality. models.dev
+    // describes what the MODEL accepts; this file describes what the LANE
+    // carries, and a lane is free to carry less. See `MetadataDriftKind::
+    // Narrowed` for the argument and for why the relaxation runs one way only.
+    match (&recorded.input_modalities, &upstream.input_modalities) {
+        // Source silent: nothing to check, exactly as everywhere else here.
+        (_, None) => {}
+        (None, Some(upstream)) => out.push(MetadataDrift {
+            field: "input_modalities",
+            kind: MetadataDriftKind::Undeclared,
+            recorded: "-".to_owned(),
+            upstream: upstream.join(","),
+        }),
+        (Some(recorded_list), Some(upstream_list)) => {
+            // What the lane claims that the model does not: the false
+            // advertisement, and the only direction that is a defect.
+            let overclaimed: Vec<&str> = recorded_list
+                .iter()
+                .filter(|modality| !upstream_list.contains(modality))
+                .map(String::as_str)
+                .collect();
+            // What the model takes that the lane declines to carry.
+            let withheld: Vec<&str> = upstream_list
+                .iter()
+                .filter(|modality| !recorded_list.contains(modality))
+                .map(String::as_str)
+                .collect();
+            if !overclaimed.is_empty() {
+                out.push(MetadataDrift {
+                    field: "input_modalities",
+                    kind: MetadataDriftKind::Disagrees,
+                    recorded: recorded_list.join(","),
+                    upstream: upstream_list.join(","),
+                });
+            } else if !withheld.is_empty() {
+                out.push(MetadataDrift {
+                    field: "input_modalities",
+                    kind: MetadataDriftKind::Narrowed,
+                    recorded: recorded_list.join(","),
+                    upstream: upstream_list.join(","),
+                });
+            }
+        }
+    }
+    out.extend(compare(
         "tool_call",
         recorded.tool_call.map(|v| v.to_string()),
         upstream.tool_call.map(|v| v.to_string()),
         recorded.tool_call == upstream.tool_call,
-    );
+    ));
 
     out
 }
@@ -1321,6 +1394,146 @@ mod tests {
         let found = reconcile(&catalog, SOURCE);
         assert_eq!(found[0].metadata_drift, vec![]);
         assert!(!found[0].has_actionable_metadata_drift());
+    }
+
+    // -----------------------------------------------------------------------
+    // Lane modalities vs model modalities. The relaxation runs ONE WAY, and
+    // both directions are asserted here together on purpose: the value of the
+    // rule is the difference between them, and a pair of tests in separate
+    // places would let someone "fix" the first by deleting the second.
+    // -----------------------------------------------------------------------
+
+    /// A lane that carries less than its model is the catalog telling the truth
+    /// about the wire — the state `#102` worked to reach, when `pdf` came off
+    /// thirteen rows no adapter could carry it on. It must not fail the command.
+    #[test]
+    fn a_lane_carrying_less_than_the_model_is_not_actionable_drift() {
+        let catalog = catalog_declaring(
+            "claude-sonnet-5",
+            rates(2.0, 0.2, 10.0),
+            rates(2.0, 0.2, 10.0),
+            ModelMetadata {
+                // The source publishes text,image,pdf; the wire carries no PDF.
+                input_modalities: Some(vec!["text".to_owned(), "image".to_owned()]),
+                ..sonnet_metadata()
+            },
+        );
+        let found = reconcile(&catalog, SOURCE);
+
+        assert!(
+            !found[0].has_actionable_metadata_drift(),
+            "a lane may carry less than the model it dispatches to"
+        );
+        assert_eq!(found[0].row_label(), "ok");
+        // It still PRINTS, so the gap an operator could close one day stays
+        // visible rather than becoming a silent skip.
+        assert_eq!(
+            found[0].metadata_drift,
+            vec![MetadataDrift {
+                field: "input_modalities",
+                kind: MetadataDriftKind::Narrowed,
+                recorded: "text,image".to_owned(),
+                upstream: "text,image,pdf".to_owned(),
+            }]
+        );
+    }
+
+    /// The direction that must stay red: a lane advertising a modality the
+    /// model does not take is the false claim that broke clients before `#102`
+    /// — a request built on that row reaches an upstream that refuses it.
+    #[test]
+    fn a_lane_claiming_more_than_the_model_is_still_actionable_drift() {
+        // `claude-sonnet-5` in SOURCE takes text,image,pdf — never video.
+        let catalog = catalog_declaring(
+            "claude-sonnet-5",
+            rates(2.0, 0.2, 10.0),
+            rates(2.0, 0.2, 10.0),
+            ModelMetadata {
+                input_modalities: Some(vec![
+                    "text".to_owned(),
+                    "image".to_owned(),
+                    "pdf".to_owned(),
+                    "video".to_owned(),
+                ]),
+                ..sonnet_metadata()
+            },
+        );
+        let found = reconcile(&catalog, SOURCE);
+
+        assert!(
+            found[0].has_actionable_metadata_drift(),
+            "advertising a modality no wire carries is the defect #102 closed"
+        );
+        assert_eq!(
+            found[0].metadata_drift[0].kind,
+            MetadataDriftKind::Disagrees
+        );
+        assert_eq!(found[0].row_label(), "METADATA DRIFT");
+    }
+
+    /// Overclaiming AND withholding at once is still a defect. The false claim
+    /// is the fact that matters, so it wins the row rather than being masked by
+    /// the honest narrowing sitting beside it.
+    #[test]
+    fn overclaiming_wins_over_narrowing_when_a_lane_does_both() {
+        let catalog = catalog_declaring(
+            "claude-sonnet-5",
+            rates(2.0, 0.2, 10.0),
+            rates(2.0, 0.2, 10.0),
+            ModelMetadata {
+                // Drops `pdf` (honest) and adds `video` (a false claim).
+                input_modalities: Some(vec![
+                    "text".to_owned(),
+                    "image".to_owned(),
+                    "video".to_owned(),
+                ]),
+                ..sonnet_metadata()
+            },
+        );
+        let found = reconcile(&catalog, SOURCE);
+        assert_eq!(found[0].metadata_drift.len(), 1);
+        assert_eq!(
+            found[0].metadata_drift[0].kind,
+            MetadataDriftKind::Disagrees
+        );
+        assert!(found[0].has_actionable_metadata_drift());
+    }
+
+    /// An exact match stays silent: the narrowing did not turn agreement into a
+    /// permanent advisory row.
+    #[test]
+    fn a_lane_matching_the_model_exactly_reports_nothing_at_all() {
+        let catalog = catalog_declaring(
+            "claude-sonnet-5",
+            rates(2.0, 0.2, 10.0),
+            rates(2.0, 0.2, 10.0),
+            sonnet_metadata(),
+        );
+        assert_eq!(reconcile(&catalog, SOURCE)[0].metadata_drift, vec![]);
+    }
+
+    /// The other fields did NOT get the subset treatment. A context window is a
+    /// single number describing one capability, not a set of capabilities a
+    /// lane may decline to carry, and a lane understating it means long-context
+    /// work quietly truncated — a defect, not a conservative claim.
+    #[test]
+    fn a_smaller_context_window_is_still_drift_and_not_a_narrowing() {
+        let catalog = catalog_declaring(
+            "claude-sonnet-5",
+            rates(2.0, 0.2, 10.0),
+            rates(2.0, 0.2, 10.0),
+            ModelMetadata {
+                context_window: Some(200_000),
+                ..sonnet_metadata()
+            },
+        );
+        let found = reconcile(&catalog, SOURCE);
+        assert!(found[0].has_actionable_metadata_drift());
+        assert_eq!(found[0].metadata_drift[0].field, "context_window");
+        assert_eq!(
+            found[0].metadata_drift[0].kind,
+            MetadataDriftKind::Disagrees
+        );
     }
 
     #[test]

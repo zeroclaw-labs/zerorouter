@@ -156,11 +156,25 @@ schema_version = 1
 # This is the same rule the xAI lanes below already argue at length — "a
 # client that believes it can send an image builds a request that fails" —
 # applied in the direction that costs the catalog a capability rather than
-# gaining one. Expect `admin catalog-drift` to report `input_modalities` rows
-# against models.dev for the lanes above: models.dev describes the MODEL and
-# is right about it, while this file describes the lane. That divergence is
-# the honest state and should not be closed by re-adding a claim the wire
-# cannot honour.
+# gaining one. `admin catalog-drift` reports `input_modalities` rows against
+# models.dev for the lanes above: models.dev describes the MODEL and is right
+# about it, while this file describes the lane. That divergence is the honest
+# state and should not be closed by re-adding a claim the wire cannot honour.
+#
+# THE DRIFT COMMAND WAS TAUGHT THE DIFFERENCE (2026-08-21). Those thirteen rows
+# were reported as `METADATA DRIFT` and failed the command, which made
+# `catalog-drift` permanently red on the state this file had just deliberately
+# reached — the exact way an alarm stops being read. They now report as
+# `lane narrower`: still printed on every run, so the capability a lane declines
+# to carry stays visible and the gap to close the day a wire learns to carry it
+# is already on screen, but not actionable, because a lane carrying less than
+# its model is a true statement.
+#
+# THE RELAXATION RUNS ONE WAY ONLY. A lane claiming a modality the model does
+# NOT take is still `METADATA DRIFT` and still fails — that is the false
+# advertisement this whole section was written to remove, and re-opening it in
+# the name of symmetry would undo the work above. Both directions are pinned by
+# test in `src/drift.rs`.
 
 # ---------------------------------------------------------------------------
 # RETENTION POSTURE (2026-08-20) — what each upstream does with a request after
@@ -260,23 +274,59 @@ verified = "2026-08-20"
 source_sha256 = "87ca1f39c855689a6b829655ad34d46cc10b5e0d261e41bd138cf465f0710407"
 openrouter_slug = "anthropic"
 
-# EXPECT THIS ONE TO GO RED MOST OFTEN. `developers.openai.com` is a docs app
-# whose rendered page includes the whole site navigation, so its visible text
-# moves whenever OpenAI publishes ANY unrelated doc — the digest below was
-# re-pinned once within an hour of first being taken, for a change that touched
-# nothing about retention. The retention prose itself has been stable.
+# THE PIN THAT OUTGREW WHOLE-PAGE HASHING, and the narrowing its own comment
+# asked for. `developers.openai.com` is a docs app whose rendered page includes
+# the whole site navigation, so its visible text moved whenever OpenAI published
+# ANY unrelated doc. The note here used to read "EXPECT THIS ONE TO GO RED MOST
+# OFTEN" and predicted the fix:
 #
-# That is the mechanism working as designed rather than a defect: the check
-# says "a human must look", not "the posture flipped". But if re-pinning this
-# becomes frequent enough to be ignored, narrow the evidence rather than
-# lowering the bar — hash a bounded extract around the retention section, or
-# pin a more stable URL. Muting the check would be the one unacceptable fix.
+#   "if re-pinning this becomes frequent enough to be ignored, narrow the
+#    evidence rather than lowering the bar — hash a bounded extract around the
+#    retention section [...] Muting the check would be the one unacceptable fix."
+#
+# It became that frequent: THREE re-pins in roughly two days (2026-08-20 twice,
+# 2026-08-21), every one of them a docs deploy that touched nothing about
+# retention, with the retention prose itself unchanged throughout. Past that
+# rate the false positive IS the failure — an alarm cleared without reading is
+# worse than no alarm, because it still looks like one. So the deferred
+# narrowing is now implemented and this is its first use.
+#
+# WHAT IS HASHED NOW: 2,000 characters of normalized text running forward from
+# the anchor below, and nothing else. The site navigation renders AHEAD of the
+# content, so it is outside the extract by construction and can churn without
+# limit. The three commitments this pin's description rests on all sit inside
+# that window, verified on 2026-08-21:
+#
+#   1. "As of March 1, 2023, data sent to the OpenAI API is not used to train
+#      or improve OpenAI models (unless you explicitly opt in to share data
+#      with us)."
+#   2. "By default, abuse monitoring logs are generated for all API feature
+#      usage and retained for up to 30 days, unless longer retention is
+#      required by law, or is reasonably necessary to protect our services or
+#      any third party from harm."
+#   3. "Eligible customers may have their customer content excluded from these
+#      abuse monitoring logs [...] by getting approved for the Zero Data
+#      Retention or Modified Abuse Monitoring controls. Currently, these
+#      controls are subject to prior approval by OpenAI."
+#
+# Item 3 is why `standard` is still the right label and is quoted rather than
+# summarized: ZDR here is a thing OpenAI grants on application, not a default,
+# and this account does not hold it. The day that changes, this pin does.
+#
+# THE NARROWING DOES NOT LOWER THE BAR. Inside the window a reworded sentence
+# moves the digest exactly as it always did — "30 days" becoming "90 days" is
+# still caught. What it stops is the navigation being able to raise an alarm.
+# And it cannot fail soft: if the anchor stops appearing exactly once, the
+# command reports PAGE CHANGED and offers NO digest to copy, because an
+# extractor that has lost its anchor knows nothing about the page. See
+# `src/retention.rs`.
 [retention.openai]
 posture = "standard"
 description = "OpenAI retains API inputs and outputs in abuse-monitoring logs for up to 30 days, unless longer retention is required by law; API data is not used to train its models."
 source_url = "https://developers.openai.com/api/docs/guides/your-data"
-verified = "2026-08-20"
-source_sha256 = "66b8f42859a4b3f4b88349d7059057f077a50b994607cf77e99b35aa11bfa4cf"
+verified = "2026-08-21"
+source_sha256 = "8c952bdac87ec2a07c78a08df12b6d65595b4bff7b9fdefabe5fae1c55b4dcf5"
+source_extract_anchors = ["Your data is your data."]
 openrouter_slug = "openai"
 
 # Google publishes NO retention window for the paid Gemini API — the terms say
@@ -683,12 +733,58 @@ openrouter_slug = "xai"
 # flagged prompt CAN be logged on their side for up to 90 days — so the label
 # says so. This is also what the operator's exception filing told Google the
 # catalog says.
+# RE-PINNED 2026-08-21 AFTER A PRODUCT RENAME, not a policy change. Google
+# renamed Vertex AI's generative-AI surface to "Gemini Enterprise Agent
+# Platform", and `source_url` below now 301-redirects to
+# `.../gemini-enterprise-agent-platform/resources/zero-data-retention`. The URL
+# is deliberately left as the vertex-ai one: it is the address a human verified
+# from, it still resolves, and rewriting a pin's `source_url` to a redirect
+# target would quietly change WHICH document the claim cites. If Google ever
+# breaks the redirect the command reports UNREACHABLE, which is the correct
+# outcome — a pin whose evidence cannot be reached has lost its loop.
+#
+# ALL FOUR PINNED FACTS RE-READ ON THE RENAMED PAGE (2026-08-21) and every one
+# still holds, restructured but not weakened:
+#
+#   1. TRAINING — "Google won't use your data to train or fine-tune any AI/ML
+#      models without your prior permission or instruction. This applies to all
+#      managed models [...] including GA and pre-GA models."
+#   2. IN-MEMORY CACHE — "cache Customer Data (inputs, outputs, and derived
+#      data) in-memory [...] stored only in-memory (not at-rest), is isolated at
+#      the project level, and has a 24-hour TTL [...] This feature can be
+#      disabled at the project level." (ZeroRouter disables it; the live
+#      cacheConfig GET above is the half a page hash cannot check.)
+#   3. ABUSE MONITORING — "Google may log prompts to detect potential abuse
+#      [...] If you are in scope for prompt logging for abuse monitoring and
+#      want zero data retention, you can request an exception for abuse
+#      monitoring." This is the open item that keeps the posture `standard`.
+#   4. REQUEST-RESPONSE LOGGING — "This feature is disabled by default."
+#
+# NARROWED EVIDENCE, and this page needs it more than OpenAI's did: 38,000 of
+# its 50,000 normalized characters are the Vertex AI API reference navigation —
+# every resource, method and type name in the product — so roughly 76% of the
+# whole-page digest was text that is not evidence and changes whenever Google
+# ships an API. Three anchors, one per region the four facts live in (1 and 3
+# share a window), 2,000 characters forward from each.
+#
+# The anchors are apostrophe-free on purpose: the page writes "won't" with a
+# straight quote today, and a CMS switching to a curly one would redden the pin
+# for a typographic change. They are also matched CASE-SENSITIVELY, which is why
+# the training anchor is the prose and not the "Training restriction" heading —
+# that heading sits directly above a quotation of the contractual term
+# "Training Restriction", so case-insensitive matching would find it twice and
+# report an ambiguous anchor on a page nobody had touched.
 [retention.vertex]
 posture = "standard"
 description = "Vertex AI on ZeroRouter's dedicated Google Cloud project: in-memory caching disabled, no request-response logging, and Google does not train on customer data. Pending Google's approval of the project's abuse-monitoring exception, prompts flagged by Google's abuse systems can be retained by Google for up to 90 days — until that approval lands this lane is labelled as subject to provider retention."
 source_url = "https://docs.cloud.google.com/vertex-ai/generative-ai/docs/data-governance"
 verified = "2026-08-21"
-source_sha256 = "af2eeb047bd207573da072b70489442daf66dc15cb08a984adaf4b389c0d5cdc"
+source_sha256 = "4f53b20a6c4e9810bcb035db83b997b604720cd21598e6f35341e63d1aaaeeca"
+source_extract_anchors = [
+  "use your data to train or fine-tune any AI/ML models",
+  "Request-response logging",
+  "In-memory data caching",
+]
 openrouter_slug = "google-vertex"
 
 # ---------------------------------------------------------------------------

@@ -33,6 +33,30 @@
 //! layout change, and it is not meant to be: the design accepts a false
 //! positive (a human reads a page that did not really change) to avoid a false
 //! negative (a policy quietly moves and nobody looks).
+//!
+//! ## Why some pins hash only part of the page
+//!
+//! That trade has a limit, and `developers.openai.com` found it: a docs app
+//! renders its entire site navigation into the page's visible text, so the
+//! digest moves whenever the vendor publishes ANY unrelated document. It
+//! churned three times in two days on deploys that touched nothing about
+//! retention. Past some rate a false positive stops being a tolerable cost and
+//! becomes the failure itself — an alarm that cries wolf daily is one a team
+//! learns to clear without reading, which is worse than no alarm because it
+//! still looks like one.
+//!
+//! The fix is to narrow the EVIDENCE, never to lower the bar: a pin may declare
+//! [`crate::config::RetentionPin::source_extract_anchors`], and then the digest
+//! is taken over bounded regions around those anchors instead of the whole
+//! page. Inside a region nothing is relaxed — a reworded sentence moves the
+//! digest exactly as before. Outside it, text that was never evidence stops
+//! being able to raise an alarm.
+//!
+//! The one thing such a mechanism must never do is fail soft. An extractor that
+//! loses its anchor and hashes an empty string would report UNCHANGED forever
+//! against a page saying anything at all. So [`extract`] has no fallback: a
+//! missing or ambiguous anchor is reported as `PAGE CHANGED`, with no observed
+//! digest offered to copy.
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -247,15 +271,138 @@ fn find_ascii_ci(haystack: &str, needle: &str) -> Option<usize> {
 /// `source_sha256` and the value printed when it no longer matches.
 #[must_use]
 pub fn digest(document: &str) -> String {
+    hash(&normalize(document))
+}
+
+/// Hex SHA-256 of an already-normalized (or already-extracted) string.
+fn hash(text: &str) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(normalize(document).as_bytes());
+    hasher.update(text.as_bytes());
     hex::encode(hasher.finalize())
+}
+
+/// How much normalized text one anchor selects, in CHARACTERS, counting from
+/// the first character of the anchor itself.
+///
+/// Characters and not bytes, and that is not a detail: these are marketing and
+/// legal pages, routinely carrying curly quotes and accented names, and slicing
+/// a `str` at a byte offset that lands mid-codepoint panics. The same class of
+/// bug is recorded in [`normalize`]'s own comment, which is why this file
+/// counts what it can count safely.
+///
+/// One constant rather than a per-pin window, deliberately. A window is a
+/// second number an author can get wrong in a direction that is invisible —
+/// set it too small and the digest silently stops covering the sentence the
+/// posture rests on, while every run still reports UNCHANGED. Anchors are the
+/// tunable; a pin that needs to cover more ground adds another anchor, which
+/// is a change whose effect is visible in the extract rather than hidden in a
+/// length. 2,000 characters is roughly two screens of prose and was chosen by
+/// measuring the two pages that needed it: OpenAI's three commitments span
+/// ~1,800 characters from the section's opening sentence.
+const EXTRACT_WINDOW_CHARS: usize = 2_000;
+
+/// Separator between the windows of a multi-anchor extract.
+///
+/// Present so two adjacent windows cannot be forged into one another by text
+/// moving across the boundary: without it, content shifting from the tail of
+/// one window to the head of the next could leave the concatenation identical
+/// while the page genuinely changed.
+const EXTRACT_JOIN: &str = "\n\u{241f}\n";
+
+/// Reduce normalized page text to the bounded regions `anchors` select, or say
+/// why that could not be done.
+///
+/// **This is the narrowing that keeps the check readable, and its whole safety
+/// argument is that it fails LOUDLY.** The failure it exists to prevent is not
+/// a false alarm — those are merely annoying — it is a silent pass: an
+/// extractor that cannot find its anchor, hashes the empty string, and reports
+/// UNCHANGED forever while the policy page it was supposed to be watching says
+/// whatever it likes. So there is no fallback path here. Every way this can
+/// fail returns an error that the caller turns into `PAGE CHANGED`, which is
+/// the same verdict a rewritten page gets, and it is the right one: an anchor
+/// that has moved IS the page having changed in the region that matters.
+///
+/// Two conditions, both required, both reported rather than worked around:
+///
+/// - **Exactly zero** occurrences: the sentence the evidence was read from is
+///   gone. Nothing to hash, and nothing legitimate to conclude.
+/// - **More than one**: the anchor no longer identifies a unique place, so
+///   which region gets hashed would depend on document order — and a later
+///   edit could move the extract to a different part of the page while the
+///   digest kept matching. An ambiguous anchor is not a bounded extract.
+///
+/// Matching is **case-sensitive**, which is a deliberate choice and not an
+/// oversight. Vertex's page carries the heading `Training restriction` directly
+/// above a quotation of the contractual term `"Training Restriction"`; matched
+/// case-insensitively that anchor is ambiguous and the pin would be red on a
+/// page nobody had edited. Case is also information on a legal page — a term
+/// of art that stops being capitalized has stopped being a defined term — so
+/// treating a case change as an edit worth a human's attention is correct on
+/// its own merits.
+///
+/// The extract runs FORWARD from each anchor and never backward, which is what
+/// makes it immune to the churn it was built for: navigation renders ahead of
+/// the content, so an arbitrary amount of it can appear, disappear, or be
+/// reordered above the anchor without moving the digest by one bit.
+pub fn extract(normalized: &str, anchors: &[String]) -> Result<String, String> {
+    let mut regions = Vec::with_capacity(anchors.len());
+    for anchor in anchors {
+        let mut found = normalized.match_indices(anchor.as_str());
+        let Some((at, _)) = found.next() else {
+            return Err(format!(
+                "the extract anchor {anchor:?} no longer appears on the page, so the evidence \
+                 this pin was read from cannot be located"
+            ));
+        };
+        if found.next().is_some() {
+            let total = normalized.matches(anchor.as_str()).count();
+            return Err(format!(
+                "the extract anchor {anchor:?} appears {total} times, so it no longer identifies \
+                 one region; narrow it to a phrase unique to the retention section"
+            ));
+        }
+        regions.push(
+            normalized[at..]
+                .chars()
+                .take(EXTRACT_WINDOW_CHARS)
+                .collect::<String>(),
+        );
+    }
+    Ok(regions.join(EXTRACT_JOIN))
+}
+
+/// The text a pin's digest is taken over: the whole normalized page, or the
+/// bounded extract its anchors select.
+pub fn evidence(pin: &RetentionPin, document: &str) -> Result<String, String> {
+    let normalized = normalize(document);
+    if pin.source_extract_anchors.is_empty() {
+        return Ok(normalized);
+    }
+    extract(&normalized, &pin.source_extract_anchors)
 }
 
 /// Compare one pinned claim against a document fetched or read for it.
 #[must_use]
 pub fn check(subject: &str, pin: &RetentionPin, document: &str) -> ProviderCheck {
-    let observed = digest(document);
+    let observed = match evidence(pin, document) {
+        Ok(evidence) => hash(&evidence),
+        // An extract that could not be taken reports CHANGED with the reason
+        // and NO observed digest. Withholding the digest is the point: every
+        // other `Changed` row prints one so re-pinning is a copy-paste, and a
+        // number printed here would be a digest of whatever the broken
+        // extractor happened to produce. Copying it would pin the pin to
+        // nothing and turn this check off permanently, which is precisely the
+        // silent pass the anchor mechanism exists to make impossible.
+        Err(error) => {
+            return ProviderCheck {
+                subject: subject.to_owned(),
+                pin: pin.clone(),
+                verdict: Verdict::Changed,
+                observed_sha256: None,
+                error: Some(error),
+            };
+        }
+    };
     let verdict = if observed.eq_ignore_ascii_case(pin.source_sha256.trim()) {
         Verdict::Unchanged
     } else {
@@ -584,7 +731,16 @@ mod tests {
             source_url: "https://example.test/policy".to_owned(),
             verified: "2026-08-20".to_owned(),
             source_sha256: sha.to_owned(),
+            source_extract_anchors: Vec::new(),
             openrouter_slug: None,
+        }
+    }
+
+    /// `pin`, narrowed to the regions `anchors` select.
+    fn anchored(sha: &str, anchors: &[&str]) -> RetentionPin {
+        RetentionPin {
+            source_extract_anchors: anchors.iter().map(|a| (*a).to_owned()).collect(),
+            ..pin(RetentionPosture::Standard, sha)
         }
     }
 
@@ -666,6 +822,200 @@ mod tests {
             stale.observed_sha256.as_deref(),
             Some(digest(document).as_str())
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // The bounded extract. Everything here is about one property: the check may
+    // become QUIETER about text that was never evidence, and must never become
+    // quieter about text that is.
+    // -----------------------------------------------------------------------
+
+    /// A docs app renders its whole site navigation into the page's visible
+    /// text, so the whole-page digest moves when the vendor publishes anything
+    /// at all. This is the case the mechanism was built for, and both halves
+    /// are asserted together on purpose: the value of the narrowing IS the
+    /// difference between them.
+    #[test]
+    fn nav_churn_moves_the_whole_page_digest_but_not_the_extract() {
+        let with_nav = |nav: &str| {
+            format!(
+                "<body><nav>{nav}</nav>\
+                 <p>Your data is your data. Retained for up to 30 days.</p>\
+                 <footer>unrelated</footer></body>"
+            )
+        };
+        let monday = with_nav("Docs Guides Pricing");
+        let tuesday = with_nav("Docs Guides Pricing Changelog NewProduct Blog");
+
+        // Whole-page: the two disagree, which is the false alarm being fixed.
+        assert_ne!(digest(&monday), digest(&tuesday));
+
+        // Narrowed to the sentence the posture was read from: identical.
+        let narrowed = anchored(&"0".repeat(64), &["Your data is your data."]);
+        let monday_evidence = evidence(&narrowed, &monday).expect("the anchor is present");
+        let tuesday_evidence = evidence(&narrowed, &tuesday).expect("the anchor is present");
+        assert_eq!(monday_evidence, tuesday_evidence);
+        assert!(monday_evidence.contains("Retained for up to 30 days."));
+        assert!(
+            !monday_evidence.contains("Docs Guides Pricing"),
+            "the navigation is what the extract exists to exclude: {monday_evidence}"
+        );
+    }
+
+    /// The narrowing must not become a way to stop noticing an edit. Text
+    /// INSIDE the window still moves the digest exactly as it always did.
+    #[test]
+    fn an_edit_inside_the_extract_still_moves_the_digest() {
+        let narrowed = anchored(&"0".repeat(64), &["Your data is your data."]);
+        let before = "<body><nav>Docs</nav><p>Your data is your data. Retained 30 days.</p></body>";
+        let after = "<body><nav>Docs</nav><p>Your data is your data. Retained 90 days.</p></body>";
+        assert_ne!(
+            evidence(&narrowed, before).expect("present"),
+            evidence(&narrowed, after).expect("present"),
+            "30 days becoming 90 days is the entire point of the check"
+        );
+    }
+
+    /// **The failure this mechanism lives or dies on.** An extractor that
+    /// cannot find its anchor and hashes the empty string would report
+    /// UNCHANGED forever against a page saying anything at all — a check that
+    /// is switched off while still looking like a check. It must go red.
+    #[test]
+    fn a_vanished_anchor_is_page_changed_and_never_a_silent_pass() {
+        let narrowed = anchored(&"0".repeat(64), &["Your data is your data."]);
+        let rewritten = "<body><nav>Docs</nav><p>We now retain everything forever.</p></body>";
+
+        let error = evidence(&narrowed, rewritten).expect_err("the anchor is gone");
+        assert!(error.contains("no longer appears"), "{error}");
+
+        let found = check("openai", &narrowed, rewritten);
+        assert_eq!(found.verdict, Verdict::Changed);
+        assert!(found.verdict.is_actionable());
+        // And no digest is offered, so the failure cannot be "fixed" by
+        // copy-pasting a number that would pin this to nothing.
+        assert_eq!(found.observed_sha256, None);
+        assert!(found.error.is_some());
+    }
+
+    /// The subtler half: a digest of the empty extract must not be able to
+    /// match a pin. Proven by pinning the hash of the empty string and showing
+    /// a page with no anchor STILL goes red.
+    #[test]
+    fn the_digest_of_an_empty_extract_can_never_satisfy_a_pin() {
+        let empty_hash = hash("");
+        let narrowed = anchored(&empty_hash, &["Your data is your data."]);
+        let found = check(
+            "openai",
+            &narrowed,
+            "<body><p>nothing familiar here</p></body>",
+        );
+        assert_eq!(
+            found.verdict,
+            Verdict::Changed,
+            "a pin holding the empty digest must not be satisfiable by a failed extract"
+        );
+        assert_eq!(found.observed_sha256, None);
+    }
+
+    /// An anchor that has stopped being unique cannot bound anything: which
+    /// region got hashed would depend on document order, and a later edit could
+    /// slide the extract onto different text while the digest kept matching.
+    #[test]
+    fn an_ambiguous_anchor_is_page_changed_rather_than_a_guess() {
+        let narrowed = anchored(&"0".repeat(64), &["Retention policy"]);
+        let twice = "<body><a>Retention policy</a><p>Retention policy: 30 days.</p></body>";
+
+        let error = evidence(&narrowed, twice).expect_err("two occurrences");
+        assert!(error.contains("appears 2 times"), "{error}");
+        assert_eq!(check("openai", &narrowed, twice).verdict, Verdict::Changed);
+    }
+
+    /// Case-sensitivity, and the real page that forced the decision. Vertex's
+    /// heading `Training restriction` sits directly above a quotation of the
+    /// contractual term `"Training Restriction"`; matched case-insensitively
+    /// the anchor is ambiguous and the pin reddens on an unedited page.
+    #[test]
+    fn anchors_match_case_sensitively_so_a_quoted_term_is_not_the_heading() {
+        let page = "<body><h2>Training restriction</h2>\
+                    <p>As outlined in \"Training Restriction\" in the Service Terms, \
+                    Google won't use your data to train.</p></body>";
+        let narrowed = anchored(&"0".repeat(64), &["Training restriction"]);
+        let evidence = evidence(&narrowed, page).expect("exactly one case-sensitive match");
+        assert!(evidence.starts_with("Training restriction"), "{evidence}");
+    }
+
+    /// Several anchors, because a page's retention facts are rarely contiguous
+    /// — Vertex states training, abuse-monitoring, request-response logging and
+    /// caching in four places thousands of characters apart.
+    #[test]
+    fn several_anchors_each_contribute_their_own_region() {
+        let page = "<body><nav>lots of nav</nav>\
+                    <p>Training restriction applies.</p>\
+                    <p>filler</p>\
+                    <p>In-memory data caching has a 24-hour TTL.</p></body>";
+        let narrowed = anchored(
+            &"0".repeat(64),
+            &["Training restriction", "In-memory data caching"],
+        );
+        let evidence = evidence(&narrowed, page).expect("both anchors present");
+        assert!(
+            evidence.contains("Training restriction applies."),
+            "{evidence}"
+        );
+        assert!(evidence.contains("24-hour TTL"), "{evidence}");
+        assert!(!evidence.contains("lots of nav"), "{evidence}");
+    }
+
+    /// One missing anchor out of several is still a failure. A partial extract
+    /// would quietly narrow the evidence further than the author declared.
+    #[test]
+    fn one_missing_anchor_fails_the_whole_extract() {
+        let narrowed = anchored(&"0".repeat(64), &["present here", "gone from the page"]);
+        let error = evidence(&narrowed, "<body><p>present here only</p></body>")
+            .expect_err("the second anchor is absent");
+        assert!(error.contains("gone from the page"), "{error}");
+    }
+
+    /// A pin that declares no anchors keeps hashing the whole page, exactly as
+    /// every pin did before the field existed. Pinned so that adding the
+    /// mechanism cannot quietly change the pins that never opted in.
+    #[test]
+    fn a_pin_without_anchors_still_hashes_the_whole_page() {
+        let page = "<body><nav>Docs</nav><p>We retain inputs for 30 days.</p></body>";
+        let whole = pin(RetentionPosture::Standard, &digest(page));
+        assert!(whole.source_extract_anchors.is_empty());
+        assert_eq!(evidence(&whole, page).expect("no anchors"), normalize(page));
+        assert_eq!(check("anthropic", &whole, page).verdict, Verdict::Unchanged);
+    }
+
+    /// The window is bounded, and bounded in CHARACTERS — these are marketing
+    /// pages, and slicing a `str` at a byte offset landing mid-codepoint
+    /// panics. The same class of bug is recorded in `normalize`'s own comment.
+    #[test]
+    fn the_window_is_bounded_and_counts_characters_not_bytes() {
+        let long = format!("<body><p>ANCHOR {}</p></body>", "é".repeat(4_000));
+        let narrowed = anchored(&"0".repeat(64), &["ANCHOR"]);
+        let evidence = evidence(&narrowed, &long).expect("the anchor is present");
+        assert_eq!(evidence.chars().count(), EXTRACT_WINDOW_CHARS);
+        // Text beyond the window is excluded, which is what makes the extract
+        // bounded rather than "the rest of the page".
+        assert!(evidence.chars().count() < normalize(&long).chars().count());
+    }
+
+    /// The extract runs FORWARD only. Anything above the anchor — which is
+    /// where navigation renders — can change without limit.
+    #[test]
+    fn text_before_the_anchor_never_reaches_the_extract() {
+        let narrowed = anchored(&"0".repeat(64), &["ANCHOR"]);
+        let a = evidence(
+            &narrowed,
+            "<body><p>alpha beta gamma ANCHOR evidence</p></body>",
+        );
+        let b = evidence(
+            &narrowed,
+            "<body><p>totally different preamble ANCHOR evidence</p></body>",
+        );
+        assert_eq!(a.expect("present"), b.expect("present"));
     }
 
     #[test]
