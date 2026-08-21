@@ -380,6 +380,12 @@ input {
 .confirm-row {
   display: inline-flex;
   gap: 8px;
+  /* The confirm pair replaces a single narrow "Revoke" button inside a
+     right-aligned table cell, and the panel clips overflow for its corner
+     radius — so the pair must be allowed to stack rather than widen the
+     table past the clip, or the confirm renders invisibly outside the box. */
+  flex-wrap: wrap;
+  justify-content: flex-end;
 }
 
 /* ── badges ──────────────────────────────────────────────────────────── */
