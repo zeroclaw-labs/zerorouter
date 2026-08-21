@@ -45,12 +45,36 @@ runtime exists. Each item carries the reason it was deferred.
 - **Readiness split (`/readyz`)** — `/healthz` currently serves both
   liveness and readiness; a separate readiness probe (DB reachability,
   migration state) matters at multi-replica rollout.
-- **Auto top-up (off-session payments)** — storing payment mandates and
-  charging off-session is a materially higher Stripe compliance bar than
-  Checkout; explicit prepaid only for now.
+- **Operator resolution for held autopay claims and withheld charges** — two
+  autopay queues are money in a known-bad state with no automated way out, and
+  no admin subcommand either. A claim that outlives the idempotency-retention
+  window is held, never replayed and never deleted (deleting it could drop the
+  only durable handle on a charge that may already have happened), and the
+  one-pending-per-user index means that user's autopay is wedged until someone
+  acts — the deferral named `v2-overdue-autopay-claims-have-no-resolution-path`
+  in `router/src/stripe.rs`. Separately, a charge collected from an account that
+  froze mid-flight has its credit withheld and must be refunded out of band.
+  Both are surfaced at ERROR on every sweep pass with their row identifiers (and
+  for withheld, the taxed figure to refund), which is what makes them
+  actionable; what is missing is the `admin` read/resolve pair every other
+  quarantine queue in this repo has (`owed-settlements` → `settle-owed`,
+  `disputes list` → `disputes resolve`). Deferred because the safe half — never
+  losing or double-charging the money — is done, and the resolution half needs a
+  refund-issuing surface that does not exist yet (see the refunds item below).
 - **Refunds/adjustments admin API** — the ledger supports `refund` and
   `adjustment` entries; issuing them stays a direct-database admin operation
   until volume justifies an authenticated API.
+- **Autopay re-authentication (`requires_action`) on the off-session charge** —
+  the top-up is a `confirm=true, off_session=true` PaymentIntent, and only
+  `succeeded` settles it. A card whose issuer demands authentication therefore
+  returns `requires_action`, sits pending until the reconciliation sweep, and is
+  then counted as a failed attempt; three of those disable autopay. Nothing
+  charges the customer wrongly and nothing is lost — but there is no path that
+  brings the customer back on-session to authenticate, so the recovery is
+  "notice it and buy credits manually". Closing it means a customer-facing
+  re-authentication surface (an email or portal prompt carrying the intent's
+  client secret) plus a distinction between a hard decline and an
+  authentication request, which today's three-strikes counter does not draw.
 - **SCIM** — no enterprise identity customer; OIDC login is sufficient.
 - **Multi-region** — the advisory-lock admission design assumes one primary
   database; multi-region needs a sharding/consistency design, not a config

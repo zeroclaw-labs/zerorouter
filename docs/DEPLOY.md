@@ -240,6 +240,17 @@ needs from the environment:
   claim rows (one pending intent per user); the ECS service already runs
   one task. Scaling out is safe for correctness (claims are DB-enforced)
   but will multiply Stripe list/read traffic.
+- **The card-setup session is card-only, and deliberately ignores the
+  Dashboard's payment-method list.** It sends `payment_method_types[]=card`,
+  because the off-session charge can only ever charge a card — it lists the
+  customer's payment methods with `type=card` and fails the attempt when there
+  is none. Enabling a further payment method in the Dashboard therefore will
+  NOT make it appear on the autopay card-setup form, and that is the intended
+  behavior: a method a customer could save but the sweep could not charge would
+  look like a successful setup and then burn one of the three strikes on every
+  pass until autopay disabled itself. Apple Pay is unaffected — Stripe persists
+  an Apple Pay enrolment as a `card`. If autopay should ever accept a genuinely
+  non-card method, the charge path has to learn it first.
 
 The sweep itself (charge candidates, reconcile stale intents, three-strikes
 disable) starts with serve mode and needs no configuration.
@@ -422,9 +433,30 @@ Three things worth knowing when it stops being inert:
   **`autopay_tax_fallback`**, whose value is one of `no_billing_address`,
   `incomplete_address`, `calculation_rejected`, `calculation_unavailable`.
   **Alert on that field** — it is the only signal that autopay is collecting
-  no tax where it should. To fix `no_billing_address` at the source, turn on
-  billing-address collection for the card-setup session in Stripe's checkout
-  settings; existing saved cards need the customer to re-add the card.
+  no tax where it should.
+
+  **The card-setup session now requires a full billing address**
+  (`billing_address_collection=required`, the same parameter the manual
+  checkout has sent since the California registration). This needs no
+  configuration and replaces the Stripe Dashboard toggle this section used to
+  recommend — the guarantee is in the code, versioned with it, and cannot be
+  switched off in a dashboard. It also removes the reason the fallback was the
+  common case rather than the rare one: a `setup`-mode session carries no
+  `automatic_tax`, so Stripe's `auto` default had nothing to raise its minimum
+  above whatever the card network wanted, which for a US card is a postal code
+  or nothing.
+
+  **Cards saved before this change are not retroactively fixed.** Stripe cannot
+  add an address to a payment method after the fact, so an existing card keeps
+  whatever it was saved with; the customer has to re-add it (portal → Credits →
+  Autopay → **Save or replace card**). Expect `autopay_tax_fallback` to keep
+  firing for those users until they do, and to stop appearing for cards saved
+  from here on. Autopay also now keeps the card's address on the user's row
+  when nothing is stored there yet, so an autopay-only account — one that never
+  runs a manual checkout — finally has a location for the redemption-tax
+  surface below. It never overwrites an address a checkout stored: a checkout
+  address is a form the buyer completed, a card address is a byproduct, and
+  letting the coarser one win would degrade every future rating.
 - **Tax reversals on a refund are automatic (migration 0024).** Stripe
   reverses tax on its own only for Checkout and for its simplified
   PaymentIntent link, neither of which this path uses — so the autopay sweep

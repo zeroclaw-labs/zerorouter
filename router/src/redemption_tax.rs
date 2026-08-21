@@ -191,6 +191,88 @@ pub async fn store_buyer_address(pool: &PgPool, user_id: Uuid, address: Option<&
     }
 }
 
+/// Keep an autopay buyer's card billing address on their row — but only if
+/// nothing is there yet.
+///
+/// # Why this exists
+///
+/// [`store_buyer_address`] runs from the checkout webhook, so a user who ONLY
+/// ever arms autopay and never runs a manual checkout keeps
+/// `tax_address_country IS NULL` forever. The redemption-tax sweep then logs
+/// that the period "will be priced when the user's next checkout stores one" —
+/// a promise that, for an autopay-only account, never comes true. The addresses
+/// are deliberately collected before the operator flips redemption taxation on
+/// (see the checkout call site); an autopay-only account accumulated nothing to
+/// flip.
+///
+/// # Why fill-only, when checkout is last-write-wins
+///
+/// The two addresses are not equal evidence, so they do not get equal
+/// precedence. Checkout's comes from a form the buyer filled in for this
+/// purpose under `billing_address_collection=required`, so it is complete by
+/// construction. A card's `billing_details.address` is a byproduct of saving
+/// the card, and for a card saved BEFORE the setup session started requiring a
+/// full address it can legitimately be country + postal code and nothing else.
+///
+/// Last-write-wins across that pair is information-destroying: an autopay
+/// charge on an old ZIP-only card would overwrite a full checkout address,
+/// silently coarsening every future rating for a user who had already given us
+/// the good one. Since autopay charges recur, it would also do so repeatedly.
+/// Filling only the empty case cannot lose anything and still closes the gap
+/// this function exists for.
+///
+/// The `country IS NULL` test is the same completeness floor
+/// [`store_buyer_address`] uses to decide an address is worth storing at all,
+/// so "has an address" means the same thing in both directions.
+///
+/// Best-effort exactly like its sibling: a lost address costs one future period
+/// a logged fallback, never money, so every failure is a WARN and none
+/// propagates. It is safe to call on every charge attempt — once a row is
+/// filled, later calls match no rows and do nothing.
+pub async fn backfill_buyer_address_if_absent(
+    pool: &PgPool,
+    user_id: Uuid,
+    address: Option<&Value>,
+) {
+    fn field<'a>(address: &'a Value, key: &str) -> Option<&'a str> {
+        let value = address.get(key)?.as_str()?.trim();
+        (!value.is_empty()).then_some(value)
+    }
+    let Some(address) = address.filter(|address| address.is_object()) else {
+        return;
+    };
+    let Some(country) = field(address, "country") else {
+        return;
+    };
+    let result = sqlx::query(
+        r#"
+        UPDATE users
+        SET tax_address_country = $2,
+            tax_address_postal_code = $3,
+            tax_address_state = $4,
+            tax_address_city = $5,
+            tax_address_line1 = $6,
+            tax_address_updated_at = NOW()
+        WHERE id = $1 AND tax_address_country IS NULL
+        "#,
+    )
+    .bind(user_id)
+    .bind(country)
+    .bind(field(address, "postal_code"))
+    .bind(field(address, "state"))
+    .bind(field(address, "city"))
+    .bind(field(address, "line1"))
+    .execute(pool)
+    .await;
+    if let Err(error) = result {
+        tracing::warn!(
+            %user_id,
+            %error,
+            "an autopay card billing address could not be stored; redemption tax periods for this user may fall back until a checkout stores one"
+        );
+    }
+}
+
 /// One full sweep pass. Public and synchronous so tests drive the exact code
 /// production loops, like `run_autopay_sweep_once`.
 pub async fn run_redemption_tax_sweep_once(

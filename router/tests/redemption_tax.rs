@@ -19,7 +19,10 @@ use sqlx_postgres::{PgConnectOptions, PgPool, PgPoolOptions};
 use uuid::Uuid;
 use zerorouter::{
     db::migrate,
-    redemption_tax::{RedemptionTaxMode, run_redemption_tax_sweep_once, store_buyer_address},
+    redemption_tax::{
+        RedemptionTaxMode, backfill_buyer_address_if_absent, run_redemption_tax_sweep_once,
+        store_buyer_address,
+    },
     web::StripeSettings,
 };
 
@@ -574,6 +577,133 @@ async fn a_missing_address_waits_for_one_instead_of_freezing_wrong() {
     let periods = periods_of(&pool, user_id).await;
     assert_eq!(periods[0].tax_usd, Some(usd(50)));
     assert!(periods[0].debited);
+}
+
+/// An autopay-only account gets its location from the saved card.
+///
+/// Before this, `store_buyer_address` ran only from the checkout webhook, so a
+/// user who armed autopay and never ran a manual checkout kept
+/// `tax_address_country IS NULL` forever — and the sweep's "priced when the
+/// user's next checkout stores one" never arrived for an account that never
+/// checks out. This is the autopay half of that promise.
+#[tokio::test]
+async fn an_autopay_card_address_fills_an_empty_row() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let _guard = SWEEP_LOCK.lock().await;
+    quiesce(&pool).await;
+
+    let user_id = enrolled_user(&pool, "autopay-only", usd(10_000), Decimal::ZERO).await;
+    query("UPDATE users SET tax_address_country = NULL WHERE id = $1")
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .expect("address must clear");
+
+    backfill_buyer_address_if_absent(
+        &pool,
+        user_id,
+        Some(&json!({
+            "country": "US",
+            "postal_code": "94110",
+            "state": "CA",
+            "city": "San Francisco",
+            "line1": "1 Valencia St",
+        })),
+    )
+    .await;
+
+    let stored = stored_address(&pool, user_id).await;
+    assert_eq!(
+        stored,
+        (
+            Some("US".to_owned()),
+            Some("94110".to_owned()),
+            Some("CA".to_owned()),
+            Some("San Francisco".to_owned()),
+        ),
+        "an empty row must take the card's address"
+    );
+}
+
+/// A card address must NEVER overwrite an address already on the row.
+///
+/// This is the guard that makes calling the backfill on every recurring charge
+/// safe. A card saved before the setup session required a full billing address
+/// can legitimately carry country + postal code and nothing else; letting that
+/// win over an address the buyer typed into checkout under
+/// `billing_address_collection=required` would silently coarsen every future
+/// rating — and, because autopay recurs, would do it again on every charge.
+#[tokio::test]
+async fn an_autopay_card_address_never_overwrites_a_checkout_address() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let _guard = SWEEP_LOCK.lock().await;
+    quiesce(&pool).await;
+
+    let user_id = enrolled_user(&pool, "checkout-then-autopay", usd(10_000), Decimal::ZERO).await;
+    query("UPDATE users SET tax_address_country = NULL WHERE id = $1")
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .expect("address must clear");
+
+    // The buyer checked out and gave a full address.
+    store_buyer_address(
+        &pool,
+        user_id,
+        Some(&json!({
+            "country": "US",
+            "postal_code": "02139",
+            "state": "MA",
+            "city": "Cambridge",
+            "line1": "5 Main St",
+        })),
+    )
+    .await;
+
+    // Later, an autopay charge reads a coarse ZIP-only address off an old card.
+    backfill_buyer_address_if_absent(
+        &pool,
+        user_id,
+        Some(&json!({ "country": "US", "postal_code": "94110" })),
+    )
+    .await;
+
+    let stored = stored_address(&pool, user_id).await;
+    assert_eq!(
+        stored,
+        (
+            Some("US".to_owned()),
+            Some("02139".to_owned()),
+            Some("MA".to_owned()),
+            Some("Cambridge".to_owned()),
+        ),
+        "the complete checkout address must survive a coarser card address"
+    );
+}
+
+/// `(country, postal_code, state, city)` — the stored components that decide
+/// how precisely Stripe can rate a buyer.
+type StoredAddress = (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
+/// Read back the stored tax address components that decide rating precision.
+async fn stored_address(pool: &PgPool, user_id: Uuid) -> StoredAddress {
+    query_as::<_, StoredAddress>(
+        "SELECT tax_address_country, tax_address_postal_code, tax_address_state, \
+         tax_address_city FROM users WHERE id = $1",
+    )
+    .bind(user_id)
+    .fetch_one(pool)
+    .await
+    .expect("address row must read")
 }
 
 /// The enrollment pass itself: a user who existed before activation gets
