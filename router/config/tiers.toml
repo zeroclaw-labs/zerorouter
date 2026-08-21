@@ -133,17 +133,23 @@ schema_version = 1
 # on EVERY row and sorts zero-retention lanes first; the portal and the CLI show
 # the same label from the same source.
 #
-# THE CURRENT STATE (2026-08-20, corrected the same day the Fireworks lanes
-# landed — this paragraph still claimed an empty zero-retention section after
-# the Bedrock lanes shipped, which was a stale sentence making a false claim
-# about the product): `anthropic`, `openai`, and `google` are ORDINARY API
-# ACCOUNTS and every lane on them is `standard`. `bedrock`, `fireworks`, and
-# `xai` are `zero` — on two of the three bases below, `bedrock` and `xai`
-# sharing basis 2 and `fireworks` alone on basis 3 — see each pin. One
-# `fireworks` LANE is nonetheless `standard`: `fireworks/qwen3.8-max` overrides
-# the provider pin, because it is closed-weight and that pin's evidence covers
-# open models only. A provider pin is the default for its lanes, not a guarantee
-# about every row.
+# THE CURRENT STATE (2026-08-21, updated when the Vertex lanes landed; the
+# paragraph was corrected once before, the day the Fireworks lanes shipped, when
+# it still claimed an empty zero-retention section after Bedrock had landed —
+# a stale sentence making a false claim about the product, which is why this
+# paragraph is updated in the same commit as any lane that changes it):
+# `anthropic`, `openai`, and `google` are ORDINARY API ACCOUNTS and every lane on
+# them is `standard`. `bedrock`, `fireworks`, `xai`, and `vertex` are `zero` — on
+# two of the three bases below, with `bedrock`, `xai`, and `vertex` sharing
+# basis 2 and `fireworks` alone on basis 3 — see each pin. One `fireworks` LANE
+# is nonetheless `standard`: `fireworks/qwen3.8-max` overrides the provider pin,
+# because it is closed-weight and that pin's evidence covers open models only. A
+# provider pin is the default for its lanes, not a guarantee about every row.
+#
+# `google` AND `vertex` ARE THE SAME MODELS WITH OPPOSITE POSTURES, and that is
+# deliberate rather than an oversight to reconcile. They are different Google
+# products — the Developer API and Vertex AI — under different data policies,
+# and the pins say so at length. See `[retention.vertex]`.
 #
 # `xai` is the one pin whose basis is re-checked at REQUEST time rather than on a
 # date: every response carries an `x-zero-data-retention` attestation the
@@ -509,6 +515,134 @@ source_url = "https://docs.x.ai/developers/faq/security"
 verified = "2026-08-20"
 source_sha256 = "5d12c2ffee82495ae0afb019e52ec7ed7ffc3b2ad7c9e8416f11b1b50ef15b75"
 openrouter_slug = "xai"
+
+# THE SAME GEMINI MODELS AS `[retention.google]`, ON A DIFFERENT PRODUCT WITH A
+# DIFFERENT ANSWER (2026-08-21). Read this pin against that one: they are the
+# same weights from the same vendor, and the postures are opposite. That is not
+# an inconsistency, it is the entire reason this lane exists.
+#
+# `google` is the Gemini **Developer API** (`generativelanguage.googleapis.com`),
+# an ordinary API key on an ordinary account, where Google logs prompts "for a
+# limited period" and publishes no window. `vertex` is **Vertex AI** on the
+# operator's own Google Cloud project, where Google publishes a documented,
+# operator-controlled path to zero data retention. Same model, same price (see
+# the tier section — Vertex's global-endpoint rates are identical to AI Studio's,
+# so unlike the Bedrock twins this posture costs the customer nothing), different
+# product, different data policy.
+#
+# BASIS 2 OF THE THREE-BASIS RULE — an ENFORCED CONFIGURATION on the operator's
+# own account with published semantics, the same basis Bedrock and xAI rest on.
+# It is NOT basis 3: Google's published DEFAULT is not zero retention. Caching is
+# on by default and abuse-monitoring prompt logging applies by default to
+# accounts on the standard Terms of Service. Zero retention here is something the
+# operator must go and configure, which is precisely what basis 2 describes.
+#
+# WHAT THE PAGE SAYS, verbatim (docs.cloud.google.com/vertex-ai/generative-ai/
+# docs/data-governance, read 2026-08-21, page footer "Last updated 2026-08-19"):
+#
+#   "As outlined in 'Training Restriction' in the Service Terms section of the
+#    Service Specific Terms, Google won't use your data to train or fine-tune
+#    any AI/ML models without your prior permission or instruction. This applies
+#    to all managed models on Gemini Enterprise Agent Platform, including GA and
+#    pre-GA models."
+#   "By default, Google's published Gemini models cache Customer Data (inputs,
+#    outputs, and derived data) in-memory to reduce latency and accelerate
+#    responses. This data is stored only in-memory (not at-rest), is isolated at
+#    the project level, and has a 24-hour TTL. ... This feature can be disabled
+#    at the project level."
+#   "Only customers whose use of Google Cloud is governed by the Google Cloud
+#    Platform Terms of Service are subject to prompt logging for abuse
+#    monitoring. If you are in scope for prompt logging for abuse monitoring and
+#    want zero data retention, you can request an exception for abuse
+#    monitoring."
+#   "Request-response logging: This feature is disabled by default. ... To
+#    achieve zero data retention, do not enable this feature."
+#
+# and from the linked abuse-monitoring page (.../docs/learn/abuse-monitoring,
+# same date), the sentence that decides who is in scope:
+#
+#   "Customers in scope: Only customers whose use of Google Cloud is governed by
+#    the Google Cloud Platform Terms of Service. This means that customers with
+#    a Google Cloud Master Agreement are exempt from prompt logging for this
+#    abuse monitoring by default."
+#   "Customer opt-out: Customers may request for an exception by filling out
+#    this form. If approved, Google won't store any prompts associated with the
+#    approved Google Cloud account."
+#
+# THE REQUIRED PROJECT CONFIGURATION, and this pin is FALSE without all of it.
+# The Bedrock pin documents `mode: none`; this is the same idea with more parts,
+# because Google spreads the controls across several features:
+#
+#   1. IN-MEMORY CACHING DISABLED at the project level:
+#        curl -X PATCH -H "Authorization: Bearer $(gcloud auth print-access-token)" \
+#          -H "Content-Type: application/json" \
+#          https://us-central1-aiplatform.googleapis.com/v1/projects/PROJECT_ID/cacheConfig \
+#          -d '{"name":"projects/PROJECT_ID/cacheConfig","disableCache":true}'
+#      Note Google's own position is that this cache "does not violate zero data
+#      retention" — in-memory only, project-isolated, 24-hour TTL. ZeroRouter
+#      disables it anyway. The claim sold here is that nothing is retained, and
+#      "retained only in RAM for a day" is a sentence a customer is entitled to
+#      not want. Disabling is free, so the stronger posture is the one to take.
+#   2. NOT IN SCOPE FOR ABUSE-MONITORING PROMPT LOGGING — by holding a Google
+#      Cloud Master Agreement (exempt by default), or by an APPROVED exception
+#      via Google's opt-out form. A plain self-serve credit-card project is
+#      governed by the Cloud Platform ToS and IS in scope, and its prompts are
+#      stored up to 90 days on a classifier hit. **Paying Google is not
+#      sufficient; the agreement or the approved exception is.**
+#   3. REQUEST-RESPONSE LOGGING NOT ENABLED (off by default, per-model
+#      per-project — leave it alone).
+#   4. NO GROUNDING with Google Search (3-day logs, undisableable) or Google Maps
+#      (30-day). ZeroRouter never sends grounding parameters.
+#   5. THE INTERACTIONS API IS NEVER DIALLED. It stores prompts, responses, and
+#      conversation state when `store = true`, and `store` DEFAULTS TO TRUE.
+#      These lanes ride the `chat_completions` adapter against
+#      `.../endpoints/openapi/chat/completions` (config/providers.json), a
+#      stateless surface the quoted zero-retention path covers. This is the same
+#      carve-out shape as the Fireworks and xAI pins' excluded Responses APIs,
+#      and it is the most dangerous of the five because the retaining default is
+#      the one you get by not thinking about it. Do not add an Interactions-shaped
+#      surface to this provider entry without revisiting this pin.
+#
+# THE HONEST WEAKNESS, stated plainly because a reader deserves it before they
+# trust the label. Item 1 is machine-verifiable and item 5 is a property of this
+# repository, but ITEM 2 IS NOT VERIFIABLE FROM ANYWHERE — no Google endpoint
+# reports "this account is exempt from abuse logging". It rests on the operator
+# knowing which agreement their Google Cloud account is under, or holding an
+# approval email. That is the same kind of evidence basis 1 accepts for a signed
+# ZDR arrangement, so it is not a new weakness in the rule; it IS a second thing
+# that must be true and cannot be re-checked by CI, and it is the reason this
+# lane must not be given a credential until a human has confirmed it. See
+# docs/DEPLOY.md, "What the operator must do in Google Cloud".
+#
+# RE-VERIFICATION IS TWO CHECKS, as with Bedrock. `admin retention-drift` hashes
+# the page below, catching Google REWORDING what these controls mean. The live
+# half is a credentialed GET that reads the account's actual cache setting:
+#
+#   curl -H "Authorization: Bearer $(gcloud auth print-access-token)" \
+#     https://us-central1-aiplatform.googleapis.com/v1/projects/PROJECT_ID/cacheConfig
+#     # expect {"name": "projects/PROJECT_ID/cacheConfig", "disableCache": true}
+#
+# A response WITHOUT `disableCache` is caching enabled — that is the default and
+# the field is simply absent — so an operator reading this must not treat a
+# missing field as a pass. It is the same trap as Bedrock's `inherit`.
+#
+# THE CORROBORATION IS FINALLY MEANINGFUL, and this pin is the reason the note
+# at the top of this section exists. `[retention.google]` maps to
+# `google-ai-studio` and explicitly warns that OpenRouter's `google-vertex` entry
+# "is a different product under a different data policy (it reports no prompt
+# retention, which would have corroborated a lane nobody here runs)". That lane
+# is now run, so the slug is correct here for the first time. Treat its
+# agreement as weak evidence even so: OpenRouter's Vertex posture reflects
+# OPENROUTER's project configuration, which knows nothing about this one — the
+# Bedrock caveat, not the Fireworks one. The evidence for this pin is the page
+# below plus the operator's own project.
+[retention.vertex]
+posture = "zero"
+description = "Vertex AI on ZeroRouter's own Google Cloud project, configured for zero data retention: in-memory caching disabled at the project level, no request-response logging, no grounding, and an account not in scope for abuse-monitoring prompt logging. Google does not train on customer data on this platform, and the stateless chat-completions surface these lanes dispatch on stores nothing between requests."
+source_url = "https://docs.cloud.google.com/vertex-ai/generative-ai/docs/data-governance"
+verified = "2026-08-21"
+source_sha256 = "af2eeb047bd207573da072b70489442daf66dc15cb08a984adaf4b389c0d5cdc"
+openrouter_slug = "google-vertex"
 
 # ---------------------------------------------------------------------------
 # PINS — you get this model, at cost, and it does not change.
@@ -1936,3 +2070,168 @@ min_prompt_tokens = 200000
 input_per_mtok = 2.50
 cached_input_per_mtok = 0.40
 output_per_mtok = 5.00
+
+# ---------------------------------------------------------------------------
+# VERTEX AI (added 2026-08-21) — THE SAME GEMINI MODELS AS THE `google/*` PINS
+# ABOVE, ZERO-RETENTION, AND AT THE SAME PRICE.
+#
+# These three lanes serve the identical weights the `google/*` lanes serve. The
+# difference is the product underneath: `google/*` reaches Gemini over the
+# Developer API on an ordinary API key, where Google logs prompts for an
+# unstated period; `vertex/*` reaches it over Vertex AI on the operator's own
+# Google Cloud project, configured for zero data retention. See
+# `[retention.vertex]` for the evidence and the exact project configuration the
+# posture depends on.
+#
+# WHY THE IDS ARE `vertex/*` RATHER THAN `google/*`, the same argument the
+# Bedrock twins make and worth restating because this is now the second pair of
+# twins in the file. A concrete candidate id is unique file-wide, so both lanes
+# could not be keyed `google/gemini-3.7-flash` even if we wanted them to be.
+# More importantly they are DIFFERENT PRODUCTS: one retains and one does not,
+# and a customer must be able to address that difference rather than being
+# silently assigned whichever ZeroRouter felt like. `owned_by` publishes as
+# `vertex`, naming the account that actually serves the request.
+#
+# WHAT MAKES THIS PAIR DIFFERENT FROM THE BEDROCK PAIR, and it is the good news:
+# THE ZERO-RETENTION LANE IS NOT MORE EXPENSIVE. The Bedrock twins cost 10% more
+# than their `anthropic/*` counterparts and that premium is the price of the
+# posture. Here the numbers are identical on every dimension. Google's published
+# Vertex prices for these models on the GLOBAL endpoint are exactly the Gemini
+# Developer API prices — verified 2026-08-21 against
+# cloud.google.com/gemini-enterprise-agent-platform/generative-ai/pricing
+# (Standard tier, "Global" region rows) and cross-checked against models.dev's
+# `google-vertex` entry, which agrees to the cent. So a customer moving from
+# `google/gemini-3.7-flash` to `vertex/gemini-3.7-flash` pays the same and stops
+# being logged. There is no reason to prefer the `google/*` lane, and the
+# ordering `/v1/models` publishes says so: zero-retention lanes sort first.
+#
+# THE GLOBAL ENDPOINT IS LOAD-BEARING FOR THAT CLAIM, and it is the single most
+# likely thing for someone to "fix" later by pinning a region. Google's pricing
+# page carries a "Non-global" row for each Flash model at exactly 10% above the
+# global one (3.7 Flash: 0.825/4.125 against 0.75/3.75; 3.5 Flash-Lite:
+# 0.33/2.75 against 0.30/2.50), and a footnote dating the split: "For non-global
+# endpoints, pricing will go into effect for the Generally available Gemini 3 and
+# later families of models on July 1, 2026." That date has passed. So dialling
+# `us-central1-aiplatform.googleapis.com` instead of the global endpoint would
+# raise this lane's cost basis 10% while these tables still said 0.75, and the
+# catalog's own invariant (basis <= sell) would NOT catch it — both sides are
+# written here, so they would simply both be wrong together and ZeroRouter would
+# sell every Vertex token below what Google invoices. `base_url` in
+# config/providers.json pins `locations/global` for this reason. If a future
+# compliance requirement forces a regional endpoint, the rates below must rise
+# by 10% in the same commit.
+#
+# Note Gemini 3.1 Pro Preview has NO non-global row at all — Google lists it as
+# global-only — so the pricing question does not arise for that lane.
+#
+# THE MODEL IDS CARRY A `google/` PREFIX ON THE WIRE. Vertex's OpenAI-compatible
+# surface names publisher models `google/gemini-3.7-flash`, not the bare id the
+# Developer API takes. That is why every `model` field below is prefixed while
+# the `google/*` tiers' are not — it is the vendor's own id on this surface, not
+# a ZeroRouter invention, and dropping the prefix returns a 404 rather than a
+# wrong model.
+#
+# THIS LANE SHIPS DARK, exactly as the Fireworks and xAI lanes did.
+# `VERTEX_SERVICE_ACCOUNT` and `VERTEX_PROJECT_ID` are both unset, so #89's
+# dispatchability filter hides all three tiers from `/v1/models` and from route
+# construction, and the configuration merges and deploys inert. Unlike those
+# lanes the credential is NOT a bare key: it is a Google service-account JSON
+# blob, exchanged for a one-hour OAuth token on every route build
+# (`src/gcp_auth.rs`). docs/DEPLOY.md carries the GCP-side steps — and note that
+# the retention posture is a PRECONDITION of provisioning that credential, not a
+# consequence of it: minting the key before the project is configured would put
+# a lane that claims zero retention in front of a project that does not have it.
+#
+# Rates and metadata are transcribed from models.dev's `google-vertex` provider,
+# which `admin catalog-drift` reconciles against via
+# `source_provider_key = "google-vertex"` in config/providers.json. Metadata is
+# copied from the `google/*` twins above rather than re-derived: same weights,
+# same limits, and a second reading would be a second thing to keep in sync.
+
+[tiers."vertex/gemini-3.7-flash"]
+
+[tiers."vertex/gemini-3.7-flash".rates]
+input_per_mtok = 0.75
+cached_input_per_mtok = 0.075
+output_per_mtok = 3.75
+
+[[tiers."vertex/gemini-3.7-flash".candidates]]
+id = "vertex/gemini-3.7-flash"
+provider = "vertex"
+model = "google/gemini-3.7-flash"
+
+[tiers."vertex/gemini-3.7-flash".candidates.metadata]
+context_window = 1048576
+max_output_tokens = 65536
+input_modalities = ["text", "image", "video", "audio", "pdf"]
+tool_call = true
+
+[tiers."vertex/gemini-3.7-flash".candidates.rates]
+input_per_mtok = 0.75
+cached_input_per_mtok = 0.075
+output_per_mtok = 3.75
+
+[tiers."vertex/gemini-3.5-flash-lite"]
+
+[tiers."vertex/gemini-3.5-flash-lite".rates]
+input_per_mtok = 0.30
+cached_input_per_mtok = 0.03
+output_per_mtok = 2.50
+
+[[tiers."vertex/gemini-3.5-flash-lite".candidates]]
+id = "vertex/gemini-3.5-flash-lite"
+provider = "vertex"
+model = "google/gemini-3.5-flash-lite"
+
+[tiers."vertex/gemini-3.5-flash-lite".candidates.metadata]
+context_window = 1048576
+max_output_tokens = 65536
+input_modalities = ["text", "image", "video", "audio", "pdf"]
+tool_call = true
+
+[tiers."vertex/gemini-3.5-flash-lite".candidates.rates]
+input_per_mtok = 0.30
+cached_input_per_mtok = 0.03
+output_per_mtok = 2.50
+
+# The 200,000-token boundary is Google's and is the same one
+# `google/gemini-3.1-pro-preview` carries — the same model repriced by the same
+# vendor, so the thresholds must match. Google's pricing page states it as a
+# property of the request rather than of the input alone: "If a query input
+# context is longer than 200K tokens, all tokens (input and output) are charged
+# at long context rates", which is exactly the STEP semantics this file's header
+# describes.
+[tiers."vertex/gemini-3.1-pro-preview"]
+
+[tiers."vertex/gemini-3.1-pro-preview".rates]
+input_per_mtok = 2.00
+cached_input_per_mtok = 0.20
+output_per_mtok = 12.00
+
+[[tiers."vertex/gemini-3.1-pro-preview".rates.conditional]]
+min_prompt_tokens = 200000
+input_per_mtok = 4.00
+cached_input_per_mtok = 0.40
+output_per_mtok = 18.00
+
+[[tiers."vertex/gemini-3.1-pro-preview".candidates]]
+id = "vertex/gemini-3.1-pro-preview"
+provider = "vertex"
+model = "google/gemini-3.1-pro-preview"
+
+[tiers."vertex/gemini-3.1-pro-preview".candidates.metadata]
+context_window = 1048576
+max_output_tokens = 65536
+input_modalities = ["text", "image", "video", "audio", "pdf"]
+tool_call = true
+
+[tiers."vertex/gemini-3.1-pro-preview".candidates.rates]
+input_per_mtok = 2.00
+cached_input_per_mtok = 0.20
+output_per_mtok = 12.00
+
+[[tiers."vertex/gemini-3.1-pro-preview".candidates.rates.conditional]]
+min_prompt_tokens = 200000
+input_per_mtok = 4.00
+cached_input_per_mtok = 0.40
+output_per_mtok = 18.00

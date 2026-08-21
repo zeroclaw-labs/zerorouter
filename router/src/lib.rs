@@ -9,6 +9,7 @@ pub mod device;
 pub mod drift;
 pub mod error;
 pub mod estimator;
+pub mod gcp_auth;
 pub mod health;
 pub mod logging;
 pub mod oidc;

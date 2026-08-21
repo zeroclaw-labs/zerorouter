@@ -477,6 +477,36 @@ fn undated(model: &str) -> Option<&str> {
     (tail.len() == 8 && tail.bytes().all(|b| b.is_ascii_digit())).then_some(head)
 }
 
+/// A model id with its PUBLISHER prefix removed, when it carries one.
+///
+/// The third and last join attempt, for the same reason [`undated`] is the
+/// second: the vendor and the source spell the same model differently, and
+/// refusing to reconcile over a naming convention would switch off the one
+/// alarm that guards margin.
+///
+/// **The case this exists for is Vertex.** Google's OpenAI-compatible surface
+/// names its own models `google/gemini-3.7-flash` — the prefix is required, and
+/// dropping it returns a 404 — while models.dev files the same model under
+/// `google-vertex` as the bare `gemini-3.7-flash`. Without this the three
+/// Vertex lanes report NOT IN SOURCE and their prices are checked by nothing.
+///
+/// Three properties keep this from becoming a way to match the wrong row:
+///
+/// - It is tried **last**, only after an exact match and the undated one have
+///   both failed, so no lane that already reconciles can change what it matches.
+/// - The lookup stays inside the SAME provider's model map, so a stripped id
+///   can only ever find another model of the same vendor at the same source key.
+/// - The stripped form is reported through `matched_as`, so the drift output
+///   says what it matched as rather than quietly claiming an exact hit.
+///
+/// It deliberately takes only the LAST segment, so Fireworks'
+/// `accounts/fireworks/models/kimi-k3` would reduce to `kimi-k3` — which is
+/// harmless, because that lane matches exactly and never reaches this arm.
+fn unpublished(model: &str) -> Option<&str> {
+    let (_, bare) = model.rsplit_once('/')?;
+    (!bare.is_empty()).then_some(bare)
+}
+
 /// Whether the catalog's conditional rates say the same thing as the source's.
 ///
 /// Both halves count. **Thresholds** must match one for one and in order: a
@@ -684,7 +714,15 @@ pub(crate) fn reconcile_with(
                             Some(entry),
                             undated(&candidate.model).map(ToOwned::to_owned),
                         ),
-                        None => (None, None),
+                        None => {
+                            match unpublished(&candidate.model).and_then(|bare| models.get(bare)) {
+                                Some(entry) => (
+                                    Some(entry),
+                                    unpublished(&candidate.model).map(ToOwned::to_owned),
+                                ),
+                                None => (None, None),
+                            }
+                        }
                     },
                 },
                 None => (None, None),
@@ -1315,6 +1353,31 @@ mod tests {
             }]
         );
         assert!(found[0].has_actionable_metadata_drift());
+    }
+
+    /// The publisher-prefix join, as a unit — the three cases that decide
+    /// whether it can ever match the wrong row.
+    #[test]
+    fn a_publisher_prefix_is_stripped_only_when_there_is_one() {
+        assert_eq!(
+            unpublished("google/gemini-3.7-flash"),
+            Some("gemini-3.7-flash")
+        );
+        assert_eq!(
+            unpublished("accounts/fireworks/models/kimi-k3"),
+            Some("kimi-k3"),
+            "only the last segment; this lane matches exactly and never reaches the arm"
+        );
+        assert_eq!(
+            unpublished("gemini-3.7-flash"),
+            None,
+            "an id with no prefix has nothing to strip"
+        );
+        assert_eq!(
+            unpublished("google/"),
+            None,
+            "a trailing slash must not produce an empty lookup key"
+        );
     }
 
     #[test]

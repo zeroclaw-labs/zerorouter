@@ -1137,17 +1137,25 @@ mod tests {
         assert_eq!(posture("fireworks/kimi-k3"), "zero");
 
         // The footnote's counts. Stated as literals on purpose: this is the
-        // arithmetic a customer reads as "11 lane(s) zero-retention", and an
+        // arithmetic a customer reads as "14 lane(s) zero-retention", and an
         // override silently stopping working would show up here as a lane
         // moving from one side of the sentence to the other.
         //
-        // The two sides became equal when the xAI lanes landed, which is a
-        // coincidence of tallies rather than anything meaningful — do not read
-        // the symmetry as a check. Zero: four Bedrock, five open-weight
-        // Fireworks, two xAI. Standard: four Anthropic, three Google, three
-        // OpenAI, and the one overridden Fireworks lane this test is about.
-        assert_eq!(posture_count(rows, "zero"), 11);
+        // The two sides were briefly equal when the xAI lanes landed; the
+        // three Vertex lanes broke the tie on 2026-08-21, which is worth
+        // saying only because someone might otherwise read the old symmetry as
+        // a check rather than the coincidence of tallies it was. Zero: four
+        // Bedrock, five open-weight Fireworks, two xAI, three Vertex.
+        // Standard: four Anthropic, three Google, three OpenAI, and the one
+        // overridden Fireworks lane this test is about.
+        //
+        // Note the three Google lanes and the three Vertex lanes are the SAME
+        // MODELS on opposite sides of this sentence. That is the product
+        // working as intended rather than a double count: two Google products
+        // under two different data policies, and a customer picks which one
+        // they are buying.
+        assert_eq!(posture_count(rows, "zero"), 14);
         assert_eq!(posture_count(rows, "standard"), 11);
-        assert_eq!(rows.len(), 22, "every shipped lane is counted exactly once");
+        assert_eq!(rows.len(), 25, "every shipped lane is counted exactly once");
     }
 }

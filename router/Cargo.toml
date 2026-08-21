@@ -37,6 +37,25 @@ axum = { version = "0.8", default-features = false, features = ["http1", "json",
 # and the decoder ABOVE them is where this repo's own tests earn their keep.
 base64 = "0.22"
 chrono = { version = "0.4", features = ["clock", "serde"] }
+# Needed only by `src/gcp_auth.rs`, which mints the short-lived OAuth2 access
+# tokens the `vertex` lane dispatches on. Google's OpenAI-compatible surface
+# accepts NO long-lived API key ("Only Google Cloud Auth is supported using the
+# OpenAI library" — cloud.google.com/vertex-ai/generative-ai/docs/start/openai),
+# so a service-account JWT-bearer exchange is the only way in, and RS256 is the
+# only signature algorithm Google accepts for it.
+#
+# Like `base64` and `crc` above, neither of these is a new artifact in the
+# dependency graph: `rsa` 0.9.10 and `pkcs8` 0.10.2 were already built
+# transitively (via `openidconnect`) at these exact versions, so this promotes
+# them to direct dependencies rather than resolving anything new.
+#
+# Hand-rolling was NOT considered here, unlike the base64/CRC case. RSA
+# signing is not a 25-line loop; a subtly wrong PKCS#1 v1.5 padding
+# implementation is a security defect rather than a corrupted token count, and
+# the failure would be silent in exactly the way that matters least — Google
+# would simply reject the assertion, until the day it did not.
+rsa = "0.9"
+pkcs8 = "0.10"
 clap = { version = "4.5", features = ["derive"] }
 crc = "3"
 futures-util = "0.3"

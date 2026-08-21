@@ -886,7 +886,7 @@ impl RouterServices {
     /// The provider route this request walks: built from upstream credentials,
     /// or supplied by the injected route when one is configured. Never cache
     /// the result — fallback selection metadata is request-scoped.
-    fn provider_route(
+    async fn provider_route(
         &self,
         resolved: &ResolvedRoute,
         max_output_tokens: u32,
@@ -895,23 +895,27 @@ impl RouterServices {
         if let Some(route) = &self.injected_route {
             return Ok(route(resolved, max_output_tokens));
         }
-        ProviderRoute::new(resolved.candidates.clone(), max_output_tokens).map_err(|error| {
-            match error {
-                // The catalog no longer lists this lane, so the honest answer
-                // names it rather than blaming the upstream fleet. The two
-                // answers must agree: `/v1/models` omits a lane whose credential
-                // is absent, and a request that names it anyway is told THAT lane
-                // is unavailable — not that no provider anywhere is up, which
-                // reads like an outage and sends an operator looking at the
-                // wrong thing. `model_unavailable` is the same code a tier
-                // withheld for below-cost pricing returns, and deliberately so:
-                // both mean "ZeroRouter cannot serve this and you cannot fix it".
-                ProviderBuildError::NoAvailableCredentials { .. } => ApiError::ModelUnavailable {
-                    tier: resolved.requested_model.clone(),
-                },
-                _ => ApiError::NoProviderAvailable,
-            }
-        })
+        ProviderRoute::new(resolved.candidates.clone(), max_output_tokens)
+            .await
+            .map_err(|error| {
+                match error {
+                    // The catalog no longer lists this lane, so the honest answer
+                    // names it rather than blaming the upstream fleet. The two
+                    // answers must agree: `/v1/models` omits a lane whose credential
+                    // is absent, and a request that names it anyway is told THAT lane
+                    // is unavailable — not that no provider anywhere is up, which
+                    // reads like an outage and sends an operator looking at the
+                    // wrong thing. `model_unavailable` is the same code a tier
+                    // withheld for below-cost pricing returns, and deliberately so:
+                    // both mean "ZeroRouter cannot serve this and you cannot fix it".
+                    ProviderBuildError::NoAvailableCredentials { .. } => {
+                        ApiError::ModelUnavailable {
+                            tier: resolved.requested_model.clone(),
+                        }
+                    }
+                    _ => ApiError::NoProviderAvailable,
+                }
+            })
     }
 }
 
@@ -1241,7 +1245,9 @@ async fn chat_completions(
     // Route construction and ordering read the FULL byte-bound usage: the
     // generation limit sent upstream is untouched by sizing, and the cost
     // ordering prices a walk rather than a reservation.
-    let mut provider_route = services.provider_route(&resolved, max_output_tokens)?;
+    let mut provider_route = services
+        .provider_route(&resolved, max_output_tokens)
+        .await?;
     // The one definition of $0 that ships: both halves of the declaration
     // (`config::TierCandidate::is_free`), read from server-side configuration
     // at selection time.

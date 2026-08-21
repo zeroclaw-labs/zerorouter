@@ -34,6 +34,7 @@ GEMINI_API_KEY
 BEDROCK_API_KEY     (+ BEDROCK_REGION, see below)
 FIREWORKS_API_KEY
 XAI_API_KEY         (the team it belongs to must have ZDR enabled — see below)
+VERTEX_SERVICE_ACCOUNT  (a service-account JSON blob, + VERTEX_PROJECT_ID — see below)
 ```
 
 `XAI_API_KEY` carries one requirement no other key here does. The `xai/*` lanes
@@ -43,6 +44,23 @@ Retention setting, and every response is checked for the
 ZDR enabled will authenticate and then have every request refused with a 502
 `retention_attestation_failed`. That is the guard working, not a fault — but
 enable ZDR in the xAI Console for that team before provisioning the key.
+
+`VERTEX_SERVICE_ACCOUNT` is the odd one out: it is **not an API key**. Google
+issues no long-lived key for the surface the `vertex/*` lanes dispatch on, so
+this variable holds a Google service-account key in JSON — private key included
+— which the router signs a JWT with and exchanges for a one-hour OAuth2 access
+token, cached and refreshed shortly before expiry (`src/gcp_auth.rs`). The value
+may be the JSON itself or a path to a file holding it. `VERTEX_PROJECT_ID` must
+be set alongside it, because the endpoint carries the project in its path; the
+lanes go dark without either.
+
+Those three lanes are the same Gemini models the `google/*` lanes serve, at the
+same price, but zero-retention — which depends entirely on how the Google Cloud
+project is configured. **Do not provision this credential before completing the
+project setup in `docs/DEPLOY.md`, "What the operator must do in Google Cloud".**
+Unlike the xAI case there is no per-response guard: a misconfigured project
+authenticates and serves normally while the catalog tells customers their
+prompts are never stored.
 
 Do not commit these values or place them in Terraform variables. The list above
 is whatever `config/providers.json` entries name in `credential_env`; that file
