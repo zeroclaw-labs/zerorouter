@@ -24,6 +24,26 @@ pub enum ApiError {
     /// The client did not finish sending its request body in time.
     RequestTimeout,
     UnsupportedRequestFields,
+    /// The request carries an input modality the requested model does not
+    /// take — an image sent to a text-only lane.
+    ///
+    /// Its own code rather than a reuse of [`Self::UnsupportedRequestFields`],
+    /// and the reason is the one [`Self::AccountFrozen`] gives for not reusing
+    /// `InsufficientCredits`: the remedy differs and a caller acts on the
+    /// code. `unsupported_request_fields` says "this router cannot carry that
+    /// shape anywhere", and the fix is to stop sending it. This one says "that
+    /// shape is fine, this MODEL does not take it", and the fix is to pick a
+    /// different model — so the message names the model and lists what it does
+    /// accept, which is the information needed to choose one.
+    ///
+    /// Refused before any reservation is taken or any upstream dialled, on the
+    /// same principle as [`Self::PriorityConflict`]: a request that cannot be
+    /// served must not move money first.
+    ModalityUnsupported {
+        model: String,
+        modality: &'static str,
+        accepted: String,
+    },
     Unauthorized,
     SpendCapExceeded,
     /// The presenting key has spent the credit limit its owner set on it
@@ -154,6 +174,29 @@ impl ApiError {
                 "invalid_request_error",
                 None,
                 "unsupported_request_fields",
+            ),
+            // 400 and `invalid_request_error`: unlike `model_unavailable`,
+            // nothing here is ZeroRouter's misconfiguration — the caller
+            // asked a model for something it does not do, and can fix it by
+            // asking a different one. `param` is `messages` rather than
+            // `model` because that is where the offending content sits, and a
+            // client that highlights the named field should highlight the
+            // image, not the model id it may have chosen deliberately.
+            Self::ModalityUnsupported {
+                model,
+                modality,
+                accepted,
+            } => (
+                StatusCode::BAD_REQUEST,
+                Cow::Owned(format!(
+                    "The model {model} does not accept {modality} input. It accepts: {accepted}. \
+                     Nothing was reserved and no upstream was contacted. Send this content to a \
+                     model whose input_modalities include {modality} — GET /v1/models lists what \
+                     each one takes."
+                )),
+                "invalid_request_error",
+                Some("messages"),
+                "modality_unsupported",
             ),
             Self::Unauthorized => (
                 StatusCode::UNAUTHORIZED,

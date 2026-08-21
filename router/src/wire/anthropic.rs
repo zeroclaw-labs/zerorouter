@@ -197,44 +197,33 @@ fn push_anthropic_block(turns: &mut Vec<Value>, role: &str, block: Value) {
 /// the pinned adapter decoded these, so sending them as literal text would be
 /// a silent vision regression (sol review). `data:` URIs become base64
 /// sources, anything else a URL source; a malformed marker stays text.
+///
+/// The marker grammar itself moved to `wire::split_image_markers` when the
+/// chat-completions and Responses wires learned to decode it too; the block
+/// SHAPES below stay here because they are Anthropic's, and the byte pin in
+/// `image_markers_become_native_image_blocks` covers both halves.
+///
+/// Verified against the Messages API image schema (platform.claude.com,
+/// "Vision", read 2026-08-21): `source.type` is one of `base64` (with
+/// `media_type` + `data`), `url`, or `file`.
 fn push_user_text_with_images(turns: &mut Vec<Value>, text: &str) {
-    let mut rest = text;
-    while let Some(start) = rest.find("[IMAGE:") {
-        let before = &rest[..start];
-        if !before.trim().is_empty() {
-            push_anthropic_block(turns, "user", json!({ "type": "text", "text": before }));
-        }
-        let after_marker = &rest[start + "[IMAGE:".len()..];
-        let Some(end) = after_marker.find(']') else {
-            // Unterminated marker: keep the raw text and stop scanning.
-            rest = &rest[start..];
-            break;
+    for part in super::split_image_markers(text) {
+        let block = match part {
+            super::UserPart::Text(text) => json!({ "type": "text", "text": text }),
+            super::UserPart::Base64Image { media_type, data } => json!({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": media_type,
+                    "data": data,
+                },
+            }),
+            super::UserPart::UrlImage(url) => json!({
+                "type": "image",
+                "source": { "type": "url", "url": url },
+            }),
         };
-        let url = &after_marker[..end];
-        let block = url
-            .strip_prefix("data:")
-            .and_then(|data_uri| {
-                let (media_type, payload) = data_uri.split_once(";base64,")?;
-                Some(json!({
-                    "type": "image",
-                    "source": {
-                        "type": "base64",
-                        "media_type": media_type,
-                        "data": payload,
-                    },
-                }))
-            })
-            .unwrap_or_else(|| {
-                json!({
-                    "type": "image",
-                    "source": { "type": "url", "url": url },
-                })
-            });
         push_anthropic_block(turns, "user", block);
-        rest = &after_marker[end + 1..];
-    }
-    if !rest.trim().is_empty() {
-        push_anthropic_block(turns, "user", json!({ "type": "text", "text": rest }));
     }
 }
 
@@ -1404,6 +1393,33 @@ mod anthropic_review_fix_tests {
             .filter_map(|block| block["text"].as_str())
             .collect();
         assert_eq!(joined, "broken [IMAGE:no-close");
+    }
+
+    /// The byte pin for this dialect's image blocks, and the twin of the
+    /// chat-completions and Responses pins. Anthropic nests the carrier under
+    /// `source` with a discriminated `type` — `base64` (with `media_type` and
+    /// `data`) or `url` — which is a third distinct shape from the two
+    /// OpenAI dialects (platform.claude.com, "Vision", read 2026-08-21).
+    ///
+    /// Keys serialize alphabetically, so `source` precedes `type` and
+    /// `media_type` precedes `data`'s sibling keys accordingly.
+    #[test]
+    fn image_blocks_are_byte_stable() {
+        let messages = vec![ChatMessage::user(
+            "look [IMAGE:data:image/png;base64,AAAA] and [IMAGE:https://example.com/x.jpg]",
+        )];
+        let (_, turns) = build_anthropic_messages(&messages);
+        assert_eq!(
+            serde_json::to_string(&turns).unwrap(),
+            concat!(
+                r#"[{"content":["#,
+                r#"{"text":"look ","type":"text"},"#,
+                r#"{"source":{"data":"AAAA","media_type":"image/png","type":"base64"},"type":"image"},"#,
+                r#"{"text":" and ","type":"text"},"#,
+                r#"{"source":{"type":"url","url":"https://example.com/x.jpg"},"type":"image"}"#,
+                r#"],"role":"user"}]"#,
+            )
+        );
     }
 }
 

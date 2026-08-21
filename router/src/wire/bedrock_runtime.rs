@@ -129,6 +129,32 @@ impl BedrockRuntimeWire {
         format!("{}/model/{model}/{operation}", self.base_url)
     }
 
+    /// Refuse a request this plane cannot carry, BEFORE dialing it.
+    ///
+    /// Anthropic's image schema is not uniform across platforms: "On Amazon
+    /// Bedrock and Google Cloud, only base64-encoded sources are currently
+    /// available" (platform.claude.com, "Vision", read 2026-08-21). So the
+    /// `{"type":"url"}` image source the Messages wire builds for an
+    /// `https://` marker is a shape THIS plane rejects, even though the body
+    /// is otherwise byte-identical to the one 1P accepts.
+    ///
+    /// Refused here rather than silently rewritten because the only rewrite
+    /// available is "fetch the URL and inline it", and a metering gateway
+    /// that fetches customer-supplied URLs has acquired a request-forgery
+    /// surface it did not have before. Refusing fails just this candidate;
+    /// the walk moves to the next rung, which on a mixed tier may well be a
+    /// lane that takes URL sources.
+    fn unsupported_image_source(messages: &[ChatMessage]) -> Option<&str> {
+        messages
+            .iter()
+            .filter(|message| message.role == "user")
+            .flat_map(|message| super::split_image_markers(&message.content))
+            .find_map(|part| match part {
+                super::UserPart::UrlImage(url) => Some(url),
+                _ => None,
+            })
+    }
+
     /// The request body: the Messages body minus `model`, plus
     /// `anthropic_version`.
     fn request_body(
@@ -284,6 +310,13 @@ impl ModelProvider for BedrockRuntimeWire {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<ChatResponse> {
+        if let Some(url) = Self::unsupported_image_source(request.messages) {
+            anyhow::bail!(
+                "{} cannot carry an image by URL: the Bedrock plane accepts base64 image \
+                 sources only (offending source: {url})",
+                self.alias,
+            );
+        }
         let body = self.request_body(request.messages, request.tools, temperature);
         let response = self
             .http
@@ -344,6 +377,17 @@ impl ModelProvider for BedrockRuntimeWire {
         temperature: Option<f64>,
         options: StreamOptions,
     ) -> futures_util::stream::BoxStream<'static, StreamResult<StreamEvent>> {
+        // Same refusal as the non-streaming path, and it must be the same:
+        // a lane that cannot carry a URL image cannot carry one on either
+        // operation, and discovering that mid-stream would mean the customer
+        // had already been handed a partial answer.
+        let unsupported_image = Self::unsupported_image_source(request.messages).map(|url| {
+            format!(
+                "{} cannot carry an image by URL: the Bedrock plane accepts base64 image \
+                 sources only (offending source: {url})",
+                self.alias,
+            )
+        });
         let body = self.request_body(request.messages, request.tools, temperature);
         let http = self.stream_http.clone();
         let url = self.invoke_url(model, true);
@@ -352,6 +396,9 @@ impl ModelProvider for BedrockRuntimeWire {
         let count_tokens = options.count_tokens;
 
         let stream = async_stream::try_stream! {
+            if let Some(message) = unsupported_image {
+                Err(StreamError::ModelProvider(message))?;
+            }
             let response = http
                 .post(&url)
                 .bearer_auth(&credential)
@@ -479,6 +526,40 @@ mod wire_contract_tests {
             512,
             900,
         )
+    }
+
+    /// The fifth clause, and the one that is NOT visible in the body: this
+    /// plane's image sources are base64-only. "On Amazon Bedrock and Google
+    /// Cloud, only base64-encoded sources are currently available"
+    /// (platform.claude.com, "Vision", read 2026-08-21), so the `url` source
+    /// the shared Messages builder produces for an `https://` marker is a
+    /// shape AWS rejects — even though the body is otherwise byte-identical
+    /// to the one Anthropic 1P accepts, which is exactly why this cannot be
+    /// caught by the differential test below.
+    #[test]
+    fn a_url_image_source_is_refused_before_the_plane_is_dialled() {
+        assert_eq!(
+            BedrockRuntimeWire::unsupported_image_source(&[ChatMessage::user(
+                "look [IMAGE:https://example.com/x.jpg]"
+            )]),
+            Some("https://example.com/x.jpg"),
+            "a URL image must be caught before dispatch, not discovered as an opaque AWS 400"
+        );
+        // base64 is the source this plane DOES take, and must not be refused.
+        assert_eq!(
+            BedrockRuntimeWire::unsupported_image_source(&[ChatMessage::user(
+                "look [IMAGE:data:image/png;base64,AAAA]"
+            )]),
+            None,
+        );
+        // And plain text is untouched, marker-shaped prose included.
+        assert_eq!(
+            BedrockRuntimeWire::unsupported_image_source(&[
+                ChatMessage::user("no images here"),
+                ChatMessage::user("broken [IMAGE:no-close"),
+            ]),
+            None,
+        );
     }
 
     #[test]

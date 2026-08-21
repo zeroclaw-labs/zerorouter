@@ -402,7 +402,7 @@ async fn model_pricing_matches_zeroclaws_model_pricing_wire_contract() {
             },
             "context_length": 1_050_000,
             "max_output_tokens": 128_000,
-            "input_modalities": ["text", "image", "pdf"],
+            "input_modalities": ["text", "image"],
             "tool_call": true,
             // Unlike every other field here, `retention` is present on EVERY
             // row and never omitted — a customer reading a row with no posture
@@ -461,7 +461,7 @@ async fn model_pricing_matches_zeroclaws_model_pricing_wire_contract() {
             },
             "context_length": 200_000,
             "max_output_tokens": 64_000,
-            "input_modalities": ["text", "image", "pdf"],
+            "input_modalities": ["text", "image"],
             "tool_call": true,
             "retention": {
                 "posture": "standard",
@@ -600,6 +600,32 @@ async fn every_shipped_model_publishes_what_it_can_take_and_produce() {
                 assert!(
                     modalities.iter().any(|modality| modality == required),
                     "{id} does not take {required}: {:?}",
+                    model["input_modalities"]
+                );
+            }
+        }
+        // NOTHING ADVERTISES WHAT THE WIRE WILL NOT CARRY (2026-08-21).
+        //
+        // The other half of the guard above, and the one that closes the gap
+        // this catalog actually shipped with: `image` is now carried by all
+        // four wires, but `pdf`, `audio` and `video` are carried by none of
+        // them — the compat surface refuses OpenAI's `file` and `input_audio`
+        // parts outright, because no upstream ZeroRouter dials accepts one on
+        // the endpoint it dials. A row advertising one of those invites a
+        // request that is a guaranteed 400.
+        //
+        // Asserted for EVERY lane including the exempt ones, because the
+        // exemptions above are about lanes that say too LITTLE and this is
+        // about lanes that say too much. If a `document` mapping ever lands,
+        // this list is what should fail first — and re-declaring the modality
+        // is then the correct fix.
+        if let Some(modalities) = model["input_modalities"].as_array() {
+            for uncarried in ["pdf", "audio", "video"] {
+                assert!(
+                    !modalities.iter().any(|modality| modality == uncarried),
+                    "{id} advertises {uncarried} input, which no ZeroRouter wire carries — a \
+                     client that believes this row builds a request that 400s. Either add the \
+                     wire mapping or drop the claim: {:?}",
                     model["input_modalities"]
                 );
             }

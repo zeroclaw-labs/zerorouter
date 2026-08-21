@@ -123,6 +123,44 @@ schema_version = 1
 # table against that same catalog on every CI run, so a window that moves
 # upstream is caught the way a price is. They are token counts and capability
 # flags, not money: nothing here changes what anyone is billed.
+#
+# `input_modalities` IS A CLAIM ABOUT THE LANE, NOT ABOUT THE MODEL, AND THE
+# TWO DIVERGED (2026-08-21). Read this before "restoring" a modality.
+#
+# Until 2026-08-21 the compat surface refused EVERY structured content array —
+# `contains_unsupported_extensions` admitted only a string or null — so a
+# client that read `"pdf"` or `"image"` off a row here and built the request
+# that row invited got a flat 400. Fourteen of the twenty-one lanes below
+# advertised at least one modality the router would not carry. The gap is now
+# closed from BOTH ends, and this is the half that took things away:
+#
+# - `image` KEPT wherever it was declared. All four wires now decode ZR's
+#   `[IMAGE:<url>]` packing into their own native shape (Anthropic image
+#   blocks, chat-completions `image_url` parts, Responses `input_image`
+#   parts), so an image is carried end to end.
+# - `pdf` REMOVED from every lane that declared it (the openai, anthropic,
+#   bedrock, google and vertex pins). No wire maps OpenAI's `{"type":"file"}`
+#   part, and — checked upstream by upstream on 2026-08-21 — NO provider here
+#   accepts one on the endpoint ZeroRouter actually dials: Fireworks' schema
+#   defines `text`/`image_url`/`video_url` only and withdrew Document
+#   Inlining, AI Studio's OpenAI-compat page documents no file part, and xAI's
+#   file attachments are an `input_file` shape bound to `/v1/responses`.
+#   Anthropic's own Messages API DOES take PDFs as `document` blocks, so this
+#   removal understates the anthropic and bedrock lanes specifically — that is
+#   deliberate: the claim is what the LANE carries today, and the router has
+#   no `document` mapping. Re-declare it the day one lands, not before.
+# - `video` and `audio` REMOVED from the google and vertex pins for the same
+#   reason and with less argument: nothing in the router has ever carried
+#   either, on any wire.
+#
+# This is the same rule the xAI lanes below already argue at length — "a
+# client that believes it can send an image builds a request that fails" —
+# applied in the direction that costs the catalog a capability rather than
+# gaining one. Expect `admin catalog-drift` to report `input_modalities` rows
+# against models.dev for the lanes above: models.dev describes the MODEL and
+# is right about it, while this file describes the lane. That divergence is
+# the honest state and should not be closed by re-adding a claim the wire
+# cannot honour.
 
 # ---------------------------------------------------------------------------
 # RETENTION POSTURE (2026-08-20) — what each upstream does with a request after
@@ -683,7 +721,7 @@ model = "gpt-5.6-luna"
 [tiers."openai/gpt-5.6-luna".candidates.metadata]
 context_window = 1050000
 max_output_tokens = 128000
-input_modalities = ["text", "image", "pdf"]
+input_modalities = ["text", "image"]
 tool_call = true
 
 [tiers."openai/gpt-5.6-luna".candidates.rates]
@@ -714,7 +752,7 @@ model = "claude-haiku-4-5-20251001"
 [tiers."anthropic/claude-haiku-4-5".candidates.metadata]
 context_window = 200000
 max_output_tokens = 64000
-input_modalities = ["text", "image", "pdf"]
+input_modalities = ["text", "image"]
 tool_call = true
 
 [tiers."anthropic/claude-haiku-4-5".candidates.rates]
@@ -747,7 +785,7 @@ model = "gpt-5.6-terra"
 [tiers."openai/gpt-5.6-terra".candidates.metadata]
 context_window = 1050000
 max_output_tokens = 128000
-input_modalities = ["text", "image", "pdf"]
+input_modalities = ["text", "image"]
 tool_call = true
 
 [tiers."openai/gpt-5.6-terra".candidates.rates]
@@ -796,7 +834,7 @@ model = "claude-sonnet-5"
 [tiers."anthropic/claude-sonnet-5".candidates.metadata]
 context_window = 1000000
 max_output_tokens = 128000
-input_modalities = ["text", "image", "pdf"]
+input_modalities = ["text", "image"]
 tool_call = true
 
 [tiers."anthropic/claude-sonnet-5".candidates.rates]
@@ -819,7 +857,7 @@ model = "claude-opus-5"
 [tiers."anthropic/claude-opus-5".candidates.metadata]
 context_window = 1000000
 max_output_tokens = 128000
-input_modalities = ["text", "image", "pdf"]
+input_modalities = ["text", "image"]
 tool_call = true
 
 [tiers."anthropic/claude-opus-5".candidates.rates]
@@ -851,7 +889,7 @@ model = "gpt-5.6-sol"
 [tiers."openai/gpt-5.6-sol".candidates.metadata]
 context_window = 1050000
 max_output_tokens = 128000
-input_modalities = ["text", "image", "pdf"]
+input_modalities = ["text", "image"]
 tool_call = true
 
 [tiers."openai/gpt-5.6-sol".candidates.rates]
@@ -880,7 +918,7 @@ model = "claude-fable-5"
 [tiers."anthropic/claude-fable-5".candidates.metadata]
 context_window = 1000000
 max_output_tokens = 128000
-input_modalities = ["text", "image", "pdf"]
+input_modalities = ["text", "image"]
 tool_call = true
 
 [tiers."anthropic/claude-fable-5".candidates.rates]
@@ -923,7 +961,7 @@ model = "gemini-3.7-flash"
 [tiers."google/gemini-3.7-flash".candidates.metadata]
 context_window = 1048576
 max_output_tokens = 65536
-input_modalities = ["text", "image", "video", "audio", "pdf"]
+input_modalities = ["text", "image"]
 tool_call = true
 
 [tiers."google/gemini-3.7-flash".candidates.rates]
@@ -946,7 +984,7 @@ model = "gemini-3.5-flash-lite"
 [tiers."google/gemini-3.5-flash-lite".candidates.metadata]
 context_window = 1048576
 max_output_tokens = 65536
-input_modalities = ["text", "image", "video", "audio", "pdf"]
+input_modalities = ["text", "image"]
 tool_call = true
 
 [tiers."google/gemini-3.5-flash-lite".candidates.rates]
@@ -979,7 +1017,7 @@ model = "gemini-3.1-pro-preview"
 [tiers."google/gemini-3.1-pro-preview".candidates.metadata]
 context_window = 1048576
 max_output_tokens = 65536
-input_modalities = ["text", "image", "video", "audio", "pdf"]
+input_modalities = ["text", "image"]
 tool_call = true
 
 [tiers."google/gemini-3.1-pro-preview".candidates.rates]
@@ -1141,7 +1179,7 @@ output_per_mtok = 18.00
 # [tiers."bedrock/claude-sonnet-5".candidates.metadata]
 # context_window = 1000000
 # max_output_tokens = 128000
-# input_modalities = ["text", "image", "pdf"]
+# input_modalities = ["text", "image"]
 # tool_call = true
 #
 # [tiers."bedrock/claude-sonnet-5".candidates.rates]
@@ -1164,7 +1202,7 @@ output_per_mtok = 18.00
 # [tiers."bedrock/claude-opus-5".candidates.metadata]
 # context_window = 1000000
 # max_output_tokens = 128000
-# input_modalities = ["text", "image", "pdf"]
+# input_modalities = ["text", "image"]
 # tool_call = true
 #
 # [tiers."bedrock/claude-opus-5".candidates.rates]
@@ -1328,7 +1366,7 @@ model = "us.anthropic.claude-opus-4-6-v1"
 [tiers."bedrock/claude-opus-4-6".candidates.metadata]
 context_window = 1000000
 max_output_tokens = 128000
-input_modalities = ["text", "image", "pdf"]
+input_modalities = ["text", "image"]
 tool_call = true
 
 [tiers."bedrock/claude-opus-4-6".candidates.rates]
@@ -1363,7 +1401,7 @@ model = "us.anthropic.claude-opus-4-5-20251101-v1:0"
 [tiers."bedrock/claude-opus-4-5".candidates.metadata]
 context_window = 200000
 max_output_tokens = 64000
-input_modalities = ["text", "image", "pdf"]
+input_modalities = ["text", "image"]
 tool_call = true
 
 [tiers."bedrock/claude-opus-4-5".candidates.rates]
@@ -1408,7 +1446,7 @@ model = "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
 [tiers."bedrock/claude-sonnet-4-5".candidates.metadata]
 context_window = 200000
 max_output_tokens = 64000
-input_modalities = ["text", "image", "pdf"]
+input_modalities = ["text", "image"]
 tool_call = true
 
 [tiers."bedrock/claude-sonnet-4-5".candidates.rates]
@@ -1438,7 +1476,7 @@ model = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
 [tiers."bedrock/claude-haiku-4-5".candidates.metadata]
 context_window = 200000
 max_output_tokens = 64000
-input_modalities = ["text", "image", "pdf"]
+input_modalities = ["text", "image"]
 tool_call = true
 
 [tiers."bedrock/claude-haiku-4-5".candidates.rates]
@@ -2172,7 +2210,7 @@ model = "google/gemini-3.7-flash"
 [tiers."vertex/gemini-3.7-flash".candidates.metadata]
 context_window = 1048576
 max_output_tokens = 65536
-input_modalities = ["text", "image", "video", "audio", "pdf"]
+input_modalities = ["text", "image"]
 tool_call = true
 
 [tiers."vertex/gemini-3.7-flash".candidates.rates]
@@ -2195,7 +2233,7 @@ model = "google/gemini-3.5-flash-lite"
 [tiers."vertex/gemini-3.5-flash-lite".candidates.metadata]
 context_window = 1048576
 max_output_tokens = 65536
-input_modalities = ["text", "image", "video", "audio", "pdf"]
+input_modalities = ["text", "image"]
 tool_call = true
 
 [tiers."vertex/gemini-3.5-flash-lite".candidates.rates]
@@ -2231,7 +2269,7 @@ model = "google/gemini-3.1-pro-preview"
 [tiers."vertex/gemini-3.1-pro-preview".candidates.metadata]
 context_window = 1048576
 max_output_tokens = 65536
-input_modalities = ["text", "image", "video", "audio", "pdf"]
+input_modalities = ["text", "image"]
 tool_call = true
 
 [tiers."vertex/gemini-3.1-pro-preview".candidates.rates]

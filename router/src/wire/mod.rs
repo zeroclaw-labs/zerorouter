@@ -24,12 +24,12 @@
 //! "unchanged").
 //!
 //! Scope discipline: these clients serve ZEROROUTER's traffic, not
-//! zeroclaw-general. ZeroRouter's compat layer rejects structured content
-//! and never emits multimodal markers, so the input builder handles exactly
-//! the five packing shapes `openai::to_provider_message` produces — system
-//! and user plain text, assistant text (with optional reasoning), assistant
-//! tool-call packs, and tool-result packs — and is unit-tested against that
-//! packer, not against hypothetical inputs.
+//! zeroclaw-general. The input builders handle exactly the packing shapes
+//! `openai::to_provider_message` produces — system and user plain text,
+//! assistant text (with optional reasoning), assistant tool-call packs,
+//! tool-result packs, and (since the compat surface accepted OpenAI-shape
+//! content arrays) user text carrying `[IMAGE:<url>]` markers — and are
+//! unit-tested against that packer, not against hypothetical inputs.
 //!
 
 mod anthropic;
@@ -49,6 +49,79 @@ use std::time::Duration;
 
 use crate::provider::{StreamError, TokenUsage};
 use futures_util::StreamExt;
+
+/// The marker `openai::content_to_text` packs an OpenAI `image_url` part into
+/// when it flattens a structured content array into the one `String` the
+/// provider interface carries (`provider::ChatMessage::content`).
+///
+/// It lives here rather than in each wire because THREE wires now decode it
+/// and a fourth (Bedrock classic) inherits Anthropic's decoder — a marker
+/// grammar spelled four times is a marker grammar that drifts in three of
+/// them.
+const IMAGE_MARKER_OPEN: &str = "[IMAGE:";
+
+/// One piece of a user turn after the image markers have been split back out.
+///
+/// Borrowed from the packed string rather than owned: a base64 data URI is
+/// routinely megabytes, and every wire re-serializes it into a request body
+/// immediately, so copying it once per split would double peak memory on
+/// exactly the requests that are already the largest.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum UserPart<'a> {
+    Text(&'a str),
+    /// A `data:<media-type>;base64,<payload>` URI, already split.
+    Base64Image {
+        media_type: &'a str,
+        data: &'a str,
+    },
+    /// Any other URL — `https://…` in practice.
+    UrlImage(&'a str),
+}
+
+/// Split ZR's `[IMAGE:<url>]` markers back out of a packed user turn.
+///
+/// The inverse of `openai::content_to_text`. Text runs that are empty or
+/// whitespace-only are dropped: Anthropic rejects empty text blocks outright,
+/// and a blank text part carries nothing on any dialect.
+///
+/// A malformed marker — one with no closing `]` — is deliberately NOT an
+/// error. It stays literal text, because the alternative is failing a request
+/// over a customer's prose that happens to contain the marker's opening
+/// bracket, and a wire is the wrong place to refuse a request.
+pub(crate) fn split_image_markers(text: &str) -> Vec<UserPart<'_>> {
+    let mut parts = Vec::new();
+    let mut rest = text;
+    while let Some(start) = rest.find(IMAGE_MARKER_OPEN) {
+        let before = &rest[..start];
+        if !before.trim().is_empty() {
+            parts.push(UserPart::Text(before));
+        }
+        let after_marker = &rest[start + IMAGE_MARKER_OPEN.len()..];
+        let Some(end) = after_marker.find(']') else {
+            // Unterminated: keep the remainder verbatim and stop scanning.
+            rest = &rest[start..];
+            break;
+        };
+        parts.push(image_part(&after_marker[..end]));
+        rest = &after_marker[end + 1..];
+    }
+    if !rest.trim().is_empty() {
+        parts.push(UserPart::Text(rest));
+    }
+    parts
+}
+
+/// Classify one marker payload. A `data:` URI whose base64 section is present
+/// splits into media type and payload; anything else — including a `data:`
+/// URI that is NOT base64-encoded, which no dialect here can carry as bytes —
+/// is treated as a URL and left for the upstream to fetch or reject.
+fn image_part(url: &str) -> UserPart<'_> {
+    url.strip_prefix("data:")
+        .and_then(|data_uri| data_uri.split_once(";base64,"))
+        .map_or(UserPart::UrlImage(url), |(media_type, data)| {
+            UserPart::Base64Image { media_type, data }
+        })
+}
 
 /// Idle ceiling for a STREAMING upstream: how long the wire waits between
 /// bytes before declaring the stream dead. A live SSE stream is never

@@ -111,6 +111,61 @@ pub struct OpenAiFunctionCall {
     pub extra: Map<String, Value>,
 }
 
+/// models.dev's spelling for image input — the vocabulary `tiers.toml`
+/// declares, `/v1/models` publishes, and `admin catalog-drift` reconciles.
+pub const IMAGE_MODALITY: &str = "image";
+
+/// What ONE image adds to a reservation, in tokens: the largest per-image
+/// figure any provider family this router dials PUBLISHES.
+///
+/// Why a constant and not a measurement: the tokens an image costs are
+/// decided by the upstream, from pixel dimensions the router never sees — it
+/// forwards a URL or a base64 blob and decodes neither. Settlement is
+/// untouched and stays metered actuals; this figure only sizes the hold.
+///
+/// Why one number and not one per family: the hold is taken before the walk
+/// picks a rung, and a walk that falls through to a later rung must still be
+/// covered by the hold it already took. A per-family constant would be right
+/// for the rung that was expected and wrong for the one that answered.
+///
+/// The published per-image figures, all read 2026-08-21:
+///
+/// | Family | Rule | Published max / image |
+/// |---|---|---|
+/// | Fireworks | measured table, Qwen2.5-VL | **10,549** at 3840×2160 |
+/// | Anthropic (Claude 4.7+) | `⌈w/28⌉ × ⌈h/28⌉`, long edge capped at 2576px | 4,784 |
+/// | Anthropic (earlier) | same formula, long edge capped at 1568px | 1,568 |
+/// | Google Gemini 3 | `media_resolution` allocates a fixed budget | 2,240 (`ultra_high`) |
+/// | OpenAI (patch budget, mini/nano/o4-mini) | `budget × multiplier` | ~3,779 |
+/// | OpenAI (tile: 4o/4.1/gpt-5) | `base + tile × tiles` | NOT PUBLISHED |
+/// | OpenAI (GPT-5.6 at `auto`/`original`) | no resize | **EXPLICITLY UNCAPPED** |
+/// | xAI | acknowledged, never quantified | NOT PUBLISHED |
+///
+/// Sources: docs.fireworks.ai "How many tokens per image";
+/// platform.claude.com "Vision" → Resolution and token cost;
+/// ai.google.dev "Media resolution"; developers.openai.com
+/// "Images and vision" → patch-based / tile-based tokenization.
+///
+/// **THIS IS A PUBLISHED-FIGURE BOUND, NOT A GUARANTEE, AND THE DIFFERENCE
+/// MATTERS.** Three rows above publish no ceiling, and OpenAI documents its
+/// newest models as deliberately uncapped at the DEFAULT detail level ("large
+/// images can use more input tokens than they did with earlier models"). For
+/// a `data:` URI none of that is reachable: the byte bound below already
+/// holds the base64 length, which is orders of magnitude above any of these
+/// figures. The residual exposure is an `https://` URL — ~60 bytes on the
+/// wire, an arbitrarily large image at the upstream — on a family that
+/// publishes no cap. That is under-recovery for ZeroRouter, never an
+/// overcharge to a customer (settlement is metered actuals, clamped to the
+/// hold), and closing it properly needs a product decision: either bound the
+/// accepted image dimensions, or refuse URL images on lanes whose family
+/// publishes no ceiling.
+///
+/// NOTE for anyone tempted to lower this to ~1600: that is Anthropic's
+/// STANDARD-tier figure. Claude 4.7 and later are high-resolution and cost up
+/// to 4,784 — roughly 3x — so a reserve sized at the older number would
+/// under-hold by two thirds on the Opus and Sonnet lanes this catalog sells.
+pub const MAX_IMAGE_PROMPT_TOKENS: u64 = 10_549;
+
 fn empty_object() -> Value {
     json!({})
 }
@@ -243,7 +298,7 @@ impl ChatCompletionRequest {
                 .as_ref()
                 .is_some_and(|options| !options.extra.is_empty())
             || self.messages.iter().any(|message| {
-                (!message.content.is_string() && !message.content.is_null())
+                !content_is_supported(&message.role, &message.content)
                     || message.extra.keys().any(|key| key != "cache_control")
                     || message
                         .tool_calls
@@ -263,23 +318,43 @@ impl ChatCompletionRequest {
     /// which is the design's B-line. `prompt_bound` is supplied by the caller
     /// rather than recomputed so selection and admission read the same number.
     ///
-    /// The modality set is text-or-nothing today, and that is a fact about the
-    /// compat surface rather than a simplification:
-    /// [`Self::contains_unsupported_extensions`] refuses any message whose
-    /// `content` is not a string or null, so a request carrying image, audio,
-    /// or file parts is a 400 long before it reaches selection. This method is
-    /// the single seam that changes when that surface widens — the comparison
-    /// on the other side ([`crate::config::ModelMetadata::can_serve`]) is
-    /// already written against a set.
+    /// The modality set was text-or-nothing until the compat surface learned
+    /// to accept OpenAI-shape content arrays; this is the seam the old comment
+    /// here nominated for that change, and the comparison on the other side
+    /// ([`crate::config::ModelMetadata::can_serve`]) was already written
+    /// against a set.
+    ///
+    /// `text` is reported for a string content AND for a text part, because a
+    /// text-only array is the same request as the joined string — the wires
+    /// flatten it back to one. `image` is reported for any `image_url` part.
+    /// Audio and file parts cannot appear: they are refused as unsupported
+    /// content by [`Self::contains_unsupported_extensions`], which runs first.
+    ///
+    /// The vocabulary is models.dev's, because that is what `tiers.toml`
+    /// declares and what `admin catalog-drift` reconciles against.
     #[must_use]
     pub fn needs(&self, prompt_bound: u64) -> RequestNeeds {
         let mut modalities = BTreeSet::new();
-        if self
-            .messages
-            .iter()
-            .any(|message| message.content.is_string())
-        {
-            modalities.insert("text".to_owned());
+        for message in &self.messages {
+            match &message.content {
+                Value::String(_) => {
+                    modalities.insert("text".to_owned());
+                }
+                Value::Array(parts) => {
+                    for part in parts {
+                        match part.get("type").and_then(Value::as_str) {
+                            Some("text") => {
+                                modalities.insert("text".to_owned());
+                            }
+                            Some("image_url") => {
+                                modalities.insert("image".to_owned());
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                _ => {}
+            }
         }
         RequestNeeds {
             prompt_bound,
@@ -314,6 +389,29 @@ impl ChatCompletionRequest {
                 .saturating_add(byte_len(&tool.function.description))
                 .saturating_add(value_byte_len(&tool.function.parameters));
         }
+        // IMAGES. The byte bound above is a bound on TEXT: it reads the
+        // serialized length of the content and treats a byte as a token,
+        // which is conservative for prose. It is NOT conservative for an
+        // image, and the two carriers fail in opposite directions:
+        //
+        // - A `data:` URI is enormous as bytes (megabytes of base64) and
+        //   cheap as tokens (capped — see `MAX_IMAGE_PROMPT_TOKENS`), so the
+        //   byte bound already over-holds by orders of magnitude.
+        // - An `https://` URL is ~60 bytes and costs the SAME capped
+        //   thousands of tokens, because the upstream fetches the image the
+        //   router never saw. There the byte bound under-holds by ~80x, and
+        //   under-holding is the direction that lets a request be served that
+        //   the balance could not cover.
+        //
+        // So each image adds its worst case ON TOP of its bytes. For a data
+        // URI that is a rounding error against a bound that was already huge;
+        // for a URL it is the whole hold. Settlement is untouched and still
+        // charges metered actuals.
+        input_bound = input_bound.saturating_add(
+            u64::try_from(image_urls(&self.messages).count())
+                .unwrap_or(u64::MAX)
+                .saturating_mul(MAX_IMAGE_PROMPT_TOKENS),
+        );
         let output = u64::from(max_output_tokens);
         OpenAiUsage {
             prompt_tokens: input_bound,
@@ -322,6 +420,98 @@ impl ChatCompletionRequest {
             prompt_tokens_details: None,
         }
     }
+}
+
+/// Whether one message's `content` is a shape this compat surface carries.
+///
+/// A string or null is accepted as it always was. An ARRAY is accepted only
+/// when every part is one this router can actually deliver to an upstream,
+/// which is narrower than what OpenAI itself defines — deliberately, and in
+/// the same spirit as the rest of this predicate: a part ZeroRouter cannot
+/// preserve is refused with a 400 rather than accepted and silently dropped.
+///
+/// The accepted grammar, matched against the official schema
+/// (openai/openai-openapi, `ChatCompletionRequestMessageContentPart*`, read
+/// 2026-08-21):
+///
+/// | Part | Where OpenAI allows it | Here |
+/// |---|---|---|
+/// | `{"type":"text","text":…}` | every role | accepted, every role |
+/// | `{"type":"image_url","image_url":{"url":…}}` | `user` only | accepted, `user` only |
+/// | `{"type":"input_audio",…}` | `user` only | REFUSED |
+/// | `{"type":"file",…}` | `user` only | REFUSED |
+/// | `{"type":"refusal",…}` | `assistant` only | REFUSED |
+///
+/// `image_url` is confined to `user` messages because that is where the
+/// official schema puts it — `ChatCompletionRequestSystemMessageContentPart`
+/// and `…ToolMessageContentPart` are `text`-only, and the spec says outright
+/// "For tool messages, only type `text` is supported". Accepting an image on
+/// a system or tool turn would be inventing a shape no SDK emits and no
+/// upstream on any of this router's four wires is documented to take.
+///
+/// `input_audio` and `file` are refused because NO lane in this catalog can
+/// carry them: none of the four wires has a mapping, and no upstream behind
+/// the chat-completions wire defines an OpenAI-shape file part at all
+/// (Fireworks' schema has `text`/`image_url`/`video_url` only and its
+/// Document Inlining was withdrawn; AI Studio's compat page documents no file
+/// part; xAI's file attachments are `input_file` on `/v1/responses`, not on
+/// chat completions). `tiers.toml` was narrowed to match rather than left
+/// advertising a `pdf` no lane could accept.
+fn content_is_supported(role: &str, content: &Value) -> bool {
+    match content {
+        Value::String(_) | Value::Null => true,
+        Value::Array(parts) => parts.iter().all(|part| part_is_supported(role, part)),
+        _ => false,
+    }
+}
+
+fn part_is_supported(role: &str, part: &Value) -> bool {
+    let Some(part) = part.as_object() else {
+        return false;
+    };
+    match part.get("type").and_then(Value::as_str) {
+        // A text part carries `type` and `text` and nothing else this surface
+        // can preserve — `prompt_cache_breakpoint` is handled by the
+        // cache-control predicate, which runs first and answers separately.
+        Some("text") => {
+            part.get("text").is_some_and(Value::is_string)
+                && part
+                    .keys()
+                    .all(|key| matches!(key.as_str(), "type" | "text"))
+        }
+        Some("image_url") if role == "user" => {
+            part.get("image_url")
+                .and_then(Value::as_object)
+                .is_some_and(|image| {
+                    image
+                        .get("url")
+                        .and_then(Value::as_str)
+                        .is_some_and(|url| !url.trim().is_empty())
+                        && image.keys().all(|key| key == "url")
+                })
+                && part
+                    .keys()
+                    .all(|key| matches!(key.as_str(), "type" | "image_url"))
+        }
+        _ => false,
+    }
+}
+
+/// Every image part in the request, as the `url` string the caller supplied.
+///
+/// Only `user` turns are consulted, matching [`content_is_supported`].
+fn image_urls(messages: &[OpenAiMessage]) -> impl Iterator<Item = &str> {
+    messages
+        .iter()
+        .filter(|message| message.role == "user")
+        .filter_map(|message| message.content.as_array())
+        .flatten()
+        .filter(|part| part.get("type").and_then(Value::as_str) == Some("image_url"))
+        .filter_map(|part| {
+            part.get("image_url")
+                .and_then(|image| image.get("url"))
+                .and_then(Value::as_str)
+        })
 }
 
 fn byte_len(value: &str) -> u64 {
@@ -1755,6 +1945,235 @@ mod tests {
             request.provider_messages()[0]
                 .content
                 .contains("reasoning_content")
+        );
+    }
+
+    /// The shape the official OpenAI SDKs emit for a vision request, which
+    /// used to be a flat 400 on every lane in this catalog including the ones
+    /// whose `/v1/models` row advertised `image`. Both carriers are here
+    /// because they behave differently everywhere downstream — the reserve
+    /// sizes them differently, and the Bedrock plane takes only one of them.
+    #[test]
+    fn an_openai_shape_content_array_is_accepted_on_a_user_turn() {
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "anthropic/claude-sonnet-5",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "what is in this image?"},
+                    {"type": "image_url", "image_url": {
+                        "url": "data:image/png;base64,AAAA"
+                    }},
+                    {"type": "image_url", "image_url": {
+                        "url": "https://example.com/x.jpg"
+                    }},
+                ],
+            }],
+        }))
+        .expect("an OpenAI-shape multimodal request should parse");
+
+        request.validate().expect("it should validate");
+        assert!(
+            !request.contains_unsupported_extensions(),
+            "the shape every official SDK emits must not be refused"
+        );
+        let needs = request.needs(0);
+        assert!(needs.modalities.contains("text"));
+        assert!(needs.modalities.contains(IMAGE_MODALITY));
+    }
+
+    /// A text-only array is the same request as the joined string: it must be
+    /// accepted everywhere, and must NOT claim the image modality, or a
+    /// client that merely uses the array form would be locked out of every
+    /// text-only lane in the catalog.
+    #[test]
+    fn a_text_only_array_needs_nothing_an_ordinary_string_does_not() {
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "fireworks/glm-5.2",
+            "messages": [
+                {"role": "system", "content": [{"type": "text", "text": "be terse"}]},
+                {"role": "user", "content": [
+                    {"type": "text", "text": "one"},
+                    {"type": "text", "text": "two"},
+                ]},
+                {"role": "tool", "tool_call_id": "c1",
+                 "content": [{"type": "text", "text": "result"}]},
+            ],
+        }))
+        .expect("a text-part array should parse");
+
+        request.validate().expect("it should validate");
+        assert!(!request.contains_unsupported_extensions());
+        assert_eq!(
+            request.needs(0).modalities,
+            ["text".to_owned()].into_iter().collect::<BTreeSet<_>>(),
+            "a text-only array must not ask a lane for vision"
+        );
+        // And it flattens to exactly the string it is equivalent to.
+        assert_eq!(request.provider_messages()[1].content, "one\ntwo");
+    }
+
+    /// The parts this router refuses, and each one is refused for a reason
+    /// recorded at `content_is_supported`.
+    ///
+    /// `file` is the load-bearing row: no upstream behind ANY of this
+    /// router's four wires defines an OpenAI-shape file part, so a PDF cannot
+    /// be carried anywhere, and `tiers.toml` was narrowed to stop advertising
+    /// one. If a lane ever gains a real file mapping, this row is what should
+    /// fail first.
+    #[test]
+    fn parts_the_router_cannot_deliver_are_refused_rather_than_dropped() {
+        let refused = [
+            (
+                "file",
+                json!([{"type": "file", "file": {"filename": "a.pdf", "file_data": "JVBER"}}]),
+            ),
+            (
+                "input_audio",
+                json!([{"type": "input_audio", "input_audio": {"data": "AAAA", "format": "wav"}}]),
+            ),
+            ("refusal", json!([{"type": "refusal", "refusal": "no"}])),
+            ("an unknown part type", json!([{"type": "video_url"}])),
+            ("a part that is not an object", json!(["bare string"])),
+            (
+                "an image part with an unpreservable field",
+                json!([{"type": "image_url", "image_url": {
+                    "url": "https://example.com/x.jpg", "detail": "high"
+                }}]),
+            ),
+            (
+                "an image part with an empty url",
+                json!([{"type": "image_url", "image_url": {"url": "   "}}]),
+            ),
+            (
+                "a text part carrying an extra field",
+                json!([{"type": "text", "text": "hi", "annotations": []}]),
+            ),
+        ];
+        for (what, content) in refused {
+            let request: ChatCompletionRequest = serde_json::from_value(json!({
+                "model": "anthropic/claude-sonnet-5",
+                "messages": [{"role": "user", "content": content}],
+            }))
+            .expect("the body parses; it is the predicate that refuses it");
+            assert!(
+                request.contains_unsupported_extensions(),
+                "{what} must be refused, not silently dropped on the way upstream"
+            );
+        }
+    }
+
+    /// An image is a `user`-turn part in OpenAI's own schema — the system and
+    /// tool content-part unions are text-only, and the spec says outright
+    /// "For tool messages, only type `text` is supported". Accepting one
+    /// elsewhere would invent a shape no SDK emits and no upstream documents.
+    #[test]
+    fn an_image_part_outside_a_user_turn_is_refused() {
+        for role in ["system", "assistant", "tool"] {
+            let mut message = json!({
+                "role": role,
+                "content": [{"type": "image_url", "image_url": {
+                    "url": "https://example.com/x.jpg"
+                }}],
+            });
+            if role == "tool" {
+                message["tool_call_id"] = json!("c1");
+            }
+            let request: ChatCompletionRequest = serde_json::from_value(json!({
+                "model": "anthropic/claude-sonnet-5",
+                "messages": [message],
+            }))
+            .expect("it parses");
+            assert!(
+                request.contains_unsupported_extensions(),
+                "an image on a {role} turn must be refused"
+            );
+        }
+    }
+
+    /// The reserve arm. An `https://` image is ~60 bytes on the wire and
+    /// costs the upstream thousands of tokens, so the byte bound alone
+    /// under-holds by roughly 80x — this is the arm that closes that, and
+    /// `MAX_IMAGE_PROMPT_TOKENS` is the documented worst case it holds.
+    #[test]
+    fn a_url_image_reserves_its_worst_case_rather_than_its_byte_length() {
+        let with_image: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "anthropic/claude-sonnet-5",
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "describe"},
+                {"type": "image_url", "image_url": {"url": "https://example.com/x.jpg"}},
+            ]}],
+        }))
+        .expect("it parses");
+        let text_only: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "anthropic/claude-sonnet-5",
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "describe"},
+            ]}],
+        }))
+        .expect("it parses");
+
+        let imaged = with_image.reservation_usage(100).prompt_tokens;
+        let plain = text_only.reservation_usage(100).prompt_tokens;
+        let url_bytes =
+            byte_len(r#"{"image_url":{"url":"https://example.com/x.jpg"},"type":"image_url"}"#);
+        assert!(
+            imaged >= plain + MAX_IMAGE_PROMPT_TOKENS,
+            "one image must add at least its documented worst case ({MAX_IMAGE_PROMPT_TOKENS}); \
+             got {imaged} against a text-only {plain}"
+        );
+        assert!(
+            MAX_IMAGE_PROMPT_TOKENS > url_bytes * 10,
+            "the point of the arm is that the URL's own byte length ({url_bytes}) is nowhere \
+             near what the upstream will meter for it"
+        );
+        // Two images hold twice.
+        let two: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "anthropic/claude-sonnet-5",
+            "messages": [{"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": "https://example.com/a.jpg"}},
+                {"type": "image_url", "image_url": {"url": "https://example.com/b.jpg"}},
+            ]}],
+        }))
+        .expect("it parses");
+        assert!(
+            two.reservation_usage(100).prompt_tokens
+                >= plain + 2 * MAX_IMAGE_PROMPT_TOKENS - url_bytes,
+            "each image reserves its own worst case"
+        );
+    }
+
+    /// `IMAGE_RESERVE_COVERS_EVERY_FAMILY` — every per-image figure this
+    /// catalog's providers publish, asserted against the constant so that a
+    /// family raising its published number past the hold fails loudly here
+    /// rather than quietly under-recovering in production.
+    ///
+    /// The rows are the evidence for `MAX_IMAGE_PROMPT_TOKENS`; the doc
+    /// comment there carries the citations and the honest caveat that three
+    /// families publish no ceiling at all.
+    #[test]
+    fn the_image_reserve_bounds_every_published_per_family_figure() {
+        // (family, published max tokens for one image)
+        const PUBLISHED: [(&str, u64); 5] = [
+            ("fireworks qwen2.5-vl 3840x2160", 10_549),
+            ("anthropic claude 4.7+ high-resolution", 4_784),
+            ("anthropic standard tier", 1_568),
+            ("openai patch-budget nano (1536 x 2.46)", 3_779),
+            ("google gemini 3 ultra_high", 2_240),
+        ];
+        for (family, published) in PUBLISHED {
+            assert!(
+                MAX_IMAGE_PROMPT_TOKENS >= published,
+                "{family} publishes {published} tokens for one image, above the {} this \
+                 reservation holds — the hold would under-recover on that lane",
+                MAX_IMAGE_PROMPT_TOKENS
+            );
+        }
+        assert_eq!(
+            MAX_IMAGE_PROMPT_TOKENS,
+            PUBLISHED.iter().map(|(_, tokens)| *tokens).max().unwrap(),
+            "the hold is exactly the largest published figure: lower under-recovers, higher \
+             would be a number no provider document supports"
         );
     }
 
