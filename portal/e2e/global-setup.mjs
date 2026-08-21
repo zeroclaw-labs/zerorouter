@@ -106,6 +106,12 @@ export default async function globalSetup() {
       // Bedrock's do without `BEDROCK_REGION`.
       VERTEX_SERVICE_ACCOUNT: 'not-a-real-service-account-key',
       VERTEX_PROJECT_ID: 'zr-e2e-not-a-real-project',
+      // Bring-your-own-key. Present so the portal renders its BYOK section and
+      // the attach flow can be driven; a fixed fixture value rather than a
+      // generated one so a failing run is reproducible. Nothing here is
+      // protecting a real secret — the keys the suite attaches are made up, and
+      // no request in it dials an upstream.
+      BYOK_ENCRYPTION_KEY: '1b'.repeat(32),
       OIDC_ISSUER_URL: `http://127.0.0.1:${IDP_PORT}`,
       OIDC_CLIENT_ID: 'e2e-portal',
       OIDC_CLIENT_SECRET: 'e2e-secret',

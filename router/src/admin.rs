@@ -56,6 +56,16 @@ pub enum AdminCommand {
     RevokeKey(RevokeKeyArgs),
     /// List key metadata without hashes or plaintext credentials.
     ListKeys(ListKeysArgs),
+    /// List the customers' own provider credentials this deployment holds,
+    /// by fingerprint. Read-only, and structurally unable to disclose a key:
+    /// the sealed column is not in the projection, so the plaintext is not
+    /// merely omitted from the output — it is never read out of the database.
+    ///
+    /// Exists for one support question, which is otherwise unanswerable:
+    /// "is the key you pasted the one we hold?" A customer can compare a
+    /// fingerprint against what they see here without either side disclosing
+    /// anything.
+    ListByokKeys(ListByokKeysArgs),
     /// List settlements that could not be recorded and are awaiting
     /// reconciliation (migration 0006).
     OwedSettlements(OwedSettlementsArgs),
@@ -370,6 +380,12 @@ pub struct ListKeysArgs {
 }
 
 #[derive(Debug, Args)]
+pub struct ListByokKeysArgs {
+    #[arg(long)]
+    pub email: Option<String>,
+}
+
+#[derive(Debug, Args)]
 pub struct OwedSettlementsArgs {
     #[arg(long, default_value_t = 100)]
     pub limit: i64,
@@ -447,6 +463,7 @@ pub async fn run(args: AdminArgs) -> Result<()> {
         AdminCommand::Treasury(args) => treasury(&pool, args).await,
         AdminCommand::RevokeKey(args) => revoke_key(&pool, args).await,
         AdminCommand::ListKeys(args) => list_keys(&pool, args).await,
+        AdminCommand::ListByokKeys(args) => list_byok_keys(&pool, args).await,
         AdminCommand::OwedSettlements(args) => owed_settlements(&pool, args).await,
         AdminCommand::SettleOwed(args) => settle_owed(&pool, args).await,
         // Handled above, before the pool exists.
@@ -1032,6 +1049,63 @@ async fn revoke_key(pool: &PgPool, args: RevokeKeyArgs) -> Result<()> {
 
 async fn list_keys(pool: &PgPool, args: ListKeysArgs) -> Result<()> {
     let rows = list_key_metadata(pool, args.email).await?;
+    println!("{}", serde_json::to_string_pretty(&rows)?);
+    Ok(())
+}
+
+/// Attached customer provider credentials, by fingerprint (migration 0026).
+///
+/// `sealed_credential` is absent from the SELECT list rather than dropped
+/// afterwards. That is the same discipline `list_key_metadata` applies to
+/// `key_hash`: excluded by projection, so widening this to disclose a
+/// credential would take an edit to the query, not an accident in the
+/// formatting. It also means this command works — and stays safe — on a
+/// deployment whose `BYOK_ENCRYPTION_KEY` is absent or has been rotated,
+/// because nothing here needs to open anything.
+async fn list_byok_keys(pool: &PgPool, args: ListByokKeysArgs) -> Result<()> {
+    let rows = sqlx::query_as::<
+        _,
+        (
+            String,
+            String,
+            String,
+            String,
+            chrono::DateTime<chrono::Utc>,
+            Option<chrono::DateTime<chrono::Utc>>,
+        ),
+    >(
+        r#"
+        SELECT users.email,
+               byok_provider_keys.provider,
+               byok_provider_keys.fingerprint,
+               byok_provider_keys.last4,
+               byok_provider_keys.created_at,
+               byok_provider_keys.last_used_at
+        FROM byok_provider_keys
+        INNER JOIN users ON users.id = byok_provider_keys.user_id
+        WHERE $1::TEXT IS NULL OR users.email = $1
+        ORDER BY users.email, byok_provider_keys.provider
+        "#,
+    )
+    .bind(args.email)
+    .fetch_all(pool)
+    .await
+    .context("failed to list BYOK credentials")?;
+    let rows: Vec<serde_json::Value> = rows
+        .into_iter()
+        .map(
+            |(email, provider, fingerprint, last4, created_at, last_used_at)| {
+                serde_json::json!({
+                    "email": email,
+                    "provider": provider,
+                    "fingerprint": fingerprint,
+                    "last4": last4,
+                    "created_at": created_at,
+                    "last_used_at": last_used_at,
+                })
+            },
+        )
+        .collect();
     println!("{}", serde_json::to_string_pretty(&rows)?);
     Ok(())
 }

@@ -5,7 +5,7 @@ use clap::{Parser, Subcommand};
 use zerorouter::{
     DEFAULT_TIER_CONFIG_PATH, PROVIDER_INVENTORY_PATH_ENV, RouterState, TIER_CONFIG_PATH_ENV,
     admin::{self, AdminArgs},
-    app,
+    app, byok,
     db::{database_pool_from_env, migrate},
     device, logging, oidc, portal, providers, redemption_tax, stripe,
     user::{self, UserArgs},
@@ -78,6 +78,14 @@ async fn serve() -> Result<()> {
         tracing::info!(path = %path.display(), providers = count, "operator providers registered");
     }
     let require_credits = credits_required_from_env()?;
+    // Read before anything is served and independent of the web plane, on the
+    // same contract as `credits_required_from_env` above: a malformed key is a
+    // startup abort, and an absent one disables the feature. Reading it here
+    // rather than inside `WebConfig` is deliberate — BYOK is a DISPATCH
+    // feature whose management surface happens to be the portal, so both
+    // planes take it from one read and cannot end up disagreeing about whether
+    // it is on.
+    let byok = byok::Keyring::from_env()?;
     let web_config = WebConfig::from_env()?;
     let pool = database_pool_from_env().await?;
     migrate(&pool).await?;
@@ -89,9 +97,11 @@ async fn serve() -> Result<()> {
         %bind_address,
         require_credits,
         web_plane = web_config.is_some(),
+        byok = byok.is_some(),
         "ZeroRouter listening"
     );
-    let state = RouterState::with_database(tier_config_path, pool.clone(), require_credits);
+    let state = RouterState::with_database(tier_config_path, pool.clone(), require_credits)
+        .with_byok(byok.clone());
     // The durable backstop for settlements that failed in-request: replays the
     // intent persisted on the reservation row (migration 0006) so delivered
     // inference cannot go unbilled because one transaction lost a connection.
@@ -123,7 +133,7 @@ async fn serve() -> Result<()> {
         let portal_dist = config.portal_dist_path.clone();
         let oidc_enabled = config.oidc.is_some();
         let stripe_enabled = config.stripe.is_some();
-        let ctx = WebCtx::new(pool, config);
+        let ctx = WebCtx::new(pool, config).with_byok(byok);
         router = router.merge(
             axum::Router::new()
                 .merge(oidc::router())

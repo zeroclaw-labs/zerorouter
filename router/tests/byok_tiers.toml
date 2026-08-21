@@ -1,0 +1,110 @@
+schema_version = 1
+
+# Fixture catalog for tests/byok.rs.
+#
+# Three tiers, each a single-candidate pin, because these tests are about WHOSE
+# CREDENTIAL a candidate dispatches on rather than about how a walk chooses
+# between candidates. A single rung makes "the request served on the customer's
+# key" and "the request served on ZeroRouter's key" the only two outcomes there
+# are, so a wire assertion cannot pass for the wrong reason.
+#
+# The providers are shipped ones rather than an operator-declared inventory,
+# deliberately: an operator inventory installs once per process and would make
+# this binary describe a deployment nobody runs. `google` and `xai` are the two
+# shipped chat-completions lanes, which is the wire whose Authorization header
+# these tests read; `vertex` is the shipped MINTING lane, and the only thing it
+# is used for here is proving that a customer cannot attach a key to it.
+
+[retention.google]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/google"
+verified = "2026-08-21"
+source_sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
+
+[retention.xai]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/xai"
+verified = "2026-08-21"
+source_sha256 = "2222222222222222222222222222222222222222222222222222222222222222"
+
+[retention.vertex]
+posture = "standard"
+description = "fixture"
+source_url = "https://example.test/vertex"
+verified = "2026-08-21"
+source_sha256 = "3333333333333333333333333333333333333333333333333333333333333333"
+
+# ---------------------------------------------------------------------------
+# zero/byok-plain — a lane with no per-response attestation. The credential
+# substitution and the fee arithmetic are tested here, away from the retention
+# question.
+# ---------------------------------------------------------------------------
+
+[tiers."zero/byok-plain"]
+
+[tiers."zero/byok-plain".rates]
+input_per_mtok = 3.00
+output_per_mtok = 15.00
+
+[[tiers."zero/byok-plain".candidates]]
+id = "google/probe"
+provider = "google"
+model = "upstream/probe"
+
+[tiers."zero/byok-plain".candidates.rates]
+input_per_mtok = 3.00
+output_per_mtok = 15.00
+
+# ---------------------------------------------------------------------------
+# zero/byok-attested — the lane whose provider declares a per-response retention
+# attestation. Exists so the decision "a BYOK dispatch asserts nothing" is
+# pinned by a test in both directions rather than only described in a comment.
+# ---------------------------------------------------------------------------
+
+[tiers."zero/byok-attested"]
+
+[tiers."zero/byok-attested".rates]
+input_per_mtok = 3.00
+output_per_mtok = 15.00
+
+[[tiers."zero/byok-attested".candidates]]
+id = "xai/probe"
+provider = "xai"
+model = "upstream/probe"
+
+[tiers."zero/byok-attested".candidates.rates]
+input_per_mtok = 3.00
+output_per_mtok = 15.00
+
+# ---------------------------------------------------------------------------
+# zero/byok-mixed — two rungs on two providers, so a route where the customer holds
+# a key for only ONE of them can be built. This is the shape that decides how
+# a reservation is sized: the walk could land on either rung, so the
+# reservation has to cover the dearer outcome.
+# ---------------------------------------------------------------------------
+
+[tiers."zero/byok-mixed"]
+
+[tiers."zero/byok-mixed".rates]
+input_per_mtok = 3.00
+output_per_mtok = 15.00
+
+[[tiers."zero/byok-mixed".candidates]]
+id = "google/first"
+provider = "google"
+model = "upstream/first"
+
+[tiers."zero/byok-mixed".candidates.rates]
+input_per_mtok = 3.00
+output_per_mtok = 15.00
+
+[[tiers."zero/byok-mixed".candidates]]
+id = "xai/second"
+provider = "xai"
+model = "upstream/second"
+
+[tiers."zero/byok-mixed".candidates.rates]
+input_per_mtok = 3.00
+output_per_mtok = 15.00

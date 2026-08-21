@@ -3432,6 +3432,7 @@ dependencies = [
  "pkcs8",
  "rand 0.10.2",
  "reqwest",
+ "ring",
  "rsa",
  "rust_decimal",
  "serde",

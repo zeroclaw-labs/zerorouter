@@ -702,6 +702,10 @@ impl ProviderInventory {
     fn provider(&self, key: &str) -> Option<&ProviderMetadata> {
         self.providers.iter().find(|provider| provider.key == key)
     }
+
+    fn providers(&self) -> impl Iterator<Item = &ProviderMetadata> {
+        self.providers.iter()
+    }
 }
 
 impl ProviderMetadata {
@@ -1245,6 +1249,12 @@ impl ProviderMetadata {
     /// keyless upstream that claimed to mint would reach
     /// [`crate::gcp_auth::ServiceAccountKey::from_json`] with an empty string
     /// on every request.
+    /// Whether a customer may attach their own credential for this entry. See
+    /// [`provider_accepts_byok`] for why each exclusion is structural.
+    fn accepts_byok(&self) -> bool {
+        self.credential == CredentialRequirement::Required && !self.credential_kind.needs_minting()
+    }
+
     fn validate_credential_kind(&self) -> Result<(), ProviderBuildError> {
         if !self.credential_kind.needs_minting() {
             return Ok(());
@@ -1533,6 +1543,18 @@ pub enum ProviderBuildError {
 pub struct ProviderCandidate {
     definition: TierCandidate,
     provider: Arc<dyn ModelProvider>,
+    /// Whether `provider` holds the CUSTOMER's credential rather than
+    /// ZeroRouter's (bring-your-own-key, migration 0026).
+    ///
+    /// It rides on the candidate rather than being looked up again later
+    /// because the walk consumes the route (`ProviderRoute::into_candidates`)
+    /// before any settle site runs, and this is the fact those sites need: what
+    /// the client that actually served was holding. Re-deriving it downstream
+    /// from "does this user have a key for this provider" would be a second
+    /// definition of the same thing, and the two would disagree in exactly the
+    /// cases that matter — a credential that failed to open, or a key detached
+    /// while the request was in flight.
+    byok: bool,
 }
 
 #[cfg(test)]
@@ -1567,6 +1589,10 @@ impl ProviderCandidate {
         Self {
             definition,
             provider,
+            // A test fake holds no credential at all, so it is not the
+            // customer's. A test that means to describe BYOK dispatch drives
+            // the real assembly path (`router/tests/byok.rs`).
+            byok: false,
         }
     }
 }
@@ -1575,6 +1601,12 @@ impl ProviderCandidate {
     #[must_use]
     pub fn definition(&self) -> &TierCandidate {
         &self.definition
+    }
+
+    /// Whether this candidate dispatches on the customer's own credential.
+    #[must_use]
+    pub fn is_byok(&self) -> bool {
+        self.byok
     }
 
     #[must_use]
@@ -1624,6 +1656,105 @@ impl fmt::Debug for ProviderCandidate {
 /// the walk's decisions, in `api.rs`.
 pub struct ProviderRoute {
     candidates: Vec<ProviderCandidate>,
+    /// Which providers on this route were built from the CUSTOMER's own
+    /// credential rather than ZeroRouter's (bring-your-own-key).
+    ///
+    /// Recorded here because it is a property of route ASSEMBLY — the moment
+    /// the credential was chosen — and every downstream consumer needs it
+    /// after the fact: metering has to know whether the served attempt is
+    /// billed at 5% or at catalog, and the response block has to tell the
+    /// customer their own provider agreement governs the request. Recomputing
+    /// it later from "does this user hold a key for this provider" would be a
+    /// second definition of the same fact, and the two could disagree exactly
+    /// when it mattered — a key detached mid-request, or a provider whose
+    /// credential failed to open and fell back to the house lane.
+    byok_providers: BTreeSet<String>,
+}
+
+/// A customer's own upstream credentials for the span of one request, keyed by
+/// provider alias.
+///
+/// Held by value and dropped with the route: nothing caches these across
+/// requests, which is what makes a detached or rotated key stop dispatching
+/// immediately rather than at the end of some TTL.
+#[derive(Default)]
+pub struct ByokCredentials {
+    by_provider: BTreeMap<String, String>,
+}
+
+impl ByokCredentials {
+    #[must_use]
+    pub fn new(pairs: Vec<(String, String)>) -> Self {
+        Self {
+            by_provider: pairs.into_iter().collect(),
+        }
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.by_provider.is_empty()
+    }
+
+    fn get(&self, provider: &str) -> Option<&str> {
+        self.by_provider.get(provider).map(String::as_str)
+    }
+}
+
+/// Never let a customer's credential reach a log line through a derived
+/// `Debug`, the same discipline `StripeSettings` applies in [`crate::web`].
+impl fmt::Debug for ByokCredentials {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ByokCredentials")
+            .field("providers", &self.by_provider.keys().collect::<Vec<_>>())
+            .field("credentials", &"<scrubbed>")
+            .finish()
+    }
+}
+
+/// Whether a customer may attach their own credential for this provider.
+///
+/// Two exclusions, both structural rather than cautious:
+///
+/// * A **keyless** upstream (`"credential": "none"`) has nothing to substitute.
+///   Accepting a key for one would store a third party's secret that could
+///   never be used.
+/// * A **minting** upstream (Vertex's service-account JSON, exchanged for a
+///   short-lived OAuth token) takes a credential of a completely different
+///   shape and dispatches on the result of a network exchange, not on the
+///   stored value. Substituting a customer's key into the token-mint path
+///   without the mint being designed for it is how a customer's service-account
+///   blob would end up in a process-global token cache keyed by ZeroRouter's
+///   own environment variable ([`TOKEN_CACHES`]) — a cross-tenant credential
+///   leak. Refusing the attach outright is the honest v1; the lane keeps
+///   serving on the house credential at catalog price.
+#[must_use]
+pub fn provider_accepts_byok(provider: &str) -> bool {
+    let Ok(inventory) = ProviderInventory::load() else {
+        return false;
+    };
+    inventory
+        .provider(provider)
+        .is_some_and(ProviderMetadata::accepts_byok)
+}
+
+/// Every provider alias in this deployment's inventory that can take a
+/// customer's own credential, for the portal's attach form.
+#[must_use]
+pub fn byok_capable_providers() -> Vec<String> {
+    let Ok(inventory) = ProviderInventory::load() else {
+        return Vec::new();
+    };
+    inventory
+        .providers()
+        .filter(|metadata| metadata.accepts_byok())
+        // A provider ZeroRouter itself cannot dispatch to is not offered: the
+        // catalog does not list its lanes, so a key attached for it could never
+        // serve a request, and inviting a customer to paste one would be asking
+        // for a secret with nothing to spend it on.
+        .filter(|metadata| provider_is_dispatchable(metadata.key.as_str()))
+        .map(|metadata| metadata.key.clone())
+        .collect()
 }
 
 impl ProviderRoute {
@@ -1650,9 +1781,37 @@ impl ProviderRoute {
         candidates: Vec<TierCandidate>,
         max_output_tokens: u32,
     ) -> Result<Self, ProviderBuildError> {
+        Self::new_with_byok(candidates, max_output_tokens, &ByokCredentials::default()).await
+    }
+
+    /// [`Self::new`], with the customer's own credentials substituted for
+    /// ZeroRouter's on the providers they have attached a key for.
+    ///
+    /// # Why substituting HERE is what makes "no silent fallback" true
+    ///
+    /// The route is the only thing the walk can dispatch through, and it is
+    /// built once per request. A candidate whose provider the customer has a
+    /// key for gets a client holding THAT key and no other, so a BYOK upstream
+    /// answering 401 retries against the same customer credential and
+    /// eventually fails the request with a clear error — there is no house
+    /// client on this route for that provider to fall back onto, because none
+    /// was ever constructed. The guarantee is structural rather than a branch
+    /// somebody has to remember not to write.
+    ///
+    /// Failover to a DIFFERENT provider is untouched and still correct: that
+    /// candidate has no customer key, so it is built from ZeroRouter's
+    /// credential and settles at full catalog price. Which of the two served is
+    /// recorded per-provider in [`Self::byok_providers`], so metering prices the
+    /// attempt that actually won rather than the intent the request started
+    /// with.
+    pub async fn new_with_byok(
+        candidates: Vec<TierCandidate>,
+        max_output_tokens: u32,
+        byok: &ByokCredentials,
+    ) -> Result<Self, ProviderBuildError> {
         let inventory = ProviderInventory::load()?;
         let minted = mint_credentials(&inventory, &candidates).await?;
-        build_with_credentials(&inventory, candidates, max_output_tokens, |env| {
+        build_with_byok(&inventory, candidates, max_output_tokens, byok, |env| {
             // `Some(None)` is NOT the same as absent: it means this variable
             // holds a key that must be minted from and the mint failed, so the
             // credential is unavailable. Only a variable this route never
@@ -1676,6 +1835,22 @@ impl ProviderRoute {
     #[must_use]
     pub fn candidates(&self) -> &[ProviderCandidate] {
         &self.candidates
+    }
+
+    /// The providers on this route whose client holds the CUSTOMER's credential.
+    ///
+    /// Read by metering to decide whether the served attempt is billed at the
+    /// BYOK fee or at catalog, and by the response block to tell the customer
+    /// which agreement governs the request.
+    #[must_use]
+    pub fn byok_providers(&self) -> &BTreeSet<String> {
+        &self.byok_providers
+    }
+
+    /// Whether the candidate that served dispatched on the customer's own key.
+    #[must_use]
+    pub fn served_on_byok(&self, provider: &str) -> bool {
+        self.byok_providers.contains(provider)
     }
 
     /// The selection-policy seam (design doc: Engine "Selection policy"):
@@ -1711,10 +1886,44 @@ impl fmt::Debug for ProviderRoute {
 /// passing them in lets a test drive the production code path over a
 /// configuration it constructed rather than over whatever the process happens
 /// to have installed globally.
+/// Assembly for a deployment with no BYOK in play.
+///
+/// `#[cfg(test)]` because production reaches [`build_with_byok`] directly
+/// through [`ProviderRoute::new_with_byok`], and the tests below predate BYOK
+/// and describe deployments without it — which is exactly what this spelling
+/// says. Keeping it means those tests were not rewritten to thread a parameter
+/// they have no opinion about, so they still pin the pre-BYOK assembly.
+#[cfg(test)]
 fn build_with_credentials<F>(
     inventory: &ProviderInventory,
     candidates: Vec<TierCandidate>,
     max_output_tokens: u32,
+    credential_for: F,
+) -> Result<ProviderRoute, ProviderBuildError>
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    build_with_byok(
+        inventory,
+        candidates,
+        max_output_tokens,
+        &ByokCredentials::default(),
+        credential_for,
+    )
+}
+
+/// [`build_with_credentials`], with the customer's own credentials substituted
+/// on the providers they have attached a key for.
+///
+/// The two are one function with the BYOK map defaulted, rather than a copy:
+/// a route built for a customer with no attached keys must go through exactly
+/// the assembly a route built before BYOK existed went through, and the only
+/// way to guarantee that is for there to be one assembly.
+fn build_with_byok<F>(
+    inventory: &ProviderInventory,
+    candidates: Vec<TierCandidate>,
+    max_output_tokens: u32,
+    byok: &ByokCredentials,
     mut credential_for: F,
 ) -> Result<ProviderRoute, ProviderBuildError>
 where
@@ -1726,6 +1935,7 @@ where
 
     let mut available = Vec::with_capacity(candidates.len());
     let mut missing_credentials = Vec::new();
+    let mut byok_providers = BTreeSet::new();
     // Keyed by (provider, surface) rather than by provider alone: two planes of
     // one upstream are two clients on two hosts speaking two wires, so sharing
     // one between them would dispatch a candidate's request at the other
@@ -1750,22 +1960,46 @@ where
         }
         let surface = definition.surface.clone();
 
+        // The customer's own credential for this upstream, if they attached
+        // one and this entry can take it. Read before `dispatchable` rather
+        // than patched over its result, so a BYOK provider is dispatchable on
+        // the customer's key even in the case where ZeroRouter's own key for it
+        // is absent — the substitution replaces the credential, never the
+        // endpoint or region resolution beside it.
+        let byok_credential = metadata
+            .accepts_byok()
+            .then(|| byok.get(provider_key))
+            .flatten();
+
         let provider = if let Some(provider) = providers.get(&(provider_key, surface.clone())) {
             Arc::clone(provider)
         } else {
-            let (credential, endpoint, surfaces) = match metadata.dispatchable(&mut credential_for)
-            {
-                Dispatchable::Ready {
-                    credential,
-                    endpoint,
-                    surfaces,
-                } => (credential, endpoint, surfaces),
-                Dispatchable::Missing { env } => {
-                    missing_credentials.push(env);
-                    unavailable.insert(provider_key);
-                    continue;
+            // Only the entry's OWN credential variable is answered from the
+            // customer's key. Every other variable `dispatchable` reads — the
+            // region, the project — still comes from the deployment, because
+            // those describe where ZeroRouter dials, not who it dials as.
+            let credential_env = metadata.credential_env.clone();
+            let mut credential_for_entry = |env: &str| -> Option<String> {
+                match byok_credential {
+                    Some(credential) if Some(env) == credential_env.as_deref() => {
+                        Some(credential.to_owned())
+                    }
+                    _ => credential_for(env),
                 }
             };
+            let (credential, endpoint, surfaces) =
+                match metadata.dispatchable(&mut credential_for_entry) {
+                    Dispatchable::Ready {
+                        credential,
+                        endpoint,
+                        surfaces,
+                    } => (credential, endpoint, surfaces),
+                    Dispatchable::Missing { env } => {
+                        missing_credentials.push(env);
+                        unavailable.insert(provider_key);
+                        continue;
+                    }
+                };
             let (adapter, endpoint) = metadata
                 .plane(surface.as_deref(), endpoint.as_deref(), &surfaces)
                 .ok_or_else(|| ProviderBuildError::UnknownSurface {
@@ -1779,14 +2013,19 @@ where
                 &credential,
                 max_output_tokens,
                 endpoint.as_deref(),
+                byok_credential.is_some(),
             )?;
             providers.insert((provider_key, surface), Arc::clone(&provider));
             provider
         };
+        if byok_credential.is_some() {
+            byok_providers.insert(provider_key.to_owned());
+        }
 
         available.push(ProviderCandidate {
             definition,
             provider,
+            byok: byok_credential.is_some(),
         });
     }
 
@@ -1796,7 +2035,10 @@ where
         });
     }
 
-    Ok(assemble_route(available))
+    Ok(ProviderRoute {
+        byok_providers,
+        ..assemble_route(available)
+    })
 }
 
 /// Put ordered candidates behind a route.
@@ -1805,7 +2047,13 @@ where
 /// a test-supplied route and a credential-built one go through the same wiring
 /// and cannot diverge.
 fn assemble_route(candidates: Vec<ProviderCandidate>) -> ProviderRoute {
-    ProviderRoute { candidates }
+    ProviderRoute {
+        candidates,
+        // An injected test route dispatches on fakes that hold no credential at
+        // all, so it is not BYOK — a test that means to describe BYOK dispatch
+        // drives the real assembly path (`router/tests/byok.rs`).
+        byok_providers: BTreeSet::new(),
+    }
 }
 
 /// Per-provider token caches, keyed by credential env variable.
@@ -2023,12 +2271,17 @@ fn base_url_override(key: &str) -> Option<String> {
 /// `metadata` here, because resolving it can FAIL — a regional endpoint whose
 /// region variable is unset has no address — and the caller is the one that can
 /// answer that failure correctly, by dropping the rung instead of the route.
+/// `byok` says the credential belongs to the CUSTOMER rather than to
+/// ZeroRouter. It changes exactly one thing — whether the house's per-response
+/// retention attestation is asserted — and the reasoning is in the
+/// chat-completions arm below.
 fn create_provider(
     metadata: &ProviderMetadata,
     adapter: ProviderAdapter,
     credential: &str,
     max_output_tokens: u32,
     effective_base_url: Option<&str>,
+    byok: bool,
 ) -> Result<Arc<dyn ModelProvider>, ProviderBuildError> {
     let alias = metadata.key.as_str();
     let provider: Arc<dyn ModelProvider> = match adapter {
@@ -2070,9 +2323,42 @@ fn create_provider(
             // makes the impossible case a refused route rather than an
             // unchecked one, on the principle that a violated guarantee
             // becomes a refusal instead of a silent downgrade.
+            //
+            // # Why a BYOK dispatch asserts NOTHING here
+            //
+            // The attestation reads a response header stating the ZDR state of
+            // the ACCOUNT that made the request. On ZeroRouter's own key that
+            // is ZeroRouter's account, and ZeroRouter sells the lane as
+            // zero-retention, so asserting-and-refusing is what keeps the
+            // advertised guarantee honest.
+            //
+            // On a customer's key the header describes the CUSTOMER's team, and
+            // all three ways of handling that are not equally defensible:
+            //
+            // * Keep asserting. A customer whose own xAI team has not enabled
+            //   ZDR would have every request refused — refused on the strength
+            //   of a guarantee ZeroRouter is not making about their traffic.
+            //   Worse, a PASS would be a fact about the customer's own contract
+            //   that ZeroRouter would be presenting as something ZeroRouter
+            //   verified on their behalf. That is false comfort, which is worse
+            //   than no check. It is also a fail-closed control whose subject
+            //   silently changed meaning, so it would read as an outage to
+            //   exactly the customers who brought a key.
+            // * Drop it silently. Then the catalog's zero-retention label reads
+            //   as though it still governs their traffic, and it does not.
+            // * Drop it and SAY SO. The request is governed by the customer's
+            //   own agreement with the provider, so ZeroRouter stops asserting
+            //   a guarantee that is not its to give and stamps `byok: true` on
+            //   the response (`crate::openai::ZeroRouterResponseMetadata`) so
+            //   the caller can see which contract applies. The docs say it in
+            //   words; `/v1/models` is deliberately untouched, because those
+            //   labels describe the HOUSE contract, which is exactly what a
+            //   customer without BYOK gets.
+            //
+            // The third is what ships.
             match (
-                metadata.attestation_header.as_deref(),
-                metadata.attestation_expect.as_deref(),
+                metadata.attestation_header.as_deref().filter(|_| !byok),
+                metadata.attestation_expect.as_deref().filter(|_| !byok),
             ) {
                 (Some(header), Some(expect)) => {
                     let attestation = crate::wire::ResponseAttestation::new(header, expect)
@@ -2323,6 +2609,7 @@ mod tests {
             "secret",
             crate::provider::BASELINE_MAX_TOKENS,
             metadata.base_url.as_deref(),
+            false,
         )
         .expect("the chat-completions arm builds");
         assert_eq!(provider.alias(), "local-llama");

@@ -64,6 +64,22 @@ hmac = "0.12"
 openidconnect = "4"
 rand = "0.10"
 reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls", "json"] }
+# Needed only by `src/byok.rs`, which seals customers' own provider API keys at
+# rest under AES-256-GCM. Like `base64`/`crc` and `rsa`/`pkcs8` above, this is
+# not a new artifact in the dependency graph: `ring` 0.17.14 was already built
+# transitively (rustls, through the `_tls-rustls-ring-webpki` sqlx feature) at
+# this exact version, so this promotes it to a direct dependency rather than
+# resolving anything new.
+#
+# Hand-rolling was not considered, for the reason the `rsa` note above gives and
+# more sharply. An AEAD assembled by hand fails silently in the direction that
+# matters least — the ciphertext still decrypts, the tag still appears to be
+# checked — while the property customers are relying on is simply absent. This
+# is also the one place in the crate where a mistake discloses a THIRD PARTY's
+# credential: the key belongs to the customer's account with Anthropic or
+# OpenAI, not to ZeroRouter, so the blast radius of a defect here reaches past
+# this deployment entirely.
+ring = "0.17"
 rust_decimal = "1.40"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

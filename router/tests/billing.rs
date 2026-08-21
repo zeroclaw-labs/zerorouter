@@ -128,6 +128,10 @@ fn usage_record(cost_usd: Decimal) -> UsageRecord {
             usage_gap: None,
             shape_ok: None,
             priority: Some(Priority::Balanced),
+            // `None`, not `Some(false)`: these fixtures describe requests from before
+            // BYOK existed, so they keep pinning the pre-BYOK settled row exactly, and
+            // they exercise the NULL arm of the new column while they are at it.
+            byok: None,
         },
         attempts: Vec::new(),
     }

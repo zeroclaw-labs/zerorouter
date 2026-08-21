@@ -863,6 +863,24 @@ pub struct ZeroRouterResponseMetadata {
     /// validator can be declared yet, and the design defines `null` as "no
     /// validator was declared", which is exactly true.
     pub validated: Option<bool>,
+    /// Whether this request dispatched on the CUSTOMER's own provider
+    /// credential (bring-your-own-key).
+    ///
+    /// This field is a disclosure, not a statistic, and it is the reason the
+    /// block is emitted at all for a BYOK request that never touched the
+    /// priority knob. A BYOK request is governed by the customer's own
+    /// agreement with the provider: ZeroRouter's catalog retention labels
+    /// describe ZeroRouter's contract and do not apply to that traffic, and
+    /// the house's per-response retention attestation is deliberately not
+    /// asserted on it (`crate::providers::create_provider`). Something has to
+    /// say so on the response itself rather than only in the docs, and this is
+    /// it.
+    ///
+    /// `skip_serializing_if` keeps every non-BYOK response byte-identical,
+    /// including a knob-engaged one — the same rule the rest of this block
+    /// follows: an absent field is the capability signal.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub byok: bool,
 }
 
 /// One walk position as the customer sees it.

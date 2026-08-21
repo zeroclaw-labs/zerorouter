@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     convert::Infallible,
     path::{Path, PathBuf},
     sync::{
@@ -23,6 +24,7 @@ use axum::{
 };
 use chrono::Utc;
 use futures_util::StreamExt;
+use rust_decimal::Decimal;
 use serde::Serialize;
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
@@ -31,6 +33,7 @@ use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
 use crate::{
     auth::{AuthenticatedKey, AuthenticationError, KeyAuthenticator},
+    byok,
     config::{RequestNeeds, ResolvedRoute, TierCandidate, TierCatalog, load_tier_catalog},
     db::{
         AttemptRecord, AttemptTokens, MeteringLane, RequestTelemetry, ReservationSize,
@@ -52,7 +55,7 @@ use crate::{
         stream_tool_call_delta, stream_usage_json, task_signature, tool_args_all_json, usage_cost,
     },
     priority::Priority,
-    providers::{ProviderBuildError, ProviderCandidate, ProviderRoute},
+    providers::{ByokCredentials, ProviderBuildError, ProviderCandidate, ProviderRoute},
     retry,
     sqlx::PgPool,
 };
@@ -82,6 +85,22 @@ struct RequestFeatures {
     // (`usage_events.estimator_basis` stays 'cold' until Stage 4 sizes
     // reservations from this).
     estimate: ZeroRouterEstimate,
+    /// Whether the attempt this settle site is about to record dispatched on
+    /// the CUSTOMER's own provider credential (migration 0026).
+    ///
+    /// It lives here for one reason: `RequestFeatures` is already carried to
+    /// every settle site and to `zerorouter_block`, which are exactly the two
+    /// consumers — the price and the disclosure. Threading a parallel `bool`
+    /// through six walk functions to reach the same eleven call sites would be
+    /// the same fact travelling twice, and the failure mode of that is a site
+    /// that gets the disclosure right and the price wrong.
+    ///
+    /// `false` at construction and set by the walk when a candidate is chosen
+    /// ([`RequestFeatures::on_candidate`]), so the default is the house lane:
+    /// a settle site reached without the walk ever selecting a candidate —
+    /// every fallback-chain terminal — prices at catalog, which is correct,
+    /// because nothing was dispatched on a customer key.
+    byok_served: bool,
 }
 
 impl RequestFeatures {
@@ -102,6 +121,32 @@ impl RequestFeatures {
             priority: priority.resolved,
             knob_engaged: priority.engaged,
             estimate,
+            byok_served: false,
+        }
+    }
+
+    /// The same features, describing an attempt about to run against
+    /// `candidate`.
+    ///
+    /// Returns a new value rather than mutating, because `RequestFeatures` is
+    /// `Copy` and the walk hands a copy to each attempt: a candidate that fails
+    /// over must not leave its own BYOK-ness on the features the NEXT candidate
+    /// settles with. Every settle site downstream of a selection therefore
+    /// describes the attempt it is actually recording.
+    fn on_candidate(self, candidate: &ProviderCandidate) -> Self {
+        Self {
+            byok_served: candidate.is_byok(),
+            ..self
+        }
+    }
+
+    /// The fee multiplier this attempt settles at: 5% of catalog on the
+    /// customer's own credential, the full catalog price on ZeroRouter's.
+    fn byok_rate(self) -> Decimal {
+        if self.byok_served {
+            byok::fee_rate()
+        } else {
+            byok::house_rate()
         }
     }
 }
@@ -129,11 +174,20 @@ impl PriorityResolution {
 /// attempts array and the persisted `request_attempts` rows are one story by
 /// construction. `None` while the knob was never engaged, which is what
 /// keeps legacy responses byte-stable.
+///
+/// BYOK is the second reason the block appears, and it is a disclosure rather
+/// than a feature signal: a request served on the customer's own credential is
+/// governed by the customer's agreement with the provider, not by ZeroRouter's
+/// catalog labels, and the house retention attestation is not asserted on it.
+/// A customer who never touched the priority knob still has to be told that,
+/// on the response itself. Byte-stability is unaffected for everyone else —
+/// the condition is only ever widened by a fact about the customer's OWN
+/// configuration, and `byok` skips serialization when false.
 fn zerorouter_block(
     features: RequestFeatures,
     attempts: &WalkLedger,
 ) -> Option<ZeroRouterResponseMetadata> {
-    features.knob_engaged.then(|| ZeroRouterResponseMetadata {
+    (features.knob_engaged || features.byok_served).then(|| ZeroRouterResponseMetadata {
         priority: features.priority,
         estimate: features.estimate,
         attempts: attempts
@@ -146,6 +200,7 @@ fn zerorouter_block(
             })
             .collect(),
         validated: None,
+        byok: features.byok_served,
     })
 }
 
@@ -553,6 +608,15 @@ struct RouterServices {
     /// behavior. Requests only read it; the background refresher
     /// ([`RouterState::spawn_estimator_refresher`]) is its only writer.
     estimator: EstimatorState,
+    /// The key customers' own provider credentials are sealed under, or `None`
+    /// when this deployment has not provisioned one.
+    ///
+    /// `None` is not "BYOK is off for this request" — it is "this deployment
+    /// cannot read a BYOK credential at all", so the dispatch path never looks
+    /// one up and every request takes exactly the house-credential path it took
+    /// before this feature existed. That is what makes shipping dark free of
+    /// risk to the metered lane.
+    byok: Option<Arc<crate::byok::Keyring>>,
     #[cfg(feature = "testing")]
     injected_route: Option<InjectedRoute>,
 }
@@ -649,10 +713,42 @@ impl RouterState {
                 require_credits,
                 health: ProviderHealth::default(),
                 estimator: EstimatorState::default(),
+                byok: None,
                 #[cfg(feature = "testing")]
                 injected_route: None,
             })),
         }
+    }
+
+    /// Attach the BYOK keyring this deployment read from the environment.
+    ///
+    /// A builder rather than a fourth argument to [`Self::with_database`] for
+    /// the reason [`crate::web::WebCtx::with_byok`] gives: every existing
+    /// construction site describes a deployment without BYOK, which is what
+    /// they are, and a test that means otherwise has to say so.
+    #[must_use]
+    pub fn with_byok(mut self, byok: Option<Arc<crate::byok::Keyring>>) -> Self {
+        if let Some(services) = self.services.take() {
+            // `RouterServices` is behind an `Arc` that nothing else holds yet at
+            // construction time, so this unwraps rather than clones. Falling
+            // back to leaving the state untouched keeps the builder total: a
+            // caller that has already cloned the state gets no BYOK rather than
+            // a panic, and the only way to reach that is to call this after
+            // spawning background tasks, which `serve` does not do.
+            match Arc::try_unwrap(services) {
+                Ok(mut services) => {
+                    services.byok = byok;
+                    self.services = Some(Arc::new(services));
+                }
+                Err(shared) => {
+                    tracing::error!(
+                        "BYOK keyring could not be attached: the router state was already shared"
+                    );
+                    self.services = Some(shared);
+                }
+            }
+        }
+        self
     }
 
     /// Serve the walk over `route` instead of one built from upstream
@@ -676,6 +772,7 @@ impl RouterState {
                 require_credits,
                 health: ProviderHealth::default(),
                 estimator: EstimatorState::default(),
+                byok: None,
                 injected_route: Some(route),
             })),
         }
@@ -886,16 +983,70 @@ impl RouterServices {
     /// The provider route this request walks: built from upstream credentials,
     /// or supplied by the injected route when one is configured. Never cache
     /// the result — fallback selection metadata is request-scoped.
+    /// Which providers this user has attached their own credential for.
+    ///
+    /// Empty — with no query at all — on a deployment that has not provisioned
+    /// `BYOK_ENCRYPTION_KEY`, which is what makes the feature free to ship
+    /// dark: the reservation path takes exactly the shape it had before BYOK
+    /// existed. A database error is also empty rather than an error, because
+    /// the honest failure direction here is the HOUSE rate: a request that
+    /// cannot confirm the customer's coverage must reserve the larger amount,
+    /// never the smaller one.
+    async fn byok_covered_providers(&self, user_id: uuid::Uuid) -> BTreeSet<String> {
+        if self.byok.is_none() {
+            return BTreeSet::new();
+        }
+        match crate::byok::covered_providers(&self.pool, user_id).await {
+            Ok(providers) => providers.into_iter().collect(),
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "could not read BYOK coverage; pricing this request at catalog rates"
+                );
+                BTreeSet::new()
+            }
+        }
+    }
+
+    /// The customer's own credentials for this request, opened for the span of
+    /// the route being built and dropped with it.
+    async fn byok_credentials(&self, user_id: uuid::Uuid) -> ByokCredentials {
+        let Some(keyring) = &self.byok else {
+            return ByokCredentials::default();
+        };
+        match crate::byok::open_credentials(&self.pool, keyring, user_id).await {
+            Ok(pairs) => ByokCredentials::new(pairs),
+            Err(error) => {
+                // The house lane is the fallback for a READ failure, which is
+                // not the same as the "no silent fallback" rule: that rule is
+                // about a customer's key being REJECTED upstream, where falling
+                // back would surprise-bill them at full price for a request
+                // they expected to pay 5% on. Here nothing has been dispatched
+                // yet and no reservation has been taken at the BYOK rate — the
+                // coverage read above failed the same way and already sized
+                // this request at catalog — so serving on the house key is both
+                // billed correctly and better than refusing.
+                tracing::warn!(
+                    error = %error,
+                    "could not read BYOK credentials; dispatching on house credentials"
+                );
+                ByokCredentials::default()
+            }
+        }
+    }
+
     async fn provider_route(
         &self,
         resolved: &ResolvedRoute,
         max_output_tokens: u32,
+        user_id: uuid::Uuid,
     ) -> Result<ProviderRoute, ApiError> {
         #[cfg(feature = "testing")]
         if let Some(route) = &self.injected_route {
             return Ok(route(resolved, max_output_tokens));
         }
-        ProviderRoute::new(resolved.candidates.clone(), max_output_tokens)
+        let byok = self.byok_credentials(user_id).await;
+        ProviderRoute::new_with_byok(resolved.candidates.clone(), max_output_tokens, &byok)
             .await
             .map_err(|error| {
                 match error {
@@ -1247,15 +1398,25 @@ async fn chat_completions(
     // lock, which admission holds and this seam does not (sol review #1,
     // `LEARNED_SIZING_CONCURRENCY_LIMIT`). Measuring is pure and cheap; the
     // learned arm is measured only when the estimator offered a bound.
-    let full_sizing = sized_reservation(&request, &resolved, max_output_tokens)?;
+    // Bring-your-own-key, read once for this request. Two lookups rather than
+    // one, and the split is deliberate: the reservation only needs to know
+    // WHICH providers are covered, so admission never decrypts anything, and
+    // the credentials themselves are opened only on the path that is about to
+    // dispatch with them. On a deployment with no `BYOK_ENCRYPTION_KEY` — and
+    // for the overwhelming majority of users on one that has it — both are a
+    // single indexed read returning nothing, and every line below behaves
+    // exactly as it did before this feature existed.
+    let byok_covered = services.byok_covered_providers(authenticated.user_id).await;
+    let byok_rate = byok_reservation_rate(&resolved, &byok_covered);
+    let full_sizing = sized_reservation(&request, &resolved, max_output_tokens, byok_rate)?;
     let learned_sizing = learned_bound
-        .map(|bound| sized_reservation(&request, &resolved, bound))
+        .map(|bound| sized_reservation(&request, &resolved, bound, byok_rate))
         .transpose()?;
     // Route construction and ordering read the FULL byte-bound usage: the
     // generation limit sent upstream is untouched by sizing, and the cost
     // ordering prices a walk rather than a reservation.
     let mut provider_route = services
-        .provider_route(&resolved, max_output_tokens)
+        .provider_route(&resolved, max_output_tokens, authenticated.user_id)
         .await?;
     // The one definition of $0 that ships: both halves of the declaration
     // (`config::TierCandidate::is_free`), read from server-side configuration
@@ -1945,7 +2106,10 @@ async fn run_non_streaming(
                         candidate.definition(),
                         response,
                         max_tokens,
-                        features,
+                        // The attempt that WON, so the price and the
+                        // disclosure describe the credential that actually
+                        // served rather than the one the walk set out with.
+                        features.on_candidate(candidate),
                         attempts,
                         attempt_no,
                         attempt_started,
@@ -2563,6 +2727,14 @@ async fn stream_to_channel(
             .await;
             return;
         };
+        // From here down this iteration is about THIS candidate: it has passed
+        // the health and deadline gates and is the one about to be dispatched
+        // to, so every settle site below describes its attempt — including
+        // whose credential the client is holding. Shadowed rather than
+        // reassigned because `RequestFeatures` is `Copy`: the terminals ABOVE
+        // this line name `last_candidate`, a previous rung, and must keep the
+        // walk-level value.
+        let features = features.on_candidate(candidate);
         let provider_request = ChatRequest {
             messages: &messages,
             tools: (!tools.is_empty()).then_some(tools.as_slice()),
@@ -3644,18 +3816,65 @@ async fn send_data(sender: &mpsc::Sender<Event>, data: String) -> bool {
 /// the same mechanism that already releases the gap between this byte bound
 /// and the measured prompt. On a flat tier `worst_case()` IS the tier's rate
 /// table, so nothing about a catalog without conditional rates changes.
+///
+/// # The BYOK fee arm, and why it is the WORST case too
+///
+/// A request dispatched on the customer's own provider key is charged 5% of
+/// what the same usage would cost at catalog rates, so its reservation is 5% of
+/// the figure above — and `byok_rate` is that multiplier, resolved by
+/// [`byok_reservation_rate`] over the whole route rather than over one
+/// candidate.
+///
+/// It has to be the whole route, and this is the part worth being explicit
+/// about. The walk may fail over from a candidate the customer has a key for to
+/// one they do not, which settles at full catalog price. Reserving 5% and then
+/// settling 100% would exceed the reservation — and the settle debit is CLAMPED
+/// to it (`crate::db`), so the excess is not charged at all. That is not a
+/// customer overspending; it is ZeroRouter delivering inference it then cannot
+/// bill for, which is the failure `AGENTS.md` names first. So a mixed route
+/// reserves at the house rate, exactly as `worst_case()` above takes the higher
+/// of two rate tables for the same reason, and for the same price: over-reserving
+/// costs the customer nothing, because settlement releases the difference.
 fn sized_reservation(
     request: &ChatCompletionRequest,
     resolved: &ResolvedRoute,
     output_bound: u32,
+    byok_rate: Decimal,
 ) -> Result<ReservationSize, ApiError> {
     let usage = request.reservation_usage(output_bound);
+    let catalog_cost =
+        usage_cost(resolved.sell_rates.worst_case(), usage).ok_or(ApiError::MeteringUnavailable)?;
     Ok(ReservationSize {
         total_tokens: i64::try_from(usage.total_tokens).map_err(|_| ApiError::InvalidRequest)?,
         output_tokens: i64::from(output_bound),
-        cost_usd: usage_cost(resolved.sell_rates.worst_case(), usage)
-            .ok_or(ApiError::MeteringUnavailable)?,
+        // An overflow here is a metering failure, never a wrapped charge — the
+        // same rule `usage_cost` follows for the multiplication above it.
+        cost_usd: byok::apply_fee(catalog_cost, byok_rate).ok_or(ApiError::MeteringUnavailable)?,
     })
+}
+
+/// The fee multiplier a reservation must be sized at, given which providers the
+/// customer holds a key for.
+///
+/// The BYOK rate only when EVERY candidate on the route would dispatch on the
+/// customer's own credential; the house rate the moment one would not. See
+/// [`sized_reservation`] for why the conservative direction is the only safe
+/// one, and note which set is quantified over: `resolved.candidates` is the
+/// CATALOG list, before route assembly drops the ones whose credential is
+/// absent. A candidate that gets dropped cannot serve, so counting it can only
+/// raise the rate to the house one — over-reserving, which is free — never
+/// lower it.
+fn byok_reservation_rate(resolved: &ResolvedRoute, covered: &BTreeSet<String>) -> Decimal {
+    if !covered.is_empty()
+        && resolved
+            .candidates
+            .iter()
+            .all(|candidate| covered.contains(&candidate.provider))
+    {
+        byok::fee_rate()
+    } else {
+        byok::house_rate()
+    }
 }
 
 async fn admit_usage(
@@ -3713,7 +3932,19 @@ async fn persist_usage(
     // ends in `MeteringUnavailable` and the reservation is released by the TTL
     // sweep unspent, rather than a `Decimal::ZERO` charge being recorded as
     // though the request had genuinely been free.
-    let cost_usd = usage_cost(sell_rates, usage).ok_or(ApiError::MeteringUnavailable)?;
+    let catalog_cost_usd = usage_cost(sell_rates, usage).ok_or(ApiError::MeteringUnavailable)?;
+    // The BYOK fee arm. `byok_served` is read from the ROUTE — which provider
+    // the winning attempt's client actually holds a credential for — not from
+    // "does this user have a key attached", so a walk that failed over to a
+    // house candidate settles at catalog price even for a customer who brought
+    // a key, and a customer whose stored credential could not be opened is
+    // billed for what really happened rather than for what they intended.
+    //
+    // Metered actuals throughout: this is 5% of the true measured cost at the
+    // band that applied, not 5% of the reservation. Same rule as the house
+    // lane, one multiplication apart.
+    let cost_usd = byok::apply_fee(catalog_cost_usd, features.byok_rate())
+        .ok_or(ApiError::MeteringUnavailable)?;
     let telemetry = RequestTelemetry {
         requested_max_tokens: features.requested_max_tokens,
         stream: features.stream,
@@ -3734,6 +3965,11 @@ async fn persist_usage(
         shape_ok: shape_label,
         usage_gap: usage_gap.map(UsageGap::as_str),
         priority: Some(features.priority),
+        // `Some`, never `None`, on every row this build settles: the live path
+        // always knows which credential served. NULL is reserved for rows that
+        // predate the column entirely (migration 0026), so "we did not record
+        // it" and "it was not BYOK" stay distinguishable forever.
+        byok: Some(features.byok_served),
     };
     usage_session
         .record(&UsageRecord {
@@ -4731,7 +4967,8 @@ mod tests {
             vec![pass_through_candidate(luna_schedule())],
             luna_schedule(),
         );
-        let sized = sized_reservation(&request, &resolved, 64).expect("luna's rates price");
+        let sized = sized_reservation(&request, &resolved, 64, byok::house_rate())
+            .expect("luna's rates price");
 
         let usage = request.reservation_usage(64);
         let at_base = usage_cost(banded(0.2, 0.02, 1.2), usage).expect("base band prices");
@@ -4758,7 +4995,8 @@ mod tests {
             cached_input_per_mtok: None,
         };
         let resolved = walk_route_selling(vec![walk_candidate("flat")], RateSchedule::flat(flat));
-        let sized = sized_reservation(&request, &resolved, 64).expect("flat rates price");
+        let sized = sized_reservation(&request, &resolved, 64, byok::house_rate())
+            .expect("flat rates price");
         assert_eq!(
             sized.cost_usd,
             usage_cost(flat, request.reservation_usage(64)).expect("flat rates price"),
@@ -4939,6 +5177,86 @@ mod tests {
         let (charged, _, recorded) = settle_at(&pool, &key, RateSchedule::flat(flat), usage).await;
         assert_eq!(charged, usage_cost(flat, usage).expect("flat rates price"));
         assert_eq!(recorded["input_per_mtok"], serde_json::json!(0.2));
+    }
+
+    /// A candidate on a named provider, for the reservation-rate rule below.
+    fn rung_on(provider: &str) -> TierCandidate {
+        TierCandidate {
+            provider: provider.to_owned(),
+            ..cloud_rung(&format!("{provider}/rung"))
+        }
+    }
+
+    #[test]
+    fn a_reservation_takes_the_byok_rate_only_when_every_rung_is_covered() {
+        // The rule that keeps a mixed route from being under-reserved, and it
+        // is the one place BYOK could cost ZeroRouter money rather than a
+        // customer. The settle debit is clamped to the reservation
+        // (`crate::db`), so a route reserved at 5% that then fails over to a
+        // house rung settling at 100% would deliver inference ZeroRouter
+        // cannot bill for.
+        let covered = |providers: &[&str]| -> BTreeSet<String> {
+            providers.iter().map(|p| (*p).to_owned()).collect()
+        };
+
+        // Every rung covered: the customer's own keys serve whatever the walk
+        // picks, so 5% is safe.
+        let all_byok = walk_route(vec![rung_on("anthropic"), rung_on("openai")]);
+        assert_eq!(
+            byok_reservation_rate(&all_byok, &covered(&["anthropic", "openai"])),
+            byok::fee_rate()
+        );
+
+        // One rung uncovered: the walk can land on the house lane, so the
+        // reservation must cover the house price. Over-reserving costs the
+        // customer nothing — settlement releases the difference.
+        assert_eq!(
+            byok_reservation_rate(&all_byok, &covered(&["anthropic"])),
+            byok::house_rate(),
+            "a mixed route must reserve at the house rate"
+        );
+
+        // No coverage at all, and coverage for something not on this route,
+        // are both just the house rate.
+        assert_eq!(
+            byok_reservation_rate(&all_byok, &covered(&[])),
+            byok::house_rate()
+        );
+        assert_eq!(
+            byok_reservation_rate(&all_byok, &covered(&["google"])),
+            byok::house_rate(),
+            "a key for a provider this route never names changes nothing"
+        );
+
+        // A single-rung route is the common case and gets the fee it should.
+        let single = walk_route(vec![rung_on("anthropic")]);
+        assert_eq!(
+            byok_reservation_rate(&single, &covered(&["anthropic"])),
+            byok::fee_rate()
+        );
+    }
+
+    #[test]
+    fn the_reserved_amount_is_five_percent_when_the_route_is_wholly_byok() {
+        // The rate rule above, carried through to the figure admission
+        // actually checks against the balance — so the two cannot drift.
+        let request = walk_request();
+        let route = walk_route(vec![rung_on("anthropic")]);
+        let house = sized_reservation(&request, &route, 64, byok::house_rate())
+            .expect("the house reservation must size");
+        let byok_sized = sized_reservation(&request, &route, 64, byok::fee_rate())
+            .expect("the byok reservation must size");
+
+        assert!(house.cost_usd > Decimal::ZERO, "the fixture tier is priced");
+        assert_eq!(
+            byok_sized.cost_usd * Decimal::from(20),
+            house.cost_usd,
+            "a wholly-BYOK route reserves exactly one twentieth of the catalog worst case"
+        );
+        // Everything else about the reservation is unchanged: the fee is a
+        // price, not a different request.
+        assert_eq!(byok_sized.total_tokens, house.total_tokens);
+        assert_eq!(byok_sized.output_tokens, house.output_tokens);
     }
 
     fn walk_route_selling(

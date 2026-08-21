@@ -445,3 +445,58 @@ test('a per-tier retention override renders on the storefront, not the provider 
   expect(title).toMatch(/open models/i)
   expect(title).toMatch(/closed-weight/i)
 })
+
+test('a provider key can be attached, is shown only by fingerprint, and is never re-displayed', async ({
+  page,
+}) => {
+  await signIn(page)
+  await page.getByRole('link', { name: /keys/i }).click()
+
+  // The section renders because the deployment provisioned an encryption key.
+  // On a deployment that has not, nothing below exists at all — see
+  // `byok_ships_dark_when_the_deployment_has_no_encryption_key` in
+  // router/tests/portal.rs for the other half of that contract.
+  await expect(page.getByRole('heading', { name: /your own provider keys/i })).toBeVisible()
+
+  // The two things the copy must say, because they are what a customer is
+  // agreeing to: what the fee is, and whose retention agreement governs.
+  await expect(page.getByText(/5% of what the same usage would have cost/i)).toBeVisible()
+  await expect(page.getByText(/governed by your agreement with that provider/i)).toBeVisible()
+
+  const providerKey = `sk-ant-e2e-${Date.now()}-0123456789abcdef`
+  await page.getByLabel(/^provider$/i).selectOption({ label: 'Anthropic' })
+  await page.getByLabel(/provider api key/i).fill(providerKey)
+  await page.getByRole('button', { name: /attach key/i }).click()
+
+  // The row shows the provider, the last four, and a 16-character fingerprint.
+  const row = page.locator('tr', { hasText: 'Anthropic' })
+  await expect(row).toBeVisible({ timeout: 10_000 })
+  await expect(row).toContainText(`…${providerKey.slice(-4)}`)
+
+  // Paste-once, asserted the only way that means anything: the full key must
+  // not appear anywhere in the rendered page, and the input that held it must
+  // be empty again.
+  const body = await page.locator('body').innerText()
+  expect(body).not.toContain(providerKey)
+  expect(body).not.toContain(providerKey.slice(0, 20))
+  await expect(page.getByLabel(/provider api key/i)).toHaveValue('')
+
+  // Nor in the API response the page reloads from — a fingerprint and a last4,
+  // and no field that could carry the key.
+  const listed = await page.evaluate(async () => {
+    const res = await fetch('/api/byok')
+    return (await res.json()) as { keys: Array<Record<string, unknown>> }
+  })
+  const attached = listed.keys.find((k) => k.provider === 'anthropic')
+  expect(attached, 'the key should be listed').toBeTruthy()
+  expect(JSON.stringify(attached)).not.toContain(providerKey)
+  expect(attached?.api_key).toBeUndefined()
+  expect(String(attached?.fingerprint)).toHaveLength(16)
+  expect(attached?.last4).toBe(providerKey.slice(-4))
+
+  // And it can be taken away again, which is the promise that makes attaching
+  // one reasonable in the first place.
+  await row.getByRole('button', { name: /^remove$/i }).click()
+  await row.getByRole('button', { name: /confirm remove/i }).click()
+  await expect(page.getByText(/no provider keys attached/i)).toBeVisible({ timeout: 10_000 })
+})

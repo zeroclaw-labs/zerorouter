@@ -1139,6 +1139,81 @@ curl -s --compressed \
 AmazonBedrockFoundationModels/current/us-east-1/index.json
 ```
 
+## Bring-your-own-key: `BYOK_ENCRYPTION_KEY` (migration 0026)
+
+BYOK lets a customer attach their own upstream provider API key. Requests
+that dispatch to that provider go out on the customer's credential, and
+ZeroRouter charges 5% of what the usage would have cost at catalog rates.
+
+**The feature ships dark.** With `BYOK_ENCRYPTION_KEY` unset — which is every
+deployment until an operator wires it — nothing changes: the portal shows no
+BYOK section, attach attempts are refused with `byok_unavailable`, and the
+dispatch path never looks a credential up. Turning it on is one secret.
+
+### Provisioning
+
+1. Add the container to the app-secret inventory. In
+   `environments/<env>/secrets.tf` of the infrastructure repo, `local.app_secrets`
+   is the list Terraform creates containers from:
+
+   ```hcl
+   app_secrets = {
+     STRIPE_SECRET_KEY     = "stripe-secret-key"
+     STRIPE_WEBHOOK_SECRET = "stripe-webhook-secret"
+     OIDC_CLIENT_SECRET    = "oidc-client-secret"
+     BYOK_ENCRYPTION_KEY   = "byok-encryption-key"   # add
+   }
+   ```
+
+   It must also be excluded from `local.injected_app_secrets` until a value
+   exists, exactly as `OIDC_CLIENT_SECRET` is: **injecting a secret with no
+   version aborts ECS task startup**, so creating the container and wiring it
+   into the task definition in one deploy takes the service down.
+
+2. Generate the value and put it in the container out of band, the same way
+   provider keys are populated — it must never enter Terraform state:
+
+   ```sh
+   openssl rand -hex 32
+   ```
+
+   64 lowercase hex characters, and only that. A base64 secret, an uppercase
+   one, or one of the wrong length **aborts startup** rather than being
+   coerced into some other key; that is deliberate, because a silently
+   accepted wrong key is undetectable until the day a customer's credential
+   fails to open.
+
+3. Wire it into the task definition as a `secrets` entry and deploy.
+
+### Rotating it, and what rotation costs
+
+There is no online re-wrap procedure yet. The stored envelopes are sealed
+under per-record data keys which are themselves sealed under this key, so a
+rotation tool would only have to re-wrap the data keys — the schema is built
+for it — but that tool is not written. **Until it is, rotating
+`BYOK_ENCRYPTION_KEY` makes every attached customer credential unreadable.**
+
+The failure is graceful and bounded rather than an outage: a credential that
+cannot be opened is dropped with a warning, the request serves on ZeroRouter's
+own key, and it is billed at the catalog price — correctly, because that is
+what actually happened. Customers keep working; they silently stop getting the
+5% rate until they re-attach. Watch for
+`a stored BYOK credential could not be opened` in the logs, and tell customers
+to re-paste.
+
+**Losing the key is not recoverable.** The credentials are the customers' own
+secrets held at third parties, and ZeroRouter cannot reconstruct them. Back
+this secret up as carefully as the database.
+
+### What it does not change
+
+- `/v1/models` is untouched. The retention labels there describe ZeroRouter's
+  contracts and continue to be exactly true for house traffic.
+- Reserve-then-settle, the advisory lock, exactly-once settlement, and the
+  metered-actuals-only rule are all unchanged — the fee is a multiplier on the
+  same figure, applied at the same two arms.
+- Velocity and spend caps still bind, measured against the fee.
+
 ## Rollback
 
 The workflow deploys immutable per-commit image tags. To roll back, re-run
