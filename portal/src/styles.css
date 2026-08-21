@@ -1415,3 +1415,10 @@ input {
     transition: none !important;
   }
 }
+
+/* Last-resort guard for tables inside clipping panels: if a table's minimum
+   width ever exceeds the panel again, the region scrolls instead of hiding
+   columns — invisible controls are the one outcome this must prevent. */
+.table-scroll {
+  overflow-x: auto;
+}

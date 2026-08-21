@@ -234,6 +234,7 @@ export function Keys() {
             hint="Create a key above to authenticate requests to /v1/chat/completions."
           />
         ) : (
+          <div className="table-scroll">
           <table className="table">
             <thead>
               <tr>
@@ -255,11 +256,22 @@ export function Keys() {
                   <td className="dim nowrap">{k.last_used_at !== null ? formatTime(k.last_used_at) : 'never'}</td>
                   <td className="dim mono nowrap">{expiryLabel(k)}</td>
                   <td className="dim mono nowrap">{limitLabel(k)}</td>
-                  <td className="dim mono nowrap">
-                    {k.spend_cap_usd !== null ? `${formatUsd(k.spend_cap_usd)}/mo` : 'no cap'}
-                    {k.velocity_cap_tokens_per_min !== null
-                      ? ` · ${formatInt(k.velocity_cap_tokens_per_min)} tok/min`
-                      : ''}
+                  {/* Each half stays unbroken, but the pair may wrap at the
+                      separator — a single nowrap run here set the table's
+                      minimum width past the panel and clipped the actions
+                      column into invisibility on desktop. */}
+                  <td className="dim mono">
+                    <span className="nowrap">
+                      {k.spend_cap_usd !== null ? `${formatUsd(k.spend_cap_usd)}/mo` : 'no cap'}
+                    </span>
+                    {k.velocity_cap_tokens_per_min !== null ? (
+                      <>
+                        {' · '}
+                        <span className="nowrap">{formatInt(k.velocity_cap_tokens_per_min)} tok/min</span>
+                      </>
+                    ) : (
+                      ''
+                    )}
                   </td>
                   <td>
                     {k.disabled ? (
@@ -300,6 +312,7 @@ export function Keys() {
               ))}
             </tbody>
           </table>
+          </div>
         )}
       </section>
 
