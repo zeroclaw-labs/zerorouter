@@ -172,7 +172,12 @@ test('the docs page is in the signed-in navigation', async ({ page }) => {
   await expect(page.getByText(E2E_EMAIL)).toBeVisible()
 })
 
-test('credits page renders balance, promo ledger, and the autopay panel', async ({ page }) => {
+// Named for what it actually asserts. It used to say "…and the autopay panel",
+// which it never touched: with Stripe unconfigured the panel collapses to the
+// billing-off banner. The autopay panel is covered by its own spec below.
+test('credits page renders balance and promo ledger, and hides checkout when billing is off', async ({
+  page,
+}) => {
   await signIn(page)
   // Fund through the same admin path production uses; the user exists
   // because the login upserted it.
@@ -245,6 +250,67 @@ test('the add-credits modal opens to our amount step when Stripe is configured',
   // payment step is reached.
   await page.keyboard.press('Escape')
   await expect(modal).toHaveCount(0)
+})
+
+test('the autopay panel offers setup, arming, and its own status', async ({ page }) => {
+  // Autopay had a complete UI and no e2e coverage at all: the credits spec
+  // above used to be named "…and the autopay panel" but, with Stripe
+  // unconfigured, the panel it claimed to cover collapses to the billing-off
+  // banner and no locator in it ever touched the panel. Injecting the
+  // publishable key the same way the modal spec does renders the real panel
+  // against the real `GET /api/billing/autopay`.
+  await page.route('**/api/me', async (route) => {
+    const response = await route.fetch()
+    const body = await response.json()
+    await route.fulfill({
+      response,
+      json: { ...body, stripe_publishable_key: 'pk_test_e2e_placeholder' },
+    })
+  })
+
+  await signIn(page)
+  await page.getByRole('link', { name: /credits/i }).click()
+  await expect(page.getByRole('heading', { name: 'Credits', exact: true })).toBeVisible()
+
+  // The panel, its status badge, and the card-setup entry point. A fresh e2e
+  // user has never saved a card, so autopay reads off and the copy says so —
+  // this is the server's answer, not a fixture.
+  const autopay = page.locator('section.panel').filter({ hasText: 'Autopay' })
+  await expect(autopay).toBeVisible()
+  await expect(autopay.getByText('off', { exact: true })).toBeVisible()
+  await expect(autopay.getByText(/no card on file yet/i)).toBeVisible()
+  await expect(autopay.getByRole('button', { name: /save a card/i })).toBeVisible()
+
+  // Disarming is offered only when autopay is on, so it must be absent here —
+  // the guard against showing a customer an off switch for something that is
+  // already off.
+  await expect(autopay.getByRole('button', { name: /turn off/i })).toHaveCount(0)
+
+  // Client-side amount validation, which is ours and never reaches the server:
+  // a top-up below the $5.00 minimum is refused in the browser.
+  await autopay.getByLabel(/autopay threshold in dollars/i).fill('10.00')
+  await autopay.getByLabel(/autopay top-up in dollars/i).fill('1.00')
+  await autopay.getByRole('button', { name: /turn on autopay/i }).click()
+  await expect(autopay.getByText(/top-up of at least \$5\.00/i)).toBeVisible()
+
+  // A valid pair passes the client check and reaches the server. Only the
+  // publishable key was injected, so the ROUTER still has no Stripe
+  // configuration and `put_autopay` refuses with `billing_unavailable` before
+  // it looks at anything else. The portal must degrade to the billing-off
+  // banner rather than report success — a deployment that cannot charge a card
+  // must never leave a customer believing autopay is armed.
+  //
+  // The sibling refusal — a 400 when Stripe IS configured but no card has been
+  // saved — is deliberately not reached here. It needs a router with real
+  // Stripe credentials, and it is already pinned server-side where the guard
+  // lives (`put_autopay` verifies a card exists at Stripe before enabling, so
+  // arming cannot burn the three-strikes budget on a card that was never
+  // saved).
+  await autopay.getByLabel(/autopay top-up in dollars/i).fill('25.00')
+  await autopay.getByRole('button', { name: /turn on autopay/i }).click()
+  await expect(page.getByText(/billing is not enabled/i).first()).toBeVisible()
+  // And autopay was never reported as on.
+  await expect(page.getByText(/autopay is on/i)).toHaveCount(0)
 })
 
 test('the api surface the SPA consumes returns the documented shapes', async ({ page }) => {

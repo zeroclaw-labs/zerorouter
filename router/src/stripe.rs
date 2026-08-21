@@ -2556,6 +2556,86 @@ mod tests {
         }
     }
 
+    /// Saving a card for autopay must collect a full billing address.
+    ///
+    /// This is the tax-location guard for the ENTIRE autopay surface, and it
+    /// only gets one chance: `autopay_tax_address` reads the saved card's
+    /// `billing_details.address`, `ensure_stripe_customer` stores no address,
+    /// and the Tax API looks nothing up on its own. An address not collected by
+    /// this form is an address that does not exist, so every future top-up on
+    /// that card is charged untaxed via the `no_billing_address` /
+    /// `incomplete_address` fallback.
+    ///
+    /// The default `auto` is weakest exactly here: a `setup` session has no
+    /// amount and therefore no `automatic_tax` to raise even a minimum, leaving
+    /// whatever the card network happens to want.
+    #[test]
+    fn autopay_card_setup_requires_a_full_billing_address() {
+        let form = autopay_setup_session_form("cus_test", "https://x/ok", "https://x/no");
+        assert_eq!(
+            setup_form_value(&form, "billing_address_collection"),
+            Some("required"),
+            "the card-setup session must collect a full billing address — it is \
+             the only address autopay will ever have to tax against"
+        );
+    }
+
+    /// Setup may only save what the charge path can actually charge.
+    ///
+    /// `replay_charge` lists payment methods with `type=card` and terminal-fails
+    /// the claim when there is none, so a session that let a customer save
+    /// anything else produced a setup that looked successful and an autopay that
+    /// burned a strike on every sweep until it disabled itself. Apple Pay is
+    /// persisted by Stripe as a `card`, so this excludes nothing the operator's
+    /// account offers.
+    #[test]
+    fn autopay_card_setup_saves_only_what_the_sweep_can_charge() {
+        let form = autopay_setup_session_form("cus_test", "https://x/ok", "https://x/no");
+        assert_eq!(
+            setup_form_value(&form, "payment_method_types[]"),
+            Some("card"),
+            "setup must not offer a payment method `replay_charge` cannot charge"
+        );
+    }
+
+    /// The setup session still sends a currency, though it no longer must.
+    ///
+    /// `currency` is "required conditionally — Required in `setup` mode when
+    /// `payment_method_types` is not set". Setting `payment_method_types` makes
+    /// it optional, and it is kept anyway: without it, deleting or widening
+    /// `payment_method_types` later would silently make this call — the one that
+    /// ARMS autopay — invalid.
+    #[test]
+    fn autopay_card_setup_sends_a_currency() {
+        let form = autopay_setup_session_form("cus_test", "https://x/ok", "https://x/no");
+        assert_eq!(
+            setup_form_value(&form, "currency"),
+            Some(CHECKOUT_CURRENCY),
+            "the setup session states its currency explicitly"
+        );
+    }
+
+    /// The rest of the setup form, pinned so a future edit is deliberate.
+    ///
+    /// The count is part of the assertion for the same reason it is on the
+    /// checkout form: a parameter silently gained or lost on the path that arms
+    /// autopay should break a test, not a customer.
+    #[test]
+    fn the_autopay_setup_form_is_exactly_its_seven_parameters() {
+        let form = autopay_setup_session_form("cus_abc", "https://x/ok", "https://x/no");
+        assert_eq!(setup_form_value(&form, "mode"), Some("setup"));
+        assert_eq!(setup_form_value(&form, "customer"), Some("cus_abc"));
+        assert_eq!(setup_form_value(&form, "success_url"), Some("https://x/ok"));
+        assert_eq!(setup_form_value(&form, "cancel_url"), Some("https://x/no"));
+        assert_eq!(form.len(), 7, "the setup form is exactly 7 parameters");
+    }
+
+    fn setup_form_value<'a>(form: &'a [(&'a str, &'a str)], key: &str) -> Option<&'a str> {
+        form.iter()
+            .find(|(name, _)| *name == key)
+            .map(|(_, value)| *value)
+    }
+
     /// A split that cannot be sold is refused before Stripe sees it.
     ///
     /// The guard exists for the one way this change could cost money: a second,
@@ -3616,8 +3696,116 @@ pub async fn sweep_autopay_tax_lifecycle(pool: &crate::sqlx::PgPool, settings: &
     }
 }
 
+/// The parameters for the autopay card-setup Checkout Session.
+///
+/// Pulled out as a pure function for the same reason [`checkout_session_form`]
+/// is one: these parameters are a TAX INPUT, and a tax input that no test can
+/// see is a tax input that drifts. Until this existed, the setup session was an
+/// inline four-element array and nothing in the suite could assert a single
+/// thing about it.
+///
+/// # Why `billing_address_collection=required` — the address is collected HERE
+/// # or nowhere
+///
+/// This is the one and only moment ZeroRouter can capture an autopay buyer's
+/// location. [`autopay_tax_address`] reads the saved card's
+/// `billing_details.address`; [`ensure_stripe_customer`] stores no address on
+/// the Customer, and the Tax API performs no lookup of its own. So whatever
+/// this form collects is what every future top-up is taxed against — and
+/// whatever it fails to collect is untaxed forever, for that card.
+///
+/// The purchase path has required a full address since the California
+/// registration (see the long note in [`checkout_session_form`]: district rates
+/// stack and their boundaries cut BELOW ZIP granularity, so a ZIP is not
+/// necessarily a rate). This path was left at Stripe's `auto` default, which
+/// made the two surfaces collect different amounts of address for the same
+/// buyer and the same product.
+///
+/// **`auto` is at its weakest precisely here.** Its documented behavior is to
+/// collect the address "only when necessary", and "when using `automatic_tax`
+/// … the minimum number of fields required for tax calculation". A `setup`-mode
+/// session has no amount, so it carries no `automatic_tax` at all — there is no
+/// tax calculation to set even that minimum. What remains is whatever the card
+/// network requires, which for a US card is a postal code or nothing. That is
+/// exactly the `no_billing_address` / `incomplete_address` fallback
+/// ([`TaxFallback`]) that the autopay charge path logs and then charges
+/// UNTAXED, and it is why the fallback was the expected case rather than the
+/// rare one.
+///
+/// `DEPLOY.md` used to answer this with a Stripe Dashboard setting. A parameter
+/// the sibling path already sends is better: it is versioned with the code,
+/// it cannot be silently switched off in a dashboard, and it does not depend on
+/// an operator having read a runbook.
+///
+/// Verified against the API reference rather than assumed: `billing_address_
+/// collection` is documented as a plain top-level enum (`auto` | `required`,
+/// default `auto`) with **no mode restriction**. That reference states mode
+/// restrictions explicitly and consistently where they exist — `customer_
+/// creation` ("Can only be set in `payment` and `setup` mode"), `payment_
+/// method_collection` ("Can only be set in `subscription` mode"), `saved_
+/// payment_method_options`, `line_items`, `submit_type`, `payment_intent_data`,
+/// `setup_intent_data` — so silence here is meaningful, not an omission.
+///
+/// # Why `payment_method_types[]=card` — setup must not write a cheque the
+/// # sweep cannot cash
+///
+/// [`replay_charge`] can only ever charge a CARD: it lists the customer's
+/// payment methods with `type=card`, takes the first, and terminal-fails the
+/// claim when there is none. Left unconstrained, this session offers whatever
+/// the Dashboard enables, so the two halves of autopay disagreed about what
+/// "saved a payment method" means. A customer who saved a non-card method
+/// completed setup, saw "a card setup has been started or completed", and then
+/// had every sweep find no card, count a strike, and disable autopay after
+/// three — a silent failure whose cause is invisible from the portal.
+///
+/// Constraining it narrows nothing real. The operator's Stripe account accepts
+/// cards and Apple Pay, and Stripe persists an Apple Pay enrolment AS a `card`
+/// payment method — so `card` is already the set of things a customer can save
+/// here, and it is exactly the set `replay_charge` can charge. This makes the
+/// form say what the charge path has always required.
+///
+/// # Why `currency` is still sent
+///
+/// The API reference marks `currency` "required conditionally — Required in
+/// `setup` mode when `payment_method_types` is not set". With
+/// `payment_method_types` now set, that condition no longer bites and the
+/// parameter becomes OPTIONAL. It is kept deliberately.
+///
+/// Dropping it would couple the session's validity to the presence of a
+/// DIFFERENT parameter: delete or widen `payment_method_types` later and
+/// `currency` silently becomes mandatory again, so a one-line edit would start
+/// failing the single call that ARMS autopay — the failure mode this function
+/// was extracted to make impossible. Keeping it costs one form field, states
+/// the currency explicitly on a money-adjacent call, and matches
+/// [`CHECKOUT_CURRENCY`], which every other Stripe call in this module sends.
+/// Stripe's own worked example for saving a card in `setup` mode passes
+/// `currency=usd` alongside the same shape.
+fn autopay_setup_session_form<'a>(
+    customer: &'a str,
+    success_url: &'a str,
+    cancel_url: &'a str,
+) -> [(&'a str, &'a str); 7] {
+    [
+        ("mode", "setup"),
+        ("customer", customer),
+        ("success_url", success_url),
+        ("cancel_url", cancel_url),
+        // A tax input. See the doc comment above: collected here or nowhere.
+        ("billing_address_collection", "required"),
+        // The only type `replay_charge` can charge. Apple Pay is persisted by
+        // Stripe as a `card`, so this excludes nothing the account offers.
+        ("payment_method_types[]", "card"),
+        // Optional now that `payment_method_types` is set; kept so a later edit
+        // to that parameter cannot silently make this call invalid.
+        ("currency", CHECKOUT_CURRENCY),
+    ]
+}
+
 // POST /api/billing/autopay/setup — a Checkout session in `setup` mode that
-// saves a card to the user's Stripe customer for off-session charging.
+// saves a card to the user's Stripe customer for off-session charging. The
+// form is card-only on purpose, so that what setup can save and what
+// `replay_charge` can charge are the same set; see
+// `autopay_setup_session_form`.
 async fn create_autopay_setup(
     State(ctx): State<WebCtx>,
     user: PortalUser,
@@ -3629,12 +3817,7 @@ async fn create_autopay_setup(
     let client = stripe_client()?;
     let success_url = ctx.config.absolute_url("/credits?autopay=saved");
     let cancel_url = ctx.config.absolute_url("/credits?autopay=cancelled");
-    let form: [(&str, &str); 4] = [
-        ("mode", "setup"),
-        ("customer", &customer),
-        ("success_url", &success_url),
-        ("cancel_url", &cancel_url),
-    ];
+    let form = autopay_setup_session_form(&customer, &success_url, &cancel_url);
     let response = client
         .post(checkout_sessions_url(stripe))
         .bearer_auth(&stripe.secret_key)
@@ -4014,11 +4197,28 @@ pub async fn run_autopay_sweep_once(pool: &crate::sqlx::PgPool, settings: &Strip
 async fn reconcile_stale_intents(pool: &crate::sqlx::PgPool, settings: &StripeSettings) {
     // Claims too old to replay safely are money in an unknown state: logged
     // loudly for an operator, never retried automatically.
+    //
+    // The rows themselves are logged, not just how many there are. These two
+    // queues are the operator's ONLY handle on money in an unknown state —
+    // there is no admin subcommand for either — and a bare count sends them to
+    // hand-written SQL to find out which rows it meant. The already-loaded
+    // tuples carry the identifiers, so discarding them cost the operator a
+    // query and bought nothing. This is the shape the tax-reversal surface
+    // below already uses (`payment_intents = ?unreversible`).
     match billing::overdue_autopay_intents(pool, AUTOPAY_REPLAY_MAX_AGE_MINUTES).await {
-        Ok(overdue) if !overdue.is_empty() => tracing::error!(
-            count = overdue.len(),
-            "autopay claims are older than the idempotency-retention window and need operator reconciliation"
-        ),
+        Ok(overdue) if !overdue.is_empty() => {
+            let claims: Vec<String> = overdue
+                .iter()
+                .map(|(intent_id, user_id, topup_usd)| {
+                    format!("{intent_id} user={user_id} topup_usd={topup_usd}")
+                })
+                .collect();
+            tracing::error!(
+                count = overdue.len(),
+                claims = ?claims,
+                "autopay claims are older than the idempotency-retention window and need operator reconciliation"
+            );
+        }
         Ok(_) => {}
         Err(error) => tracing::warn!(%error, "could not list overdue autopay claims"),
     }
@@ -4026,11 +4226,25 @@ async fn reconcile_stale_intents(pool: &crate::sqlx::PgPool, settings: &StripeSe
     // are money owed back to a frozen / indebted account. Surface them loudly on
     // every pass until an operator refunds them out of band; automation must not
     // credit them, and deliberately does not refund inline.
+    //
+    // `refund_usd` is the figure to refund and it is the TAXED total, not the
+    // ex-tax gross — refunding the gross would short the customer by exactly
+    // the tax. It is logged because it is the one number the operator must not
+    // get wrong and the one number they had no way to see.
     match billing::withheld_autopay_intents(pool).await {
-        Ok(withheld) if !withheld.is_empty() => tracing::error!(
-            count = withheld.len(),
-            "autopay charges were collected but withheld from a frozen / indebted account and need an operator refund"
-        ),
+        Ok(withheld) if !withheld.is_empty() => {
+            let charges: Vec<String> = withheld
+                .iter()
+                .map(|(intent_id, user_id, refundable_usd)| {
+                    format!("{intent_id} user={user_id} refund_usd={refundable_usd}")
+                })
+                .collect();
+            tracing::error!(
+                count = withheld.len(),
+                charges = ?charges,
+                "autopay charges were collected but withheld from a frozen / indebted account and need an operator refund"
+            );
+        }
         Ok(_) => {}
         Err(error) => tracing::warn!(%error, "could not list withheld autopay charges"),
     }
@@ -4218,6 +4432,31 @@ async fn replay_charge(
         billing::fail_autopay_intent(pool, &format!("local_{idempotency_key}")).await?;
         anyhow::bail!("no saved card payment method");
     };
+
+    // Keep the card's billing address on the buyer's row if nothing is there
+    // yet (migration 0025). The checkout webhook stores one, so a user who only
+    // ever arms autopay had none at all and their redemption-tax periods could
+    // never be priced — the sweep's "priced when the user's next checkout
+    // stores one" never arrives for an account that never checks out.
+    //
+    // FILL-ONLY, not last-write-wins: a card saved before the setup session
+    // required a full address can carry country + postal code alone, and
+    // letting that overwrite a complete checkout address would coarsen every
+    // future rating (and would do it again on every recurring charge). See
+    // `backfill_buyer_address_if_absent`.
+    //
+    // Placed here deliberately: it is a local, per-user keyed write that runs
+    // BEFORE the tax call's existing round trip and well before the HIGH-2
+    // guard below, which re-reads eligibility afterwards — so it widens no
+    // window that guard exists to close. Best-effort; it cannot fail the
+    // charge.
+    crate::redemption_tax::backfill_buyer_address_if_absent(
+        pool,
+        user_id,
+        card.get("billing_details")
+            .and_then(|details| details.get("address")),
+    )
+    .await;
 
     // `topup_usd` is the NET credit the user wants; the fee rides on top and
     // Stripe collects the gross.
