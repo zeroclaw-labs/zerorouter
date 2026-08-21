@@ -1571,7 +1571,15 @@ async fn retention_drift(args: RetentionDriftArgs) -> Result<()> {
         println!(
             "posture should be, then update `verified` and `source_sha256` in the tier file. A ZDR"
         );
-        println!("label may only be pinned against a signed arrangement — see docs/DEPLOY.md.");
+        // Three bases since 2026-08-20, not one. The old line named only the
+        // contractual basis, which would have read as a refusal of the two
+        // postures actually shipped — an operator following this advice
+        // literally would have downgraded `bedrock` and `fireworks` to
+        // `standard`.
+        println!(
+            "label may only be pinned against a signed arrangement, an enforced account setting,"
+        );
+        println!("or the vendor's published default — see docs/DEPLOY.md.");
     }
 
     // `--allow-drift` releases the PAGE checks and nothing else. Its whole
