@@ -98,6 +98,35 @@ struct ProviderMetadata {
     /// configuration that is not true.
     #[serde(default)]
     region_env: Option<String>,
+    /// The environment variable holding the cloud PROJECT this upstream's
+    /// endpoint is addressed in, for an entry whose `base_url` carries the
+    /// [`PROJECT_PLACEHOLDER`].
+    ///
+    /// The sibling of [`Self::region_env`] and validated by the identical
+    /// present-iff-interpolated rule, but it names a different kind of fact and
+    /// the difference matters. A region is a routing choice; a project is an
+    /// ACCOUNT BOUNDARY. Google addresses Vertex as
+    /// `projects/{project}/locations/global/endpoints/openapi`, and the project
+    /// in that path is what the zero-retention configuration is applied to —
+    /// `projects/{id}/cacheConfig` is the switch that disables the 24-hour
+    /// cache, and the abuse-monitoring exemption is granted per Google Cloud
+    /// account. So a wrong project here is not a slower route, it is a request
+    /// served under a retention posture nobody verified.
+    ///
+    /// That is also why it is not defaulted and never will be. There is no
+    /// sensible fallback project: the shipped inventory cannot know the
+    /// operator's, and inventing one would dial a stranger's account.
+    #[serde(default)]
+    project_env: Option<String>,
+    /// What KIND of thing `credential_env` holds, when it is not simply the
+    /// string to send.
+    ///
+    /// Defaults to [`CredentialKind::ApiKey`], so every entry written before
+    /// this field existed keeps meaning exactly what it meant: read the
+    /// variable, send its contents. See [`CredentialKind`] for why the second
+    /// variant had to exist.
+    #[serde(default)]
+    credential_kind: CredentialKind,
     /// Why the public catalog `admin catalog-drift` reconciles against cannot
     /// price this upstream, and where its rates really come from.
     ///
@@ -241,6 +270,58 @@ struct ProviderSurface {
 
 /// The token a regional `base_url` writes where its region belongs.
 const REGION_PLACEHOLDER: &str = "{region}";
+
+/// The token a project-scoped `base_url` writes where its project belongs.
+const PROJECT_PLACEHOLDER: &str = "{project}";
+
+/// What a provider's `credential_env` actually holds.
+///
+/// **Why this enum exists at all**, because for five providers it did not need
+/// to. Every upstream in this repo until Vertex took a credential that was
+/// literally the string to send: an API key, read from the environment, handed
+/// to the wire, put in a header. The variable held the secret, and there was
+/// nothing to decide.
+///
+/// Google does not issue such a key for the surface the `vertex` lane
+/// dispatches on — "Only Google Cloud Auth is supported using the OpenAI
+/// library" (cloud.google.com/vertex-ai/generative-ai/docs/start/openai). What
+/// the operator can store is a service-account key, and what the wire must send
+/// is an OAuth2 access token minted from it that expires in an hour. Those are
+/// two different strings, and the second one cannot be put in a secret because
+/// it does not exist until something signs a JWT for it.
+///
+/// So the inventory has to say which it is holding. It is an enum rather than a
+/// bool because the interesting question is not "does this need minting" but
+/// "what protocol mints it", and a second cloud (Azure AD, AWS STS) would be a
+/// third variant rather than a reinterpretation of a flag.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CredentialKind {
+    /// The variable holds the credential verbatim. Send it as-is.
+    #[default]
+    ApiKey,
+    /// The variable holds a Google service-account key in JSON — either the
+    /// JSON itself or a path to a file containing it — which is exchanged for a
+    /// short-lived OAuth2 access token before dispatch
+    /// ([`crate::gcp_auth`]).
+    GoogleServiceAccount,
+}
+
+impl CredentialKind {
+    /// Whether reaching this upstream needs a token minted before dispatch.
+    ///
+    /// Written as a match rather than `!= ApiKey` for the reason
+    /// [`ProviderAdapter::dials_a_billed_endpoint`] gives: a third variant must
+    /// force a decision here instead of silently inheriting whichever answer
+    /// the inequality happened to give.
+    #[must_use]
+    pub const fn needs_minting(self) -> bool {
+        match self {
+            Self::ApiKey => false,
+            Self::GoogleServiceAccount => true,
+        }
+    }
+}
 
 /// Whether a deployment holds everything one upstream needs.
 enum Dispatchable {
@@ -571,6 +652,8 @@ impl ProviderInventory {
             provider.validate_reconciliation()?;
             provider.validate_attestation()?;
             provider.validate_surfaces()?;
+            provider.validate_project()?;
+            provider.validate_credential_kind()?;
             provider.validate_runtime_roots()?;
             if !keys.insert(provider.key.as_str()) {
                 return Err(ProviderBuildError::InvalidInventory {
@@ -708,7 +791,7 @@ impl ProviderMetadata {
             // deployment missing — and an endpoint this provider cannot address
             // is as disqualifying as a key it cannot present.
             return Dispatchable::Missing {
-                env: self.region_env.clone().unwrap_or_default(),
+                env: self.unresolvable_endpoint_env(),
             };
         };
         // Every named plane, resolved by the same rules and against the same
@@ -720,13 +803,16 @@ impl ProviderMetadata {
         for (name, surface) in &self.surfaces {
             let resolved = match override_url.clone() {
                 Some(url) => Some(url),
-                None => {
-                    resolve_region(&surface.base_url, self.region_env.as_deref(), &mut read_env)
-                }
+                None => resolve_region(
+                    &surface.base_url,
+                    self.region_env.as_deref(),
+                    self.project_env.as_deref(),
+                    &mut read_env,
+                ),
             };
             let Some(resolved) = resolved else {
                 return Dispatchable::Missing {
-                    env: self.region_env.clone().unwrap_or_default(),
+                    env: self.unresolvable_endpoint_env(),
                 };
             };
             surfaces.insert(name.clone(), resolved);
@@ -1105,6 +1191,76 @@ impl ProviderMetadata {
         }
     }
 
+    /// The same present-iff-interpolated rule for [`PROJECT_PLACEHOLDER`].
+    ///
+    /// Kept as its own function rather than folded into
+    /// [`Self::validate_region`] with a parameter, because the two error
+    /// messages are the useful part and they are not the same message: a
+    /// missing region sends a request to the wrong PLACE, a missing project
+    /// sends it to the wrong ACCOUNT. An operator reading the failure needs to
+    /// know which.
+    fn validate_project(&self) -> Result<(), ProviderBuildError> {
+        let interpolates = self
+            .base_url
+            .as_deref()
+            .into_iter()
+            .chain(
+                self.surfaces
+                    .values()
+                    .map(|surface| surface.base_url.as_str()),
+            )
+            .any(|url| url.contains(PROJECT_PLACEHOLDER));
+        let declared = self
+            .project_env
+            .as_deref()
+            .is_some_and(|name| !name.trim().is_empty());
+        match (interpolates, declared) {
+            (true, false) => Err(ProviderBuildError::InvalidInventory {
+                detail: format!(
+                    "provider {} writes {PROJECT_PLACEHOLDER} in its base_url and declares no \
+                     project_env to fill it; the placeholder would survive into the request URL, \
+                     so every request would name a project that does not exist",
+                    self.key
+                ),
+            }),
+            (false, true) => Err(ProviderBuildError::InvalidInventory {
+                detail: format!(
+                    "provider {} declares project_env but its base_url has no \
+                     {PROJECT_PLACEHOLDER} to substitute; the entry would read as \
+                     project-scoped while dialling a fixed path, so setting that variable would \
+                     change nothing",
+                    self.key
+                ),
+            }),
+            _ => Ok(()),
+        }
+    }
+
+    /// A minted credential must name the variable it mints FROM, and must not
+    /// be declared on an upstream that takes no credential at all.
+    ///
+    /// The second half is the one worth stating: `credential: "none"` plus a
+    /// minting kind is a contradiction, and the safe reading of a contradiction
+    /// on a credential is to refuse the entry rather than to pick a half. A
+    /// keyless upstream that claimed to mint would reach
+    /// [`crate::gcp_auth::ServiceAccountKey::from_json`] with an empty string
+    /// on every request.
+    fn validate_credential_kind(&self) -> Result<(), ProviderBuildError> {
+        if !self.credential_kind.needs_minting() {
+            return Ok(());
+        }
+        if self.credential != CredentialRequirement::Required {
+            return Err(ProviderBuildError::InvalidInventory {
+                detail: format!(
+                    "provider {} declares a credential_kind that must be exchanged for a token \
+                     but takes no credential to exchange",
+                    self.key
+                ),
+            });
+        }
+        Ok(())
+    }
+
     /// This entry's endpoint with its region substituted, or `None` when the
     /// region cannot be resolved.
     ///
@@ -1122,7 +1278,27 @@ impl ProviderMetadata {
         let Some(base_url) = self.base_url.as_deref() else {
             return Some(None);
         };
-        resolve_region(base_url, self.region_env.as_deref(), read_env).map(Some)
+        resolve_region(
+            base_url,
+            self.region_env.as_deref(),
+            self.project_env.as_deref(),
+            read_env,
+        )
+        .map(Some)
+    }
+
+    /// The variable to name when an endpoint could not be addressed.
+    ///
+    /// A provider interpolates at most one of the two today, so this reports
+    /// whichever it declares. When one ever declares both, the message names
+    /// the region first — arbitrary, but a deployment missing both is missing
+    /// its whole configuration and the operator will not be misled by which
+    /// half is quoted.
+    fn unresolvable_endpoint_env(&self) -> String {
+        self.region_env
+            .clone()
+            .or_else(|| self.project_env.clone())
+            .unwrap_or_default()
     }
 
     fn validate_credential(&self) -> Result<(), ProviderBuildError> {
@@ -1177,18 +1353,34 @@ impl ProviderMetadata {
 /// Shared by the entry's own endpoint and by every surface, so a provider's
 /// planes can never resolve their region by different rules — which is what
 /// makes it safe for `dispatchable` to answer for all of them at once.
-fn resolve_region<F>(base_url: &str, region_env: Option<&str>, mut read_env: F) -> Option<String>
+fn resolve_region<F>(
+    base_url: &str,
+    region_env: Option<&str>,
+    project_env: Option<&str>,
+    mut read_env: F,
+) -> Option<String>
 where
     F: FnMut(&str) -> Option<String>,
 {
-    if !base_url.contains(REGION_PLACEHOLDER) {
-        return Some(base_url.to_owned());
+    let mut resolved = base_url.to_owned();
+    // Both substitutions are all-or-nothing and both disqualify the provider
+    // when their variable is unset. That is the same failure `region_env` has
+    // always had, and it is deliberately NOT softened for the project: an
+    // endpoint URL still containing a literal `{project}` would be dialled as a
+    // host path segment named `{project}`, and the 404 that comes back reads as
+    // an upstream outage rather than as a missing configuration value.
+    if resolved.contains(REGION_PLACEHOLDER) {
+        // Validated present whenever the placeholder is, so an empty name here
+        // is unreachable; reading it as "no region" keeps this total rather
+        // than panicking.
+        let region = read_env(region_env.unwrap_or_default())?;
+        resolved = resolved.replace(REGION_PLACEHOLDER, &region);
     }
-    // Validated present whenever the placeholder is, so an empty name here
-    // is unreachable; reading it as "no region" keeps this total rather
-    // than panicking.
-    let region = read_env(region_env.unwrap_or_default())?;
-    Some(base_url.replace(REGION_PLACEHOLDER, &region))
+    if resolved.contains(PROJECT_PLACEHOLDER) {
+        let project = read_env(project_env.unwrap_or_default())?;
+        resolved = resolved.replace(PROJECT_PLACEHOLDER, &project);
+    }
+    Some(resolved)
 }
 
 /// Whether `provider` declares a plane named `surface`.
@@ -1440,12 +1632,33 @@ impl ProviderRoute {
     /// Missing credentials make an individual candidate unavailable. Building
     /// fails only when no configured candidate can be constructed. Do not cache
     /// this value across requests: fallback selection metadata is request-scoped.
-    pub fn new(
+    /// **Async because of one provider, and structured so it stays that way.**
+    /// Vertex's credential is a service-account key that must be exchanged for
+    /// a short-lived token over the network before anything can be dispatched
+    /// ([`CredentialKind`]). That exchange is the only await here, it is
+    /// skipped entirely for a route with no minting provider on it, and it is
+    /// almost always a cache hit ([`crate::gcp_auth::TokenCache`]).
+    ///
+    /// The minting is done BEFORE [`build_with_credentials`] rather than inside
+    /// it, and that is deliberate: it keeps the whole of route assembly — the
+    /// dispatchability rules, the surface resolution, the rung ordering —
+    /// synchronous and exactly as it was, with the token substituted in through
+    /// the same `credential_for` seam a test uses. A minted token is just
+    /// another string that came from somewhere, which is the property that made
+    /// this a small change instead of a rewrite of the request path.
+    pub async fn new(
         candidates: Vec<TierCandidate>,
         max_output_tokens: u32,
     ) -> Result<Self, ProviderBuildError> {
         let inventory = ProviderInventory::load()?;
-        build_with_credentials(&inventory, candidates, max_output_tokens, read_credential)
+        let minted = mint_credentials(&inventory, &candidates).await?;
+        build_with_credentials(&inventory, candidates, max_output_tokens, |env| {
+            // `Some(None)` is NOT the same as absent: it means this variable
+            // holds a key that must be minted from and the mint failed, so the
+            // credential is unavailable. Only a variable this route never
+            // minted for reaches the environment. See [`mint_credentials`].
+            resolve_credential(&minted, env, read_credential)
+        })
     }
 
     /// Assemble a route from pre-built candidates.
@@ -1593,6 +1806,189 @@ where
 /// and cannot diverge.
 fn assemble_route(candidates: Vec<ProviderCandidate>) -> ProviderRoute {
     ProviderRoute { candidates }
+}
+
+/// Per-provider token caches, keyed by credential env variable.
+///
+/// Process-global because the CACHE is the point: a per-request cache would
+/// mint a token per request, which is the behaviour this exists to avoid. Keyed
+/// by the variable rather than by the provider key so that a rotated secret —
+/// which reaches this process as a NEW TASK, with a fresh map — cannot be
+/// served a token minted from the old one.
+///
+/// The outer lock is a std mutex held only long enough to clone an `Arc`; the
+/// awaiting happens on the `TokenCache`'s own mutex, never this one.
+static TOKEN_CACHES: std::sync::OnceLock<
+    std::sync::Mutex<BTreeMap<String, Arc<crate::gcp_auth::TokenCache>>>,
+> = std::sync::OnceLock::new();
+
+/// Resolve the raw credential for a minting provider into a usable token,
+/// building (and remembering) that provider's token cache on first use.
+///
+/// The service-account JSON may be given inline or as a PATH to a file holding
+/// it. Both are supported because the two deployment shapes genuinely differ
+/// and neither is wrong: ECS injects secrets as environment values, so the blob
+/// arrives inline; a developer running locally has a downloaded key file and
+/// should not have to paste 2 KB of JSON into a shell. The discriminator is
+/// whether the value starts with `{` — a JSON object cannot begin any other
+/// way after trimming, and a filesystem path cannot begin with `{`.
+async fn minted_credential(
+    metadata: &ProviderMetadata,
+    raw: &str,
+) -> Result<String, ProviderBuildError> {
+    let env_name = metadata.credential_env.clone().unwrap_or_default();
+    let cache = {
+        let caches = TOKEN_CACHES.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()));
+        let mut caches = caches
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match caches.get(&env_name) {
+            Some(cache) => Arc::clone(cache),
+            None => {
+                let trimmed = raw.trim();
+                let json = if trimmed.starts_with('{') {
+                    trimmed.to_owned()
+                } else {
+                    std::fs::read_to_string(trimmed).map_err(|error| {
+                        ProviderBuildError::InvalidInventory {
+                            detail: format!(
+                                "provider {}: {env_name} is not JSON and could not be read as a \
+                                 path to a service-account key file: {error}",
+                                metadata.key
+                            ),
+                        }
+                    })?
+                };
+                let key =
+                    crate::gcp_auth::ServiceAccountKey::from_json(&json).map_err(|error| {
+                        ProviderBuildError::InvalidInventory {
+                            detail: format!("provider {}: {error}", metadata.key),
+                        }
+                    })?;
+                tracing::info!(
+                    provider = %metadata.key,
+                    service_account = %key.client_email(),
+                    "minting Vertex access tokens for this service account"
+                );
+                let cache = Arc::new(crate::gcp_auth::TokenCache::new(
+                    key,
+                    reqwest::Client::new(),
+                ));
+                caches.insert(env_name.clone(), Arc::clone(&cache));
+                cache
+            }
+        }
+    };
+
+    cache
+        .token(std::time::SystemTime::now())
+        .await
+        .map(|token| token.secret().to_owned())
+        .map_err(|error| ProviderBuildError::InvalidInventory {
+            detail: format!("provider {}: {error}", metadata.key),
+        })
+}
+
+/// Mint a token for every provider on this route whose credential needs it.
+///
+/// Returns a map from credential env variable to the token that should stand in
+/// for its raw value. Empty — and free — for a route with no minting provider,
+/// which is every route in the catalog but Vertex's.
+///
+/// **A minting failure drops the rung; it does not fail the route.** That is
+/// the same rule a missing credential follows, and it is the right one for the
+/// same reason: an unreachable Google token endpoint should cost a customer the
+/// Vertex lane, not the whole request when another candidate could serve it.
+/// The error is logged at `warn` with the provider named, because unlike a
+/// missing key — a deployment fact that is true until someone changes it — this
+/// one is usually transient and worth seeing in a log.
+/// **The map's value is an `Option`, and that is a safety property rather than
+/// a convenience.** A key present with `None` means "this variable is
+/// minting-only and minting did not succeed", and the caller must then treat
+/// the credential as ABSENT. Falling back to the environment there would read
+/// the raw service-account key — a 2 KB JSON blob containing an RSA private key
+/// — and send it upstream as a bearer token: the private key would leave the
+/// process, over the network, in an `Authorization` header, on every request,
+/// because a token refresh briefly failed. `a_failed_mint_never_sends_the_service_account_key`
+/// is the test that holds this shut.
+async fn mint_credentials(
+    inventory: &ProviderInventory,
+    candidates: &[TierCandidate],
+) -> Result<BTreeMap<String, Option<String>>, ProviderBuildError> {
+    let mut minted = BTreeMap::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for candidate in candidates {
+        if !seen.insert(candidate.provider.clone()) {
+            continue;
+        }
+        let Some(metadata) = inventory.provider(&candidate.provider) else {
+            continue;
+        };
+        if !metadata.credential_kind.needs_minting() {
+            continue;
+        }
+        let Some(env_name) = metadata.credential_env.as_deref() else {
+            continue;
+        };
+        // The raw key comes through the ordinary environment read. A provider
+        // whose key is absent is left alone entirely: `dispatchable` will drop
+        // the rung by itself, and minting from an empty string would turn a
+        // dark lane into a noisy error on every request.
+        let Some(raw) = read_credential(env_name) else {
+            continue;
+        };
+        match minted_credential(metadata, &raw).await {
+            Ok(token) => {
+                minted.insert(env_name.to_owned(), Some(token));
+            }
+            Err(error) => {
+                tracing::warn!(
+                    provider = %candidate.provider,
+                    %error,
+                    "could not mint an access token; this lane is unavailable for this request"
+                );
+                // Recorded as an explicit `None` rather than simply left out.
+                // Leaving it out would let the caller fall back to the raw
+                // environment value, which for this provider is the private
+                // key itself. See this function's doc comment.
+                minted.insert(env_name.to_owned(), None);
+            }
+        }
+    }
+    Ok(minted)
+}
+
+/// Resolve one credential variable against the tokens minted for this route.
+///
+/// **Extracted from the closure it used to be, because as a closure it could
+/// not be tested and therefore was not.** A test asserting this rule inline had
+/// no connection to the code that ran: reinstating the environment fallback in
+/// `ProviderRoute::new` left the whole suite green, so the guard below was
+/// decorative for the path that matters. Naming the rule is what lets
+/// `a_failed_mint_never_sends_the_service_account_key` drive the real thing.
+///
+/// The three cases, and the middle one is the guard:
+///
+/// - **not in the map** — an ordinary credential this route minted nothing for.
+///   Read the environment, exactly as every provider before Vertex did.
+/// - **in the map as `None`** — a minting provider whose mint FAILED. The
+///   credential is unavailable and the rung drops. Falling through to the
+///   environment here would read the raw service-account key and send an RSA
+///   private key upstream in an `Authorization` header.
+/// - **in the map as `Some`** — the minted token stands in for the variable's
+///   contents, so the wire is handed the token and never the key.
+fn resolve_credential<F>(
+    minted: &BTreeMap<String, Option<String>>,
+    env: &str,
+    read_env: F,
+) -> Option<String>
+where
+    F: FnOnce(&str) -> Option<String>,
+{
+    match minted.get(env) {
+        Some(token) => token.clone(),
+        None => read_env(env),
+    }
 }
 
 fn read_credential(name: &str) -> Option<String> {
@@ -1822,6 +2218,17 @@ mod tests {
         // FIFTH chat-completions entry is still the signal this comment
         // describes, and moving the xai entry to another adapter would not
         // quietly drop its retention check — it would refuse to load.
+        //
+        // `vertex` is that fifth entry, added 2026-08-21, and it too was a
+        // deliberate edit. Vertex AI publishes an OpenAI-compatible
+        // `/v1/.../endpoints/openapi/chat/completions`, so the WIRE is the
+        // ordinary one and no new adapter was warranted. What is new about the
+        // entry is not its adapter but its CREDENTIAL: it is the first to
+        // declare `credential_kind = "google_service_account"`, because Google
+        // issues no long-lived key for this surface and the wire is handed a
+        // minted OAuth token instead of the secret's contents
+        // (`crate::gcp_auth`). A SIXTH chat-completions entry remains the
+        // signal to stop and think.
         assert_eq!(
             adapters,
             [
@@ -1831,6 +2238,7 @@ mod tests {
                 ("bedrock", ProviderAdapter::Anthropic),
                 ("fireworks", ProviderAdapter::ChatCompletions),
                 ("xai", ProviderAdapter::ChatCompletions),
+                ("vertex", ProviderAdapter::ChatCompletions),
             ]
         );
 
@@ -2045,6 +2453,7 @@ mod tests {
                 "bedrock",
                 "fireworks",
                 "xai",
+                "vertex",
                 "local-llama"
             ]
         );
@@ -2356,6 +2765,222 @@ mod tests {
             google.endpoint(|_| None).expect("no region to resolve"),
             google.base_url.clone()
         );
+    }
+
+    /// The shipped Vertex entry, asserted by value — every field of it is a
+    /// claim that something else in the repo depends on.
+    #[test]
+    fn the_shipped_vertex_entry_is_the_zero_retention_gemini_lane_it_claims_to_be() {
+        let inventory = ProviderInventory::load().expect("inventory should load");
+        let vertex = inventory.provider("vertex").expect("vertex is shipped");
+
+        // THE GLOBAL ENDPOINT, and this is the assertion with money behind it.
+        // Google prices non-global endpoints 10% above global for these models
+        // (and has done since 2026-07-01). `tiers.toml` records the global
+        // rates as this lane's cost basis, so a base_url pointing at a regional
+        // host would sell every Vertex token ~10% below what Google invoices —
+        // and the catalog's basis-vs-sell invariant could not see it, because
+        // both sides are written in the same file and would simply both be
+        // wrong. Nothing else in the repository checks this; this line is it.
+        assert_eq!(
+            vertex.base_url.as_deref(),
+            Some(
+                "https://aiplatform.googleapis.com/v1/projects/{project}/locations/global/endpoints/openapi/chat/completions"
+            ),
+            "the Vertex lane must dial the GLOBAL endpoint — a regional one costs 10% more"
+        );
+        assert!(
+            vertex
+                .base_url
+                .as_deref()
+                .is_some_and(|url| url.contains("/locations/global/")),
+            "stated twice on purpose: the substring is what the 10% turns on"
+        );
+
+        // The credential is a service-account key to be exchanged, not a key to
+        // be sent. If this ever read `ApiKey` the wire would put a 2 KB JSON
+        // blob containing an RSA private key in an Authorization header.
+        assert_eq!(vertex.credential_kind, CredentialKind::GoogleServiceAccount);
+        assert!(vertex.credential_kind.needs_minting());
+        assert_eq!(
+            vertex.credential_env.as_deref(),
+            Some("VERTEX_SERVICE_ACCOUNT")
+        );
+        assert_eq!(vertex.project_env.as_deref(), Some("VERTEX_PROJECT_ID"));
+
+        // No attestation: Google publishes no per-response retention header,
+        // and declaring one that never arrives would fail every request closed.
+        assert!(vertex.attestation_header.is_none());
+
+        // The wire is the ordinary OpenAI-compatible one. Vertex's
+        // `endpoints/openapi` surface speaks it, which is why this lane needed
+        // no new adapter.
+        assert_eq!(vertex.adapter, ProviderAdapter::ChatCompletions);
+    }
+
+    /// Both variables or no lane. A project is an ACCOUNT boundary, and the
+    /// zero-retention configuration is applied per project, so a Vertex request
+    /// against the wrong project is served under a posture nobody verified.
+    #[test]
+    fn the_vertex_endpoint_resolves_its_project_and_disqualifies_without_one() {
+        let inventory = ProviderInventory::load().expect("inventory should load");
+        let vertex = inventory.provider("vertex").expect("vertex is shipped");
+
+        let resolved = vertex
+            .endpoint(|name| (name == "VERTEX_PROJECT_ID").then(|| "zr-prod-42".to_owned()))
+            .expect("a resolvable project yields an endpoint")
+            .expect("the entry declares a base_url");
+        assert_eq!(
+            resolved,
+            "https://aiplatform.googleapis.com/v1/projects/zr-prod-42/locations/global/endpoints/openapi/chat/completions"
+        );
+        assert!(
+            !resolved.contains(PROJECT_PLACEHOLDER),
+            "no placeholder may survive into a dialled URL: {resolved}"
+        );
+
+        // Without the project there is no address, so the rung goes — exactly
+        // as a missing region drops a Bedrock rung. Dialling a path segment
+        // literally named `{project}` would 404, and a 404 reads as an upstream
+        // outage rather than as the missing configuration it is.
+        assert!(
+            vertex.endpoint(|_| None).is_none(),
+            "an unresolvable project must disqualify rather than dial a placeholder"
+        );
+    }
+
+    #[test]
+    fn a_project_placeholder_without_a_project_env_is_refused() {
+        let error = assemble(
+            r#"{
+                "key": "projectless",
+                "adapter": "chat_completions",
+                "credential_env": "PROJECTLESS_API_KEY",
+                "secret_name": "projectless-api-key",
+                "base_url": "https://svc.example.test/v1/projects/{project}/chat/completions"
+            }"#,
+        )
+        .expect_err("a project placeholder with nothing to fill it must be refused");
+        assert!(error.to_string().contains("project_env"), "{error}");
+    }
+
+    #[test]
+    fn a_project_env_without_a_placeholder_is_refused() {
+        let error = assemble(
+            r#"{
+                "key": "fixedproject",
+                "adapter": "chat_completions",
+                "credential_env": "FIXEDPROJECT_API_KEY",
+                "secret_name": "fixedproject-api-key",
+                "base_url": "https://svc.example.test/v1/chat/completions",
+                "project_env": "FIXEDPROJECT_PROJECT"
+            }"#,
+        )
+        .expect_err("a project_env with no placeholder must be refused");
+        assert!(error.to_string().contains("fixedproject"), "{error}");
+    }
+
+    /// A credential that must be exchanged, on an upstream that takes no
+    /// credential, is a contradiction — and the safe reading of a contradiction
+    /// about a credential is to refuse the entry rather than pick a half.
+    #[test]
+    fn a_minting_credential_kind_on_a_keyless_upstream_is_refused() {
+        let error = assemble(
+            r#"{
+                "key": "keyless-minter",
+                "adapter": "chat_completions",
+                "credential": "none",
+                "credential_kind": "google_service_account",
+                "base_url": "https://svc.example.test/v1/chat/completions"
+            }"#,
+        )
+        .expect_err("minting without a credential to mint from must be refused");
+        assert!(
+            error.to_string().contains("no credential to exchange"),
+            "{error}"
+        );
+    }
+
+    /// **The guard that keeps an RSA private key inside this process.**
+    ///
+    /// `VERTEX_SERVICE_ACCOUNT` holds a service-account key, and the wire sends
+    /// whatever the credential resolves to as `Authorization: Bearer`. So if a
+    /// failed mint fell back to reading the environment, the private key would
+    /// be transmitted upstream, in a header, on every request — because a token
+    /// refresh briefly failed. `mint_credentials` records a failed mint as an
+    /// explicit `None` precisely so the fallback cannot happen, and this test is
+    /// what holds that shut.
+    ///
+    /// Driven through `build_with_credentials` with the resolution rule
+    /// `ProviderRoute::new` uses, rather than by calling the closure directly,
+    /// so it is the production wiring that is under test.
+    #[test]
+    fn a_failed_mint_never_sends_the_service_account_key() {
+        const KEY_MATERIAL: &str =
+            r#"{"type":"service_account","private_key":"-----BEGIN PRIVATE KEY-----"}"#;
+        let inventory = ProviderInventory::load().expect("inventory should load");
+
+        // The shape `mint_credentials` produces when minting failed: the
+        // variable is present in the map, with no token behind it.
+        let minted: BTreeMap<String, Option<String>> =
+            BTreeMap::from([("VERTEX_SERVICE_ACCOUNT".to_owned(), None)]);
+
+        let route = build_with_credentials(
+            &inventory,
+            vec![
+                candidate("vertex-rung", "vertex"),
+                candidate("anthropic-rung", "anthropic"),
+            ],
+            crate::provider::BASELINE_MAX_TOKENS,
+            // The PRODUCTION rule, not a restatement of it. Everything else
+            // resolves, INCLUDING the raw key material and the project — so
+            // the only reason the Vertex rung can drop is the failed mint.
+            |env| {
+                resolve_credential(&minted, env, |env| {
+                    Some(if env == "VERTEX_SERVICE_ACCOUNT" {
+                        KEY_MATERIAL.to_owned()
+                    } else {
+                        "present".to_owned()
+                    })
+                })
+            },
+        )
+        .expect("the other rungs still build");
+
+        let ids: Vec<&str> = route
+            .candidates
+            .iter()
+            .map(|candidate| candidate.definition.id.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            ["anthropic-rung"],
+            "a failed mint must drop the Vertex rung, not fall back to the raw key"
+        );
+    }
+
+    /// The same wiring on the success path: a minted token stands in for the
+    /// variable's contents, so the wire is handed the token and never the key.
+    ///
+    /// Without this, `a_failed_mint_never_sends_the_service_account_key` would
+    /// still pass if minting were broken outright and the lane simply never
+    /// built — the pair is what distinguishes "fails closed" from "never works".
+    #[test]
+    fn a_minted_token_stands_in_for_the_service_account_key() {
+        let inventory = ProviderInventory::load().expect("inventory should load");
+        let minted: BTreeMap<String, Option<String>> = BTreeMap::from([(
+            "VERTEX_SERVICE_ACCOUNT".to_owned(),
+            Some("ya29.minted-token".to_owned()),
+        )]);
+
+        let route = build_with_credentials(
+            &inventory,
+            vec![candidate("vertex-rung", "vertex")],
+            crate::provider::BASELINE_MAX_TOKENS,
+            |env| resolve_credential(&minted, env, |_| Some("present".to_owned())),
+        )
+        .expect("a minted token builds the lane");
+        assert_eq!(route.candidates.len(), 1);
     }
 
     #[test]
@@ -3001,27 +3626,49 @@ mod tests {
     }
 
     #[test]
-    fn only_fireworks_declares_a_source_key_and_it_is_the_one_models_dev_uses() {
-        // The shipped mapping, asserted by name. models.dev files Fireworks
-        // under `fireworks-ai`; the other providers' keys happen to match and
-        // must stay unmapped, because a mapping that appeared on one of them by
-        // accident would silently reconcile it against another vendor's prices.
+    fn every_shipped_provider_joins_models_dev_at_the_key_it_declares() {
+        // The shipped mapping, asserted EXHAUSTIVELY rather than by naming the
+        // providers that should have none. That distinction is the whole value
+        // of this test: it used to loop over a hardcoded list of the other
+        // providers, so a NEW provider was checked by nothing at all and could
+        // acquire — or silently need — a mapping without any test noticing.
+        // Building the expectation from the inventory itself means a new entry
+        // fails here until someone states which key it joins on.
+        //
+        //   fireworks  models.dev files it under `fireworks-ai`.
+        //   vertex     models.dev files Vertex under `google-vertex`, which is
+        //              a DIFFERENT entry from `google` with different prices
+        //              for some models. Joining on the bare provider key would
+        //              find nothing; joining on `google` would reconcile this
+        //              lane against the Developer API's rate card.
+        //   everything else joins on its own key, and a mapping appearing on
+        //   one later would be a silent decision to reconcile its rates against
+        //   whatever sits at the named key.
+        let inventory = ProviderInventory::load().expect("shipped inventory must load");
+        let declared: BTreeMap<&str, Option<String>> = inventory
+            .providers
+            .iter()
+            .map(|provider| {
+                (
+                    provider.key.as_str(),
+                    provider_source_key(provider.key.as_str()),
+                )
+            })
+            .collect();
+        let expected: BTreeMap<&str, Option<String>> = BTreeMap::from([
+            ("anthropic", None),
+            ("openai", None),
+            ("google", None),
+            ("bedrock", None),
+            ("fireworks", Some("fireworks-ai".to_owned())),
+            ("xai", None),
+            ("vertex", Some("google-vertex".to_owned())),
+        ]);
         assert_eq!(
-            provider_source_key("fireworks").as_deref(),
-            Some("fireworks-ai"),
-            "fireworks must join models.dev at the key models.dev actually uses"
+            declared, expected,
+            "a provider gaining or losing a models.dev mapping is a decision \
+             about which vendor's prices its rates are checked against"
         );
-        // `xai` is included here deliberately rather than left out of the loop:
-        // models.dev files xAI under `xai`, the same string ZeroRouter uses, so
-        // the join works with no mapping — and a mapping appearing on it later
-        // would be a silent decision to reconcile Grok's rates against whatever
-        // sits at the named key.
-        for provider in ["anthropic", "openai", "google", "bedrock", "xai"] {
-            assert!(
-                provider_source_key(provider).is_none(),
-                "{provider} joins on its own key and must not acquire a mapping"
-            );
-        }
     }
 
     /// The shipped attestation declaration, asserted by value.
@@ -3054,13 +3701,21 @@ mod tests {
         // And nothing else declares one. This is not tidiness: an attestation
         // on another upstream would be a claim, published through that
         // provider's retention pin, that its guarantee is checked per request.
-        for provider in ["anthropic", "openai", "google", "bedrock", "fireworks"] {
-            let metadata = inventory
-                .provider(provider)
-                .expect("shipped provider is addressable");
+        //
+        // Derived from the inventory rather than from a hardcoded list of the
+        // other providers, for the reason
+        // `every_shipped_provider_joins_models_dev_at_the_key_it_declares`
+        // gives: a list cannot cover a provider that does not exist yet, and
+        // "nothing ELSE declares one" is a claim about everything else.
+        for metadata in inventory
+            .providers
+            .iter()
+            .filter(|entry| entry.key != "xai")
+        {
             assert!(
                 metadata.attestation_header.is_none() && metadata.attestation_expect.is_none(),
-                "{provider} must not acquire an attestation without a deliberate edit"
+                "{} must not acquire an attestation without a deliberate edit",
+                metadata.key
             );
         }
     }

@@ -41,9 +41,39 @@ defines it:
   definition. The set the shipped `providers.json` can consume is whatever
   its entries' `credential_env` name — today `ANTHROPIC_API_KEY`,
   `OPENAI_API_KEY`, `GEMINI_API_KEY`, `BEDROCK_API_KEY`, `FIREWORKS_API_KEY`,
-  and `XAI_API_KEY`. A provider whose
+  `XAI_API_KEY`, and `VERTEX_SERVICE_ACCOUNT`. A provider whose
   key is absent is simply not a candidate — set only what the catalog actually
   routes to.
+- **`VERTEX_SERVICE_ACCOUNT` is not an API key**, and it is the one credential
+  in this list that is not a string the upstream accepts. It holds a Google
+  **service-account key in JSON** — the whole blob, including an RSA private
+  key — because Google issues no long-lived key for the surface the Vertex lane
+  dispatches on ("Only Google Cloud Auth is supported using the OpenAI
+  library"). ZeroRouter signs a JWT with it and exchanges that for a one-hour
+  OAuth2 access token, cached in-process and refreshed five minutes before
+  expiry (`router/src/gcp_auth.rs`). Two consequences for an operator:
+  - The secret is **larger and more sensitive** than the others. Treat a leak of
+    it as a compromise of the service account, and rotate by creating a new key
+    in GCP and deleting the old one — not by editing the JSON.
+  - The value may be either the JSON itself or a **path to a file** containing
+    it; ZeroRouter tells them apart by whether the value starts with `{`. ECS
+    injects the JSON inline; the path form is for running locally against a
+    downloaded key.
+- **`VERTEX_PROJECT_ID`** — plain env, not a secret; a project id is not a
+  credential. It is **required whenever `VERTEX_SERVICE_ACCOUNT` is set**,
+  because the endpoint carries the project in its path
+  (`.../v1/projects/{project}/locations/global/endpoints/openapi/...`). Unset,
+  the Vertex rungs drop out of every route exactly as a missing key would.
+  Nothing is defaulted, and here that matters more than it does for a region: a
+  project is an **account boundary**, and the zero-retention configuration
+  (below) is applied per project. A guessed project would serve requests under
+  a posture nobody verified.
+
+  Note the endpoint is pinned to `locations/global` deliberately. Google prices
+  non-global endpoints 10% above global for these models, and `tiers.toml`
+  records the global rates as this lane's cost basis — so switching to a
+  regional endpoint without repricing sells every Vertex token below cost. See
+  the Vertex section of `router/config/tiers.toml`.
 - **`BEDROCK_REGION`** — plain env, not a secret; a region is not a credential.
   It is **required whenever `BEDROCK_API_KEY` is set**, because BOTH Bedrock
   endpoints carry the region in their hostname
@@ -529,7 +559,7 @@ The labels are pinned in `router/config/tiers.toml` under `[retention.<provider>
 and are never written by any tool — the same rule prices follow, for a sharper
 reason: a retention label is a claim to a customer about their own data.
 
-**Today eleven lanes are `zero` and the rest are `standard`.** `anthropic`,
+**Today fourteen lanes are `zero` and the rest are `standard`.** `anthropic`,
 `openai`, and `google` are ordinary API accounts. `bedrock` — the four
 `bedrock/claude-*` lanes, added 2026-08-20 — was the first zero-retention
 upstream, and it got there by configuration rather than by contract.
@@ -539,8 +569,22 @@ published default for every customer. `xai` — the two `xai/grok-*` lanes, adde
 the same day again — rests on the same basis as Bedrock, an enforced account
 setting, but is verified in a way nothing else here is: xAI restates the
 guarantee in a response header on **every** response, and ZeroRouter asserts it
-before serving. The three sections below on enforced configuration, published
-defaults, and per-response attestation are why each counts.
+before serving. `vertex` — the three `vertex/gemini-*` lanes, added 2026-08-21 —
+rests on the same basis as Bedrock and xAI, an enforced configuration on the
+operator's own account, this time a Google Cloud **project**. The three sections
+below on enforced configuration, published defaults, and per-response
+attestation are why each counts.
+
+**`google` and `vertex` publish opposite postures for the same three Gemini
+models, and that is the product rather than a bug to reconcile.** They are two
+different Google products under two different data policies: `google` is the
+Gemini Developer API on an ordinary key, which logs prompts for an unstated
+period; `vertex` is Vertex AI on a project configured for zero data retention.
+Unlike the Bedrock/Anthropic twins — where the zero-retention lane costs 10%
+more — Vertex's global-endpoint price for these models is identical to the
+Developer API's, so the zero-retention lane is strictly better and
+`/v1/models` sorts it first. See "What the operator must do in Google Cloud"
+below before that lane is ever given a credential.
 
 The posture is pinned per PROVIDER, and that is what lets one `[retention.bedrock]`
 block cover both of Bedrock's API planes (see the next section):
@@ -808,6 +852,120 @@ Three deliberate differences from `--corroborate`:
 Asking for the check and being unable to run it (credential unset, rotated, or
 AWS unreachable) is a **failure**, not a pass: a check that could not run has
 not verified anything.
+
+### What the operator must do in Google Cloud
+
+**The `vertex` lanes ship dark and must stay dark until every step below is
+done.** The posture is a precondition of the credential, not a consequence of
+it: minting the key first would put three lanes that publish "zero retention" in
+front of a project that does not have it. Nothing in the repository can detect
+that, because a Google Cloud project reports no such summary — see the honest
+weakness noted in step 3.
+
+1. **Create a dedicated project** (for example `zerorouter-vertex-prod`) and
+   attach a Cloud Billing account. A dedicated project rather than a shared one,
+   because every control below is applied *per project* and a project shared
+   with anything else invites someone to re-enable caching for an unrelated
+   workload.
+
+2. **Enable the Vertex AI API** on it:
+
+   ```bash
+   gcloud config set project PROJECT_ID
+   gcloud services enable aiplatform.googleapis.com
+   ```
+
+3. **Get out of scope for abuse-monitoring prompt logging.** Google logs prompts
+   for up to 90 days on a classifier hit for customers "whose use of Google
+   Cloud is governed by the Google Cloud Platform Terms of Service", and states
+   that "customers with a Google Cloud Master Agreement are exempt from prompt
+   logging for this abuse monitoring by default". Either:
+   - hold a **Google Cloud Master Agreement** covering this account, or
+   - file Google's **abuse-monitoring exception form** and get it approved
+     ("If approved, Google won't store any prompts associated with the approved
+     Google Cloud account"), linked from the data-governance page pinned in
+     `[retention.vertex]`.
+
+   **Paying Google is not sufficient.** A self-serve credit-card project is
+   governed by the Cloud Platform ToS and *is* in scope. This is the step with
+   no machine check behind it — no API reports whether an account is exempt — so
+   it rests on knowing which agreement the account is under, or on holding the
+   approval. Record which of the two applies, and where the evidence lives,
+   before continuing.
+
+4. **Disable in-memory data caching** for the project:
+
+   ```bash
+   curl -X PATCH \
+     -H "Authorization: Bearer $(gcloud auth print-access-token)" \
+     -H "Content-Type: application/json" \
+     https://us-central1-aiplatform.googleapis.com/v1/projects/PROJECT_ID/cacheConfig \
+     -d '{"name":"projects/PROJECT_ID/cacheConfig","disableCache":true}'
+   ```
+
+   The change applies to all regions. Requires `roles/aiplatform.admin`.
+   Google's own position is that this cache does not violate zero data retention
+   — it is in-memory only, project-isolated, 24-hour TTL — and ZeroRouter
+   disables it anyway, because "retained only in RAM for a day" is a sentence a
+   customer is entitled to not want, and disabling costs nothing.
+
+5. **Leave request-response logging off.** It is off by default and per-model
+   per-project. Do not enable it for any model in this project.
+
+6. **Create the service account and key.** Give it the narrowest role that can
+   call the API:
+
+   ```bash
+   gcloud iam service-accounts create zerorouter-vertex \
+     --display-name="ZeroRouter Vertex dispatch"
+   gcloud projects add-iam-policy-binding PROJECT_ID \
+     --member="serviceAccount:zerorouter-vertex@PROJECT_ID.iam.gserviceaccount.com" \
+     --role="roles/aiplatform.user"
+   gcloud iam service-accounts keys create vertex-key.json \
+     --iam-account=zerorouter-vertex@PROJECT_ID.iam.gserviceaccount.com
+   ```
+
+   `roles/aiplatform.user` can invoke models; it deliberately cannot change
+   `cacheConfig`, so a compromise of this key cannot silently turn caching back
+   on. Do the cache change in step 4 as an admin, not as this account.
+
+7. **Store the key and set the project.** The secret container follows the
+   existing convention, `<env>/providers/<secret_name>`:
+
+   ```bash
+   aws secretsmanager create-secret \
+     --name zerorouter-beta/providers/vertex-service-account \
+     --secret-string file://vertex-key.json
+   shred -u vertex-key.json   # it is a private key; do not leave it on disk
+   ```
+
+   Then wire `VERTEX_SERVICE_ACCOUNT` as a task-definition secret and
+   `VERTEX_PROJECT_ID` as plain env, and add `vertex` to `enabled_provider_keys`
+   in the environment's tfvars. Injection is opt-in per key: a secret present in
+   Secrets Manager but absent from that list leaves these lanes dark with no
+   error anywhere.
+
+8. **Verify before the first customer request**, both halves:
+
+   ```bash
+   # the cache setting is really off
+   curl -H "Authorization: Bearer $(gcloud auth print-access-token)" \
+     https://us-central1-aiplatform.googleapis.com/v1/projects/PROJECT_ID/cacheConfig
+   # expect {"name": "projects/PROJECT_ID/cacheConfig", "disableCache": true}
+   ```
+
+   **A response without `disableCache` means caching is ENABLED.** The field is
+   simply absent at the default, so an operator reading a bare
+   `{"name": "..."}` must not treat it as a pass. It is the same trap as
+   Bedrock's `inherit`.
+
+   Then confirm the lane actually dispatches, and that `/v1/models` lists the
+   three `vertex/*` rows with `"posture": "zero"`.
+
+If any step above cannot be completed — most likely step 3 — **the honest
+outcome is to change `[retention.vertex]` to `standard` rather than to ship the
+lane anyway**. A wrong `standard` costs a little marketing; a wrong `zero` is a
+false statement to a customer about their data.
 
 ### If a provider's posture actually changes
 

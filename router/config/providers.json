@@ -50,6 +50,16 @@
       "base_url": "https://api.x.ai/v1/chat/completions",
       "attestation_header": "x-zero-data-retention",
       "attestation_expect": "true"
+    },
+    {
+      "key": "vertex",
+      "adapter": "chat_completions",
+      "credential_env": "VERTEX_SERVICE_ACCOUNT",
+      "credential_kind": "google_service_account",
+      "secret_name": "vertex-service-account",
+      "base_url": "https://aiplatform.googleapis.com/v1/projects/{project}/locations/global/endpoints/openapi/chat/completions",
+      "project_env": "VERTEX_PROJECT_ID",
+      "source_provider_key": "google-vertex"
     }
   ]
 }

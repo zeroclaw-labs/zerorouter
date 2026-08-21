@@ -88,6 +88,24 @@ export default async function globalSetup() {
       // not bite in this harness, but it is why this value must stay
       // implausible rather than becoming a real key someone pastes in.
       XAI_API_KEY: 'not-a-real-key',
+      // Added 2026-08-21 with the three Vertex Gemini lanes, for the same
+      // reason as the two paragraphs above.
+      //
+      // This pair is unlike every other credential here in a way worth
+      // knowing before someone "fixes" it. `VERTEX_SERVICE_ACCOUNT` really
+      // holds a Google service-account key in JSON, and this string is not
+      // one — it could not be parsed, let alone exchanged for a token. That is
+      // fine here and only here: `/v1/models` decides what to publish from
+      // whether the variable is PRESENT, never from whether it works, so the
+      // catalog surface under test renders all three rows. A harness that
+      // dialled an upstream would need a real key, and would then be putting a
+      // live GCP credential in a repository.
+      //
+      // `VERTEX_PROJECT_ID` is required alongside it — the endpoint carries the
+      // project in its path, so without it these lanes drop out exactly as
+      // Bedrock's do without `BEDROCK_REGION`.
+      VERTEX_SERVICE_ACCOUNT: 'not-a-real-service-account-key',
+      VERTEX_PROJECT_ID: 'zr-e2e-not-a-real-project',
       OIDC_ISSUER_URL: `http://127.0.0.1:${IDP_PORT}`,
       OIDC_CLIENT_ID: 'e2e-portal',
       OIDC_CLIENT_SECRET: 'e2e-secret',

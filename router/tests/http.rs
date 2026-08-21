@@ -278,8 +278,12 @@ async fn models_are_materialized_from_tiers_toml() {
     // is re-attested on every response. (The two Bedrock mantle lanes added with
     // the rest are commented out in `tiers.toml` because AWS's per-account Sales
     // gate refuses this account 5-generation Claude, so they could be listed but
-    // never served.)
-    assert_eq!(data.len(), 22);
+    // never served.) The three `vertex/*` lanes added 2026-08-21 are the same
+    // three Gemini models the `google/*` pins serve, reached over Vertex AI on
+    // a zero-retention Google Cloud project instead of the retaining Developer
+    // API — the second pair of twins in the catalog, and the first where the
+    // zero-retention half costs the customer no more than the retaining one.
+    assert_eq!(data.len(), 25);
     assert!(data.iter().all(|model| model["object"] == "model"));
 
     let ids = data
@@ -313,6 +317,9 @@ async fn models_are_materialized_from_tiers_toml() {
             "openai/gpt-5.6-luna",
             "openai/gpt-5.6-sol",
             "openai/gpt-5.6-terra",
+            "vertex/gemini-3.1-pro-preview",
+            "vertex/gemini-3.5-flash-lite",
+            "vertex/gemini-3.7-flash",
             "xai/grok-4.3",
             "xai/grok-4.6",
         ]),
@@ -712,14 +719,14 @@ async fn every_shipped_lane_publishes_a_retention_posture() {
     }
 
     // The shipped catalog's state, asserted rather than assumed. It was EMPTY
-    // until 2026-08-20 and is now eleven lanes — and it is pinned by NAME rather
+    // until 2026-08-20 and is now fourteen lanes — and it is pinned by NAME rather
     // than by count, because the thing that must not happen quietly is a lane
     // ACQUIRING this label, not the tally moving. A count would still pass if
     // someone relabelled `anthropic/*` zero and dropped an existing lane.
     //
     // A lane arriving in this list is a legal-adjacent claim about a customer's
-    // data, and it arrives only with evidence behind it. The eleven below rest on
-    // THREE DIFFERENT KINDS of evidence, which is the reason to keep reading
+    // data, and it arrives only with evidence behind it. The fourteen below rest
+    // on THREE DIFFERENT KINDS of evidence, which is the reason to keep reading
     // rather than to append the next lane by pattern-match:
     //
     //   bedrock/*    an ENFORCED `data_retention_mode: none` on the operator's
@@ -738,6 +745,17 @@ async fn every_shipped_lane_publishes_a_retention_posture() {
     //                (`crate::wire::ResponseAttestation`). These are the only
     //                two lanes in the catalog whose posture is checked at
     //                request time rather than on a date in the past.
+    //   vertex/*     an ENFORCED project configuration on the operator's own
+    //                Google Cloud project — in-memory caching disabled, no
+    //                request-response logging, and an account out of scope for
+    //                abuse-monitoring prompt logging — plus Google's published
+    //                semantics for each of those controls. Basis 2 again, and
+    //                the same three models the `google/*` lanes serve
+    //                `standard`: same weights, same price, different product,
+    //                different data policy. Its cache setting is re-readable
+    //                live (`projects/PROJECT_ID/cacheConfig`); its
+    //                abuse-monitoring scope is NOT, and `[retention.vertex]`
+    //                says so rather than glossing it.
     //
     // NOT EVERY `fireworks/*` LANE IS HERE, and the absentee is the point.
     // `fireworks/qwen3.8-max` dispatches the same account on the same key, and
@@ -768,6 +786,9 @@ async fn every_shipped_lane_publishes_a_retention_posture() {
             "fireworks/glm-5.2",
             "fireworks/kimi-k3",
             "fireworks/minimax-m3",
+            "vertex/gemini-3.1-pro-preview",
+            "vertex/gemini-3.5-flash-lite",
+            "vertex/gemini-3.7-flash",
             "xai/grok-4.3",
             "xai/grok-4.6"
         ],
@@ -1066,16 +1087,30 @@ async fn bundled_tier_catalog_has_expected_virtual_models() {
             "openai/gpt-5.6-luna",
             "openai/gpt-5.6-sol",
             "openai/gpt-5.6-terra",
+            "vertex/gemini-3.1-pro-preview",
+            "vertex/gemini-3.5-flash-lite",
+            "vertex/gemini-3.7-flash",
             "xai/grok-4.3",
             "xai/grok-4.6",
         ],
-        "the twenty-two vendor-named model pins (Gemini flash + flash-lite added \
+        "the twenty-five vendor-named model pins (Gemini flash + flash-lite added \
          2026-08-18; Gemini Pro joined them once conditional rates could \
          express the 200,000-token boundary Google prices it at; the four \
          Bedrock classic-runtime zero-retention lanes on 2026-08-20, the \
          five open-weight Fireworks lanes the same day, closed-weight \
          Qwen 3.8 Max alongside them under a per-tier retention override, and \
-         the two xAI Grok lanes the same day again). \
+         the two xAI Grok lanes the same day again; and the three Vertex \
+         Gemini lanes on 2026-08-21). \
+         THE THREE `vertex/*` IDS NAME THE SAME MODELS AS THE THREE \
+         `google/*` ONES and that is the point rather than a duplicate: they \
+         are two different Google products under two different data policies. \
+         `google/*` is the Gemini Developer API, which logs prompts for an \
+         unstated period; `vertex/*` is Vertex AI on the operator's own \
+         zero-retention Google Cloud project. Unlike the Bedrock twins the \
+         zero-retention half costs no more — Vertex's global-endpoint price \
+         for these models is identical to the Developer API's. The dispatched \
+         model strings differ from the ids by a `google/` prefix, which is \
+         the vendor's own naming on Vertex's OpenAI-compatible surface. \
          \
          THE XAI IDS ARE THE VENDOR'S IDS, exactly: `grok-4.6` and `grok-4.3` \
          are what xAI dispatches, so these two pins keep this file's original \
@@ -1130,7 +1165,7 @@ async fn bundled_tier_catalog_has_expected_virtual_models() {
         assert!(
             matches!(
                 provider,
-                "openai" | "anthropic" | "google" | "bedrock" | "fireworks" | "xai"
+                "openai" | "anthropic" | "google" | "bedrock" | "fireworks" | "xai" | "vertex"
             ),
             "{tier_id} routes to {provider}, which is not in the shipped inventory"
         );
@@ -1575,6 +1610,9 @@ async fn a_basis_hike_above_sell_withholds_that_tier_and_nothing_else() {
             "openai/gpt-5.6-luna",
             "openai/gpt-5.6-sol",
             "openai/gpt-5.6-terra",
+            "vertex/gemini-3.1-pro-preview",
+            "vertex/gemini-3.5-flash-lite",
+            "vertex/gemini-3.7-flash",
             "xai/grok-4.3",
             "xai/grok-4.6",
         ]
@@ -1617,12 +1655,12 @@ async fn a_basis_hike_above_sell_withholds_that_tier_and_nothing_else() {
     assert_eq!(sell.output_per_mtok, Some(10.00));
 
     // And the public catalog stops advertising what it cannot serve: the
-    // twenty-one surviving pins, one row each. A Bedrock lane is among the survivors and
+    // twenty-four surviving pins, one row each. A Bedrock lane is among the survivors and
     // that is the point of naming one — Bedrock lanes are a different account
     // with their own rate card, so a repricing of a first-party Anthropic lane
     // withholds only that first-party lane.
     let listed = listed_model_ids(RouterState::fully_credentialed(path)).await;
-    assert_eq!(listed.len(), 21);
+    assert_eq!(listed.len(), 24);
     assert!(listed.iter().any(|id| id == "bedrock/claude-sonnet-4-5"));
     assert!(listed.iter().any(|id| id == "openai/gpt-5.6-luna"));
     assert!(listed.iter().any(|id| id == "anthropic/claude-haiku-4-5"));
@@ -1648,7 +1686,7 @@ async fn the_shipped_catalog_withholds_no_tier_today() {
         "the shipped catalog withholds {:?}",
         catalog.unavailable.keys().collect::<Vec<_>>()
     );
-    assert_eq!(catalog.tiers.len(), 22);
+    assert_eq!(catalog.tiers.len(), 25);
 }
 
 /// Every conditional rate the shipped catalog declares, transcribed from
@@ -1668,13 +1706,18 @@ async fn the_shipped_catalog_withholds_no_tier_today() {
 /// the `>=` this catalog implements — unlike the OpenAI and Google rows, where
 /// `tiers.toml` records that the vendors disagree in writing about that one
 /// token and `>=` was chosen as the markup-not-loss side.
-const SHIPPED_CONDITIONAL_RATES: [(&str, u64, f64, f64, f64); 6] = [
+const SHIPPED_CONDITIONAL_RATES: [(&str, u64, f64, f64, f64); 7] = [
     ("openai/gpt-5.6-luna", 272_000, 0.40, 0.04, 1.80),
     ("openai/gpt-5.6-terra", 272_000, 4.00, 0.40, 18.00),
     ("openai/gpt-5.6-sol", 272_000, 10.00, 1.00, 45.00),
     ("google/gemini-3.1-pro-preview", 200_000, 4.00, 0.40, 18.00),
     ("xai/grok-4.6", 200_000, 4.00, 1.00, 12.00),
     ("xai/grok-4.3", 200_000, 2.50, 0.40, 5.00),
+    // The same model and the same boundary as the `google/*` row above, on the
+    // zero-retention Vertex lane. Google prices the two identically on the
+    // global endpoint, so a divergence between these two rows is a mistake in
+    // one of them rather than a vendor decision.
+    ("vertex/gemini-3.1-pro-preview", 200_000, 4.00, 0.40, 18.00),
 ];
 
 #[tokio::test]
@@ -1741,7 +1784,7 @@ async fn every_shipped_conditional_rate_is_the_one_the_vendor_publishes() {
 // rungs across >=2 providers). Every tier is pass-through until a second
 // provider serves a model class again.
 const ROUTED_TIERS: [&str; 0] = [];
-const PASS_THROUGH_TIERS: [&str; 22] = [
+const PASS_THROUGH_TIERS: [&str; 25] = [
     // Model pins, keyed by their OpenRouter-standard {vendor}/{model} ids.
     "openai/gpt-5.6-luna",
     "anthropic/claude-haiku-4-5",
@@ -1797,6 +1840,18 @@ const PASS_THROUGH_TIERS: [&str; 22] = [
     // two independent checks on the same mistake.
     "xai/grok-4.6",
     "xai/grok-4.3",
+    // The Vertex zero-retention twins of the three `google/*` Gemini pins
+    // (2026-08-21). Pass-through, and the assertion below is load-bearing in a
+    // way it is not for the Bedrock twins: those sell 10% ABOVE their
+    // first-party counterparts and the gap is visible on inspection, while
+    // these sell at EXACTLY the `google/*` rate because Google's global-endpoint
+    // Vertex price is the same number. That makes a wrong basis here invisible
+    // to the eye — the failure mode is someone pointing a candidate at a
+    // regional endpoint, which costs 10% more, while these tables still read
+    // 0.75/3.75. See the section header in `tiers.toml`.
+    "vertex/gemini-3.7-flash",
+    "vertex/gemini-3.5-flash-lite",
+    "vertex/gemini-3.1-pro-preview",
 ];
 
 #[tokio::test]
