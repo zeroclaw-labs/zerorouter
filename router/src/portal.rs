@@ -286,6 +286,20 @@ struct MeResponse {
     /// entirely rather than sending an explicit null.
     #[serde(skip_serializing_if = "Option::is_none")]
     byok_allowance: Option<byok::AllowanceStatus>,
+    /// Whether this deployment offers the stablecoin deposit rail.
+    ///
+    /// The same shape of signal as `stripe_publishable_key` and
+    /// `byok_providers` above, and it ships dark the same way: FALSE means the
+    /// Credits page renders no crypto option at all, rather than a button whose
+    /// every press would answer 501.
+    ///
+    /// It is a plain boolean rather than something richer because there is
+    /// nothing else the browser needs. Stablecoin acceptance is a Stripe
+    /// payment method on the account ZeroRouter already holds, so unlike BYOK
+    /// there is no per-provider list and unlike Stripe.js there is no key to
+    /// hand over — the crypto session is created server-side by the same
+    /// endpoint the card one is.
+    crypto_rail: bool,
 }
 
 async fn me(State(ctx): State<WebCtx>, user: PortalUser) -> Result<Json<MeResponse>, PortalError> {
@@ -321,6 +335,11 @@ async fn me(State(ctx): State<WebCtx>, user: PortalUser) -> Result<Json<MeRespon
             Vec::new()
         },
         byok_allowance,
+        crypto_rail: ctx
+            .config
+            .stripe
+            .as_ref()
+            .is_some_and(|stripe| stripe.crypto_rail),
     }))
 }
 

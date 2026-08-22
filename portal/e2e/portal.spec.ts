@@ -252,6 +252,113 @@ test('the add-credits modal opens to our amount step when Stripe is configured',
   await expect(modal).toHaveCount(0)
 })
 
+/**
+ * Inject an /api/me that claims a given deployment capability set.
+ *
+ * The same technique the modal spec above uses, and for the same reason: the
+ * portal decides what to offer purely from what /api/me reports, and the e2e
+ * router runs without Stripe. Overriding the response exercises the real
+ * component path for a capability this harness's router cannot itself have.
+ */
+async function withCapabilities(
+  page: Page,
+  extra: Record<string, unknown>,
+): Promise<void> {
+  await page.route('**/api/me', async (route) => {
+    const response = await route.fetch()
+    const body = await response.json()
+    await route.fulfill({
+      response,
+      json: { ...body, stripe_publishable_key: 'pk_test_e2e_placeholder', ...extra },
+    })
+  })
+}
+
+test('the stablecoin option is absent when the deployment has not enabled it', async ({ page }) => {
+  // The dark-ship contract, rendered. `crypto_rail: false` is what every
+  // deployment reports until the operator sets ZEROROUTER_CRYPTO_RAIL, and the
+  // Credits page must then look exactly as it did before the rail existed —
+  // not a disabled control, not an explanatory note, nothing at all.
+  await withCapabilities(page, { crypto_rail: false })
+  await signIn(page)
+  await page.getByRole('link', { name: /credits/i }).click()
+  await page.getByRole('button', { name: /add credits/i }).click()
+
+  const modal = page.getByRole('dialog', { name: /add credits/i })
+  await expect(modal).toBeVisible()
+  // The amount step is fully present...
+  await expect(modal.getByRole('button', { name: '$25', exact: true })).toBeVisible()
+  // ...and carries no trace of the other rail.
+  await expect(modal.getByRole('group', { name: /payment method/i })).toHaveCount(0)
+  await expect(modal.getByRole('radio', { name: /stablecoin/i })).toHaveCount(0)
+  await expect(modal.getByText(/stablecoin/i)).toHaveCount(0)
+})
+
+test('an older router that never heard of the rail also renders no crypto option', async ({
+  page,
+}) => {
+  // `crypto_rail` absent entirely, not false — the shape a router built before
+  // this feature returns. The portal must read that as "off" rather than
+  // crashing or defaulting to on.
+  await withCapabilities(page, {})
+  await signIn(page)
+  await page.getByRole('link', { name: /credits/i }).click()
+  await page.getByRole('button', { name: /add credits/i }).click()
+
+  const modal = page.getByRole('dialog', { name: /add credits/i })
+  await expect(modal).toBeVisible()
+  await expect(modal.getByRole('button', { name: '$25', exact: true })).toBeVisible()
+  await expect(modal.getByRole('radio', { name: /stablecoin/i })).toHaveCount(0)
+})
+
+test('with the rail enabled, card stays the default and stablecoin is the opt-in', async ({
+  page,
+}) => {
+  await withCapabilities(page, { crypto_rail: true })
+  await signIn(page)
+  await page.getByRole('link', { name: /credits/i }).click()
+  await page.getByRole('button', { name: /add credits/i }).click()
+
+  const modal = page.getByRole('dialog', { name: /add credits/i })
+  await expect(modal).toBeVisible()
+
+  const card = modal.getByRole('radio', { name: /^card$/i })
+  const crypto = modal.getByRole('radio', { name: /stablecoin/i })
+  await expect(card).toBeVisible()
+  await expect(crypto).toBeVisible()
+
+  // Card is selected on open. The crypto rail is an opt-in per purchase, never
+  // a remembered preference — a customer must not be silently returned to a
+  // rail they used once.
+  await expect(card).toBeChecked()
+  await expect(crypto).not.toBeChecked()
+  // Nothing crypto-specific is claimed until it is chosen.
+  await expect(modal.getByText(/cannot be charged back/i)).toHaveCount(0)
+
+  // Choosing it discloses the things a buyer needs before committing: the
+  // different fee, that we settle in dollars rather than holding coin, the
+  // per-transaction ceiling, and the absence of chargebacks.
+  await crypto.check()
+  await expect(crypto).toBeChecked()
+  await expect(card).not.toBeChecked()
+  await expect(modal.getByText(/5% on stablecoin instead of 5\.5%/i)).toBeVisible()
+  await expect(modal.getByText(/settle in dollars and never hold the coin/i)).toBeVisible()
+  await expect(modal.getByText(/\$10,000 per crypto payment/i)).toBeVisible()
+  await expect(modal.getByText(/cannot be charged back/i)).toBeVisible()
+
+  // Switching back retracts all of it, and selecting a rail never navigates.
+  await card.check()
+  await expect(modal.getByText(/cannot be charged back/i)).toHaveCount(0)
+  await expect(page).toHaveURL(/\/credits$/)
+
+  // Reopening resets to card even after choosing crypto.
+  await crypto.check()
+  await page.keyboard.press('Escape')
+  await expect(modal).toHaveCount(0)
+  await page.getByRole('button', { name: /add credits/i }).click()
+  await expect(modal.getByRole('radio', { name: /^card$/i })).toBeChecked()
+})
+
 test('the autopay panel offers setup, arming, and its own status', async ({ page }) => {
   // Autopay had a complete UI and no e2e coverage at all: the credits spec
   // above used to be named "…and the autopay panel" but, with Stripe

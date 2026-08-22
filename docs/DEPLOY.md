@@ -553,6 +553,129 @@ What to know when it is on:
   registrations exist; the hourly sweep prices at most one calculation per
   user per pass.
 
+## Paying with stablecoins: `ZEROROUTER_CRYPTO_RAIL` (ships dark)
+
+ZeroRouter can take credit top-ups in USDC as a **second fee schedule on the
+existing Stripe integration** — not a second processor. Stripe accepts the
+stablecoin, converts it, and settles **USD into the same Stripe balance** as
+every card payment. ZeroRouter never holds, custodies, or converts crypto, and
+there is no new vendor, no new API credential, and no new webhook endpoint.
+
+The rail **ships dark**: with `ZEROROUTER_CRYPTO_RAIL` unset, the portal renders
+no crypto option, `POST /api/billing/checkout` answers `501
+crypto_rail_unavailable` to any request that asks for it, and every card session
+is byte-for-byte the request it was before this feature existed.
+
+### Why the fee differs
+
+| Rail | ZeroRouter deposit fee | What Stripe charges us |
+|---|---|---|
+| Card | 5.5%, minimum $0.80 | 2.9% + $0.30 |
+| Stablecoin | **5% flat, no minimum** | **1.5%, no fixed component** |
+
+The card floor exists solely to clear Stripe's fixed $0.30. Stablecoin has no
+fixed component, so the percentage alone is above water at every size: on the
+$5 minimum deposit the fee is $0.25 against a cost of `0.015 × 5.25 = $0.079`.
+A floor there would overcharge the smallest buyers for a cost that does not
+exist.
+
+### Eligibility, before you start
+
+- **Not available to businesses in New York.** Stripe excludes NY outright.
+  ZeroRouter's head office is Cambridge MA, so this deployment qualifies — but
+  it is a hard gate if the entity ever redomiciles.
+- Stripe settles **at most $10,000 per crypto transaction**. The router refuses
+  a stablecoin quote whose ex-tax gross exceeds **$8,900**, leaving headroom for
+  sales tax added on top (the cap applies to the final, tax-inclusive amount).
+  This is nowhere near binding while `ZEROROUTER_CHECKOUT_MAX_USD` is its
+  default of $1,000.
+- **Crypto payments cannot be charged back.** Stripe documents no dispute
+  mechanism for them, so `charge.dispute.created` cannot fire for a stablecoin
+  purchase and the dispute-freeze machinery (migration 0009) simply never
+  applies to one. Refunds still work, but Stripe returns them **as stablecoin to
+  the customer's original wallet**, not as dollars.
+
+### Operator steps, in order
+
+1. **Dashboard → Payment methods → request "Stablecoins and Crypto".** Stripe
+   *reviews* the request; the method shows as **Pending** until approved. This
+   is not a toggle that takes effect immediately, so start it before you plan to
+   launch.
+2. **Wait for the method to show Active.** There is deliberately no code that
+   polls for this — see "Why a flag and not detection" below.
+3. **In a sandbox first**, set `ZEROROUTER_CRYPTO_RAIL=1` and run one real
+   stablecoin purchase end to end using testnet assets (Stripe recommends
+   MetaMask + the Polygon Amoy testnet + the Circle faucet; the walkthrough is
+   in Stripe's "Accept stablecoin payments" doc). Confirm the credit lands and
+   the ledger shows the net.
+4. **Run one test-mode CARD purchase in the same sandbox, immediately after.**
+   This step is not optional and not a formality — see the warning below.
+5. Set `ZEROROUTER_CRYPTO_RAIL=1` in live and repeat both purchases for real,
+   smallest allowed amount, before announcing the option.
+
+### ⚠️ The one unverified wire value, and why step 4 exists
+
+Enabling the rail changes the **card** session request: it starts sending
+`excluded_payment_method_types[0]=crypto`, so that Stripe's dynamic payment
+methods do not begin offering stablecoin at the *card* price once the method is
+live account-wide.
+
+`crypto` is Stripe's documented payment-method type name, and it is documented as
+a valid `payment_method_types` value. But Stripe's rendered API reference does
+**not** enumerate the members of `excluded_payment_method_types`, so that it is
+accepted *there* is an inference rather than something read from the docs.
+
+If that inference is wrong, Stripe rejects the create call and **every card
+purchase fails** with `502 checkout_failed` — loudly, crediting nothing, but a
+total checkout outage. One test-mode card purchase after enabling the flag
+proves it either way in under a minute. Roll back by unsetting
+`ZEROROUTER_CRYPTO_RAIL`, which removes the parameter.
+
+### Why a flag and not automatic detection
+
+There is no supported API that answers "is my own account approved for this
+payment method?". `/v1/account`'s `capabilities.crypto_payments` is documented
+for **connected** accounts, and Stripe's own guidance frames it that way; whether
+it is populated for a standalone account that enabled crypto through the
+Dashboard is not documented. `/v1/payment_method_configurations` exposes an
+`available` boolean per method, but its meaning is never defined in prose and it
+has no `pending` state. Detecting by creating a probe session would mean minting
+throwaway sessions against the live account.
+
+So the flag is a **declaration by the operator**, and the consequences of it
+being wrong are bounded and deliberately unequal:
+
+- **Set too early** (method still Pending): the portal offers the option, Stripe
+  refuses the session, the buyer sees `checkout_failed`, and **no money moves**.
+- **Left unset when it could be set**: the option is not offered. Card purchases
+  are untouched.
+
+Neither can mis-price a purchase, because the fee schedule and the session's
+payment-method restriction are set from the same value in the same API call.
+
+### What the accountant needs to know
+
+Sales tax on a stablecoin purchase is calculated by **Stripe Tax**, against the
+same billing address, the same registrations, and the same product tax code as a
+card purchase — there is no second tax implementation and no self-declaration.
+The payment method does not change the taxability of the sale. Everything in
+"Stripe Tax must be configured BEFORE this deploys" above applies unchanged.
+
+For reconciliation: a stablecoin purchase is an ordinary Checkout Session, so it
+appears in `stripe_checkout_intents` and `credit_ledger` exactly like a card one,
+anchored on the same `stripe_session_id`. To tell the rails apart, read
+`metadata.rail` on the session at Stripe — it is `crypto` on a stablecoin session
+and **absent** on a card one (absent is what every session created before this
+feature also looks like, which is why the webhook reads absent as "card").
+
+### ⚠️ Terms of Service
+
+`portal/src/pages/Terms.tsx` has been updated with a stablecoin clause and a
+crypto deposit-fee sentence. **Both need the operator's legal review before this
+rail is enabled in live**, because they describe what customers are charged and
+what recourse they have. Enabling `ZEROROUTER_CRYPTO_RAIL` before that review is
+what makes an unreviewed term operative.
+
 ## Credit enforcement is on by default
 
 `ZEROROUTER_REQUIRE_CREDITS` **defaults to `true`**. It previously defaulted

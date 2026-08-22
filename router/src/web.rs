@@ -23,6 +23,8 @@ pub const STRIPE_PUBLISHABLE_KEY_ENV: &str = "STRIPE_PUBLISHABLE_KEY";
 pub const STRIPE_API_BASE_ENV: &str = "STRIPE_API_BASE";
 pub const DEFAULT_STRIPE_API_BASE: &str = "https://api.stripe.com";
 pub const STRIPE_WEBHOOK_SECRET_ENV: &str = "STRIPE_WEBHOOK_SECRET";
+/// Turns on the stablecoin deposit rail. See [`StripeSettings::crypto_rail`].
+pub const CRYPTO_RAIL_ENV: &str = "ZEROROUTER_CRYPTO_RAIL";
 pub const SIGNUP_CREDIT_ENV: &str = "ZEROROUTER_SIGNUP_CREDIT_USD";
 pub const REQUIRE_CREDITS_ENV: &str = "ZEROROUTER_REQUIRE_CREDITS";
 pub const PORTAL_DIST_ENV: &str = "ZEROROUTER_PORTAL_DIST";
@@ -66,6 +68,30 @@ pub struct StripeSettings {
     /// Stripe API origin. Production default; tests point it at a fixture
     /// server so the sweep and outbound calls are testable without Stripe.
     pub api_base: String,
+    /// Whether this deployment offers the stablecoin deposit rail.
+    ///
+    /// **This is a declaration by the operator, not a discovery.** Stripe gates
+    /// stablecoin acceptance behind a Dashboard access request that it reviews
+    /// and approves out of band; there is no supported API that answers "is my
+    /// own account approved for this payment method?" (`/v1/account`'s
+    /// `capabilities` hash carries `crypto_payments` for CONNECTED accounts,
+    /// not for the platform's own). Detecting it by creating a probe session
+    /// and reading what Stripe offers would mean minting throwaway sessions on
+    /// the live account, so the honest mechanism is an explicit flag the
+    /// operator sets once the Dashboard says the method is active.
+    ///
+    /// The consequence of the flag being WRONG is bounded and unequal, which is
+    /// why it defaults to off:
+    ///
+    /// - Set when it should not be: the portal offers the rail, Stripe refuses
+    ///   the session (the requested payment method is not active), the customer
+    ///   sees `checkout_failed`, and NO money moves.
+    /// - Unset when it could be set: the rail simply is not offered. Card
+    ///   purchases are untouched.
+    ///
+    /// Neither can mis-price a purchase, because the fee schedule travels with
+    /// the session's payment-method restriction rather than with this flag.
+    pub crypto_rail: bool,
 }
 
 impl std::fmt::Debug for StripeSettings {
@@ -79,6 +105,7 @@ impl std::fmt::Debug for StripeSettings {
             .field("webhook_secret", &"<scrubbed>")
             .field("checkout_min_usd", &self.checkout_min_usd)
             .field("checkout_max_usd", &self.checkout_max_usd)
+            .field("crypto_rail", &self.crypto_rail)
             .finish()
     }
 }
@@ -149,6 +176,11 @@ impl WebConfig {
         if checkout_max_usd < checkout_min_usd {
             bail!("{CHECKOUT_MAX_ENV} must be at least {CHECKOUT_MIN_ENV}");
         }
+        // Read BEFORE the feature group so an unparseable value aborts startup
+        // even on a deployment with no Stripe configuration at all — the same
+        // discipline `redemption_tax::mode_from_env` follows, and for the same
+        // reason: a typo must never read as "off".
+        let crypto_rail = bool_env(CRYPTO_RAIL_ENV, false)?;
         let stripe = feature_group(
             "Stripe billing",
             [
@@ -173,8 +205,18 @@ impl WebConfig {
                 api_base: optional_env(STRIPE_API_BASE_ENV)
                     .map(|base| base.trim_end_matches('/').to_owned())
                     .unwrap_or_else(|| DEFAULT_STRIPE_API_BASE.to_owned()),
+                crypto_rail,
             },
         );
+        // Naming the mistake beats silently ignoring it: the rail is a Stripe
+        // payment method, so asking for it without Stripe configured is a
+        // deployment error the operator wants to hear about at startup rather
+        // than discover from a portal that renders no crypto option.
+        if crypto_rail && stripe.is_none() {
+            bail!(
+                "{CRYPTO_RAIL_ENV} is set but Stripe billing is not configured; the stablecoin rail is a Stripe payment method and cannot be offered without it"
+            );
+        }
 
         let signup_credit_usd = decimal_env(SIGNUP_CREDIT_ENV, Decimal::ZERO)?;
         if signup_credit_usd < Decimal::ZERO {
@@ -332,6 +374,19 @@ fn optional_env(name: &str) -> Option<String> {
         None
     } else {
         Some(trimmed.to_owned())
+    }
+}
+
+/// Read a boolean setting, refusing anything unrecognized.
+///
+/// Blank normalizes to absent via [`optional_env`], so a variable that is
+/// present but empty takes the default rather than reading as an opt-in.
+fn bool_env(name: &str, default: bool) -> Result<bool> {
+    match optional_env(name).as_deref() {
+        None => Ok(default),
+        Some("true" | "1") => Ok(true),
+        Some("false" | "0") => Ok(false),
+        Some(other) => bail!("{name} must be true or false, got {other:?}"),
     }
 }
 

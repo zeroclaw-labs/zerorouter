@@ -265,7 +265,8 @@ export function Docs() {
         </li>
         <li>
           <strong>Add credits.</strong> Credits are prepaid and denominated in dollars. A deposit
-          fee applies when you buy them; inference itself is passed through at cost.
+          fee applies when you buy them — lower if you pay with stablecoin, where that is offered —
+          and inference itself is passed through at cost.
         </li>
         <li>
           <strong>Mint a key</strong> on the <Link to="/keys">Keys</Link> page. The plaintext key
@@ -633,6 +634,23 @@ export function Docs() {
         before you confirm. See the <Link to="/terms">Terms</Link> for the full statement. If you
         bring your own provider key, you pay a percentage of catalog instead of the catalog price —
         see <a href="#byok">Bring your own key</a>.
+      </p>
+      <p>
+        <strong>Paying with stablecoins.</strong> Where it is offered, you can top up with USDC
+        instead of a card. The deposit fee is <strong>5% flat with no minimum</strong>, against
+        5.5% with a $0.80 minimum on a card — cards carry a fixed per-charge cost that stablecoin
+        does not, and the fee follows the cost rather than rounding it up. On a $5 top-up that is
+        $0.25 instead of $0.80. You are handed to Stripe to connect a wallet; the payment settles
+        to us in dollars, and ZeroRouter never holds, custodies, or converts the coin itself.
+      </p>
+      <p>
+        Everything after the payment is identical to a card purchase. The same sales-tax
+        calculation runs against the same billing address, exactly the credit you bought is added
+        to your balance, and the fee and any tax are never credited. Two differences are worth
+        knowing before you choose it: Stripe settles at most{' '}
+        <strong>$10,000 per crypto payment</strong>, and a crypto payment{' '}
+        <strong>cannot be charged back</strong> — there is no dispute mechanism to reverse one, so
+        check the amount before you pay.
       </p>
 
       {/* ── BYOK ────────────────────────────────────────────────────────── */}

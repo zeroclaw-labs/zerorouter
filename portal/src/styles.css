@@ -1723,3 +1723,32 @@ input {
     max-height: 380px;
   }
 }
+
+/* The card-vs-stablecoin choice. Deliberately quiet: a small radio row under
+   the amount rather than a second prominent button, so the card path stays the
+   obvious one and crypto reads as the alternative it is. Rendered only on
+   deployments where the operator has enabled stablecoin acceptance. */
+.rail-choice {
+  display: flex;
+  gap: 16px;
+  flex-wrap: wrap;
+  margin-top: 12px;
+}
+
+.rail-option {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.rail-option:hover {
+  color: var(--text);
+}
+
+.rail-option input {
+  accent-color: var(--accent);
+  cursor: pointer;
+}

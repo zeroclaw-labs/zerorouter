@@ -583,6 +583,18 @@ pub(crate) enum StripeHttpError {
     StatusUnavailable,
     UnknownUser,
     DatabaseUnavailable,
+    /// The request named a payment rail this build does not know.
+    InvalidRail,
+    /// A stablecoin deposit larger than Stripe's per-transaction cap can
+    /// settle. See [`CRYPTO_MAX_EX_TAX_GROSS_USD`].
+    CryptoAmountTooLarge,
+    /// The request asked for the stablecoin rail on a deployment where the
+    /// operator has not turned it on. This is the DARK-SHIP answer: it is what
+    /// every crypto-rail request gets until `ZEROROUTER_CRYPTO_RAIL` is set,
+    /// and it is deliberately a 501 rather than a 400 — the request is
+    /// well-formed and would be honoured on a deployment that had the rail; it
+    /// is this deployment that cannot serve it.
+    CryptoRailUnavailable,
 }
 
 impl IntoResponse for StripeHttpError {
@@ -647,6 +659,22 @@ impl IntoResponse for StripeHttpError {
                 "Credit application is temporarily unavailable.",
                 "database_unavailable",
             ),
+            Self::InvalidRail => (
+                StatusCode::BAD_REQUEST,
+                "That payment rail is not one this deployment offers.",
+                "invalid_rail",
+            ),
+            Self::CryptoAmountTooLarge => (
+                StatusCode::BAD_REQUEST,
+                "That amount is too large to pay with stablecoins; Stripe settles at most \
+                 $10,000 per crypto transaction. Buy a smaller amount, or pay by card.",
+                "crypto_amount_too_large",
+            ),
+            Self::CryptoRailUnavailable => (
+                StatusCode::NOT_IMPLEMENTED,
+                "Paying with stablecoins is not enabled on this deployment.",
+                "crypto_rail_unavailable",
+            ),
         };
         (
             status,
@@ -667,6 +695,33 @@ struct CheckoutRequest {
     /// `rust_decimal`'s deserializer accepts both JSON strings ("25.00") and
     /// JSON numbers (25), so no untagged wrapper is needed.
     amount_usd: Decimal,
+    /// Which rail to price and create the session on. ABSENT means
+    /// [`Rail::Card`] — the shape every portal bundle built before the crypto
+    /// rail existed sends, and the schedule those bundles' buyers expect. A
+    /// PRESENT but unrecognized value is refused rather than defaulted, so a
+    /// typo can never quietly bill someone on the wrong schedule.
+    #[serde(default)]
+    rail: Option<String>,
+}
+
+/// Resolve the rail named by a request, refusing unknown names.
+///
+/// Also the gate that keeps the crypto rail dark: a deployment whose operator
+/// has not turned it on answers [`StripeHttpError::CryptoRailUnavailable`], so
+/// a hand-made request cannot obtain a crypto-priced session on an account that
+/// cannot take a stablecoin payment for it.
+fn resolve_rail(
+    requested: Option<&str>,
+    settings: &StripeSettings,
+) -> Result<Rail, StripeHttpError> {
+    let rail = match requested {
+        None => Rail::Card,
+        Some(raw) => Rail::parse(raw).ok_or(StripeHttpError::InvalidRail)?,
+    };
+    if rail == Rail::Crypto && !settings.crypto_rail {
+        return Err(StripeHttpError::CryptoRailUnavailable);
+    }
+    Ok(rail)
 }
 
 async fn create_checkout(
@@ -677,12 +732,14 @@ async fn create_checkout(
     let Some(stripe) = ctx.config.stripe.as_ref() else {
         return Err(StripeHttpError::BillingUnavailable);
     };
+    let rail = resolve_rail(request.rail.as_deref(), stripe)?;
     let amount_usd = request.amount_usd;
     // `amount_usd` is the CREDIT (net) the user picked. Validate its bounds and
     // whole-cent granularity, then price the deposit: the fee rides on top and
     // Stripe collects the gross.
     let credit_cents = validate_checkout_amount(amount_usd, stripe)?;
-    let quote = deposit_fee_quote(amount_usd);
+    let quote = deposit_fee_quote(amount_usd, rail);
+    enforce_rail_ceiling(quote.gross_usd, rail)?;
     // Credit and fee are each whole cents, so the gross is too; refuse rather
     // than quote a sub-cent unit_amount Stripe would reject.
     let gross_cents = usd_to_cents(quote.gross_usd).ok_or(StripeHttpError::InvalidAmount)?;
@@ -700,19 +757,26 @@ async fn create_checkout(
     // created in the first place, which is the half that also saves Stripe
     // sessions.
     //
-    // Safe because the key is `(user, gross_cents)`: the secret handed back
-    // belongs to a session priced identically to the one this request would
-    // have created, for the same person. Entries are dropped as soon as a
-    // status read shows the session is no longer `open` (see
+    // Safe because the key is `(user, rail, gross_cents)`: the secret handed
+    // back belongs to a session priced identically to the one this request would
+    // have created, ON THE SAME RAIL, for the same person. Entries are dropped
+    // as soon as a status read shows the session is no longer `open` (see
     // [`forget_session`]), and expire on their own well inside Stripe's 24h
     // session lifetime, so a paid or stale session is never re-served.
+    //
+    // The rail is in the key even though the two schedules cannot currently
+    // price the same gross for the same credit (5% vs 5.5%-with-a-floor differ
+    // at every amount). Relying on that would make a fee-schedule edit able to
+    // hand a crypto buyer a card-only session, or the reverse — a collision
+    // whose symptom is an unpayable form rather than a visible error.
     if let Ok(cache) = reuse_cache().lock()
-        && let Some(entry) = cache.get(&(user.user_id, gross_cents))
+        && let Some(entry) = cache.get(&(user.user_id, rail, gross_cents))
         && entry.at.elapsed() < SESSION_REUSE_TTL
     {
         tracing::debug!(
             user_id = %user.user_id,
             stripe_session_id = %entry.session_id,
+            rail = rail.as_str(),
             "reusing an open checkout session instead of creating another"
         );
         return Ok(Json(
@@ -733,6 +797,8 @@ async fn create_checkout(
             // renders cannot disagree with what the webhook will corroborate.
             credit_cents,
             gross_cents,
+            rail,
+            crypto_rail_live: stripe.crypto_rail,
             return_url: ctx.config.absolute_url(CHECKOUT_RETURN_PATH),
         },
     )
@@ -771,6 +837,7 @@ async fn create_checkout(
         credit_usd = %amount_usd,
         fee_usd = %quote.fee_usd,
         gross_usd = %quote.gross_usd,
+        rail = rail.as_str(),
         "created stripe checkout session"
     );
     // Only cached AFTER the intent row is durable. Caching earlier would let a
@@ -778,7 +845,7 @@ async fn create_checkout(
     // refuse to credit.
     if let Ok(mut cache) = reuse_cache().lock() {
         cache.insert(
-            (user.user_id, gross_cents),
+            (user.user_id, rail, gross_cents),
             ReuseEntry {
                 session_id: session.id.clone(),
                 client_secret: session.client_secret.clone(),
@@ -848,14 +915,22 @@ fn status_cache() -> &'static std::sync::Mutex<std::collections::HashMap<String,
     CACHE.get_or_init(Default::default)
 }
 
-/// Reusable unpaid sessions, keyed by `(user, ex-tax gross in cents)`.
+/// What identifies a reusable unpaid session: the buyer, the RAIL, and the
+/// ex-tax gross in cents.
 ///
-/// Keyed by the buyer AND the price so a reused session can never be one
-/// quoted for a different amount — the client secret handed back always
-/// belongs to a session priced exactly as this request would have priced it.
-fn reuse_cache() -> &'static std::sync::Mutex<std::collections::HashMap<(Uuid, i64), ReuseEntry>> {
+/// All three are load-bearing. The buyer, so one customer's secret is never
+/// handed to another; the price, so a reused session is never one quoted for a
+/// different amount; and the rail, so it is never one payable by a different
+/// set of methods than the request asked for.
+type ReuseKey = (Uuid, Rail, i64);
+
+/// Reusable unpaid sessions, keyed by [`ReuseKey`].
+///
+/// The client secret handed back always belongs to a session priced exactly as
+/// this request would have priced it, on the rail it asked for.
+fn reuse_cache() -> &'static std::sync::Mutex<std::collections::HashMap<ReuseKey, ReuseEntry>> {
     static CACHE: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashMap<(Uuid, i64), ReuseEntry>>,
+        std::sync::Mutex<std::collections::HashMap<ReuseKey, ReuseEntry>>,
     > = std::sync::OnceLock::new();
     CACHE.get_or_init(Default::default)
 }
@@ -863,13 +938,26 @@ fn reuse_cache() -> &'static std::sync::Mutex<std::collections::HashMap<(Uuid, i
 /// Drop a session from both caches once it is known to be unusable (paid,
 /// expired, or gone). Without this a customer who pays $25 and immediately
 /// buys another $25 would be handed the completed session back.
+///
+/// The caller ([`checkout_status`]) knows the buyer, the gross, and the session
+/// id, but NOT which rail priced it — `stripe_checkout_intents` stores the
+/// quote, not the rail. Both rails' slots are therefore checked, and the
+/// session id is what actually authorizes the removal: only the slot holding
+/// THIS session is cleared, so a same-priced session on the other rail is left
+/// alone. (Today the two schedules cannot collide on one gross; this does not
+/// depend on that staying true.)
 fn forget_session(user_id: Uuid, gross_cents: i64, session_id: &str) {
-    if let Ok(mut cache) = reuse_cache().lock()
-        && cache
-            .get(&(user_id, gross_cents))
+    let Ok(mut cache) = reuse_cache().lock() else {
+        return;
+    };
+    for rail in [Rail::Card, Rail::Crypto] {
+        let key = (user_id, rail, gross_cents);
+        if cache
+            .get(&key)
             .is_some_and(|entry| entry.session_id == session_id)
-    {
-        cache.remove(&(user_id, gross_cents));
+        {
+            cache.remove(&key);
+        }
     }
 }
 
@@ -1073,6 +1161,10 @@ struct QuoteParams {
     /// The credit (net) amount to price. Same deserializer flexibility as
     /// `CheckoutRequest.amount_usd`: JSON/query string or number.
     credit: Decimal,
+    /// Which rail to price on; absent means [`Rail::Card`], on the same
+    /// backwards-compatible contract as `CheckoutRequest.rail`.
+    #[serde(default)]
+    rail: Option<String>,
 }
 
 /// GET /api/billing/quote?credit=C — price a deposit server-side so the portal
@@ -1087,16 +1179,23 @@ async fn checkout_quote(
     let Some(stripe) = ctx.config.stripe.as_ref() else {
         return Err(StripeHttpError::BillingUnavailable);
     };
+    // Resolved with the SAME helper the checkout uses, so a rail the checkout
+    // would refuse cannot be quoted a price here first.
+    let rail = resolve_rail(params.rail.as_deref(), stripe)?;
     let credit_usd = params.credit;
     // The same bounds and whole-cent validation the checkout enforces, so a
     // quote never advertises a price the checkout would then refuse.
     validate_checkout_amount(credit_usd, stripe)?;
-    let quote = deposit_fee_quote(credit_usd);
+    let quote = deposit_fee_quote(credit_usd, rail);
+    // Enforced on the QUOTE too, so the portal is never shown a price the
+    // checkout would then refuse.
+    enforce_rail_ceiling(quote.gross_usd, rail)?;
     usd_to_cents(quote.gross_usd).ok_or(StripeHttpError::InvalidAmount)?;
     Ok(Json(serde_json::json!({
         "credit": quote.credit_usd,
         "fee": quote.fee_usd,
         "gross": quote.gross_usd,
+        "rail": rail.as_str(),
     })))
 }
 
@@ -1161,6 +1260,115 @@ const DEPOSIT_FEE_RATE: Decimal = Decimal::from_parts(55, 0, 0, false, 3);
 /// Stripe Tax only bills where it actually calculates.
 const DEPOSIT_FEE_FLOOR_USD: Decimal = Decimal::from_parts(80, 0, 0, false, 2);
 
+/// The stablecoin deposit-fee rate: 5% of the credit, collected on top as a
+/// surcharge exactly like [`DEPOSIT_FEE_RATE`]. `Decimal` literal 5 / 10^2 =
+/// 0.05; never a float.
+///
+/// **Lower than the card rate because the cost it covers is lower.** Stripe
+/// prices stablecoin acceptance at a flat 1.5% of the transaction with no fixed
+/// per-transaction component, against 2.9% + $0.30 for cards, and the price
+/// includes conversion to fiat, wallet/AML screening and gas sponsorship.
+const CRYPTO_FEE_RATE: Decimal = Decimal::from_parts(5, 0, 0, false, 2);
+
+/// The largest EX-TAX gross a stablecoin session may quote.
+///
+/// Stripe caps a stablecoin payment at **10,000 USD per transaction**, and the
+/// figure it applies that cap to is the FINAL amount — Stripe's dynamic
+/// payment-method docs are explicit that "the final amount, including tax and
+/// discounts, is the amount used to determine available payment methods". Every
+/// figure ZeroRouter quotes is ex-tax, and `automatic_tax` adds the tax on top
+/// afterwards, so a gross quoted just under 10,000 can cross the cap once tax
+/// lands.
+///
+/// Crossing it is not a mispricing, it is a DEAD SESSION: the crypto rail
+/// allowlists exactly one payment method, so a session the cap removes crypto
+/// from has no payable method at all and the buyer meets an empty form with
+/// nothing to click. Refusing server-side turns that into an honest error
+/// before any session is minted.
+///
+/// 8,900 is 10,000 with room for any US rate that can actually be levied: the
+/// highest combined state-plus-local sales tax in the country is a little over
+/// 11.5%, and 8,900 * 1.115 = 9,923.50, still inside the cap. The headroom is
+/// deliberately generous because the failure it prevents is silent and the cost
+/// of the margin is nil — `ZEROROUTER_CHECKOUT_MAX_USD` defaults to 1,000, so
+/// this ceiling is nowhere near binding unless an operator raises that first.
+const CRYPTO_MAX_EX_TAX_GROSS_USD: Decimal = Decimal::from_parts(8_900, 0, 0, false, 0);
+
+/// Refuse a stablecoin quote Stripe's per-transaction cap would strand.
+///
+/// Card sessions are never limited here — they have no such cap, and a card
+/// session that loses one payment method still has the rest.
+fn enforce_rail_ceiling(gross_usd: Decimal, rail: Rail) -> Result<(), StripeHttpError> {
+    if rail == Rail::Crypto && gross_usd > CRYPTO_MAX_EX_TAX_GROSS_USD {
+        return Err(StripeHttpError::CryptoAmountTooLarge);
+    }
+    Ok(())
+}
+
+/// Which payment rail a deposit is priced on and payable with.
+///
+/// The fee schedule and the set of payment methods Stripe will accept for a
+/// session are chosen together from this one value and are never selected
+/// independently — see [`Rail::fee_quote`] and [`Rail::payment_method_type`].
+/// That inseparability is the whole safety property: a session priced on the
+/// cheaper crypto schedule must not be payable by card, or a card buyer would
+/// pay the crypto fee while ZeroRouter absorbed the card cost.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum Rail {
+    /// The original rail: cards and every other dynamically-offered method,
+    /// priced at [`DEPOSIT_FEE_RATE`] with the [`DEPOSIT_FEE_FLOOR_USD`] floor.
+    Card,
+    /// Stablecoin, priced at [`CRYPTO_FEE_RATE`] with no floor.
+    Crypto,
+}
+
+impl Rail {
+    /// The `metadata[rail]` value, and the string the portal names a rail by.
+    ///
+    /// Deliberately equal to Stripe's own payment-method type names, but they
+    /// are NOT the same fact and [`Self::payment_method_type`] is the one that
+    /// goes on the wire — see its note.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Card => "card",
+            Self::Crypto => "crypto",
+        }
+    }
+
+    /// Stripe's `payment_method_types` enum value for this rail.
+    ///
+    /// A separate function from [`Self::as_str`] even though the two currently
+    /// return the same strings. One is ZeroRouter's own vocabulary (a portal
+    /// request field, a metadata key we defined); the other is a Stripe API
+    /// enum we do not control. Collapsing them would make a future Stripe
+    /// rename — or a future ZeroRouter rail whose name is not a Stripe type —
+    /// silently rewrite the wire contract.
+    ///
+    /// `crypto` is the documented enum value for stablecoin payments and was
+    /// added to `Checkout.Session#create.payment_method_types` in Stripe's
+    /// `2025-06-30.basil` release, so it predates the [`CHECKOUT_API_VERSION`]
+    /// pin and is available to these requests.
+    fn payment_method_type(self) -> &'static str {
+        match self {
+            Self::Card => "card",
+            Self::Crypto => "crypto",
+        }
+    }
+
+    /// Parse a rail from an untrusted string (the portal's request body, or a
+    /// webhook event's metadata). Unknown values are refused rather than
+    /// defaulting: defaulting to `Card` would let a crypto-priced session be
+    /// re-read as a card one, and defaulting to `Crypto` would price a card
+    /// session too cheaply.
+    pub(crate) fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "card" => Some(Self::Card),
+            "crypto" => Some(Self::Crypto),
+            _ => None,
+        }
+    }
+}
+
 /// A priced deposit: the credit the user picked, the fee charged on top, and
 /// the gross Stripe collects. Every field is exact `Decimal`; `gross_usd` is a
 /// whole number of cents by construction, so it survives [`usd_to_cents`].
@@ -1171,19 +1379,38 @@ struct DepositFeeQuote {
     gross_usd: Decimal,
 }
 
-/// Price a deposit. The ONLY place the fee math lives — the checkout path, the
-/// autopay charge path, the webhook corroborations, and the portal quote
-/// endpoint all consume this, so "what we charge" and "what we require Stripe to
-/// have collected" can never drift.
+/// Price a deposit on a named rail. The ONLY place the fee math lives — the
+/// checkout path, the autopay charge path, the webhook corroborations, and the
+/// portal quote endpoint all consume this, so "what we charge" and "what we
+/// require Stripe to have collected" can never drift.
 ///
 /// `fee = max(ceil_to_cent(rate * credit), floor)`, `gross = credit + fee`. The
 /// fee is CEILED to the whole cent so ZeroRouter is never undercharged, and the
 /// caller is expected to have already validated `credit_usd` to whole cents, so
 /// `gross_usd` is whole cents too.
-fn deposit_fee_quote(credit_usd: Decimal) -> DepositFeeQuote {
-    let percentage_fee = (DEPOSIT_FEE_RATE * credit_usd)
-        .round_dp_with_strategy(2, RoundingStrategy::ToPositiveInfinity);
-    let fee_usd = percentage_fee.max(DEPOSIT_FEE_FLOOR_USD);
+///
+/// # Why the rail is a parameter rather than two functions
+///
+/// Every call site is forced to say which rail it is pricing, so a new one
+/// cannot silently inherit whichever schedule happened to be the default. The
+/// autopay paths pass [`Rail::Card`] explicitly and deliberately: a saved-card
+/// recharge is a card charge whatever the customer's last manual purchase used,
+/// and pricing one on the crypto schedule would collect 5% against a 2.9% +
+/// $0.30 cost.
+fn deposit_fee_quote(credit_usd: Decimal, rail: Rail) -> DepositFeeQuote {
+    let (rate, floor) = match rail {
+        Rail::Card => (DEPOSIT_FEE_RATE, DEPOSIT_FEE_FLOOR_USD),
+        // No floor. The card floor exists solely to clear Stripe's fixed $0.30
+        // per-charge cost, and stablecoin acceptance has no fixed component:
+        // on the smallest allowed deposit ($5, gross $5.25) Stripe's 1.5% is
+        // 0.015 * 5.25 = $0.079 against a $0.25 fee, leaving $0.171. The
+        // percentage alone is above water at every deposit size, so a floor
+        // would only overcharge the smallest buyers for no cost it covers.
+        Rail::Crypto => (CRYPTO_FEE_RATE, Decimal::ZERO),
+    };
+    let percentage_fee =
+        (rate * credit_usd).round_dp_with_strategy(2, RoundingStrategy::ToPositiveInfinity);
+    let fee_usd = percentage_fee.max(floor);
     DepositFeeQuote {
         credit_usd,
         fee_usd,
@@ -1208,6 +1435,16 @@ struct CheckoutSessionParams<'a> {
     /// `unit_amount` any more: the fee line's amount is derived from this and
     /// [`Self::credit_cents`], never recomputed from the fee rate.
     gross_cents: i64,
+    /// The rail this session was priced on. Decides BOTH the fee already baked
+    /// into the figures above AND which payment methods the session will
+    /// accept, which is what stops a card paying a crypto-priced session.
+    rail: Rail,
+    /// Whether the stablecoin rail is live on this deployment, which is the
+    /// same question as "can Stripe offer crypto on a dynamic-payment-methods
+    /// session?". Only consulted on the [`Rail::Card`] arm, where it decides
+    /// whether the crypto type has to be excluded; see
+    /// [`checkout_session_form`].
+    crypto_rail_live: bool,
     /// Where Checkout sends the browser once the payment attempt finishes.
     /// Carries the `{CHECKOUT_SESSION_ID}` template variable, which Stripe
     /// substitutes before redirecting.
@@ -1325,7 +1562,7 @@ fn checkout_session_form(
         return Err(CheckoutError::Mispriced);
     }
 
-    let mut form: Vec<(String, String)> = Vec::with_capacity(19);
+    let mut form: Vec<(String, String)> = Vec::with_capacity(21);
     let mut push = |key: &str, value: &str| form.push((key.to_owned(), value.to_owned()));
     push("mode", "payment");
     push("ui_mode", CHECKOUT_UI_MODE);
@@ -1385,8 +1622,11 @@ fn checkout_session_form(
     //
     // `billing_address_collection=required` makes the form ALWAYS collect a
     // full billing address. This was deliberately left at the default `auto`
-    // until ZeroRouter registered for California sales tax, and the
-    // registration is what changed the answer. Under `auto`, Stripe decides how
+    // until a district-tax state entered the picture (a CA registration was
+    // planned when this shipped; MA — a flat-rate state — remains the only
+    // collecting jurisdiction, and the full address stays because the next
+    // registration will want it and precision never hurts a flat rate).
+    // Under `auto`, Stripe decides how
     // much address to ask for: the API reference's own words are that with
     // `automatic_tax` enabled Checkout "will collect the minimum number of
     // fields required for tax calculation". California is a district-tax state
@@ -1474,10 +1714,106 @@ fn checkout_session_form(
     push("automatic_tax[enabled]", "true");
     push("tax_id_collection[enabled]", "true");
     push("billing_address_collection", "required");
+
+    // --- Binding the payable methods to the price that was quoted -----------
+    //
+    // The two rails are priced differently (5% flat vs 5.5% with a $0.80
+    // floor), so which methods a session accepts is not a presentation choice —
+    // it is half of the price. A card paying a crypto-priced session would be
+    // charged 5% against a cost of 2.9% + $0.30; on the $5 minimum that is
+    // $0.25 collected against $0.445, a loss on every such purchase. The two
+    // facts are therefore set from the SAME `params.rail` in the same request
+    // that sets the line items, so no Dashboard toggle and no later edit can
+    // separate them.
+    match params.rail {
+        // The card rail sends NOTHING, which is what leaves Stripe's dynamic
+        // payment methods in charge — cards plus whatever wallets (Apple Pay,
+        // Google Pay, Link) the Dashboard has enabled and the buyer can use.
+        //
+        // Pinning `payment_method_types[0]=card` here would be the stronger
+        // allowlist, and it is deliberately NOT done: Stripe documents manual
+        // listing as disabling dynamic payment methods, so it would silently
+        // switch every existing buyer's wallet off. That is a conversion
+        // regression disguised as a safety measure, and cards were never the
+        // rail at risk of being mispriced.
+        //
+        // What DOES have to be shut off is crypto, and only once the operator
+        // has enabled it account-wide — because from that moment Stripe's
+        // dynamic selection would start offering stablecoin on this
+        // card-priced session, letting a buyer pay the 5.5% + $0.80 schedule
+        // with a method that is meant to cost 5%. Overcharging, not a loss,
+        // but it breaks the same binding in the other direction and makes the
+        // portal's own quote a lie.
+        //
+        // `excluded_payment_method_types` is Stripe's documented mechanism for
+        // exactly this shape — its reference says it "should only be used when
+        // payment methods for this Checkout Session are managed through the
+        // Stripe Dashboard", which is precisely this arm. A denylist is the
+        // right tool here and not in general: the only type that must never
+        // appear is the one with a different fee schedule, while a future
+        // payment method Stripe adds is priced correctly by the card schedule
+        // and is exactly what dynamic payment methods are for.
+        //
+        // Gated on `crypto_rail_live` so a deployment that has not turned the
+        // rail on sends the byte-for-byte request it sent before this feature
+        // existed. That is not caution for its own sake: it means the card
+        // path can be proven unchanged for every deployment that has not opted
+        // in, which is all of them today.
+        //
+        // ONE UNVERIFIED VALUE: Stripe's rendered docs do not enumerate the
+        // members of `excluded_payment_method_types`, so that `crypto` is
+        // accepted THERE is an inference from it being the documented type
+        // name everywhere else. If it is wrong, Stripe rejects the request and
+        // every CARD purchase on a crypto-enabled deployment fails with
+        // `checkout_failed` — loudly, and crediting nothing, but a total
+        // checkout outage. DEPLOY.md therefore requires one test-mode card
+        // purchase immediately after enabling the rail, before live traffic.
+        Rail::Card => {
+            if params.crypto_rail_live {
+                push(
+                    "excluded_payment_method_types[0]",
+                    Rail::Crypto.payment_method_type(),
+                );
+            }
+        }
+        // The crypto rail is a hard allowlist of one. Nothing else can be
+        // presented, so the 5% schedule and the only payable method are the
+        // same decision.
+        //
+        // Note this session is redirect-based: Stripe sends the buyer to
+        // crypto.stripe.com to connect a wallet. `return_url` below is
+        // therefore REQUIRED rather than merely useful, and
+        // `redirect_on_completion=never` must never be sent on this arm —
+        // Stripe documents that value as disabling redirect-based payment
+        // methods, which here would disable the only method the session has.
+        // This module sends `redirect_on_completion` nowhere, so the hazard is
+        // recorded rather than guarded.
+        Rail::Crypto => {
+            push("payment_method_types[0]", params.rail.payment_method_type());
+        }
+    }
+
     push("metadata[user_id]", &params.user_id.to_string());
     push("metadata[credit_usd]", &params.credit_usd.to_string());
     push("metadata[fee_usd]", &params.fee_usd.to_string());
     push("metadata[gross_usd]", &params.gross_usd.to_string());
+    // The rail the webhook re-prices against — stamped ONLY on the crypto rail.
+    //
+    // Attacker-writable like every other metadata field, and safe for the same
+    // reason: it only has to AGREE with the money Stripe collected (Layer 1)
+    // and with the gross ZeroRouter stored (Layer 2). Claiming the cheaper rail
+    // on a card-priced session makes the recomputed gross disagree with what
+    // was collected, which is a rejection rather than a discount.
+    //
+    // A CARD session deliberately sends no `rail` key at all, so that its
+    // request is byte-for-byte the one this module sent before the crypto rail
+    // existed. That costs nothing in precision, because the webhook already has
+    // to read an absent `rail` as [`Rail::Card`] — every session created by an
+    // older build carries no such key and was priced on the card schedule. One
+    // rule, not two: absent means card, present must parse.
+    if params.rail != Rail::Card {
+        push("metadata[rail]", params.rail.as_str());
+    }
     push("customer_email", params.customer_email);
     push("return_url", &params.return_url);
     Ok(form)
@@ -1664,7 +2000,47 @@ async fn stripe_webhook(
     // event: forged metadata on a session we did create cannot make the money
     // collected agree with an inflated credit. This is independent of the intent
     // row Layer 2 checks; both must hold.
-    let expected_gross = deposit_fee_quote(credit_usd).gross_usd;
+    //
+    // # Which fee schedule this credit is priced against
+    //
+    // `metadata[rail]` says which one the session was sold on. It is
+    // attacker-writable like every other metadata field, and it does not need
+    // to be trusted: it only has to AGREE. Naming the cheaper rail on a
+    // card-priced session makes the recomputed gross (credit + 5%) disagree
+    // with the money Stripe actually collected (credit + 5.5%, floored), so
+    // the equality below fails and nothing is credited. The claim is checked,
+    // never believed.
+    //
+    // ABSENT reads as [`Rail::Card`], which is the truth for every session
+    // created before the crypto rail existed — those sessions carry no `rail`
+    // key and were priced on the card schedule. An absent value must therefore
+    // NOT be an error, or this deploy would refuse every in-flight purchase
+    // created by the previous build.
+    //
+    // A PRESENT but unparseable value is refused outright rather than
+    // defaulted, because defaulting an unrecognized rail to `Card` would price
+    // a future rail's session on the wrong schedule the moment its name
+    // reached a router that predates it.
+    let rail = match object
+        .get("metadata")
+        .and_then(|metadata| metadata.get("rail"))
+        .and_then(Value::as_str)
+    {
+        None => Rail::Card,
+        Some(raw) => match Rail::parse(raw) {
+            Some(rail) => rail,
+            None => {
+                tracing::error!(
+                    stripe_session_id = %session_id,
+                    metadata_user_id = %user_id,
+                    "stripe webhook rejected: paid session names a payment rail this build does \
+                     not know, so its fee schedule cannot be verified; crediting nothing"
+                );
+                return Err(StripeHttpError::MalformedEvent);
+            }
+        },
+    };
+    let expected_gross = deposit_fee_quote(credit_usd, rail).gross_usd;
     let Some(expected_gross_cents) = usd_to_cents(expected_gross) else {
         tracing::warn!(
             stripe_session_id = %session_id,
@@ -1686,6 +2062,7 @@ async fn stripe_webhook(
             amount_total_cents,
             %currency,
             expected_currency = CHECKOUT_CURRENCY,
+            rail = rail.as_str(),
             "stripe webhook rejected: paid session does not corroborate its own metadata; \
              crediting nothing"
         );
@@ -2273,6 +2650,8 @@ mod tests {
             checkout_min_usd: Decimal::from(5),
             checkout_max_usd: Decimal::from(1000),
             api_base: "https://api.stripe.com".to_owned(),
+            // A card-only deployment, which is what this harness describes.
+            crypto_rail: false,
         }
     }
 
@@ -2342,7 +2721,7 @@ mod tests {
     #[test]
     fn deposit_fee_is_five_point_five_percent_above_the_floor() {
         // $100: 0.055 * 100 = 5.50 exactly, well above the $0.80 floor.
-        let quote = deposit_fee_quote(decimal("100"));
+        let quote = deposit_fee_quote(decimal("100"), Rail::Card);
         assert_eq!(quote.fee_usd, decimal("5.50"));
         assert_eq!(quote.gross_usd, decimal("105.50"));
         assert_eq!(quote.credit_usd, decimal("100"));
@@ -2352,12 +2731,15 @@ mod tests {
     fn deposit_fee_ceils_to_the_whole_cent() {
         // $25: 0.055 * 25 = 1.375 — a sub-cent fee ZeroRouter must never round
         // DOWN. It is ceiled to $1.38, so the gross is a whole $26.38.
-        let quote = deposit_fee_quote(decimal("25"));
+        let quote = deposit_fee_quote(decimal("25"), Rail::Card);
         assert_eq!(quote.fee_usd, decimal("1.38"));
         assert_eq!(quote.gross_usd, decimal("26.38"));
         // Any half-cent product ceils up rather than banker-rounds: $45 gives
         // 0.055 * 45 = 2.475 -> 2.48.
-        assert_eq!(deposit_fee_quote(decimal("45")).fee_usd, decimal("2.48"));
+        assert_eq!(
+            deposit_fee_quote(decimal("45"), Rail::Card).fee_usd,
+            decimal("2.48")
+        );
     }
 
     #[test]
@@ -2365,7 +2747,7 @@ mod tests {
         // $5 is the smallest allowed deposit. 0.055 * 5 = 0.275 -> ceils to
         // $0.28, which would not clear Stripe's fixed $0.30, so the $0.80 floor
         // takes over and the user pays $5.80 gross.
-        let quote = deposit_fee_quote(decimal("5"));
+        let quote = deposit_fee_quote(decimal("5"), Rail::Card);
         assert_eq!(quote.fee_usd, decimal("0.80"));
         assert_eq!(quote.gross_usd, decimal("5.80"));
     }
@@ -2376,8 +2758,14 @@ mod tests {
         // credit = 0.80 / 0.055 = 14.5454...  At $14.54 the percentage is
         // 0.055 * 14.54 = 0.7997 -> ceils to 0.80, tying the floor. At $14.55
         // it is 0.800250 -> ceils to 0.81 and overtakes the floor.
-        assert_eq!(deposit_fee_quote(decimal("14.54")).fee_usd, decimal("0.80"));
-        assert_eq!(deposit_fee_quote(decimal("14.55")).fee_usd, decimal("0.81"));
+        assert_eq!(
+            deposit_fee_quote(decimal("14.54"), Rail::Card).fee_usd,
+            decimal("0.80")
+        );
+        assert_eq!(
+            deposit_fee_quote(decimal("14.55"), Rail::Card).fee_usd,
+            decimal("0.81")
+        );
     }
 
     /// The fee schedule can never price a ZERO fee, which is what makes the
@@ -2396,7 +2784,7 @@ mod tests {
             "0.01", "0.02", "1", "4.99", "5", "5.01", "14.54", "14.55", "25", "99.99", "100",
             "1000", "100000",
         ] {
-            let quote = deposit_fee_quote(decimal(raw));
+            let quote = deposit_fee_quote(decimal(raw), Rail::Card);
             assert!(
                 quote.fee_usd >= DEPOSIT_FEE_FLOOR_USD,
                 "fee for {raw} ({}) must be at least the floor",
@@ -2416,7 +2804,7 @@ mod tests {
         // anything finer than a cent. Every credit that is itself whole cents
         // must therefore price a whole-cent gross.
         for raw in ["5", "5.01", "14.54", "14.55", "25", "99.99", "100", "1000"] {
-            let quote = deposit_fee_quote(decimal(raw));
+            let quote = deposit_fee_quote(decimal(raw), Rail::Card);
             assert!(
                 usd_to_cents(quote.gross_usd).is_some(),
                 "gross for {raw} ({}) must be whole cents",
@@ -2430,10 +2818,165 @@ mod tests {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // The two fee schedules, pinned against each other
+    // -----------------------------------------------------------------------
+
+    /// Both schedules at every interesting amount, in ONE table.
+    ///
+    /// Two rails priced by one function is the whole risk this change
+    /// introduces, and the failure it invites is not a crash — it is a rail
+    /// quietly inheriting the other's number. A table that states both answers
+    /// side by side makes any such drift a diff on a literal rather than a
+    /// subtle change in behavior nobody reads.
+    ///
+    /// Card: `max(ceil(0.055 * credit), 0.80)`. Crypto: `ceil(0.05 * credit)`,
+    /// no floor. Card is ALWAYS the more expensive of the two — asserted below
+    /// rather than assumed, because a future rate edit that inverted it would
+    /// silently make the crypto rail the one that loses money.
+    #[test]
+    fn the_two_rails_price_every_amount_differently_and_card_is_always_dearer() {
+        // (credit, card fee, crypto fee)
+        let table = [
+            ("5", "0.80", "0.25"),
+            ("10", "0.80", "0.50"),
+            ("14.54", "0.80", "0.73"),
+            ("14.55", "0.81", "0.73"),
+            ("25", "1.38", "1.25"),
+            ("45", "2.48", "2.25"),
+            ("100", "5.50", "5.00"),
+            ("1000", "55.00", "50.00"),
+        ];
+        for (credit, card_fee, crypto_fee) in table {
+            let card = deposit_fee_quote(decimal(credit), Rail::Card);
+            let crypto = deposit_fee_quote(decimal(credit), Rail::Crypto);
+            assert_eq!(
+                card.fee_usd,
+                decimal(card_fee),
+                "card fee for {credit} must be {card_fee}"
+            );
+            assert_eq!(
+                crypto.fee_usd,
+                decimal(crypto_fee),
+                "crypto fee for {credit} must be {crypto_fee}"
+            );
+            assert_eq!(card.gross_usd, decimal(credit) + decimal(card_fee));
+            assert_eq!(crypto.gross_usd, decimal(credit) + decimal(crypto_fee));
+            assert!(
+                card.fee_usd > crypto.fee_usd,
+                "the card schedule must stay strictly dearer than the crypto one at {credit}: \
+                 card {} vs crypto {}",
+                card.fee_usd,
+                crypto.fee_usd
+            );
+            // The two grosses must never coincide, which is what keeps the
+            // reuse cache's `(user, rail, gross)` key from ever needing to
+            // disambiguate two same-priced sessions.
+            assert_ne!(card.gross_usd, crypto.gross_usd);
+        }
+    }
+
+    /// The crypto rail has NO floor, and that is the point of it.
+    ///
+    /// The card floor exists to clear Stripe's fixed $0.30 per-charge cost.
+    /// Stablecoin acceptance is a flat 1.5% with no fixed component, so the
+    /// percentage alone clears it at every size: at the $5 minimum the fee is
+    /// $0.25 against a cost of 0.015 * 5.25 = $0.0788. A floor here would
+    /// overcharge the smallest buyers for a cost that does not exist.
+    #[test]
+    fn the_crypto_rail_has_no_floor() {
+        assert_eq!(
+            deposit_fee_quote(decimal("5"), Rail::Crypto).fee_usd,
+            decimal("0.25")
+        );
+        assert_eq!(
+            deposit_fee_quote(decimal("5"), Rail::Crypto).gross_usd,
+            decimal("5.25")
+        );
+        // Well below the card floor at every small amount, with no step.
+        for raw in ["5", "6", "10", "14.54"] {
+            assert!(
+                deposit_fee_quote(decimal(raw), Rail::Crypto).fee_usd < DEPOSIT_FEE_FLOOR_USD,
+                "crypto fee for {raw} must sit below the card floor"
+            );
+        }
+    }
+
+    /// The crypto fee still ceils to the whole cent, so ZeroRouter is never
+    /// undercharged by a rounding direction.
+    #[test]
+    fn the_crypto_fee_ceils_to_the_whole_cent() {
+        // 0.05 * 5.10 = 0.255 -> 0.26, not 0.25.
+        assert_eq!(
+            deposit_fee_quote(decimal("5.10"), Rail::Crypto).fee_usd,
+            decimal("0.26")
+        );
+        // 0.05 * 99.99 = 4.9995 -> 5.00.
+        assert_eq!(
+            deposit_fee_quote(decimal("99.99"), Rail::Crypto).fee_usd,
+            decimal("5.00")
+        );
+        for raw in ["5", "5.01", "5.10", "14.55", "25", "99.99", "1000"] {
+            let quote = deposit_fee_quote(decimal(raw), Rail::Crypto);
+            assert!(
+                usd_to_cents(quote.gross_usd).is_some(),
+                "crypto gross for {raw} must be whole cents"
+            );
+            assert!(
+                usd_to_cents(quote.fee_usd).is_some_and(|cents| cents > 0),
+                "crypto fee for {raw} must be a positive whole number of cents"
+            );
+        }
+    }
+
+    /// Stripe's $10,000-per-transaction stablecoin cap is enforced on the
+    /// crypto rail and NOT on the card one.
+    #[test]
+    fn the_stablecoin_ceiling_binds_only_the_crypto_rail() {
+        // Inside the ceiling: allowed.
+        assert!(enforce_rail_ceiling(decimal("8900"), Rail::Crypto).is_ok());
+        // A cent past it: refused, because tax on top could cross Stripe's cap
+        // and leave the session with no payable method at all.
+        assert!(matches!(
+            enforce_rail_ceiling(decimal("8900.01"), Rail::Crypto),
+            Err(StripeHttpError::CryptoAmountTooLarge)
+        ));
+        // The card rail has no such cap at any amount.
+        for raw in ["8900.01", "50000", "999999"] {
+            assert!(enforce_rail_ceiling(decimal(raw), Rail::Card).is_ok());
+        }
+    }
+
+    /// Rail names round-trip, and an unknown name is refused rather than
+    /// defaulted — the property the webhook's Layer-1 rail read depends on.
+    #[test]
+    fn rail_names_round_trip_and_reject_the_unknown() {
+        for rail in [Rail::Card, Rail::Crypto] {
+            assert_eq!(Rail::parse(rail.as_str()), Some(rail));
+        }
+        for raw in ["", "CARD", "Crypto", "bitcoin", "card ", "usdc"] {
+            assert_eq!(Rail::parse(raw), None, "{raw:?} must not parse as a rail");
+        }
+    }
+
     /// A [`CheckoutSessionParams`] priced however the caller says, including
     /// ways the live fee schedule cannot price. The dollar fields are only
     /// stamped into metadata, so they follow the cents rather than lead them.
+    ///
+    /// Defaults to the CARD rail on a deployment where the crypto rail has not
+    /// been turned on — i.e. exactly the deployment every one of these tests
+    /// described before the rail existed, which is what lets them keep asserting
+    /// the unchanged card wire contract. [`rail_params`] is the opt-in.
     fn split_params(credit_cents: i64, gross_cents: i64) -> CheckoutSessionParams<'static> {
+        rail_params(credit_cents, gross_cents, Rail::Card, false)
+    }
+
+    fn rail_params(
+        credit_cents: i64,
+        gross_cents: i64,
+        rail: Rail,
+        crypto_rail_live: bool,
+    ) -> CheckoutSessionParams<'static> {
         let credit_usd = Decimal::from(credit_cents) / Decimal::ONE_HUNDRED;
         let gross_usd = Decimal::from(gross_cents) / Decimal::ONE_HUNDRED;
         CheckoutSessionParams {
@@ -2444,6 +2987,8 @@ mod tests {
             gross_usd,
             credit_cents,
             gross_cents,
+            rail,
+            crypto_rail_live,
             return_url: "https://portal.test/credits/return?session_id={CHECKOUT_SESSION_ID}"
                 .to_owned(),
         }
@@ -2489,6 +3034,138 @@ mod tests {
             );
         }
         assert_eq!(form.len(), 19, "the two-line form is exactly 19 parameters");
+    }
+
+    // -----------------------------------------------------------------------
+    // The price and the payable methods are one decision
+    // -----------------------------------------------------------------------
+
+    /// **The card wire contract is unchanged, byte for byte.**
+    ///
+    /// This is the load-bearing test of the whole rail change. The card path
+    /// carries every live purchase, so the only acceptable effect on it of
+    /// adding a second rail is none at all. A deployment that has not turned
+    /// the crypto rail on must send Stripe exactly the request it sent before
+    /// this module knew what a rail was — same parameters, same values, same
+    /// count, and in particular NO `payment_method_types` (which would disable
+    /// dynamic payment methods and silently switch off Apple Pay, Google Pay
+    /// and Link for every buyer) and NO `metadata[rail]`.
+    #[test]
+    fn a_card_session_on_a_crypto_free_deployment_sends_the_pre_rail_request() {
+        let form =
+            checkout_session_form(&rail_params(2_500, 2_638, Rail::Card, false)).expect("builds");
+        assert_eq!(
+            form.len(),
+            19,
+            "the card form must still be exactly its 19 pre-rail parameters"
+        );
+        for absent in [
+            "payment_method_types[0]",
+            "excluded_payment_method_types[0]",
+            "metadata[rail]",
+            "payment_method_configuration",
+        ] {
+            assert_eq!(
+                form_value(&form, absent),
+                None,
+                "a card session must not send {absent}"
+            );
+        }
+    }
+
+    /// Once the operator turns the rail on, the card session gains EXACTLY one
+    /// parameter: the exclusion that stops Stripe offering stablecoin at the
+    /// card price.
+    ///
+    /// Still no `payment_method_types` — dynamic payment methods stay in
+    /// charge, so wallets keep working. That is the difference between
+    /// excluding one method and allowlisting one.
+    #[test]
+    fn a_card_session_excludes_crypto_once_the_rail_is_live() {
+        let form =
+            checkout_session_form(&rail_params(2_500, 2_638, Rail::Card, true)).expect("builds");
+        assert_eq!(
+            form_value(&form, "excluded_payment_method_types[0]"),
+            Some("crypto")
+        );
+        assert_eq!(
+            form_value(&form, "payment_method_types[0]"),
+            None,
+            "the card rail must never allowlist, only exclude — allowlisting kills wallets"
+        );
+        assert_eq!(form_value(&form, "metadata[rail]"), None);
+        assert_eq!(
+            form.len(),
+            20,
+            "enabling the rail may add the exclusion and nothing else"
+        );
+    }
+
+    /// A crypto session allowlists stablecoin and nothing else, and says so in
+    /// its metadata so the webhook prices it on the same schedule.
+    #[test]
+    fn a_crypto_session_allowlists_only_stablecoin() {
+        // $25 credit + $1.25 fee = $26.25 gross — the crypto schedule.
+        let form =
+            checkout_session_form(&rail_params(2_500, 2_625, Rail::Crypto, true)).expect("builds");
+        assert_eq!(form_value(&form, "payment_method_types[0]"), Some("crypto"));
+        assert_eq!(form_value(&form, "payment_method_types[1]"), None);
+        assert_eq!(
+            form_value(&form, "excluded_payment_method_types[0]"),
+            None,
+            "an allowlist of one needs no denylist beside it"
+        );
+        assert_eq!(form_value(&form, "metadata[rail]"), Some("crypto"));
+        // The fee line carries the CRYPTO fee, not the card one.
+        assert_eq!(
+            form_value(&form, "line_items[1][price_data][unit_amount]"),
+            Some("125")
+        );
+        // Redirect-based: the return url must be present, because Stripe sends
+        // the buyer to crypto.stripe.com and needs somewhere to send them back.
+        assert!(
+            form_value(&form, "return_url")
+                .is_some_and(|url| url.contains("{CHECKOUT_SESSION_ID}"))
+        );
+        // ...and `redirect_on_completion=never` must never appear, since Stripe
+        // documents it as disabling redirect-based methods — here, the only one.
+        assert_eq!(form_value(&form, "redirect_on_completion"), None);
+        assert_eq!(form.len(), 21);
+    }
+
+    /// Tax collection is identical on both rails.
+    ///
+    /// The crypto rail deliberately reuses Stripe Tax rather than computing
+    /// anything itself: same `automatic_tax`, same address collection, same
+    /// tax-ID field, so the same registration decides the same rate and there
+    /// is no second tax implementation to drift.
+    #[test]
+    fn both_rails_collect_tax_the_same_way() {
+        let card = checkout_session_form(&rail_params(2_500, 2_638, Rail::Card, true)).expect("ok");
+        let crypto =
+            checkout_session_form(&rail_params(2_500, 2_625, Rail::Crypto, true)).expect("ok");
+        for key in [
+            "automatic_tax[enabled]",
+            "tax_id_collection[enabled]",
+            "billing_address_collection",
+        ] {
+            assert_eq!(
+                form_value(&card, key),
+                form_value(&crypto, key),
+                "{key} must be identical on both rails"
+            );
+            assert!(form_value(&card, key).is_some(), "{key} must be sent");
+        }
+        // Stripe requires every line item on a stablecoin session to be USD.
+        for index in 0..2 {
+            assert_eq!(
+                form_value(
+                    &crypto,
+                    &format!("line_items[{index}][price_data][currency]")
+                ),
+                Some("usd")
+            );
+        }
     }
 
     /// The fee line is derived, never re-derived: whatever the fee happens to
@@ -4028,7 +4705,7 @@ async fn handle_autopay_intent_event(
             // A terminal (failed) row is never credited, but the table now
             // records the gross charge beside the net credit; derive it from the
             // same fee helper so the charge >= credit CHECK holds.
-            let gross_usd = deposit_fee_quote(credit_usd).gross_usd;
+            let gross_usd = deposit_fee_quote(credit_usd, Rail::Card).gross_usd;
             billing::record_autopay_charge(&ctx.pool, intent_id, user_id, credit_usd, gross_usd)
                 .await
                 .map_err(|_| StripeHttpError::BillingUnavailable)?;
@@ -4061,7 +4738,14 @@ async fn handle_autopay_intent_event(
     // twin of the checkout Layer-1 self-check, and the exact same manoeuvre
     // [`collected_ex_tax_cents`] performs there. Recomputed from the net
     // credit, not trusting metadata[gross_usd].
-    let expected_gross = deposit_fee_quote(credit_usd).gross_usd;
+    //
+    // [`Rail::Card`] is not a default here, it is the fact: autopay charges a
+    // saved CARD via a PaymentIntent, so the card schedule is the only one that
+    // can ever have priced this intent. There is no crypto autopay — a
+    // stablecoin payment is customer-authenticated at crypto.stripe.com and
+    // cannot be pulled from a stored credential — so a crypto-priced autopay
+    // intent is not a shape this arm has to consider.
+    let expected_gross = deposit_fee_quote(credit_usd, Rail::Card).gross_usd;
     let Some(expected_gross_cents) = usd_to_cents(expected_gross) else {
         return Err(StripeHttpError::MalformedEvent);
     };
@@ -4353,7 +5037,7 @@ async fn charge_candidate(
     // Price the deposit once so the claim records both the NET credit the user
     // wants and the GROSS charge Stripe will collect. `replay_charge` re-prices
     // from the same net topup, so the two agree by construction.
-    let quote = deposit_fee_quote(candidate.topup_usd);
+    let quote = deposit_fee_quote(candidate.topup_usd, Rail::Card);
     if !billing::claim_autopay_attempt(
         pool,
         candidate.user_id,
@@ -4460,7 +5144,7 @@ async fn replay_charge(
 
     // `topup_usd` is the NET credit the user wants; the fee rides on top and
     // Stripe collects the gross.
-    let quote = deposit_fee_quote(topup_usd);
+    let quote = deposit_fee_quote(topup_usd, Rail::Card);
     let Some(gross_cents) = usd_to_cents(quote.gross_usd) else {
         billing::fail_autopay_intent(pool, &format!("local_{idempotency_key}")).await?;
         anyhow::bail!("top-up gross is not a whole cent");

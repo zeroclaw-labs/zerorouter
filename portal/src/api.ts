@@ -44,6 +44,11 @@ export interface Me {
    * promise after a change — and this panel is where a customer reads what
    * they will be billed. */
   byok_allowance?: ByokAllowance
+  /** Whether this deployment offers paying with stablecoins. FALSE (or absent,
+   * on a router older than the feature) renders no crypto option at all — the
+   * dark-ship contract, the same one `byok_providers` uses. Optional in the
+   * type so an older router cannot crash this page. */
+  crypto_rail?: boolean
 }
 
 /** This month's free BYOK allowance, as `/api/me` reports it. Amounts are
@@ -227,12 +232,25 @@ export interface Model {
   retention?: { posture: 'zero' | 'standard' | string; description: string; verified: string }
 }
 
+/** Which payment rail a deposit is priced on and payable with. The two are one
+ * decision on the server: a crypto-priced session only accepts stablecoin and a
+ * card-priced one never does. */
+export type Rail = 'card' | 'crypto'
+
 /** A server-priced deposit: the credit picked, the fee on top, and the gross
- * Stripe collects. All are decimal strings — the fee is never computed in TS. */
+ * Stripe collects. All are decimal strings — the fee is never computed in TS.
+ *
+ * The fee DIFFERS by rail (5% flat for crypto, 5.5% with a $0.80 minimum for
+ * card), which is exactly why this page must never derive it: the only correct
+ * fee is the one the server quoted for the rail the customer chose. */
 export interface Quote {
   credit: string
   fee: string
   gross: string
+  /** Echoed back so a late-arriving quote can be matched to the rail it was
+   * asked for, rather than being rendered against whichever rail is selected by
+   * the time it lands. */
+  rail?: Rail
 }
 
 export interface AutopayStatus {
@@ -340,15 +358,24 @@ export const api = {
       'GET',
       `/api/billing/ledger?limit=${limit}`,
     ).then((r) => r.entries),
-  checkout: (amountUsd: string) =>
-    request<CheckoutClientSecret>('POST', '/api/billing/checkout', { amount_usd: amountUsd }),
+  // `rail` is omitted for the card path so an unchanged request body reaches an
+  // unchanged server path — the crypto rail is additive on the wire too.
+  checkout: (amountUsd: string, rail: Rail = 'card') =>
+    request<CheckoutClientSecret>(
+      'POST',
+      '/api/billing/checkout',
+      rail === 'card' ? { amount_usd: amountUsd } : { amount_usd: amountUsd, rail },
+    ),
   checkoutStatus: (sessionId: string) =>
     request<CheckoutStatus>(
       'GET',
       `/api/billing/checkout/status?session_id=${encodeURIComponent(sessionId)}`,
     ),
-  quote: (creditUsd: string) =>
-    request<Quote>('GET', `/api/billing/quote?credit=${encodeURIComponent(creditUsd)}`),
+  quote: (creditUsd: string, rail: Rail = 'card') =>
+    request<Quote>(
+      'GET',
+      `/api/billing/quote?credit=${encodeURIComponent(creditUsd)}&rail=${rail}`,
+    ),
   autopay: () => request<AutopayStatus>('GET', '/api/billing/autopay'),
   putAutopay: (update: AutopayUpdate) =>
     request<AutopayStatus>('PUT', '/api/billing/autopay', update),
