@@ -131,6 +131,18 @@ export default async function globalSetup() {
       // Bedrock's do without `BEDROCK_REGION`.
       VERTEX_SERVICE_ACCOUNT: 'not-a-real-service-account-key',
       VERTEX_PROJECT_ID: 'zr-e2e-not-a-real-project',
+      // Added 2026-08-22 with the three Groq and four Together lanes, for the
+      // same reason as every paragraph above: an upstream missing from this
+      // list publishes no rows and quietly narrows what the suite proves.
+      //
+      // These seven matter more to this harness than their count suggests.
+      // They took the catalog's zero-retention lanes from a minority to a
+      // majority (18 of 32), so `portal.spec.ts`'s footnote assertion is now
+      // reading a sentence whose larger number comes mostly from providers
+      // added here. A missing key would not fail anything — it would just make
+      // the counted branch smaller and still true.
+      GROQ_API_KEY: 'not-a-real-key',
+      TOGETHER_API_KEY: 'not-a-real-key',
       // Bring-your-own-key. Present so the portal renders its BYOK section and
       // the attach flow can be driven; a fixed fixture value rather than a
       // generated one so a failing run is reproducible. Nothing here is

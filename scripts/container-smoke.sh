@@ -106,6 +106,8 @@ docker run --detach --name "${APP_CONTAINER}" \
     --env BEDROCK_REGION=us-east-1 \
     --env FIREWORKS_API_KEY=smoke-placeholder-not-a-real-key \
     --env XAI_API_KEY=smoke-placeholder-not-a-real-key \
+    --env GROQ_API_KEY=smoke-placeholder-not-a-real-key \
+    --env TOGETHER_API_KEY=smoke-placeholder-not-a-real-key \
     --env RUST_LOG=warn \
     "${IMAGE}" >/dev/null
 

@@ -35,7 +35,25 @@ BEDROCK_API_KEY     (+ BEDROCK_REGION, see below)
 FIREWORKS_API_KEY
 XAI_API_KEY         (the team it belongs to must have ZDR enabled — see below)
 VERTEX_SERVICE_ACCOUNT  (a service-account JSON blob, + VERTEX_PROJECT_ID — see below)
+GROQ_API_KEY        (the org it belongs to must have ZDR enabled for Inference — see below)
+TOGETHER_API_KEY    (the org's three Privacy toggles must be OFF — see below)
 ```
+
+`GROQ_API_KEY` and `TOGETHER_API_KEY` carry the same class of requirement
+`XAI_API_KEY` does, and they carry it in opposite directions. The `groq/*` lanes
+are sold as zero-retention on the strength of an **organization-level Zero Data
+Retention toggle** in Groq's Data Controls, which must be enabled and must cover
+Inference — Groq allows ZDR to be set globally or per feature, so "ZDR is on"
+is not the same statement as "this lane's guarantee holds". The `together/*`
+lanes rest on Together's **published default**, which is already zero retention;
+what must be true there is that nobody has opted the organization back out of it
+via the three Privacy toggles (store prompts, allow training, allow passthrough).
+
+Neither is checked at runtime the way xAI's is, because neither vendor publishes
+a per-response attestation header. A key from a wrongly configured account on
+either provider authenticates and serves normally, and the lanes go on
+publishing `zero`. Get the account right before the key lands. See
+`docs/DEPLOY.md`.
 
 `XAI_API_KEY` carries one requirement no other key here does. The `xai/*` lanes
 are sold as zero-retention on the strength of xAI's team-level Zero Data

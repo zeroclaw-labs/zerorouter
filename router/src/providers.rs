@@ -2582,18 +2582,23 @@ mod tests {
             "bedrock",
             "fireworks",
             "xai",
+            "vertex",
+            "groq",
+            "together",
         ] {
             assert!(is_supported_provider(provider));
         }
         // Retired with the git dependency that supplied their adapters, and
-        // still gone. Two names have now left this list rather than joined it:
-        // `bedrock` came BACK on 2026-08-20 as the zero-retention lane, on
+        // still gone. THREE names have now left this list rather than joined
+        // it: `bedrock` came BACK on 2026-08-20 as the zero-retention lane, on
         // ZeroRouter's own Messages wire rather than the pinned Converse
         // adapter that once served it, and `fireworks` came back the same day
-        // on the generic chat-completions wire. Neither is the old pinned
-        // adapter returning — both are entries in `config/providers.json`
-        // speaking a wire this repo owns.
-        for provider in ["deepinfra", "together", "minimax"] {
+        // on the generic chat-completions wire. `together` returned on
+        // 2026-08-22, likewise on chat completions. None of them is the old
+        // pinned adapter returning — all are entries in
+        // `config/providers.json` speaking a wire this repo owns, which is why
+        // a name leaving this list is a deliberate edit and not a regression.
+        for provider in ["deepinfra", "minimax"] {
             assert!(
                 !is_supported_provider(provider),
                 "{provider} is no longer in the inventory"
@@ -2659,8 +2664,27 @@ mod tests {
         // declare `credential_kind = "google_service_account"`, because Google
         // issues no long-lived key for this surface and the wire is handed a
         // minted OAuth token instead of the secret's contents
-        // (`crate::gcp_auth`). A SIXTH chat-completions entry remains the
-        // signal to stop and think.
+        // (`crate::gcp_auth`). THAT SIXTH ENTRY ARRIVED, and so did a seventh
+        // and an eighth: `groq` and `together` on 2026-08-22. The note above
+        // asked whoever crossed the line to stop and think, so here is the
+        // thinking, recorded rather than silently overwritten.
+        //
+        // The worry a growing list is meant to catch is a shared adapter
+        // quietly becoming a shared IDENTITY — many upstreams behind one wire,
+        // one of them acquiring a behaviour the others inherit by accident.
+        // That has not happened and the structure is why: every entry below
+        // carries its own key, its own credential env, and its own `base_url`,
+        // which `validate` REQUIRES of every chat-completions entry precisely
+        // so that no upstream can inherit another's endpoint by omission. The
+        // one per-upstream behaviour that exists — xAI's response attestation
+        // — is declared per entry and asserted by a test that iterates the
+        // whole inventory, so a new chat-completions entry cannot pick it up
+        // by being on the same wire.
+        //
+        // What the count still means is that `chat_completions` is now the
+        // house wire and a regression in it reaches six of eight upstreams.
+        // That is an argument for the coverage in `wire/chat_completions.rs`,
+        // not against another entry here.
         assert_eq!(
             adapters,
             [
@@ -2671,6 +2695,8 @@ mod tests {
                 ("fireworks", ProviderAdapter::ChatCompletions),
                 ("xai", ProviderAdapter::ChatCompletions),
                 ("vertex", ProviderAdapter::ChatCompletions),
+                ("groq", ProviderAdapter::ChatCompletions),
+                ("together", ProviderAdapter::ChatCompletions),
             ]
         );
 
@@ -2887,6 +2913,8 @@ mod tests {
                 "fireworks",
                 "xai",
                 "vertex",
+                "groq",
+                "together",
                 "local-llama"
             ]
         );
@@ -3499,6 +3527,10 @@ mod tests {
                 vec!["BEDROCK_API_KEY", "BEDROCK_REGION"],
             ),
             (
+                "vertex account without its project",
+                vec!["VERTEX_SERVICE_ACCOUNT"],
+            ),
+            (
                 "everything set",
                 vec![
                     "ANTHROPIC_API_KEY",
@@ -3508,6 +3540,10 @@ mod tests {
                     "BEDROCK_REGION",
                     "FIREWORKS_API_KEY",
                     "XAI_API_KEY",
+                    "VERTEX_SERVICE_ACCOUNT",
+                    "VERTEX_PROJECT_ID",
+                    "GROQ_API_KEY",
+                    "TOGETHER_API_KEY",
                 ],
             ),
         ];
@@ -3521,6 +3557,23 @@ mod tests {
             // 2026-08-20; `fireworks` had been missing since it shipped, which
             // left the newest upstream outside the one test that proves the
             // catalog and the dispatcher cannot disagree about it.
+            //
+            // IT HAPPENED AGAIN, and the deliberate-edit rule is the reason it
+            // could. `vertex` shipped on 2026-08-21 and was never added here,
+            // so for a day this test proved nothing about the newest upstream —
+            // the exact failure the paragraph above describes, repeated
+            // verbatim. It is added below alongside `groq` and `together`
+            // (2026-08-22), together with a `vertex` environment case, because
+            // Vertex is the second provider whose endpoint needs a variable
+            // (`{project}`) as well as a credential, and the endpoint-before-
+            // credential ordering in `dispatchable` is exactly what this test
+            // exists to hold.
+            //
+            // A derived loop would have prevented both misses. It is still
+            // spelled out, because the point is that a human states what a new
+            // upstream's dispatchability should be rather than inheriting it —
+            // but if this happens a third time, derive it and assert the list's
+            // LENGTH instead.
             for provider in [
                 "anthropic",
                 "openai",
@@ -3528,6 +3581,9 @@ mod tests {
                 "bedrock",
                 "fireworks",
                 "xai",
+                "vertex",
+                "groq",
+                "together",
             ] {
                 let listed = provider_is_dispatchable_with(provider, read_env);
                 // The route builder's verdict for the same provider and the
@@ -4096,6 +4152,13 @@ mod tests {
             ("fireworks", Some("fireworks-ai".to_owned())),
             ("xai", None),
             ("vertex", Some("google-vertex".to_owned())),
+            // Groq is one of the coincidences: models.dev files it under
+            // `groq`, which is also ZeroRouter's key, so the join needs no
+            // declaration. Together is not — `togetherai` — and a guess at
+            // `together` finds no row at all, which would report every lane on
+            // it as NOT IN SOURCE forever on rates that are in fact published.
+            ("groq", None),
+            ("together", Some("togetherai".to_owned())),
         ]);
         assert_eq!(
             declared, expected,

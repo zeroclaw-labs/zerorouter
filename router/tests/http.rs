@@ -283,7 +283,14 @@ async fn models_are_materialized_from_tiers_toml() {
     // a zero-retention Google Cloud project instead of the retaining Developer
     // API — the second pair of twins in the catalog, and the first where the
     // zero-retention half costs the customer no more than the retaining one.
-    assert_eq!(data.len(), 25);
+    // The three `groq/*` and four `together/*` lanes added 2026-08-22 are the
+    // first lanes bought for a property other than price or policy: Groq for
+    // latency (its own table publishes tokens per second, which no other
+    // vendor here does) and Together for four open-weight models nothing else
+    // in the catalog carries. Together deliberately does NOT twin the five
+    // models it shares with Fireworks — on every one of them Fireworks is the
+    // same price or cheaper, so a twin would add a row and nothing else.
+    assert_eq!(data.len(), 32);
     assert!(data.iter().all(|model| model["object"] == "model"));
 
     let ids = data
@@ -314,9 +321,16 @@ async fn models_are_materialized_from_tiers_toml() {
             "google/gemini-3.1-pro-preview",
             "google/gemini-3.5-flash-lite",
             "google/gemini-3.7-flash",
+            "groq/gpt-oss-120b",
+            "groq/gpt-oss-20b",
+            "groq/qwen3.6-27b",
             "openai/gpt-5.6-luna",
             "openai/gpt-5.6-sol",
             "openai/gpt-5.6-terra",
+            "together/deepseek-v4-pro-0813",
+            "together/kimi-k2.7-code",
+            "together/nemotron-3-ultra",
+            "together/qwen3.6-plus",
             "vertex/gemini-3.1-pro-preview",
             "vertex/gemini-3.5-flash-lite",
             "vertex/gemini-3.7-flash",
@@ -518,7 +532,7 @@ async fn every_shipped_model_publishes_what_it_can_take_and_produce() {
     // path runs through the Files API that ZDR disables, so `pdf` may be true of
     // the model and false of this lane. `tiers.toml` argues each omission at the
     // tier.
-    const NO_MAX_OUTPUT: [&str; 6] = [
+    const NO_MAX_OUTPUT: [&str; 7] = [
         "fireworks/deepseek-v4-flash",
         "fireworks/deepseek-v4-pro",
         "fireworks/minimax-m3",
@@ -527,10 +541,15 @@ async fn every_shipped_model_publishes_what_it_can_take_and_produce() {
         // `max_tokens: 4000` — 32x lower, and a statement about an example
         // rather than about the model. Same shape as the DeepSeek pair above.
         "fireworks/qwen3.8-max",
+        // models.dev gives 512300, byte-identical to the context window — the
+        // same tell that disqualified MiniMax M3's and grok-4.6's figures.
+        // Together publishes no output cap, so there is no second source to
+        // break the tie.
+        "together/nemotron-3-ultra",
         "xai/grok-4.3",
         "xai/grok-4.6",
     ];
-    const NO_IMAGE_INPUT: [&str; 7] = [
+    const NO_IMAGE_INPUT: [&str; 13] = [
         "fireworks/deepseek-v4-flash",
         "fireworks/deepseek-v4-pro",
         "fireworks/glm-5.2",
@@ -548,21 +567,77 @@ async fn every_shipped_model_publishes_what_it_can_take_and_produce() {
         // — both DO take images; the two sources disagree only about `pdf`.
         "xai/grok-4.3",
         "xai/grok-4.6",
+        // The 2026-08-22 lanes, and unlike most of the entries above these are
+        // the SIMPLE case: vendor and models.dev agree that each of these six
+        // is text-only, so each declares `["text"]` rather than omitting the
+        // list. They are here because this list means "does not advertise
+        // image input", which covers a confident text-only claim as well as a
+        // withheld one. `groq/qwen3.6-27b` is deliberately absent — it is the
+        // one lane on either new provider that does take images, and both
+        // sources say so.
+        "groq/gpt-oss-120b",
+        "groq/gpt-oss-20b",
+        "together/deepseek-v4-pro-0813",
+        "together/kimi-k2.7-code",
+        "together/nemotron-3-ultra",
+        "together/qwen3.6-plus",
     ];
+
+    // THE TWO FLOORS BELOW WERE SPLIT FROM THEIR ASSERTIONS ON 2026-08-22, and
+    // the reasoning matters more than the numbers because it is the second time
+    // this test has had to choose between weakening a guard and naming an
+    // exception.
+    //
+    // Until Groq arrived, every lane in the catalog had a window of at least
+    // 200,000 and a max output of at least 64,000, so "assert a plausible
+    // floor" and "assert the field is there" were one assertion. Groq's entire
+    // catalog is 131,072 tokens and `qwen/qwen3.6-27b` caps completions at
+    // 16,384. Both figures are real, documented in Groq's own model table, and
+    // agreed by models.dev — they are not the failure these floors were written
+    // to catch.
+    //
+    // Lowering the floors to fit would have been the wrong repair. What the
+    // 200,000 bound actually catches is a UNIT SLIP (200 written for 200k) or a
+    // field that silently went missing, and a floor low enough to admit Groq
+    // still catches both — but only if it stays deliberate. So the floors are
+    // kept and the small lanes are named, exactly as the metadata omissions
+    // above are named, and with the same anti-staleness property: a lane listed
+    // here that grows past the floor FAILS, so an exemption cannot outlive its
+    // reason.
+    //
+    // The absence check is what is genuinely universal, and it survives
+    // untouched below: no lane, exempt or not, may ship without a window.
+    const SMALL_WINDOW: [&str; 3] = ["groq/gpt-oss-120b", "groq/gpt-oss-20b", "groq/qwen3.6-27b"];
+    const SMALL_MAX_OUTPUT: [&str; 1] = ["groq/qwen3.6-27b"];
 
     for model in listed_models(RouterState::fully_credentialed(tier_config_path())).await {
         let id = model["id"].as_str().expect("every model carries an id");
-        // The shipped catalog's real floor is MiniMax M3's 512k, then haiku's
-        // 200k. The assertion is a sanity bound, not a spec: it catches a unit
-        // slip (200 for 200k) or a field that silently went missing, which are
-        // the ways this regresses. NO lane is exempt from this one — a context
-        // window is the single claim whose absence caused the original bug.
-        let window = model["context_length"].as_u64();
-        assert!(
-            window.is_some_and(|window| window >= 200_000),
-            "{id} ships without a plausible context window: {}",
-            model["context_length"]
-        );
+        // The assertion is a sanity bound, not a spec: it catches a unit slip
+        // (200 for 200k) or a field that silently went missing, which are the
+        // ways this regresses. NO lane is exempt from having to state one — a
+        // context window is the single claim whose absence caused the original
+        // bug — and the named exemptions below change only the FLOOR.
+        let window = model["context_length"]
+            .as_u64()
+            .unwrap_or_else(|| panic!("{id} ships without a context window at all"));
+        if SMALL_WINDOW.contains(&id) {
+            assert!(
+                window < 200_000,
+                "{id} is listed as a small-window lane and now publishes {window}; remove it \
+                 from SMALL_WINDOW rather than leaving a stale exemption"
+            );
+            // Still a floor, and still enough to catch the unit slip this
+            // assertion exists for: 200 written for 200k fails here too.
+            assert!(
+                window >= 100_000,
+                "{id} publishes an implausible window even for an exempt lane: {window}"
+            );
+        } else {
+            assert!(
+                window >= 200_000,
+                "{id} ships without a plausible context window: {window}"
+            );
+        }
         if NO_MAX_OUTPUT.contains(&id) {
             assert!(
                 model["max_output_tokens"].is_null(),
@@ -570,13 +645,29 @@ async fn every_shipped_model_publishes_what_it_can_take_and_produce() {
                  remove it from NO_MAX_OUTPUT rather than leaving a stale exemption"
             );
         } else {
-            assert!(
-                model["max_output_tokens"]
-                    .as_u64()
-                    .is_some_and(|output| output >= 64_000),
-                "{id} ships without a plausible max output: {}",
-                model["max_output_tokens"]
-            );
+            let output = model["max_output_tokens"].as_u64().unwrap_or_else(|| {
+                panic!(
+                    "{id} is not listed as declining to state a max output, so it must state \
+                     one: {}",
+                    model["max_output_tokens"]
+                )
+            });
+            if SMALL_MAX_OUTPUT.contains(&id) {
+                assert!(
+                    output < 64_000,
+                    "{id} is listed as a small-output lane and now publishes {output}; remove \
+                     it from SMALL_MAX_OUTPUT rather than leaving a stale exemption"
+                );
+                assert!(
+                    output >= 16_000,
+                    "{id} publishes an implausible max output even for an exempt lane: {output}"
+                );
+            } else {
+                assert!(
+                    output >= 64_000,
+                    "{id} ships without a plausible max output: {output}"
+                );
+            }
         }
         // Modalities: the floor is asserted rather than the exact set, because
         // this table's job is to report what a model IS (the same kind of claim
@@ -752,13 +843,19 @@ async fn every_shipped_lane_publishes_a_retention_posture() {
     }
 
     // The shipped catalog's state, asserted rather than assumed. It was EMPTY
-    // until 2026-08-20 and is now fourteen lanes — and it is pinned by NAME rather
-    // than by count, because the thing that must not happen quietly is a lane
-    // ACQUIRING this label, not the tally moving. A count would still pass if
-    // someone relabelled `anthropic/*` zero and dropped an existing lane.
+    // until 2026-08-20 and is now eighteen lanes — and it is pinned by NAME
+    // rather than by count, because the thing that must not happen quietly is a
+    // lane ACQUIRING this label, not the tally moving. A count would still pass
+    // if someone relabelled `anthropic/*` zero and dropped an existing lane.
+    //
+    // As of 2026-08-22 this list is a MAJORITY of the catalog (eighteen of
+    // thirty-two) for the first time, which is worth noticing rather than
+    // celebrating: the majority arrived because two providers were added whose
+    // guarantee rests on a setting an admin can change in a console, without
+    // touching this repository and without notifying anyone.
     //
     // A lane arriving in this list is a legal-adjacent claim about a customer's
-    // data, and it arrives only with evidence behind it. The fourteen below rest
+    // data, and it arrives only with evidence behind it. The eighteen below rest
     // on THREE DIFFERENT KINDS of evidence, which is the reason to keep reading
     // rather than to append the next lane by pattern-match:
     //
@@ -790,6 +887,28 @@ async fn every_shipped_lane_publishes_a_retention_posture() {
     //                abuse-monitoring scope is NOT, and `[retention.vertex]`
     //                says so rather than glossing it.
     //
+    //   groq/*       an ENFORCED organization-level ZDR toggle in Groq's Data
+    //                Controls. Basis 2, the same as Bedrock's and xAI's — but
+    //                read it as xAI's WITHOUT the safety net, because that is
+    //                what it is: a self-serve switch any org admin can flip,
+    //                with no per-response attestation to catch it having been
+    //                flipped. Groq publishes no such header (checked against
+    //                the OpenAPI document embedded in its own docs, which
+    //                declares no response header but `Transfer-Encoding`), so
+    //                these three are verified by a human on a date like every
+    //                pin except xAI's. Note also that the toggle can be set
+    //                "globally or on a per-feature basis", so ZDR being on is
+    //                NOT sufficient — it must cover Inference.
+    //   together/*   the vendor's PUBLISHED DEFAULT, basis 3 like Fireworks —
+    //                and the only lanes here whose risk runs the other way.
+    //                Everywhere else the operator must switch something ON or
+    //                the label is false; here the guarantee ships on and three
+    //                organization Privacy toggles can silently take it away.
+    //                A correct default is the easiest guarantee in the catalog
+    //                to lose without anyone noticing, which is why the
+    //                DEPLOY.md step is "confirm they are off" rather than
+    //                "turn something on".
+    //
     // NOT EVERY `fireworks/*` LANE IS HERE, and the absentee is the point.
     // `fireworks/qwen3.8-max` dispatches the same account on the same key, and
     // it is deliberately missing from this list because it is CLOSED-WEIGHT and
@@ -819,6 +938,13 @@ async fn every_shipped_lane_publishes_a_retention_posture() {
             "fireworks/glm-5.2",
             "fireworks/kimi-k3",
             "fireworks/minimax-m3",
+            "groq/gpt-oss-120b",
+            "groq/gpt-oss-20b",
+            "groq/qwen3.6-27b",
+            "together/deepseek-v4-pro-0813",
+            "together/kimi-k2.7-code",
+            "together/nemotron-3-ultra",
+            "together/qwen3.6-plus",
             // The three vertex lanes are DELIBERATELY absent: their provider
             // pin sits at `standard` while Google's abuse-monitoring exception
             // (filed 2026-08-21) is pending — see the pin's comment in
@@ -1119,23 +1245,32 @@ async fn bundled_tier_catalog_has_expected_virtual_models() {
             "google/gemini-3.1-pro-preview",
             "google/gemini-3.5-flash-lite",
             "google/gemini-3.7-flash",
+            "groq/gpt-oss-120b",
+            "groq/gpt-oss-20b",
+            "groq/qwen3.6-27b",
             "openai/gpt-5.6-luna",
             "openai/gpt-5.6-sol",
             "openai/gpt-5.6-terra",
+            "together/deepseek-v4-pro-0813",
+            "together/kimi-k2.7-code",
+            "together/nemotron-3-ultra",
+            "together/qwen3.6-plus",
             "vertex/gemini-3.1-pro-preview",
             "vertex/gemini-3.5-flash-lite",
             "vertex/gemini-3.7-flash",
             "xai/grok-4.3",
             "xai/grok-4.6",
         ],
-        "the twenty-five vendor-named model pins (Gemini flash + flash-lite added \
+        "the thirty-two vendor-named model pins (Gemini flash + flash-lite added \
          2026-08-18; Gemini Pro joined them once conditional rates could \
          express the 200,000-token boundary Google prices it at; the four \
          Bedrock classic-runtime zero-retention lanes on 2026-08-20, the \
          five open-weight Fireworks lanes the same day, closed-weight \
          Qwen 3.8 Max alongside them under a per-tier retention override, and \
-         the two xAI Grok lanes the same day again; and the three Vertex \
-         Gemini lanes on 2026-08-21). \
+         the two xAI Grok lanes the same day again; the three Vertex \
+         Gemini lanes on 2026-08-21; and on 2026-08-22 three Groq lanes bought \
+         for latency and four Together lanes chosen for being the models \
+         Fireworks does NOT serve). \
          THE THREE `vertex/*` IDS NAME THE SAME MODELS AS THE THREE \
          `google/*` ONES and that is the point rather than a duplicate: they \
          are two different Google products under two different data policies. \
@@ -1200,7 +1335,15 @@ async fn bundled_tier_catalog_has_expected_virtual_models() {
         assert!(
             matches!(
                 provider,
-                "openai" | "anthropic" | "google" | "bedrock" | "fireworks" | "xai" | "vertex"
+                "openai"
+                    | "anthropic"
+                    | "google"
+                    | "bedrock"
+                    | "fireworks"
+                    | "xai"
+                    | "vertex"
+                    | "groq"
+                    | "together"
             ),
             "{tier_id} routes to {provider}, which is not in the shipped inventory"
         );
@@ -1642,9 +1785,16 @@ async fn a_basis_hike_above_sell_withholds_that_tier_and_nothing_else() {
             "google/gemini-3.1-pro-preview",
             "google/gemini-3.5-flash-lite",
             "google/gemini-3.7-flash",
+            "groq/gpt-oss-120b",
+            "groq/gpt-oss-20b",
+            "groq/qwen3.6-27b",
             "openai/gpt-5.6-luna",
             "openai/gpt-5.6-sol",
             "openai/gpt-5.6-terra",
+            "together/deepseek-v4-pro-0813",
+            "together/kimi-k2.7-code",
+            "together/nemotron-3-ultra",
+            "together/qwen3.6-plus",
             "vertex/gemini-3.1-pro-preview",
             "vertex/gemini-3.5-flash-lite",
             "vertex/gemini-3.7-flash",
@@ -1690,12 +1840,12 @@ async fn a_basis_hike_above_sell_withholds_that_tier_and_nothing_else() {
     assert_eq!(sell.output_per_mtok, Some(10.00));
 
     // And the public catalog stops advertising what it cannot serve: the
-    // twenty-four surviving pins, one row each. A Bedrock lane is among the survivors and
+    // thirty-one surviving pins, one row each. A Bedrock lane is among the survivors and
     // that is the point of naming one — Bedrock lanes are a different account
     // with their own rate card, so a repricing of a first-party Anthropic lane
     // withholds only that first-party lane.
     let listed = listed_model_ids(RouterState::fully_credentialed(path)).await;
-    assert_eq!(listed.len(), 24);
+    assert_eq!(listed.len(), 31);
     assert!(listed.iter().any(|id| id == "bedrock/claude-sonnet-4-5"));
     assert!(listed.iter().any(|id| id == "openai/gpt-5.6-luna"));
     assert!(listed.iter().any(|id| id == "anthropic/claude-haiku-4-5"));
@@ -1721,7 +1871,7 @@ async fn the_shipped_catalog_withholds_no_tier_today() {
         "the shipped catalog withholds {:?}",
         catalog.unavailable.keys().collect::<Vec<_>>()
     );
-    assert_eq!(catalog.tiers.len(), 25);
+    assert_eq!(catalog.tiers.len(), 32);
 }
 
 /// Every conditional rate the shipped catalog declares, transcribed from
@@ -1819,7 +1969,7 @@ async fn every_shipped_conditional_rate_is_the_one_the_vendor_publishes() {
 // rungs across >=2 providers). Every tier is pass-through until a second
 // provider serves a model class again.
 const ROUTED_TIERS: [&str; 0] = [];
-const PASS_THROUGH_TIERS: [&str; 25] = [
+const PASS_THROUGH_TIERS: [&str; 32] = [
     // Model pins, keyed by their OpenRouter-standard {vendor}/{model} ids.
     "openai/gpt-5.6-luna",
     "anthropic/claude-haiku-4-5",
@@ -1887,6 +2037,29 @@ const PASS_THROUGH_TIERS: [&str; 25] = [
     "vertex/gemini-3.7-flash",
     "vertex/gemini-3.5-flash-lite",
     "vertex/gemini-3.1-pro-preview",
+    // The Groq latency lanes (2026-08-22). Pass-through at Groq's published
+    // per-1M rates. The equality the assertion below checks earns its keep on
+    // the CACHED dimension in particular: Groq publishes no per-model cached
+    // figure anywhere, only a blanket "50% discount for cached input tokens",
+    // so both numbers here are arithmetic rather than quotations and a slip in
+    // one table that is not mirrored in the other would not look wrong to a
+    // reader. Note also that Groq does not offer caching on `qwen3.6-27b` at
+    // all today, so that lane's 0.30 is a rate that cannot currently fire —
+    // see the tier's comment for why it is declared anyway.
+    "groq/gpt-oss-120b",
+    "groq/gpt-oss-20b",
+    "groq/qwen3.6-27b",
+    // The Together open-weight lanes (2026-08-22). Pass-through at Together's
+    // published serverless rates. `together/qwen3.6-plus` is the one lane in
+    // the catalog whose cached rate deliberately EQUALS its input rate, because
+    // Together's card shows a single price for that model where its neighbours
+    // show an explicit "(cached)" figure — so cached input genuinely bills at
+    // full price there, and the equality below must hold that too rather than
+    // let someone "correct" it to a discount the vendor does not give.
+    "together/qwen3.6-plus",
+    "together/kimi-k2.7-code",
+    "together/nemotron-3-ultra",
+    "together/deepseek-v4-pro-0813",
 ];
 
 #[tokio::test]
