@@ -780,3 +780,169 @@ async fn byok_ships_dark_when_the_deployment_has_no_encryption_key() {
             .expect("count must query");
     assert_eq!(stored, 0, "a refused attach must store nothing");
 }
+
+// ---------------------------------------------------------------------------
+// The playground key
+// ---------------------------------------------------------------------------
+
+fn post_playground_key(cookie: Option<&str>, csrf: bool) -> Request<Body> {
+    let mut builder = Request::builder().method("POST").uri("/api/playground/key");
+    if let Some(cookie) = cookie {
+        builder = builder.header(header::COOKIE, cookie);
+    }
+    if csrf {
+        builder = builder.header(CSRF_HEADER, "1");
+    }
+    builder
+        .body(Body::empty())
+        .expect("playground key request should build")
+}
+
+/// The playground's key is an ORDINARY key, and this pins the two halves of
+/// that claim a customer can actually see: it carries the caps the key dialog's
+/// untouched form would have given it, and it appears in the key list like any
+/// other row — which is what makes the Keys page a real revoke switch for the
+/// playground rather than a list that quietly omits one credential.
+#[tokio::test]
+async fn the_playground_key_is_an_ordinary_key_with_default_caps() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let user_id = seed_user(&pool, "playground-defaults").await;
+    let (token, _) = create_session(&pool, user_id, Duration::from_secs(3_600))
+        .await
+        .expect("session must create");
+    let cookie = format!("{SESSION_COOKIE}={token}");
+
+    // Mint through the playground, and mint the key the dialog produces when a
+    // customer fills in nothing but a name. The two must agree on every cap: a
+    // playground that quietly granted itself a larger allowance would be
+    // spending the customer's balance under terms they never saw.
+    let (status, _, playground) = send(&pool, post_playground_key(Some(&cookie), true)).await;
+    assert_eq!(status, StatusCode::CREATED, "playground mint: {playground}");
+    let (status, _, dialog) = send(
+        &pool,
+        post_keys(&cookie, true, json!({ "name": "by hand" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "dialog mint: {dialog}");
+
+    assert_eq!(playground["name"], "playground");
+    assert!(
+        playground["api_key"]
+            .as_str()
+            .expect("the mint returns a plaintext key")
+            .starts_with("zcr_"),
+        "the playground presents the same kind of credential every client does"
+    );
+    for field in ["spend_cap_usd", "velocity_cap_tokens_per_min"] {
+        assert_eq!(
+            playground[field], dialog[field],
+            "{field} must match the key the dialog mints with its defaults"
+        );
+    }
+    // Null rather than a value: no expiry, no per-key credit limit, and so
+    // nothing spent against one.
+    for field in [
+        "expires_at",
+        "credit_limit_usd",
+        "credit_limit_window",
+        "credit_limit_used_usd",
+    ] {
+        assert_eq!(playground[field], Value::Null, "{field} must be unset");
+    }
+
+    // And it is listed. The revoke path is the ordinary one — nothing about the
+    // playground needs its own switch — so the row simply has to be there.
+    let (status, _, listed) = send(&pool, get("/api/keys", Some(&cookie))).await;
+    assert_eq!(status, StatusCode::OK);
+    let named: Vec<&Value> = listed["keys"]
+        .as_array()
+        .expect("keys envelope")
+        .iter()
+        .filter(|key| key["name"] == "playground")
+        .collect();
+    assert_eq!(named.len(), 1, "one playground row: {listed}");
+    assert_eq!(named[0]["id"], playground["id"]);
+    assert_eq!(named[0]["disabled"], json!(false));
+}
+
+/// The mint is session-gated and CSRF-gated exactly like every other mutating
+/// portal route. Worth its own assertion rather than trusting the extractor:
+/// this endpoint hands back a live credential, so it is the one place where
+/// forgetting either gate would be worst.
+#[tokio::test]
+async fn the_playground_mint_requires_a_session_and_the_csrf_header() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let user_id = seed_user(&pool, "playground-gates").await;
+    let (token, _) = create_session(&pool, user_id, Duration::from_secs(3_600))
+        .await
+        .expect("session must create");
+    let cookie = format!("{SESSION_COOKIE}={token}");
+
+    let (status, _, json) = send(&pool, post_playground_key(None, true)).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(json["error"]["code"], "session_required");
+
+    let (status, _, json) = send(&pool, post_playground_key(Some(&cookie), false)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(json["error"]["code"], "csrf_rejected");
+
+    let minted = query_scalar::<_, i64>("SELECT COUNT(*) FROM api_keys WHERE user_id = $1")
+        .bind(user_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count must query");
+    assert_eq!(minted, 0, "neither refusal may mint a key");
+}
+
+/// **The playground has no server-side inference path, and must not grow one.**
+///
+/// The page runs its requests through the public `POST /v1/chat/completions`
+/// with a real key, which is what makes every admission, cap and settlement
+/// invariant apply to it unchanged. The alternative — a session-authenticated
+/// route on this control plane — would have to construct an admission identity
+/// from a cookie, and a cookie carries no key row, no caps and nothing to
+/// attribute usage to. That is a second admission path, and this is the
+/// tripwire for anyone who adds one here later without meaning to.
+#[tokio::test]
+async fn the_portal_control_plane_serves_no_inference_route() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let user_id = seed_user(&pool, "playground-no-proxy").await;
+    let (token, _) = create_session(&pool, user_id, Duration::from_secs(3_600))
+        .await
+        .expect("session must create");
+    let cookie = format!("{SESSION_COOKIE}={token}");
+
+    // Every shape a well-meaning proxy would plausibly take, against a VALID
+    // session — so a 404 here is "this router has no such route", not "you were
+    // not signed in".
+    for path in [
+        "/v1/chat/completions",
+        "/api/playground/completions",
+        "/api/playground/chat",
+        "/api/chat/completions",
+    ] {
+        let request = Request::builder()
+            .method("POST")
+            .uri(path)
+            .header(header::COOKIE, &cookie)
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(CSRF_HEADER, "1")
+            .body(Body::from(
+                json!({ "model": "anthropic/claude-haiku-4-5", "messages": [] }).to_string(),
+            ))
+            .expect("request should build");
+        let (status, _, _) = send(&pool, request).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "{path} must not exist on the portal control plane: inference is \
+             authenticated by a key, never by a session"
+        );
+    }
+}

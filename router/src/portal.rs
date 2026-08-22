@@ -11,14 +11,21 @@
 //! Because disabling is only a flag flip, key CREATION is throttled rather than
 //! only key liveness: [`crate::db::admit_key_mint`] counts disabled keys
 //! against a trailing window, and the same check guards the device-claim mint
-//! path, so neither surface can be used to churn keys past a quota.
+//! path and the playground's implicit key, so no surface can be used to churn
+//! keys past a quota.
+//!
+//! This module serves the portal's control plane and nothing else. It has no
+//! inference route and must not gain one: the playground page runs its requests
+//! through the public `POST /v1/chat/completions` with a real key, so every
+//! admission, cap and settlement invariant applies to it unchanged. See
+//! [`PLAYGROUND_KEY_NAME`] for why that is the design rather than a proxy.
 
 use axum::{
     Json, Router,
     extract::{Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
-    routing::{delete, get},
+    routing::{delete, get, post},
 };
 use chrono::{DateTime, NaiveDate, Utc};
 use rust_decimal::Decimal;
@@ -106,6 +113,7 @@ pub fn router() -> Router<WebCtx> {
             "/api/byok/{provider}",
             delete(remove_byok).patch(set_byok_fallback),
         )
+        .route("/api/playground/key", post(ensure_playground_key))
 }
 
 /// Static serving for the built portal SPA: files from `dist_path`, with
@@ -679,6 +687,150 @@ async fn create_key(
             credit_limit_usd: validated.credit_limit_usd,
             credit_limit_window: validated.credit_limit_window,
             credit_limit_used_usd: validated.credit_limit_usd.map(|_| Decimal::ZERO),
+            created_at,
+            last_used_at: None,
+        }),
+    ))
+}
+
+// ---------------------------------------------------------------------------
+// The playground key (the portal's /playground page)
+//
+// The playground runs inference against the SAME `POST /v1/chat/completions`
+// every customer calls, presenting a real `zcr_` key in an
+// `Authorization: Bearer` header. That is the entire design, and the endpoint
+// below is the entire server surface it needs: there is deliberately NO
+// session-authenticated inference route, and adding one later would undo this.
+//
+// Why not a proxy the browser session could POST to directly. Admission is
+// keyed on a PRESENTING KEY, never on a user. `crate::db::begin_usage_session`
+// locks an `api_keys` row and reads `spend_cap_usd`, `credit_limit_usd`,
+// `credit_limit_window` and `velocity_cap_tokens_per_min` off it, and
+// `usage_events.api_key_id` is what attributes the spend afterwards. A session
+// cookie carries none of that. So a proxy would have to either
+//
+//   - invent an admission identity, which means a second implementation of
+//     every ceiling in `begin_usage_session` — precisely the second admission
+//     path the settlement invariants (AGENTS.md) exist to prevent; or
+//   - quietly spend against some key the customer minted for something else,
+//     under caps they chose for that other thing, and file the usage under it.
+//
+// The first is unsafe and the second is dishonest. So the playground gets a key
+// of its own — an ordinary one, which the customer can see in their key list
+// and revoke like any other.
+// ---------------------------------------------------------------------------
+
+/// The name the playground's key carries in the customer's key list.
+///
+/// An ordinary name on an ordinary row, not a marker the rest of the system
+/// reads: nothing in authentication, admission, settlement or attribution
+/// branches on it. It exists so a customer scanning the Keys page can tell what
+/// minted this key and revoke it deliberately, and so this endpoint can find
+/// the one it is replacing.
+pub const PLAYGROUND_KEY_NAME: &str = "playground";
+
+/// Ensure this account holds exactly one live playground key, and hand back its
+/// plaintext.
+///
+/// **Idempotent in STATE, not in secret**, and that distinction is forced by
+/// the storage model rather than chosen. Only `sha256(key)` is kept, so this
+/// endpoint *cannot* return the plaintext of a key that already exists — the
+/// same property that makes "shown once" true for every other key. What it can
+/// guarantee, and does, is that however many times it is called the account is
+/// left holding exactly one live key named [`PLAYGROUND_KEY_NAME`]. Each call
+/// replaces the previous one, which is why the browser asks for a key only when
+/// it has none rather than on every page load.
+///
+/// The revoke runs BEFORE [`admit_key_mint`], and the ordering is load-bearing
+/// in both directions:
+///
+/// - It relaxes the ACTIVE-key cap, which is right. Replacing one key with
+///   another nets zero live keys, so a customer sitting at
+///   [`crate::db::MAX_ACTIVE_KEYS_PER_USER`] must not be refused the one action
+///   that would not increase their count.
+/// - It does NOT relax the CREATION throttle, which is also right, and is the
+///   whole reason [`crate::db::MAX_KEYS_CREATED_PER_WINDOW`] counts disabled
+///   keys over a trailing window. Churning playground keys is exactly the
+///   pattern that throttle bounds, and this path must be no cheaper than
+///   `POST /api/keys`.
+///
+/// A refusal returns `Err` before the commit, so the transaction — the revoke
+/// included — rolls back. A customer who meets the throttle keeps the
+/// playground key they already had rather than losing it to a replacement that
+/// never arrived.
+async fn ensure_playground_key(
+    State(ctx): State<WebCtx>,
+    user: PortalUser,
+) -> Result<(StatusCode, Json<CreatedKeyResponse>), PortalError> {
+    let mut transaction = ctx.pool.begin().await?;
+    // The same row lock `create_key` takes, for the same reason: the counting
+    // inside `admit_key_mint` is only a limit if concurrent mints serialize.
+    sqlx::query_scalar::<_, Uuid>("SELECT id FROM users WHERE id = $1 FOR UPDATE")
+        .bind(user.user_id)
+        .fetch_one(&mut *transaction)
+        .await?;
+    // Scoped by name AND user, and it disables rather than deletes, on the same
+    // contract the rest of this module keeps: usage history references keys.
+    sqlx::query(
+        r#"
+        UPDATE api_keys
+        SET disabled = TRUE
+        WHERE user_id = $1 AND name = $2 AND NOT disabled
+        "#,
+    )
+    .bind(user.user_id)
+    .bind(PLAYGROUND_KEY_NAME)
+    .execute(&mut *transaction)
+    .await?;
+    // Exhaustive for the reason `create_key` states: a new refusal reason must
+    // be answered here rather than falling through to a mint.
+    match admit_key_mint(&mut transaction, user.user_id).await? {
+        KeyMintAdmission::Allowed => {}
+        KeyMintAdmission::LimitReached => return Err(PortalError::KeyLimitReached),
+        KeyMintAdmission::AccountFrozen => return Err(PortalError::AccountFrozen),
+    }
+
+    let api_key = generate_api_key();
+    let key_id = Uuid::new_v4();
+    // Default caps, stated by omission: no expiry, no per-key credit limit, and
+    // the column defaults for `spend_cap_usd` and `velocity_cap_tokens_per_min`
+    // — the same key `POST /api/keys` mints when the dialog is left alone. The
+    // playground is a client, not a privileged one, and must not be a cheaper
+    // one either.
+    sqlx::query("INSERT INTO api_keys (id, user_id, key_hash, name) VALUES ($1, $2, $3, $4)")
+        .bind(key_id)
+        .bind(user.user_id)
+        .bind(hash_api_key(&api_key))
+        .bind(PLAYGROUND_KEY_NAME)
+        .execute(&mut *transaction)
+        .await?;
+    let (spend_cap_usd, velocity_cap_tokens_per_min, created_at) =
+        sqlx::query_as::<_, (Decimal, i32, DateTime<Utc>)>(
+            r#"
+            SELECT spend_cap_usd, velocity_cap_tokens_per_min, created_at
+            FROM api_keys
+            WHERE id = $1
+            "#,
+        )
+        .bind(key_id)
+        .fetch_one(&mut *transaction)
+        .await?;
+    transaction.commit().await?;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(CreatedKeyResponse {
+            id: key_id,
+            api_key,
+            name: PLAYGROUND_KEY_NAME.to_owned(),
+            disabled: false,
+            spend_cap_usd,
+            velocity_cap_tokens_per_min,
+            default_priority: None,
+            expires_at: None,
+            credit_limit_usd: None,
+            credit_limit_window: None,
+            credit_limit_used_usd: None,
             created_at,
             last_used_at: None,
         }),

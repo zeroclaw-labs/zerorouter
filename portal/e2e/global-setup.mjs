@@ -11,6 +11,7 @@ const repo = path.resolve(here, '..', '..')
 
 const IDP_PORT = 9400
 const ROUTER_PORT = 9410
+const MOCK_UPSTREAM_PORT = 9420
 export const BASE_URL = `http://127.0.0.1:${ROUTER_PORT}`
 
 async function waitFor(url, label, tries = 60) {
@@ -18,6 +19,20 @@ async function waitFor(url, label, tries = 60) {
     try {
       const res = await fetch(url)
       if (res.ok) return
+    } catch {}
+    await new Promise((r) => setTimeout(r, 500))
+  }
+  throw new Error(`${label} did not come up at ${url}`)
+}
+
+/// Readiness for a server that has no 200-answering route. The mock upstream
+/// answers anything but POST with a 405, which is a perfectly good proof that
+/// the socket is accepting — `waitFor` above would spin forever on it.
+async function waitForSocket(url, label, tries = 60) {
+  for (let i = 0; i < tries; i++) {
+    try {
+      await fetch(url)
+      return
     } catch {}
     await new Promise((r) => setTimeout(r, 500))
   }
@@ -35,6 +50,16 @@ export default async function globalSetup() {
     stdio: 'inherit',
   })
   await waitFor(`http://127.0.0.1:${IDP_PORT}/.well-known/openid-configuration`, 'mock idp')
+
+  // An OpenAI-compatible upstream the router can actually dispatch to, so the
+  // playground spec can drive a completion end to end instead of asserting on a
+  // page that never sends one. See `mock-upstream.mjs` for why the fake has to
+  // sit on the wire rather than inside the process.
+  const upstream = spawn('node', [path.join(here, 'mock-upstream.mjs')], {
+    env: { ...process.env, MOCK_UPSTREAM_PORT: String(MOCK_UPSTREAM_PORT) },
+    stdio: 'inherit',
+  })
+  await waitForSocket(`http://127.0.0.1:${MOCK_UPSTREAM_PORT}/`, 'mock upstream')
 
   const router = spawn(path.join(repo, 'router', 'target', 'debug', 'zerorouter'), ['serve'], {
     env: {
@@ -112,6 +137,19 @@ export default async function globalSetup() {
       // protecting a real secret — the keys the suite attaches are made up, and
       // no request in it dials an upstream.
       BYOK_ENCRYPTION_KEY: '1b'.repeat(32),
+      // Point the `google` upstream at the mock above. This is the router's own
+      // production test seam (`base_url_override`), and it is the ONLY thing in
+      // this harness that changes the request path — the browser still presents
+      // a real key, admission still reserves against a real balance, and
+      // settlement still bills the usage the far end reported.
+      //
+      // `google` and not one of its neighbours, for two reasons worth keeping:
+      // it rides the `chat_completions` adapter, which is the wire this mock
+      // speaks, and it declares no per-response retention attestation. The xAI
+      // lanes DO (`x-zero-data-retention: true`), so pointing this at them would
+      // fail every request closed and the failure would look like a bug in the
+      // playground rather than a mock that cannot make the claim.
+      ZEROROUTER_PROVIDER_BASE_URL_GOOGLE: `http://127.0.0.1:${MOCK_UPSTREAM_PORT}/v1/chat/completions`,
       OIDC_ISSUER_URL: `http://127.0.0.1:${IDP_PORT}`,
       OIDC_CLIENT_ID: 'e2e-portal',
       OIDC_CLIENT_SECRET: 'e2e-secret',
@@ -121,5 +159,8 @@ export default async function globalSetup() {
   })
   await waitFor(`${BASE_URL}/healthz`, 'router')
 
-  writeFileSync(path.join(here, '.state', 'pids.json'), JSON.stringify({ idp: idp.pid, router: router.pid }))
+  writeFileSync(
+    path.join(here, '.state', 'pids.json'),
+    JSON.stringify({ idp: idp.pid, router: router.pid, upstream: upstream.pid }),
+  )
 }

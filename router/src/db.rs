@@ -4192,11 +4192,18 @@ pub enum KeyMintAdmission {
 /// mint paths take `SELECT ... FROM users WHERE id = $1 FOR UPDATE`), otherwise
 /// two concurrent mints can each observe a count below the limit.
 ///
-/// Scope note: this governs the two SELF-SERVICE mint paths only —
-/// `portal::create_key` and the device-claim mint in [`crate::device`]. The
-/// `admin mint-key` CLI is operator-only (it needs database credentials, not a
-/// session) and is deliberately left exempt, so an operator can always issue a
-/// key for a user who has hit the throttle.
+/// Scope note: this governs the SELF-SERVICE mint paths only —
+/// `portal::create_key`, `portal::ensure_playground_key`, and the device-claim
+/// mint in [`crate::device`]. The `admin mint-key` CLI is operator-only (it
+/// needs database credentials, not a session) and is deliberately left exempt,
+/// so an operator can always issue a key for a user who has hit the throttle.
+///
+/// `ensure_playground_key` disables the key it is replacing before calling
+/// this, which is why the two limits above are counted differently on purpose:
+/// a replacement nets zero ACTIVE keys and so must not meet that cap, but it is
+/// still a creation and must meet the trailing-window throttle. Anything that
+/// let the playground mint past this call would make the throttle optional for
+/// whichever surface forgot it.
 ///
 /// The freeze check (migration 0009) lives here for the same reason the two
 /// limits do: both self-service mint paths already funnel through this call

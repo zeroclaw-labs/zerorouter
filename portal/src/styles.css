@@ -1422,3 +1422,304 @@ input {
 .table-scroll {
   overflow-x: auto;
 }
+
+/* ── playground (/playground) ────────────────────────────────────────── */
+
+/* Two columns: the lane picker is a long list that wants its own scroll, and
+   the conversation beside it wants the remaining width. They collapse to one
+   column at the same breakpoint the rest of the portal uses. */
+.playground {
+  display: grid;
+  grid-template-columns: 320px minmax(0, 1fr);
+  gap: 18px;
+  align-items: start;
+}
+
+.playground-lanes {
+  position: sticky;
+  top: 40px;
+  max-height: calc(100vh - 96px);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.lane-groups {
+  overflow-y: auto;
+  padding: 0 0 10px;
+}
+
+.lane-group + .lane-group {
+  margin-top: 6px;
+}
+
+/* The posture heading. This is the page's grouping made visible — a picker has
+   room to name the two halves of the catalog outright, where the storefront
+   table can only order them. */
+.lane-group-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin: 0;
+  padding: 10px 18px 6px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+  background: var(--surface);
+  position: sticky;
+  top: 0;
+}
+
+.lane-group[data-posture='zero'] .lane-group-title {
+  color: var(--good);
+}
+
+.lane-group-count {
+  font-weight: 400;
+  color: var(--faint);
+  letter-spacing: 0;
+}
+
+.lane-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.lane {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  width: 100%;
+  padding: 8px 18px;
+  background: none;
+  border: none;
+  border-left: 2px solid transparent;
+  text-align: left;
+  color: var(--text);
+  cursor: pointer;
+}
+
+.lane:hover {
+  background: var(--surface-2);
+}
+
+.lane-active {
+  background: var(--accent-soft);
+  border-left-color: var(--accent);
+}
+
+.lane-id {
+  font-size: 13px;
+}
+
+.lane-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.playground-chat {
+  display: flex;
+  flex-direction: column;
+  min-height: 520px;
+}
+
+.field-label {
+  display: block;
+  font-size: 12px;
+  color: var(--muted);
+  margin-bottom: 6px;
+}
+
+.playground-system {
+  resize: vertical;
+  font-family: inherit;
+}
+
+/* The conversation. Scrolls on its own so the composer stays put while a
+   response streams in. */
+.transcript {
+  flex: 1;
+  overflow-y: auto;
+  padding: 4px 18px;
+  border-top: 1px solid var(--border);
+  min-height: 240px;
+  max-height: 52vh;
+}
+
+.turn {
+  padding: 14px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.turn:last-child {
+  border-bottom: none;
+}
+
+.turn-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 6px;
+}
+
+.turn-role {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+/* The lane that answered, with its retention claim beside it. Both belong on
+   the response rather than only in the picker: a customer scrolling back
+   through a conversation where they switched lanes has to be able to read which
+   promise applied to which answer. */
+.turn-lane {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-size: 12px;
+}
+
+.turn-body {
+  white-space: pre-wrap;
+  word-break: break-word;
+  line-height: 1.6;
+}
+
+.turn-user .turn-body {
+  color: var(--muted);
+}
+
+.turn-image {
+  display: block;
+  max-width: 260px;
+  max-height: 200px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  margin-bottom: 8px;
+}
+
+.turn-usage {
+  display: flex;
+  gap: 14px;
+  flex-wrap: wrap;
+  margin-top: 10px;
+  font-size: 12px;
+  color: var(--faint);
+  font-family: var(--mono);
+}
+
+.turn-cost {
+  color: var(--muted);
+}
+
+.turn-note {
+  margin: 8px 0 0;
+  font-size: 12px;
+  color: var(--muted);
+  border-left: 2px solid var(--accent);
+  padding-left: 10px;
+}
+
+/* The streaming cursor: present only while a response is still arriving, so a
+   finished answer never looks like it is still going. */
+.caret {
+  display: inline-block;
+  width: 7px;
+  height: 1em;
+  margin-left: 2px;
+  vertical-align: text-bottom;
+  background: var(--accent);
+  animation: caret-blink 1s steps(2, start) infinite;
+}
+
+@keyframes caret-blink {
+  to {
+    visibility: hidden;
+  }
+}
+
+.composer {
+  border-top: 1px solid var(--border);
+  padding: 14px 18px 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.composer-text {
+  resize: vertical;
+  font-family: inherit;
+}
+
+.composer-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+}
+
+/* A file input styled as a button. The input itself is hidden rather than
+   removed: a screen reader still reaches it through the label. */
+.attach-button {
+  position: relative;
+  overflow: hidden;
+  margin-right: auto;
+}
+
+.attach-button input[type='file'] {
+  position: absolute;
+  inset: 0;
+  opacity: 0;
+  cursor: pointer;
+}
+
+.attachment {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 8px 10px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 12px;
+}
+
+.attachment-thumb {
+  width: 36px;
+  height: 36px;
+  object-fit: cover;
+  border-radius: 4px;
+}
+
+.attachment-name {
+  color: var(--muted);
+}
+
+/* Shown when the SELECTED lane declares it takes only text. It is a warning,
+   not a block: the server is the authority on what a lane accepts, and its
+   refusal is rendered in the page banner. */
+.attachment-warn {
+  color: var(--accent-bright);
+}
+
+@media (max-width: 900px) {
+  .playground {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .playground-lanes {
+    position: static;
+    max-height: 380px;
+  }
+}

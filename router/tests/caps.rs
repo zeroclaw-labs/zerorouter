@@ -29,9 +29,9 @@ use zerorouter::provider::ModelRates;
 use zerorouter::{
     auth::{AuthenticatedKey, generate_api_key, hash_api_key},
     db::{
-        ByokReservation, KEY_CREATION_WINDOW_HOURS, MAX_KEYS_CREATED_PER_WINDOW, MeteringLane,
-        RequestTelemetry, ReservationSize, ReservationSizing, UsageAdmission, UsageRecord,
-        begin_usage_session, migrate,
+        ByokReservation, KEY_CREATION_WINDOW_HOURS, MAX_ACTIVE_KEYS_PER_USER,
+        MAX_KEYS_CREATED_PER_WINDOW, MeteringLane, RequestTelemetry, ReservationSize,
+        ReservationSizing, UsageAdmission, UsageRecord, begin_usage_session, migrate,
     },
     device,
     openai::{
@@ -762,6 +762,269 @@ async fn device_claims_below_the_creation_limit_still_mint() {
         key_counts(&pool, user_id).await.1,
         MAX_KEYS_CREATED_PER_WINDOW
     );
+}
+
+// ---------------------------------------------------------------------------
+// The playground's implicit key
+//
+// `POST /api/playground/key` is the third self-service mint path, and the whole
+// reason this file exists is that a mint path which forgets the throttle makes
+// the throttle optional. It is also the path most likely to be called often —
+// the browser asks for a key whenever it finds it has none — so "no cheaper
+// than the key dialog" is the property to pin.
+// ---------------------------------------------------------------------------
+
+/// A live key created `hours_ago` in the past, so a test can separate the
+/// ACTIVE-key cap from the trailing-window creation throttle. The two limits
+/// are numerically equal, so seeding history outside the window is the only way
+/// to load one of them without the other.
+async fn seed_live_key(pool: &PgPool, user_id: Uuid, hours_ago: i64) {
+    query(
+        r#"
+        INSERT INTO api_keys (id, user_id, key_hash, name, created_at)
+        VALUES ($1, $2, $3, 'long-lived', NOW() - ($4 * INTERVAL '1 hour'))
+        "#,
+    )
+    .bind(Uuid::new_v4())
+    .bind(user_id)
+    .bind(hash_api_key(&generate_api_key()))
+    .bind(hours_ago)
+    .execute(pool)
+    .await
+    .expect("long-lived key must insert");
+}
+
+/// `(id, disabled)` for every key this user holds named `playground`, newest
+/// first — the state the endpoint claims to converge.
+async fn playground_keys(pool: &PgPool, user_id: Uuid) -> Vec<(Uuid, bool)> {
+    sqlx_core::query_as::query_as::<_, (Uuid, bool)>(
+        "SELECT id, disabled FROM api_keys WHERE user_id = $1 AND name = 'playground' \
+         ORDER BY created_at DESC, id DESC",
+    )
+    .bind(user_id)
+    .fetch_all(pool)
+    .await
+    .expect("playground key rows must query")
+}
+
+#[tokio::test]
+async fn the_playground_key_meets_the_same_creation_throttle_as_the_key_dialog() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let app = portal_app(&pool);
+    let user_id = create_user(&pool, "playground-throttle").await;
+    let cookie = portal_cookie(&pool, user_id).await;
+
+    // The same end state `disabling_keys_does_not_reset_the_portal_creation_limit`
+    // sets up for the key dialog. If the playground could mint here it would be
+    // a way to churn keys the dialog refuses, which is the exact bypass this
+    // file was written for.
+    for _ in 0..MAX_KEYS_CREATED_PER_WINDOW {
+        seed_disabled_key(&pool, user_id, 0).await;
+    }
+    let (status, body) = send(&app, post_json("/api/playground/key", &cookie, json!({}))).await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "the playground must be no cheaper than the key dialog: {body}"
+    );
+    assert_eq!(body["error"]["code"], "key_limit_reached");
+    assert_eq!(
+        key_counts(&pool, user_id).await.1,
+        MAX_KEYS_CREATED_PER_WINDOW,
+        "a refused playground mint must write no key row"
+    );
+}
+
+#[tokio::test]
+async fn a_refused_playground_mint_leaves_the_existing_key_live() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let app = portal_app(&pool);
+    let user_id = create_user(&pool, "playground-rollback").await;
+    let cookie = portal_cookie(&pool, user_id).await;
+
+    // One playground key, minted while there was room.
+    let (status, body) = send(&app, post_json("/api/playground/key", &cookie, json!({}))).await;
+    assert_eq!(status, StatusCode::CREATED, "first mint: {body}");
+    let original = playground_keys(&pool, user_id).await;
+    assert_eq!(original.len(), 1);
+    assert!(!original[0].1, "the freshly minted key is live");
+
+    // Now fill the window. The endpoint disables the existing key BEFORE it
+    // checks the throttle — deliberately, so a replacement does not meet the
+    // active-key cap — which means a refusal has to roll that disable back. If
+    // it did not, meeting the throttle would COST the customer the working key
+    // they already had, and the playground would go dark on a request that
+    // changed nothing.
+    for _ in 1..MAX_KEYS_CREATED_PER_WINDOW {
+        seed_disabled_key(&pool, user_id, 0).await;
+    }
+    let (status, body) = send(&app, post_json("/api/playground/key", &cookie, json!({}))).await;
+    assert_eq!(status, StatusCode::CONFLICT, "second mint: {body}");
+
+    let after = playground_keys(&pool, user_id).await;
+    assert_eq!(after, original, "the refused replacement changed nothing");
+}
+
+#[tokio::test]
+async fn replacing_the_playground_key_converges_on_exactly_one_live_key() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let app = portal_app(&pool);
+    let user_id = create_user(&pool, "playground-idempotent").await;
+    let cookie = portal_cookie(&pool, user_id).await;
+
+    // Called three times, which is what a customer opening the playground in
+    // three browsers does. The endpoint is idempotent in STATE, not in secret:
+    // only a digest is stored, so it cannot hand back a key it already minted,
+    // and what it guarantees instead is that the account never accumulates
+    // playground keys.
+    let mut secrets = Vec::new();
+    for attempt in 0..3 {
+        let (status, body) = send(&app, post_json("/api/playground/key", &cookie, json!({}))).await;
+        assert_eq!(status, StatusCode::CREATED, "mint {attempt}: {body}");
+        assert_eq!(body["name"], "playground");
+        let secret = body["api_key"]
+            .as_str()
+            .expect("the mint must return a plaintext key")
+            .to_owned();
+        assert!(secret.starts_with("zcr_"), "an ordinary key: {secret}");
+        secrets.push(secret);
+    }
+    assert_eq!(
+        secrets
+            .iter()
+            .collect::<std::collections::HashSet<_>>()
+            .len(),
+        3,
+        "each call mints a NEW secret; none of them can be re-derived later"
+    );
+
+    let rows = playground_keys(&pool, user_id).await;
+    assert_eq!(rows.len(), 3, "keys are disabled, never deleted");
+    let live: Vec<_> = rows.iter().filter(|(_, disabled)| !disabled).collect();
+    assert_eq!(
+        live.len(),
+        1,
+        "exactly one playground key is live: {rows:?}"
+    );
+    assert_eq!(
+        live[0].0, rows[0].0,
+        "the live one is the newest — the older secrets no longer authenticate"
+    );
+}
+
+#[tokio::test]
+async fn replacing_the_playground_key_does_not_meet_the_active_key_cap() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let app = portal_app(&pool);
+    let user_id = create_user(&pool, "playground-active-cap").await;
+    let cookie = portal_cookie(&pool, user_id).await;
+
+    // A long-lived account sitting AT the active-key cap, with every creation
+    // safely outside the trailing window. One of those keys is the playground's.
+    seed_live_key(&pool, user_id, KEY_CREATION_WINDOW_HOURS + 1).await;
+    query(
+        r#"
+        INSERT INTO api_keys (id, user_id, key_hash, name, created_at)
+        VALUES ($1, $2, $3, 'playground', NOW() - ($4 * INTERVAL '1 hour'))
+        "#,
+    )
+    .bind(Uuid::new_v4())
+    .bind(user_id)
+    .bind(hash_api_key(&generate_api_key()))
+    .bind(KEY_CREATION_WINDOW_HOURS + 1)
+    .execute(&pool)
+    .await
+    .expect("existing playground key must insert");
+    for _ in 2..MAX_ACTIVE_KEYS_PER_USER {
+        seed_live_key(&pool, user_id, KEY_CREATION_WINDOW_HOURS + 1).await;
+    }
+    let (active, _) = key_counts(&pool, user_id).await;
+    assert_eq!(
+        active, MAX_ACTIVE_KEYS_PER_USER,
+        "the account is at the cap"
+    );
+
+    // The dialog is correctly refused: it would add a twenty-first live key.
+    let (status, _) = send(
+        &app,
+        post_json("/api/keys", &cookie, json!({ "name": "one more" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+
+    // The playground is not, because replacing its own key nets zero live keys.
+    // Refusing here would tell a customer they cannot re-enable a page they had
+    // working — and the action they were refused is the one that does not grow
+    // their key count.
+    let (status, body) = send(&app, post_json("/api/playground/key", &cookie, json!({}))).await;
+    assert_eq!(status, StatusCode::CREATED, "replacement: {body}");
+    assert_eq!(
+        key_counts(&pool, user_id).await.0,
+        MAX_ACTIVE_KEYS_PER_USER,
+        "still at the cap, never above it"
+    );
+}
+
+#[tokio::test]
+async fn admission_does_not_know_the_playground_key_is_a_playground_key() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let user_id = create_user(&pool, "playground-admission").await;
+
+    // Two keys of one user, identical but for their names, each with the same
+    // small spend cap. The playground's key is an ordinary row and admission
+    // never reads a name — this asserts it, because "the playground bills like
+    // API traffic" is only true while that stays so. A name-based exemption
+    // anywhere in `begin_usage_session` shows up here as a divergence.
+    let cap = Decimal::new(1, 0);
+    let playground = {
+        let key_id = Uuid::new_v4();
+        query(
+            r#"
+            INSERT INTO api_keys (id, user_id, key_hash, name, spend_cap_usd, velocity_cap_tokens_per_min)
+            VALUES ($1, $2, $3, 'playground', $4, 100000)
+            "#,
+        )
+        .bind(key_id)
+        .bind(user_id)
+        .bind(hash_api_key(&generate_api_key()))
+        .bind(cap)
+        .execute(&pool)
+        .await
+        .expect("playground key must insert");
+        AuthenticatedKey {
+            id: key_id,
+            user_id,
+            default_priority: None,
+        }
+    };
+
+    // Spend the shared user ceiling out through the playground's own key.
+    spend(&pool, &playground, cap).await;
+
+    // Both keys are now refused, with the SAME verdict. The cap is counted
+    // against the user, so exhausting it through the playground closes the API
+    // too — which is the honest direction: playground traffic is not a side
+    // channel that leaves the customer's real quota untouched.
+    let ordinary = create_key(&pool, user_id, cap, 100_000).await;
+    for (label, key) in [("playground", &playground), ("ordinary", &ordinary)] {
+        assert!(
+            matches!(
+                admit(&pool, key, 1_000, Decimal::new(1, 2)).await,
+                UsageAdmission::SpendExceeded
+            ),
+            "the {label} key must be refused by the same predicate"
+        );
+    }
 }
 
 /// The per-key priority default's full portal lifecycle (rollout stage 3a):

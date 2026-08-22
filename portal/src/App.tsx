@@ -11,6 +11,7 @@ import { CreditsReturn } from './pages/CreditsReturn'
 import { Docs } from './pages/Docs'
 import { Keys } from './pages/Keys'
 import { Models } from './pages/Models'
+import { Playground } from './pages/Playground'
 import { Overview } from './pages/Overview'
 import { Privacy } from './pages/Privacy'
 import { Terms } from './pages/Terms'
@@ -165,6 +166,7 @@ function SignedInLayout({ user }: { user: Me }) {
         <Routes>
           <Route path="/" element={<Overview />} />
           <Route path="/models" element={<Models />} />
+          <Route path="/playground" element={<Playground />} />
           <Route path="/credits" element={<Credits />} />
           {/* Stripe's return_url target. Must stay in sync with
               CHECKOUT_RETURN_PATH in router/src/stripe.rs. */}
@@ -193,6 +195,12 @@ function Sidebar({ user }: { user: Me }) {
         </NavLink>
         <NavLink to="/models" className={link}>
           Models
+        </NavLink>
+        {/* Signed-in only, deliberately: the playground spends the reader's own
+            credits through their own key, so there is nothing to show a visitor
+            without an account. The storefront at /models is the public half. */}
+        <NavLink to="/playground" className={link}>
+          Playground
         </NavLink>
         <NavLink to="/credits" className={link}>
           Credits

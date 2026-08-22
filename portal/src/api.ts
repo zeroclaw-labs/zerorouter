@@ -189,10 +189,31 @@ export interface CheckoutStatus {
  * strings in USD **per single token**; the UI renders them per-Mtok. Metadata
  * fields are optional — absent means the catalog does not publish one, never a
  * default. */
+/** One repricing band from `/v1/models`, in OpenRouter's `pricing.overrides[]`
+ * shape. Several vendors reprice long-context requests, and the repricing is a
+ * STEP rather than a margin: at or above `min_prompt_tokens` these rates
+ * replace the base table for the WHOLE request, input and output alike.
+ *
+ * The portal reads these because the playground quotes a cost back to the
+ * customer, and quoting only the base rate would understate a long-prompt
+ * request by half on four of the catalog's ten models. */
+export interface PricingOverride {
+  min_prompt_tokens: number
+  prompt: string
+  completion: string
+  input_cache_read?: string
+}
+
 export interface Model {
   id: string
   owned_by: string
-  pricing: { prompt: string; completion: string; input_cache_read?: string }
+  pricing: {
+    prompt: string
+    completion: string
+    input_cache_read?: string
+    /** Absent (not empty) on a model that charges one price at every size. */
+    overrides?: PricingOverride[]
+  }
   context_length?: number | null
   max_output_tokens?: number | null
   input_modalities?: string[] | null
@@ -332,6 +353,12 @@ export const api = {
   putAutopay: (update: AutopayUpdate) =>
     request<AutopayStatus>('PUT', '/api/billing/autopay', update),
   autopaySetup: () => request<RedirectSession>('POST', '/api/billing/autopay/setup'),
+  // Ensure this account holds exactly one live key named "playground" and hand
+  // back its plaintext. Idempotent in STATE, not in secret: the server keeps
+  // only a digest, so it cannot return a key it already minted, and each call
+  // replaces the previous one. Call it when the browser finds it has no key —
+  // never on every page load, or the account's creation throttle pays for it.
+  ensurePlaygroundKey: () => request<CreatedKey>('POST', '/api/playground/key'),
   deviceLookup: (userCode: string) =>
     request<DeviceLookup>('POST', '/api/device/lookup', { user_code: userCode }),
   deviceApprove: (userCode: string) =>
