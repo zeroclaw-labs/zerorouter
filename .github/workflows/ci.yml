@@ -60,6 +60,21 @@ jobs:
         run: cargo clippy --locked --all-targets --features testing -- -D warnings
       - name: Run tests
         run: cargo test --locked
+      # AGENTS.md lists this among the gates and explains why it is not
+      # redundant with `cargo test`: it proves the test-only upstream
+      # substitution surface (`src/testing.rs`, behind the `testing` feature) is
+      # ABSENT from a production binary. `cargo test` cannot show that, because
+      # the self dev-dependency in Cargo.toml turns the feature ON for every
+      # test build — including the lib's own unit tests, via feature
+      # unification. So this is the only command in CI that compiles the crate
+      # the way it actually ships.
+      #
+      # It did already run in CI, but incidentally: the portal-e2e job builds a
+      # binary for the Playwright harness. That is a side effect of needing an
+      # executable, not a check of this invariant, and it would disappear the
+      # day the e2e harness changed how it starts the router.
+      - name: Build (production profile, testing feature must stay off)
+        run: cargo build --locked
 
   portal:
     name: Portal build
@@ -169,7 +184,10 @@ jobs:
           tar --extract --gzip --file "${archive}" --directory "${RUNNER_TEMP}" actionlint
           "${RUNNER_TEMP}/actionlint" \
             .github/workflows/ci.yml \
-            .github/workflows/deploy.yml
+            .github/workflows/deploy.yml \
+            .github/workflows/security.yml \
+            .github/workflows/catalog-drift.yml \
+            .github/workflows/retention-drift.yml
 
   arm64-container:
     name: ARM64 container
@@ -190,3 +208,56 @@ jobs:
           push: false
           cache-from: type=gha,scope=zerorouter-router-arm64
           cache-to: type=gha,scope=zerorouter-router-arm64,mode=max
+
+  container-smoke:
+    name: Container smoke test
+    # A NATIVE arm64 runner, which is free for public repositories. This matters
+    # more than it looks:
+    #
+    #   * The Dockerfile REFUSES to build anything else — its first builder step
+    #     is `test "${TARGETARCH}" = "arm64"`. Producing an amd64 image would
+    #     mean relaxing that assertion, and the assertion is correct: deploy.yml
+    #     ships linux/arm64 and nothing else. A smoke test of an image the
+    #     project never ships would gate the wrong artifact.
+    #   * Running the arm64 image on an amd64 runner is possible through QEMU,
+    #     but then a boot failure could be an emulation artifact, and the whole
+    #     point of this job is to trust its verdict about booting.
+    #
+    # Separate from arm64-container rather than appended to it so the two run in
+    # parallel and a smoke failure is distinguishable at a glance from a build
+    # failure. It re-builds rather than importing that job's image because the
+    # buildx GHA cache makes the second build cheap, and `needs:` would
+    # serialize two jobs that are each useful on their own.
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
+      # No setup-qemu-action here, deliberately: the runner is already arm64, so
+      # the build is native and emulation would only slow it down.
+      - name: Build the image
+        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/arm64
+          push: false
+          # Loaded into the local daemon rather than left in the build cache,
+          # because the next step has to actually run it.
+          load: true
+          tags: zerorouter:smoke
+          # A cache scope of its own: this job builds natively while
+          # arm64-container cross-compiles from amd64, and the two produce
+          # different intermediate layers. Sharing one scope would make each
+          # run evict the other's cache.
+          cache-from: type=gha,scope=zerorouter-router-arm64-native
+          cache-to: type=gha,scope=zerorouter-router-arm64-native,mode=max
+      # Boots the image against Postgres and asserts /healthz, the /v1/models
+      # catalog shape including its retention claims, and that an
+      # unauthenticated completion is refused with the documented error body.
+      # The script owns its own Postgres container: the router must reach the
+      # database over LOOPBACK (router/src/db.rs refuses a non-loopback
+      # DATABASE_URL without a pinned CA), which a `services:` container on the
+      # host network cannot provide to a container.
+      - name: Smoke test the image
+        run: ./scripts/container-smoke.sh zerorouter:smoke

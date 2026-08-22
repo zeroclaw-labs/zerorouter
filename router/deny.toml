@@ -1,0 +1,183 @@
+# cargo-deny configuration for the ZeroRouter router crate.
+#
+# Run from `router/` (this crate is its own Cargo workspace):
+#
+#     cargo deny check
+#
+# Four checks run, and they answer different questions:
+#
+#   advisories  is anything in the lockfile known-vulnerable?
+#   licenses    may we distribute what we link, under AGPL-3.0?
+#   bans        is anything in the graph there that should not be?
+#   sources     did every crate come from a registry we trust?
+#
+# The licence question is the load-bearing one here. ZeroRouter is
+# AGPL-3.0-only (see `../LICENSE`), and the AGPL's network-use clause means
+# every deployment is a distribution. A dependency whose licence imposes terms
+# the AGPL cannot carry is therefore a legal defect in production, not merely
+# in a tarball we never ship.
+
+# ---------------------------------------------------------------------------
+
+[advisories]
+# `yanked = "deny"` catches the other way a lockfile rots: a crate pulled from
+# the registry after we pinned it. That is not a vulnerability, but it is a
+# build that cannot be reproduced from crates.io, which matters for a service
+# whose deploy provenance is attested (`/transparency`).
+yanked = "deny"
+
+# `unmaintained = "workspace"` scores only crates this workspace names
+# directly. The transitive setting is mostly noise for a graph this size — it
+# reports crates we cannot act on without replacing a direct dependency — and a
+# noisy security job gets ignored, which is the failure mode worth avoiding.
+unmaintained = "workspace"
+
+ignore = [
+    # RUSTSEC-2023-0071 — "Marvin Attack": the `rsa` crate's PKCS#1 v1.5
+    # implementation is not constant-time, so an attacker who can time many
+    # private-key operations may recover the key.
+    #
+    # THERE IS NO FIXED RELEASE. RustSec itself records "No safe upgrade is
+    # available"; the constant-time rewrite lives only in the `0.10.0-rc.*`
+    # pre-release line, which is not something a service that moves money
+    # should link against. Bumping is therefore not an option, and this entry
+    # is the honest record of that — not a way to make the job quiet.
+    #
+    # Why the exposure is acceptable in the meantime, checked against the
+    # actual code rather than assumed:
+    #
+    #   * `rsa` is used in exactly ONE file, `src/gcp_auth.rs`, and only to
+    #     SIGN (`rsa::pkcs1v15::SigningKey`). There is no RSA decryption
+    #     anywhere in the crate — no `Pkcs1v15Encrypt`, no OAEP. The Marvin
+    #     attack's sharpest form is a decryption padding oracle, and that
+    #     shape is absent.
+    #   * The key signed with is ZeroRouter's OWN Google service-account key,
+    #     used to mint Vertex access tokens. It is not a customer credential,
+    #     so a compromise does not reach a third party's account the way a
+    #     BYOK key would.
+    #   * The signature is sent to Google's token endpoint and never returned
+    #     to a caller, so its generation is not directly observable.
+    #   * Tokens are CACHED (`TokenCache`, a `tokio::sync::Mutex` held across
+    #     the mint, with `REFRESH_SKEW`), so a signature happens about once
+    #     per token lifetime — order of an hour — not once per request. An
+    #     attacker cannot drive the millions of timed operations the attack
+    #     needs, because request volume does not translate into signing
+    #     volume.
+    #   * The second path into `rsa` is `openidconnect`, which uses it to
+    #     VERIFY ID-token signatures. Public-key operations leak no private
+    #     key.
+    #
+    # Revisit when `rsa` 0.10 ships stable, and delete this entry then.
+    "RUSTSEC-2023-0071",
+]
+
+# ---------------------------------------------------------------------------
+
+[licenses]
+# Every entry below is present in the ACTUAL resolved dependency graph and was
+# added because some crate cannot be taken under anything already on the list.
+# This is deliberately NOT a blanket permissive allowlist: a licence that no
+# current dependency needs stays off, so that adding a dependency which drags
+# in a new licence class is a decision someone makes on purpose, in a diff.
+#
+# `unused-allowed-license = "deny"` is what keeps that promise honest — it
+# fails the check if an entry here stops being load-bearing, so this list
+# cannot quietly accumulate permissions the tree no longer justifies.
+unused-allowed-license = "deny"
+
+allow = [
+    # The overwhelming majority of the graph, dual-licensed `MIT OR
+    # Apache-2.0`. Both are permissive and impose only notice-retention, which
+    # AGPL-3.0 distribution carries without conflict. Apache-2.0's patent
+    # grant is explicitly one-way compatible with GPL-3.0/AGPL-3.0.
+    "MIT",
+    "Apache-2.0",
+
+    # ISC — a simplified BSD-style permissive licence, notice-retention only.
+    # Required rather than optional: `ring` is `Apache-2.0 AND ISC` (both
+    # terms apply simultaneously — an allowlist without ISC cannot satisfy
+    # it), and `rustls-webpki` and `untrusted` are ISC and nothing else.
+    # These arrive through the rustls TLS stack that `reqwest` and `sqlx` use.
+    "ISC",
+
+    # BSD-3-Clause — permissive; its extra clause only forbids using the
+    # authors' names to endorse, which constrains marketing, not distribution.
+    # Required: `curve25519-dalek`, `ed25519-dalek` and `subtle` are
+    # BSD-3-Clause only, and `matchit` (axum's router) is `MIT AND
+    # BSD-3-Clause`, so both terms apply at once.
+    "BSD-3-Clause",
+
+    # Unicode-3.0 — the Unicode licence covering the ICU data and the tables
+    # in `unicode-ident`. Permissive, notice-retention only, and OSI-approved.
+    # Required two ways: the `icu_*` crates carry no alternative, and
+    # `unicode-ident` is `(MIT OR Apache-2.0) AND Unicode-3.0`, so it applies
+    # even though the code half is dual-licensed. Reaches us through `idna`
+    # and therefore `url`/`reqwest`.
+    "CDLA-Permissive-2.0",
+    "Unicode-3.0",
+
+    # Zlib — permissive, notice-retention only. Required for `foldhash`
+    # (hashbrown's default hasher), which is Zlib and nothing else.
+    "Zlib",
+]
+
+# NOT allowed, deliberately, even though it appears in the graph:
+#
+#   LGPL-2.1-or-later — `r-efi` is `MIT OR Apache-2.0 OR LGPL-2.1-or-later`.
+#   Because that is an OR, the crate can be taken under MIT and the copyleft
+#   term never applies. Leaving LGPL off the allowlist is what FORCES that
+#   resolution: if a future dependency ever offers LGPL as its only term, this
+#   check fails and someone has to decide, rather than the term arriving
+#   silently. The same reasoning applies to the licences that are omitted
+#   simply because an allowed one already satisfies the expression —
+#   BSD-1-Clause (`fiat-crypto`), BSD-2-Clause (`zerocopy`), BSL-1.0 (`ryu`,
+#   `whoami`, `wasite`), and Unlicense (`byteorder`, `memchr`).
+
+[licenses.private]
+# `zerorouter` itself is AGPL-3.0-only and `publish = false`. It is the thing
+# being licensed, not a dependency being consumed, so it is not subject to the
+# allowlist above; adding AGPL-3.0-only to `allow` would instead permit an
+# AGPL *dependency* to enter unnoticed.
+ignore = true
+
+# ---------------------------------------------------------------------------
+
+[bans]
+# Duplicate versions are reported but do not fail. This crate has a single
+# workspace member and cannot unify versions that its transitive dependencies
+# disagree about (`base64` 0.21/0.22, `rand` 0.8/0.10, `thiserror` 1/2,
+# `getrandom` 0.2/0.4, several `windows-sys` generations). Failing on those
+# would mean a permanent skip list that has to be edited whenever an unrelated
+# dependency updates — churn that teaches people to edit this file to make CI
+# green, which is exactly the habit a security gate must not create.
+multiple-versions = "warn"
+
+# A `*` version requirement means the next release of that crate ships to
+# production without anyone approving it. None exist today; this keeps it so.
+wildcards = "deny"
+
+deny = [
+    # `openssl`/`openssl-sys` would pull a C TLS stack into an image built on
+    # `distroless/cc`, alongside the rustls stack already in the graph. Two TLS
+    # implementations means two patch cadences and an ambiguous answer to
+    # "which one terminated this connection?". Every current dependency is
+    # configured for rustls (`reqwest` default-features = false, sqlx's
+    # `_tls-rustls-ring-webpki`); this keeps an inadvertent feature flip from
+    # undoing that.
+    { crate = "openssl", reason = "TLS is rustls-only here; see reqwest/sqlx feature selection in Cargo.toml" },
+    { crate = "openssl-sys", reason = "TLS is rustls-only here; see reqwest/sqlx feature selection in Cargo.toml" },
+]
+
+# ---------------------------------------------------------------------------
+
+[sources]
+# Everything must come from crates.io. `unknown-git = "deny"` with an empty
+# allow-list is the point: AGENTS.md records that the router used to pin
+# `zeroclaw-api`/`zeroclaw-providers` to a git rev and that the pin was
+# deliberately CUT — the router owns its wire now. A git dependency
+# reappearing is a change to that decision, and it should fail here and be
+# argued for, rather than land inside an unrelated pull request.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

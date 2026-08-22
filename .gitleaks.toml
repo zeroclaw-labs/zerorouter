@@ -1,0 +1,155 @@
+# gitleaks configuration for ZeroRouter.
+#
+# Run locally exactly as CI does:
+#
+#     gitleaks git --config .gitleaks.toml --redact            # full history
+#     gitleaks dir --config .gitleaks.toml .                   # working tree
+#
+# Every entry below suppresses a KNOWN NON-SECRET that the default rules flag
+# on a generic pattern. Two rules were followed in writing them, and they are
+# what keep this file from decaying into a blanket mute:
+#
+#   1. Each allowlist names the rule it applies to (`targetRules`). Allowlisting
+#      a path outright would also hide an AWS key, a GitHub token or a Stripe
+#      SECRET key dropped into that same file. Scoping to the one rule that
+#      misfires keeps every other rule live everywhere.
+#
+#   2. Where the non-secret is a recognizable literal, the allowlist matches the
+#      LITERAL rather than the file. That way the exemption travels with the
+#      placeholder if the test moves, and a genuine credential pasted into the
+#      same file is still caught.
+#
+# If you are adding an entry here, the question to answer in its comment is not
+# "is this flagged?" but "why is this not a credential?".
+
+[extend]
+useDefault = true
+
+# ---------------------------------------------------------------------------
+
+[[allowlists]]
+description = """
+Build output and vendored dependencies.
+
+This is the ONE entry that is not scoped to a rule, and it is safe because
+these paths contain nothing this repository authored: `git ls-files` reports
+zero tracked files under any of them, and all three are gitignored.
+
+It has no effect on the CI history scan (`gitleaks git` reads commits, and
+these were never committed). It exists for `gitleaks dir`, the working-tree
+mode a developer runs locally — without it, compiled `.rmeta` files under
+router/target/ match the `private-key` rule on fragments of the `rsa`, `pkcs1`
+and `pem-rfc7468` crates' embedded documentation, producing eleven findings
+that are all noise about somebody else's doc comments.
+"""
+paths = [
+    '''(^|/)target/''',
+    '''(^|/)node_modules/''',
+    '''^portal/dist/''',
+]
+
+# ---------------------------------------------------------------------------
+
+[[allowlists]]
+description = """
+The committed throwaway RSA private key used by the gcp_auth test suite.
+
+router/tests/fixtures/README.md documents it at length: it was generated for
+the tests, authenticates nothing, and has never been uploaded to Google or
+anywhere else. It is committed rather than generated per run because RSA
+keygen is slow and a fixture that changes every run cannot be reasoned about.
+That README explicitly anticipates this situation and says the correct
+response is to allowlist the path rather than weaken the test — which is what
+this entry does.
+
+Scoped to `private-key` only, and to that exact path: a private key appearing
+anywhere else in the repository is still a finding.
+"""
+targetRules = ["private-key"]
+paths = ['''^router/tests/fixtures/vertex_test_key\.pem$''']
+
+# ---------------------------------------------------------------------------
+
+[[allowlists]]
+description = """
+Stripe PUBLISHABLE keys, in docs and in tests.
+
+A publishable key is designed to be shipped to browsers — the portal serves
+ZeroRouter's own to every visitor via /api/me — so it is public by
+construction and discloses nothing. `docs/DEPLOY.md` mentions the `pk_live_`
+form only to say which environment it belongs to.
+
+The matched literals are additionally all `pk_test_*` placeholders
+(`pk_test_e2e_placeholder`, `pk_test_visible`, `pk_test_unused`,
+`pk_test_mock`) that name no real Stripe account.
+
+NOTE the deliberate asymmetry: `sk_live_`/`sk_test_` SECRET keys are NOT
+allowlisted here, and the default `stripe-access-token` rule still covers
+them. Only the publishable half is exempt.
+"""
+targetRules = ["generic-api-key"]
+regexTarget = "match"
+regexes = ['''pk_(?:test|live)_[A-Za-z0-9_]*''']
+
+# ---------------------------------------------------------------------------
+
+[[allowlists]]
+description = """
+ZeroRouter's own API-key placeholders in documentation and tests.
+
+`zcr_` is ZeroRouter's key prefix. The flagged occurrences are the literal
+documentation placeholder `zcr_YOUR_KEY` (docs/getting-started-hosted.md, in
+the copy-paste curl example) and the test constant `zcr_0123456789abcdef`
+(router/src/user.rs, in a test asserting that a key FINGERPRINT is not the key
+itself). Neither was ever issued and neither authenticates against any
+deployment.
+
+A real ZeroRouter key is a high-entropy random string, so this narrow pattern
+— `YOUR_KEY` and an obvious counting sequence — cannot match one.
+"""
+targetRules = ["curl-auth-header", "generic-api-key"]
+regexTarget = "match"
+regexes = [
+    '''zcr_YOUR_KEY''',
+    '''zcr_0123456789abcdef''',
+]
+
+# ---------------------------------------------------------------------------
+
+[[allowlists]]
+description = """
+BYOK test literals that exist precisely to prove a key is NOT disclosed.
+
+router/tests/byok.rs seals a customer key and then asserts the ciphertext
+contains no recognizable run of the plaintext — so the strings `sk-customer`,
+`OWNKEY` and `0123456789abcdef` appear as NEEDLES being searched for, not as
+credentials. router/tests/portal.rs posts `sk-anything-0123456789abcdef` to
+the BYOK endpoint for the same reason.
+
+Removing these literals would delete the assertion that customer keys are not
+stored in the clear, which is the single most security-relevant test in the
+BYOK path.
+"""
+targetRules = ["generic-api-key"]
+regexTarget = "match"
+regexes = [
+    '''sk-anything-0123456789abcdef''',
+    '''sk-customer[A-Za-z0-9-]*''',
+    '''OWNKEY''',
+]
+
+# ---------------------------------------------------------------------------
+
+[[allowlists]]
+description = """
+Container smoke-test placeholders.
+
+scripts/container-smoke.sh sets provider credential env vars to the literal
+`smoke-placeholder-not-a-real-key` so that /v1/models renders a non-empty
+catalog — the endpoint hides a lane whose credential variable is unset. The
+value is never dialed against any provider; it exists only to make the lane
+visible to the catalog renderer.
+"""
+targetRules = ["generic-api-key"]
+regexTarget = "match"
+regexes = ['''smoke-placeholder-not-a-real-key''']
