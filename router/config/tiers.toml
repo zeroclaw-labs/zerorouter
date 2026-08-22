@@ -777,7 +777,7 @@ openrouter_slug = "xai"
 [retention.vertex]
 posture = "standard"
 description = "Vertex AI on ZeroRouter's dedicated Google Cloud project: in-memory caching disabled, no request-response logging, and Google does not train on customer data. Pending Google's approval of the project's abuse-monitoring exception, prompts flagged by Google's abuse systems can be retained by Google for up to 90 days — until that approval lands this lane is labelled as subject to provider retention."
-source_url = "https://docs.cloud.google.com/vertex-ai/generative-ai/docs/data-governance"
+source_url = "https://docs.cloud.google.com/gemini-enterprise-agent-platform/resources/zero-data-retention"
 verified = "2026-08-21"
 source_sha256 = "4f53b20a6c4e9810bcb035db83b997b604720cd21598e6f35341e63d1aaaeeca"
 source_extract_anchors = [
