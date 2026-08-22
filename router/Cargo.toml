@@ -55,7 +55,7 @@ chrono = { version = "0.4", features = ["clock", "serde"] }
 # the failure would be silent in exactly the way that matters least — Google
 # would simply reject the assertion, until the day it did not.
 rsa = "0.9"
-pkcs8 = "0.10"
+pkcs8 = "0.11"
 clap = { version = "4.5", features = ["derive"] }
 crc = "3"
 futures-util = "0.3"
