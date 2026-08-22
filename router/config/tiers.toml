@@ -787,6 +787,196 @@ source_extract_anchors = [
 ]
 openrouter_slug = "google-vertex"
 
+# BASIS 2 AGAIN — AN ENFORCED ACCOUNT SETTING — BUT WITHOUT xAI'S SAFETY NET.
+# Read this pin against `[retention.xai]` above, because the two rest on the
+# same basis and are NOT equally well guarded, and the difference is the whole
+# reason this comment is long.
+#
+# Groq's Zero Data Retention is a toggle in the account's Data Controls, flipped
+# by an organization admin, exactly the shape of xAI's team-level switch. What
+# Groq does NOT publish is any per-response attestation, so there is nothing for
+# the dispatch path to assert and this lane is verified the ordinary way: a
+# human read the page on `verified`, and `retention-drift` re-reads it.
+#
+# THAT ABSENCE WAS CHECKED, NOT ASSUMED (2026-08-22). Groq's docs embed their
+# own OpenAPI document, and the only response header it declares anywhere is
+# `Transfer-Encoding`; the sole occurrence of the token "zero-data-retention" in
+# the page source is the HTML anchor id of the heading below, and the
+# `x-groq-metadata` / `x-groq-meta` keys that look like headers are OpenAPI
+# vendor extensions carrying documentation examples. If Groq ever ships a real
+# one, wire `attestation_header` / `attestation_expect` in providers.json and
+# this lane gains xAI's per-request guarantee for free.
+#
+# WHAT THE PAGE SAYS, verbatim (console.groq.com/docs/your-data, read
+# 2026-08-22):
+#
+#   "By default, Groq does not retain customer data for inference requests."
+#   "We may temporarily log inputs and outputs only when: Troubleshooting
+#    errors that degrade platform reliability, or Investigating suspected abuse
+#    (e.g. rate-limit circumvention)."
+#   "These logs are retained for up to 30 days, unless legally required to
+#    retain longer. You may opt out of this storage in Data Controls settings"
+#   "All customers may enable Zero Data Retention (ZDR) in Data Controls
+#    settings. When ZDR is enabled, Groq will not retain customer data for
+#    system reliability and abuse monitoring. As noted above, this also means
+#    that features that rely on data retention to function will be disabled.
+#    Organization admins can decide to enable ZDR globally or on a per-feature
+#    basis at any time"
+#   "All customer data is retained in Google Cloud Platform (GCP) buckets
+#    located in the United States."
+#
+# and from the page's summary table, the row that decides this lane, because it
+# names the exact endpoint providers.json dials:
+#
+#   Inference | /openai/v1/chat/completions ... | System reliability and abuse
+#   monitoring | Up to 30 days | ZDR Eligible: Yes
+#
+# SO THE DEFAULT IS NOT GOOD ENOUGH AND THE TOGGLE IS THE ENTIRE CLAIM. Groq's
+# default already says it does not retain inference data, which is why it is
+# tempting to call this basis 3 and stop. It is not basis 3, because the same
+# page carves out a path back to thirty days of stored prompts and completions
+# whenever Groq decides it is troubleshooting or investigating abuse — a
+# condition the customer cannot observe and ZeroRouter cannot query. ZDR is what
+# closes that carve-out. A key on an account without it authenticates, serves,
+# and silently sells a thirty-day-eligible lane under a `zero` label.
+#
+# "GLOBALLY OR ON A PER-FEATURE BASIS" IS THE SHARP EDGE. Groq's toggle is not
+# one switch, and a per-feature ZDR that covers Batch but not Inference would
+# leave this lane's claim false while the Data Controls page shows ZDR plainly
+# enabled. The runbook in docs/DEPLOY.md therefore requires the Inference row
+# specifically, not "ZDR is on". Enabling it globally is the recommended form
+# because it is the one that cannot be read wrong.
+#
+# WHAT THIS PAGE DOES NOT SAY, AND WHY THE DESCRIPTION IS SILENT TOO. Every
+# other pin in this table states a training posture, because every other
+# vendor's page states one. Groq's does not. The only occurrence of the word
+# "training" on it is "Model weights and training datasets retained until
+# deleted by the customer", which is about data the CUSTOMER uploads to
+# fine-tune — it says nothing about whether Groq trains on inference inputs.
+#
+# So the description above claims nothing about training. A first draft of it
+# ended "Groq does not use API data to train models", which is very probably
+# true and is what OpenRouter's directory reports, and it was cut because
+# neither of those is this pin's evidence. The rule that a `zero` description
+# names its basis cuts both ways: a clause the pinned page does not support does
+# not belong in a sentence customers read, however likely it is to be right.
+# Groq's Terms of Use may well settle it; that is a different document and would
+# need its own pin.
+#
+# `openrouter_slug` is `groq`, AND UNLIKE THE xAI PIN THIS ONE IS EXPECTED TO
+# CORROBORATE GREEN — OpenRouter's directory reports `retainsPrompts: false`
+# and `training: false` for `groq` (read 2026-08-22 from the same
+# `api/frontend/v1/all-providers` document the corroboration pass fetches).
+# Worth knowing how little that agreement is worth: a third party cannot see
+# this account's Data Controls, so what it is describing is Groq's DEFAULT — the
+# very posture that still permits thirty-day abuse logs. It agrees with the pin
+# for a reason weaker than the pin's own. Advisory either way.
+[retention.groq]
+posture = "zero"
+description = "Groq under organization-level Zero Data Retention: inputs and outputs are not retained for inference requests, and the temporary reliability and abuse-monitoring logs Groq may otherwise keep for up to 30 days do not apply. Enabling ZDR also disables the batch and fine-tuning features that require storage to work. Unlike the Grok lanes there is no per-response attestation, so this rests on the account setting plus a pinned policy page rather than a runtime check."
+source_url = "https://console.groq.com/docs/your-data"
+verified = "2026-08-22"
+source_sha256 = "d6409f6168ca3f4221a90e3376554c81d3d1b459be164dbb329ccd9dfdd241ce"
+source_extract_anchors = [
+  "By default, Groq does not retain customer data for inference requests.",
+  "All customers may enable Zero Data Retention",
+]
+openrouter_slug = "groq"
+
+# THE ONLY PIN IN THIS TABLE WHOSE `zero` IS THE VENDOR'S DEFAULT AND WHOSE
+# RISK IS THEREFORE INVERTED. Fireworks (basis 3) publishes zero retention as
+# what the platform does for everybody. Bedrock, xAI, Vertex and Groq (basis 2)
+# require the operator to go and turn something ON. Together is basis 3 with a
+# basis-2 hazard bolted to it: the guarantee arrives switched on, and there are
+# three organization toggles that TAKE IT AWAY.
+#
+# That inversion is worth stating because it changes what the runbook is for.
+# Everywhere else the provisioning step is "enable the thing or the lane is a
+# lie". Here it is "confirm nobody enabled the things", which is the step people
+# skip, because a default that is already correct produces no error when it is
+# quietly changed later.
+#
+# WHAT THE PAGE SAYS, verbatim (docs.together.ai/docs/privacy-and-security, read
+# 2026-08-22):
+#
+#   "Together does not store inputs or outputs by default, i.e. it supports zero
+#    data retention (ZDR). Temporary caching may be used to improve performance
+#    unless otherwise configured."
+#   "Data sharing for training other models is opt-in and not enabled by
+#    default."
+#   "Store prompts and model responses: opt in to storing prompts and outputs
+#    for product improvements. Required before you can enable passthrough
+#    models."
+#   "Allow organization's data for training: opt in to using your organization's
+#    data for training models released by Together AI and partners."
+#   "Allow passthrough models: opt in to models that forward prompts and
+#    responses to third-party providers"
+#   "When a request uses an organization's API key, the organization setting is
+#    what applies."
+#   "Models published by third-party authors (DeepSeek, Qwen, Mistral, etc.) and
+#    hosted on Together run on Together's own infrastructure. They do not call
+#    out to the model author. The model author has no access to your requests or
+#    API calls."
+#
+# THE PASSTHROUGH CARVE-OUT CLOSES ITSELF, which is the one genuinely reassuring
+# thing here and the reason no model below needed to be excluded for it. Every
+# other `zero` pin in this file carries a surface that would break it if
+# somebody dialled it — Fireworks' and xAI's Responses APIs, Vertex's
+# Interactions API — and each is held off by a rule a human has to keep
+# remembering. Together's equivalent hazard is the passthrough model, which
+# forwards the prompt to a third party under THAT party's policy. But Together
+# requires "Store prompts and model responses" to be ON before passthrough can
+# be enabled at all, and that toggle being OFF is already a precondition of this
+# pin. So the two hazards are the same hazard: satisfy the storage condition and
+# passthrough is structurally unavailable, not merely unused. The four lanes
+# below are in any case first-party — the last quotation above covers exactly
+# the DeepSeek/Qwen/Moonshot/NVIDIA weights they serve.
+#
+# WHAT IS NOT CLAIMED, and it is in the description rather than buried here
+# because a customer is entitled to it: "temporary caching may be used to
+# improve performance unless otherwise configured". Together does not say what
+# that cache holds, where it lives, or how long it survives, and there is no
+# documented switch on the serverless product to turn it off. This is the same
+# shape as the in-memory cache the Vertex pin disables — except that there the
+# operator CAN disable it and does, and here the sentence is all there is. It
+# does not sink the pin, because the vendor states plainly and separately that
+# inputs and outputs are not stored; it does mean this pin's `zero` is the
+# vendor's word about persistence with an unquantified caching caveat attached,
+# and that a reader deserves to see the caveat.
+#
+# `openrouter_slug` is `together` and this pin should corroborate GREEN
+# (`retainsPrompts: false`, `training: false`, read 2026-08-22). Here the
+# agreement is worth slightly more than Groq's: what OpenRouter is describing is
+# the same published default this pin actually rests on, rather than a default
+# the pin exists to escape.
+[retention.together]
+posture = "zero"
+description = "Together does not store inputs or outputs by default — zero data retention is the platform default rather than a setting to negotiate — and this organization leaves all three Privacy toggles off, so prompts and responses are not stored, not used for training, and never forwarded to a third-party passthrough provider. Models run on Together's own infrastructure and the model authors receive nothing. Together does state that temporary caching may be used to improve performance unless otherwise configured, and publishes no further detail on it."
+source_url = "https://docs.together.ai/docs/privacy-and-security"
+verified = "2026-08-22"
+source_sha256 = "1f7216f9af9f36d711a2f83939ec52ada096879bf8d3caa38a9eb81694f6c9f9"
+# THREE ANCHORS, AND THE THIRD IS HERE BECAUSE IT WAS MEASURED TO BE MISSING.
+# Each anchor hashes 2,000 characters running forward from itself, so the set
+# has to be checked against the CLAIMS rather than eyeballed. The first two
+# cover the storage default, the training opt-in, all three organization
+# toggles, and the passthrough carve-out. They stop short of "Models published
+# by third-party authors ... run on Together's own infrastructure. They do not
+# call out to the model author" — which sits two sections further down and is
+# the sentence that covers the DeepSeek, Qwen, Moonshot and NVIDIA weights every
+# lane below actually dials. Without a third anchor that sentence could have
+# been rewritten with the pin still reporting UNCHANGED.
+#
+# The anchors are apostrophe-free on purpose, the same trap the Vertex pin
+# documents: this page renders "organization's" and "Together's" with straight
+# quotes today and a CMS switching to curly ones would redden the pin for a
+# typographic change.
+source_extract_anchors = [
+  "Together does not store inputs or outputs by default",
+  "meaning that Together forwards your prompts and responses directly to the upstream provider",
+  "Models published by third-party authors",
+]
+openrouter_slug = "together"
+
 # ---------------------------------------------------------------------------
 # PINS — you get this model, at cost, and it does not change.
 # ---------------------------------------------------------------------------
@@ -2378,3 +2568,411 @@ min_prompt_tokens = 200000
 input_per_mtok = 4.00
 cached_input_per_mtok = 0.40
 output_per_mtok = 18.00
+
+# ---------------------------------------------------------------------------
+# GROQ (added 2026-08-22) — THREE ZERO-RETENTION LANES BOUGHT FOR SPEED, AND THE
+# FIRST LANES IN THIS FILE WHOSE CONTEXT WINDOW IS UNDER 200,000.
+#
+# Groq sells latency. Its own model table publishes a tokens-per-second figure
+# beside every price, which no other vendor in this file does, and the three
+# lanes below run at ~500, ~1000 and ~500 t/s. That is the entire reason to
+# carry them: none of these three models is scarce — `openai/gpt-oss-120b` is
+# also on Together at the identical $0.15/$0.60 — and what Groq adds is not a
+# cheaper token but a faster one.
+#
+# THREE LANES IS THE WHOLE OF GROQ'S GENERAL-PURPOSE CHAT CATALOG, not a
+# selection from it. This is the smallest upstream in the file by a wide margin
+# and the shortlist was not a matter of taste; everything held out is held out
+# for a stated reason:
+#
+# - `openai/gpt-oss-safeguard-20b` — a safety CLASSIFIER, priced identically to
+#   the `gpt-oss-20b` lane below. It answers "does this content violate a
+#   policy", not a user's prompt. Nothing blocks it; it is simply not what a
+#   general gateway's customers are naming a model to get.
+# - `meta-llama/llama-prompt-guard-2-22m` / `-86m` — same shape, and with
+#   512-token windows they could not satisfy any sane context assertion.
+# - `minimaxai/minimax-m2.7` — reads "Contact Sales" in BOTH the price and the
+#   rate-limit column. This catalog's basis is a published rate card; a lane
+#   whose cost is a negotiation has no pass-through basis to record, and a
+#   guessed one on a money path is exactly the mistake the header forbids.
+# - `groq/compound` and `groq/compound-mini` — agentic SYSTEMS rather than
+#   models, publishing no token price at all. They also call built-in web
+#   search and code execution, which would carry the prompt outside the
+#   envelope `[retention.groq]` describes. Two independent disqualifications.
+# - `whisper-large-v3*`, `canopylabs/orpheus-*` — audio in, audio out, priced
+#   per hour and per character. Not chat-completions lanes.
+# - LLAMA IS GONE, and this is a note for whoever comes looking. Groq's catalog
+#   carried `llama-3.3-70b-versatile` and `llama-3.1-8b-instant` and neither
+#   appears in any current pricing table; they survive only in the docs'
+#   model-migration guidance. models.dev still lists both with prices, which is
+#   the one place a reader might reasonably conclude they are still buyable.
+#   They are not. Do not add them back from that source alone.
+#
+# PRICES, all read 2026-08-22 from Groq's own model table at
+# console.groq.com/docs/models, the column headed "PRICE PER 1M TOKENS", and all
+# three agreeing with models.dev to the cent on both dimensions. models.dev
+# files Groq under `groq`, which is ZeroRouter's own key, so unlike Fireworks
+# and Together no `source_provider_key` is declared — and that is a coincidence
+# of naming rather than a rule, exactly as `providers.rs` says.
+#
+# THE CACHED RATES COME FROM A PUBLISHED FORMULA, NOT A PUBLISHED NUMBER. Groq's
+# prompt-caching page states one blanket rule — "There is a 50% discount for
+# cached input tokens" — and prints no per-model cached figure anywhere. Half of
+# each input rate is therefore what is recorded below, and models.dev's
+# independent per-model figures (0.075, 0.0375, 0.30) agree with that
+# arithmetic exactly, which is the triple agreement this file wants.
+#
+# One caveat that the arithmetic hides, recorded here because it will look like
+# an error later: the same page limits caching to `gpt-oss-20b`,
+# `gpt-oss-120b` and `gpt-oss-safeguard-20b`, so `qwen/qwen3.6-27b` is NOT a
+# cached-eligible model today and its 0.30 below will simply never fire. It is
+# declared rather than omitted for two reasons — models.dev publishes it, so
+# omitting it would leave `catalog-drift` comparing an implicit 0.60 fallback
+# against a source figure of 0.30 and reporting a 2x basis error on a lane that
+# has none; and if Groq extends caching to the model, 0.30 is already the right
+# number under its own published rule. Nothing is billed on it either way.
+#
+# TWO METADATA FLOORS MOVED FOR THESE LANES, and the argument is in
+# `tests/http.rs` where the exception lists live. Every Groq model has a 131,072
+# context window and `qwen/qwen3.6-27b` caps completions at 16,384 — both real,
+# both documented by vendor and models.dev alike, and both under assertion
+# floors written when this catalog was made entirely of frontier models. The
+# floors were split rather than lowered: an ABSENT window or max output still
+# fails for every lane, and a small DECLARED one is now a named, reviewed
+# exemption. Lowering the numbers would have deleted the guard for everyone.
+#
+# THESE LANES SHIP DARK. `GROQ_API_KEY` is unset, so #89's dispatchability
+# filter hides all three from `/v1/models` and from route construction, and this
+# deploys inert. Provisioning is NOT just creating a key: as with xAI, the key
+# must belong to an account whose Data Controls have ZDR enabled for Inference,
+# or every lane below serves under a `zero` label it does not have. See
+# docs/DEPLOY.md.
+
+[tiers."groq/gpt-oss-120b"]
+
+[tiers."groq/gpt-oss-120b".rates]
+input_per_mtok = 0.15
+cached_input_per_mtok = 0.075
+output_per_mtok = 0.60
+
+[[tiers."groq/gpt-oss-120b".candidates]]
+id = "groq/gpt-oss-120b"
+provider = "groq"
+# `openai/gpt-oss-120b` is Groq's own model string for the open-weight model
+# OpenAI published; the `openai/` prefix here is part of the UPSTREAM id and has
+# nothing to do with ZeroRouter's `openai` provider, which dials a different
+# company's API. The tier id is `groq/...` because the lane is the Groq one.
+model = "openai/gpt-oss-120b"
+
+# Every figure agreed by Groq's table and models.dev: 131,072 and 65,536. The
+# window is the smallest in this catalog and is deliberately stated rather than
+# rounded — a client that assumes more will fail a long request rather than
+# degrade quietly, which is the whole point of publishing it.
+[tiers."groq/gpt-oss-120b".candidates.metadata]
+context_window = 131072
+max_output_tokens = 65536
+input_modalities = ["text"]
+tool_call = true
+
+[tiers."groq/gpt-oss-120b".candidates.rates]
+input_per_mtok = 0.15
+cached_input_per_mtok = 0.075
+output_per_mtok = 0.60
+
+# The cheapest lane in the entire catalog on both dimensions, and the fastest
+# thing in it at ~1000 t/s.
+[tiers."groq/gpt-oss-20b"]
+
+[tiers."groq/gpt-oss-20b".rates]
+input_per_mtok = 0.075
+cached_input_per_mtok = 0.0375
+output_per_mtok = 0.30
+
+[[tiers."groq/gpt-oss-20b".candidates]]
+id = "groq/gpt-oss-20b"
+provider = "groq"
+model = "openai/gpt-oss-20b"
+
+[tiers."groq/gpt-oss-20b".candidates.metadata]
+context_window = 131072
+max_output_tokens = 65536
+input_modalities = ["text"]
+tool_call = true
+
+[tiers."groq/gpt-oss-20b".candidates.rates]
+input_per_mtok = 0.075
+cached_input_per_mtok = 0.0375
+output_per_mtok = 0.30
+
+# THE ONLY GROQ LANE THAT TAKES IMAGES, and the only one whose max output is
+# genuinely modest. Groq's table gives it a 20 MB max file size where the
+# gpt-oss rows give none, and Groq documents an OCR and image-recognition
+# surface; models.dev independently reports text and image. Two sources, one
+# answer, so the modality list is declared rather than withheld.
+#
+# 16,384 max completion tokens is not a typo and not a sample-request figure —
+# it is the value in the vendor's own MAX COMPLETION TOKENS column, and
+# models.dev agrees. It is a quarter of what the gpt-oss lanes allow and an
+# eighth of the catalog's assertion floor, which is why this id is named in
+# `tests/http.rs`.
+[tiers."groq/qwen3.6-27b"]
+
+[tiers."groq/qwen3.6-27b".rates]
+input_per_mtok = 0.60
+cached_input_per_mtok = 0.30
+output_per_mtok = 3.00
+
+[[tiers."groq/qwen3.6-27b".candidates]]
+id = "groq/qwen3.6-27b"
+provider = "groq"
+model = "qwen/qwen3.6-27b"
+
+[tiers."groq/qwen3.6-27b".candidates.metadata]
+context_window = 131072
+max_output_tokens = 16384
+input_modalities = ["text", "image"]
+tool_call = true
+
+[tiers."groq/qwen3.6-27b".candidates.rates]
+input_per_mtok = 0.60
+cached_input_per_mtok = 0.30
+output_per_mtok = 3.00
+
+# ---------------------------------------------------------------------------
+# TOGETHER (added 2026-08-22) — FOUR ZERO-RETENTION LANES CHOSEN ENTIRELY BY
+# WHAT FIREWORKS ALREADY SELLS.
+#
+# Together's serverless catalog is the largest this file has met, and it
+# overlaps ZeroRouter's existing Fireworks lanes on FIVE models. Not one of the
+# five was pinned, because on every one of them Fireworks is the same price or
+# cheaper — so a Together twin would add a second row, a second thing to
+# re-verify, and nothing a customer could want. The comparison, all figures read
+# 2026-08-22 from together.ai/pricing (the "Serverless Inference" table) against
+# the Fireworks rates already in this file:
+#
+#   model              Together in/cached/out   Fireworks in/cached/out   verdict
+#   Kimi K3            3.00 / 0.30 / 15.00      3.00 / 0.30 / 15.00       identical
+#   MiniMax M3         0.30 / 0.06 / 1.20       0.30 / 0.06 / 1.20        identical
+#   GLM-5.2            1.40 / 0.26 / 4.40       1.40 / 0.14 / 4.40        cached 1.9x dearer
+#   DeepSeek V4 Pro    1.74 / 0.20 / 3.48       1.74 / 0.145 / 3.48       cached 1.4x dearer
+#   DeepSeek V4 Flash  0.14 / 0.03 / 0.28       0.14 / 0.028 / 0.28       cached dearer
+#
+# Two are identical to the cent and three are dearer on the cached dimension
+# only. Together also loses the context comparison on the two that matter —
+# Fireworks serves GLM-5.2 at 1,048,575 tokens against Together's 512,000, and
+# DeepSeek V4 Pro at 1,000,000 against 512,000. There is no reading on which a
+# twin earns its row, so the four below are all models this catalog cannot
+# currently sell at all.
+#
+# WHY THESE FOUR:
+#
+# - `Qwen/Qwen3.6-Plus` — a 1,000,000-token open-weight model at 0.50/3.00. The
+#   catalog's only million-token lanes are Kimi K3 (6x the input price, 5x the
+#   output) and the Gemini pair. This is the cheap long-context lane.
+# - `moonshotai/Kimi-K2.7-Code` — a coding specialist at roughly a third of Kimi
+#   K3's input price and a quarter of its output. Same lab, adjacent generation,
+#   and the price gap is the point.
+# - `nvidia/nemotron-3-ultra-550b-a55b` — a 550B open-weight flagship with a
+#   512,300-token window; nothing else here is from NVIDIA and nothing else is
+#   this shape.
+# - `deepseek-ai/DeepSeek-V4-Pro-0813` — read the next paragraph before touching
+#   this one.
+#
+# THIS SECTION ANSWERS AN OPEN QUESTION THE FIREWORKS SECTION LEFT. That section
+# records, at length, that it pinned the UNDATED `deepseek-v4-pro` id because
+# Fireworks' price list carries exactly one DeepSeek V4 Pro row and the 0813
+# snapshot has no row in it — publishing 1.32/0.044/3.96 on a model page while
+# the list stayed silent. Its instruction was "once a key exists, send one real
+# request to each id and read the billing line".
+#
+# Together settles half of it without a key: it lists `DeepSeek-V4-Pro-0813` in
+# its serverless price table at 1.32 input / 0.13 cached / 3.96 output, and
+# models.dev agrees to the cent on all three. So the 0813 snapshot IS a
+# published, purchasable model at a real rate card — just not at Fireworks —
+# and 1.32/3.96 is confirmed by two independent sources as its input and output
+# price. Note what is NOT settled: Fireworks' own page said the CACHED rate was
+# 0.044 and Together says 0.13, which is a 3x disagreement between two vendors
+# about the same weights and is exactly why per-vendor rate cards are pinned per
+# lane rather than per model. THE FIREWORKS TIER IS UNCHANGED by this. Nothing
+# here licenses moving it to 0813; that still needs the billing-line probe its
+# own comment describes.
+#
+# WHAT ELSE WAS LOOKED AT AND LEFT:
+#
+# - `Qwen/Qwen3.5-397B-A17B` — the best case for a fifth lane, and it fails an
+#   availability check rather than a price one. It is priced on
+#   together.ai/pricing (0.60/0.35/3.60) and carried by models.dev, but it is
+#   ABSENT from Together's own serverless model list at
+#   docs.together.ai/docs/serverless-models, which is the document that says
+#   what an API key can actually call. A price for a model you cannot dial is
+#   not a lane. Two vendor pages disagreeing about whether a model exists is
+#   resolved the conservative way; re-check it if a key ever lands.
+# - `thinkingmachines/Inkling` (1.00/0.17/4.05) — a genuinely interesting
+#   524,288-token model, held out for a wire reason rather than a commercial
+#   one. models.dev reports its input modalities as text, image AND AUDIO, and
+#   no ZeroRouter wire carries audio — `tests/http.rs` asserts that no lane may
+#   advertise a modality the compat surface refuses. Declaring `["text",
+#   "image"]` and dropping the audio claim would be a defensible lane; it would
+#   also be this file quietly narrowing a vendor's model, so it waits for a
+#   deliberate decision rather than arriving as a side effect of this one.
+# - `Qwen/Qwen3.7-Plus` (0.32/1.28, 1,000,000 tokens) — the cheapest long-
+#   context model either vendor sells, and omitted only because models.dev has
+#   NO ROW for it. `catalog-drift` would report NOT IN SOURCE, which is
+#   actionable and fails the nightly job, so pinning it means either an
+#   `unreconcilable_reason` on a lane that is merely new, or a red check. Worth
+#   revisiting once the source catches up.
+# - `Qwen/Qwen3.8-2.4T-A95B` (2.50/0.50/6.25) — the same weights this file
+#   already sells as `fireworks/qwen3.8-max` at 2.00/0.25/6.00. Dearer on input
+#   and twice the cached rate. Note also that the Fireworks twin needed a
+#   per-tier `standard` retention override because it is closed-weight and
+#   Fireworks' zero-retention sentence is scoped to open models. Together's is
+#   not scoped that way, so this lane could have been `zero` — an interesting
+#   asymmetry, and not enough to buy a dearer token.
+# - `Prism-ML/Ternary-Bonsai-27B` — free ($0.00 both dimensions). An unbillable
+#   rate is a STRUCTURAL fault in this file and would refuse the whole catalog.
+# - `thinkingmachines/Inkling-Small`, `meta-models/Muse-Glimmer-30B` — no
+#   models.dev row, same NOT IN SOURCE problem as Qwen3.7-Plus.
+# - `openai/gpt-oss-120b` / `-20b` — Together sells both. The 120B is the
+#   identical 0.15/0.60 that the Groq section above pins, and Groq adds ~500 t/s
+#   and a 50% cached discount that Together does not offer at all, so the Groq
+#   lane strictly dominates. The 20B is genuinely CHEAPER on Together
+#   (0.05/0.20 against Groq's 0.075/0.30) and is the one real cross-vendor
+#   trade-off in this pair — a second row for the same weights, slower but a
+#   third off. It was left out to keep one model in one place; the catalog
+#   already carries Claude twins on `anthropic/*` and `bedrock/*`, so there is
+#   precedent for adding it later if anyone wants the cheaper token.
+# - `meta-llama/Llama-3.3-70B-Instruct-Turbo` at 1.04/1.04 — an older model
+#   priced above several better ones here.
+#
+# PRICES AND METADATA: rates from together.ai/pricing, context lengths from
+# docs.together.ai/docs/serverless-models, both read 2026-08-22, and every
+# figure below agreeing with models.dev — which files Together under
+# `togetherai`, declared as `source_provider_key` in providers.json because a
+# guess landing on a real-but-wrong key reconciles green against somebody
+# else's prices.
+#
+# THESE LANES SHIP DARK. `TOGETHER_API_KEY` is unset. Provisioning here is the
+# inverse of every other zero-retention lane: nothing must be switched ON, but
+# the three organization Privacy toggles must be confirmed OFF. See
+# docs/DEPLOY.md — and read `[retention.together]` above for why a correct
+# default is the easiest guarantee in this file to lose silently.
+
+# 1,000,000 tokens at 0.50/3.00. Together's rate card shows a single input price
+# with no "(cached)" figure beside it, unlike its Kimi and DeepSeek rows which
+# show both, and models.dev likewise records no cache-read rate — so cached
+# input bills at the full input rate here. That is stated explicitly below
+# rather than left to the header's fallback, because on a money path an
+# intentional equality should look intentional.
+[tiers."together/qwen3.6-plus"]
+
+[tiers."together/qwen3.6-plus".rates]
+input_per_mtok = 0.50
+cached_input_per_mtok = 0.50
+output_per_mtok = 3.00
+
+[[tiers."together/qwen3.6-plus".candidates]]
+id = "together/qwen3.6-plus"
+provider = "together"
+model = "Qwen/Qwen3.6-Plus"
+
+# models.dev's 500,000 max output is half the window, which is the shape of a
+# real cap rather than the window-echoing figure that disqualified MiniMax M3's
+# and grok-4.6's. Together publishes no output cap, so it is not a second claim
+# in conflict — it is silence, and the header's rule is that a field is declared
+# where the sources agree or where the vendor is merely less precise.
+[tiers."together/qwen3.6-plus".candidates.metadata]
+context_window = 1000000
+max_output_tokens = 500000
+input_modalities = ["text"]
+tool_call = true
+
+[tiers."together/qwen3.6-plus".candidates.rates]
+input_per_mtok = 0.50
+cached_input_per_mtok = 0.50
+output_per_mtok = 3.00
+
+[tiers."together/kimi-k2.7-code"]
+
+[tiers."together/kimi-k2.7-code".rates]
+input_per_mtok = 0.95
+cached_input_per_mtok = 0.19
+output_per_mtok = 4.00
+
+[[tiers."together/kimi-k2.7-code".candidates]]
+id = "together/kimi-k2.7-code"
+provider = "together"
+model = "moonshotai/Kimi-K2.7-Code"
+
+[tiers."together/kimi-k2.7-code".candidates.metadata]
+context_window = 262144
+max_output_tokens = 131072
+input_modalities = ["text"]
+tool_call = true
+
+[tiers."together/kimi-k2.7-code".candidates.rates]
+input_per_mtok = 0.95
+cached_input_per_mtok = 0.19
+output_per_mtok = 4.00
+
+# MAX OUTPUT IS OMITTED, and this is the familiar tell rather than a gap in the
+# research. models.dev gives 512,300 — byte-identical to the context window,
+# which is the same signature that disqualified MiniMax M3's figure and
+# grok-4.6's. A model cannot in general spend its entire window on completion,
+# so a number equal to the window is far more likely to be a field defaulted
+# from another than a documented cap. Together publishes no output cap at all,
+# so there is no second source to break the tie and nothing is claimed. Close it
+# by asking for a 200,000-token completion once a key exists. This id is named
+# in `tests/http.rs`'s NO_MAX_OUTPUT list so the omission is reviewed in a diff
+# and a stale exemption fails.
+[tiers."together/nemotron-3-ultra"]
+
+[tiers."together/nemotron-3-ultra".rates]
+input_per_mtok = 0.60
+cached_input_per_mtok = 0.20
+output_per_mtok = 3.60
+
+[[tiers."together/nemotron-3-ultra".candidates]]
+id = "together/nemotron-3-ultra"
+provider = "together"
+model = "nvidia/nemotron-3-ultra-550b-a55b"
+
+[tiers."together/nemotron-3-ultra".candidates.metadata]
+context_window = 512300
+input_modalities = ["text"]
+tool_call = true
+
+[tiers."together/nemotron-3-ultra".candidates.rates]
+input_per_mtok = 0.60
+cached_input_per_mtok = 0.20
+output_per_mtok = 3.60
+
+# The dated snapshot Fireworks could not price. See the section header — this
+# lane's existence is evidence about a question the Fireworks section asked, and
+# it deliberately does not answer that question for the Fireworks tier.
+[tiers."together/deepseek-v4-pro-0813"]
+
+[tiers."together/deepseek-v4-pro-0813".rates]
+input_per_mtok = 1.32
+cached_input_per_mtok = 0.13
+output_per_mtok = 3.96
+
+[[tiers."together/deepseek-v4-pro-0813".candidates]]
+id = "together/deepseek-v4-pro-0813"
+provider = "together"
+model = "deepseek-ai/DeepSeek-V4-Pro-0813"
+
+# 1,048,576 — an exact power of two — from both Together's serverless list and
+# models.dev, and notably LARGER than the 512,000 Together gives the undated
+# `DeepSeek-V4-Pro`. The 0813 snapshot is a bigger-context model as well as a
+# differently priced one, which is more evidence that the two ids are genuinely
+# different products rather than a rename.
+[tiers."together/deepseek-v4-pro-0813".candidates.metadata]
+context_window = 1048576
+max_output_tokens = 384000
+input_modalities = ["text"]
+tool_call = true
+
+[tiers."together/deepseek-v4-pro-0813".candidates.rates]
+input_per_mtok = 1.32
+cached_input_per_mtok = 0.13
+output_per_mtok = 3.96

@@ -41,7 +41,8 @@ defines it:
   definition. The set the shipped `providers.json` can consume is whatever
   its entries' `credential_env` name — today `ANTHROPIC_API_KEY`,
   `OPENAI_API_KEY`, `GEMINI_API_KEY`, `BEDROCK_API_KEY`, `FIREWORKS_API_KEY`,
-  `XAI_API_KEY`, and `VERTEX_SERVICE_ACCOUNT`. A provider whose
+  `XAI_API_KEY`, `VERTEX_SERVICE_ACCOUNT`, `GROQ_API_KEY`, and
+  `TOGETHER_API_KEY`. A provider whose
   key is absent is simply not a candidate — set only what the catalog actually
   routes to.
 - **`VERTEX_SERVICE_ACCOUNT` is not an API key**, and it is the one credential
@@ -591,7 +592,13 @@ The labels are pinned in `router/config/tiers.toml` under `[retention.<provider>
 and are never written by any tool — the same rule prices follow, for a sharper
 reason: a retention label is a claim to a customer about their own data.
 
-**Today fourteen lanes are `zero` and the rest are `standard`.** `anthropic`,
+**Today eighteen of thirty-two lanes are `zero` and the rest are `standard`.**
+That crossed into a majority on 2026-08-22 with the Groq and Together lanes, and
+it is worth saying plainly what the majority is made of: eleven of the eighteen
+now rest on a setting in somebody's console rather than on a contract or a
+published default that applies to everyone. The catalog's zero-retention claim
+is therefore, more than ever, a claim about **account configuration** — which is
+why the provisioning steps below are preconditions and not tips. `anthropic`,
 `openai`, and `google` are ordinary API accounts. `bedrock` — the four
 `bedrock/claude-*` lanes, added 2026-08-20 — was the first zero-retention
 upstream, and it got there by configuration rather than by contract.
@@ -603,7 +610,16 @@ setting, but is verified in a way nothing else here is: xAI restates the
 guarantee in a response header on **every** response, and ZeroRouter asserts it
 before serving. `vertex` — the three `vertex/gemini-*` lanes, added 2026-08-21 —
 rests on the same basis as Bedrock and xAI, an enforced configuration on the
-operator's own account, this time a Google Cloud **project**. The three sections
+operator's own account, this time a Google Cloud **project**. `groq` — the three
+`groq/*` lanes, added 2026-08-22 — rests on basis 2 as well, an
+organization-level ZDR toggle in Groq's Data Controls; read it as xAI's basis
+**without** xAI's runtime check, because Groq publishes no attestation header
+and so nothing re-reads the toggle at request time. `together` — the four
+`together/*` lanes, added the same day — is basis 3 like Fireworks, but it is the
+only lane in the catalog whose risk runs the other way: Together's *default* is
+zero retention, and three organization Privacy toggles can take it away. Every
+other zero lane fails because somebody did not switch something on; this one
+fails because somebody switched something on. The three sections
 below on enforced configuration, published defaults, and per-response
 attestation are why each counts.
 
@@ -789,6 +805,72 @@ OpenRouter cannot see a toggle on somebody else's team. `--corroborate` will
 therefore flag this pin as appearing to disagree. The slug is `xai`; note that
 OpenRouter namespaces xAI's *models* `x-ai/*`, which is a different string.
 
+#### Provisioning Groq and Together: preconditions, not tips
+
+Both providers shipped **dark** on 2026-08-22 — `GROQ_API_KEY` and
+`TOGETHER_API_KEY` are unset, so the dispatchability filter hides all seven lanes
+from `/v1/models` and from route construction, and the configuration deploys
+inert. Lighting them up is a two-part act, and **the account work comes first**.
+
+The reason to be strict is that neither provider has xAI's safety net. Neither
+publishes a per-response attestation header, so nothing in the router re-reads
+either account's configuration. A key from a wrongly configured account on
+either provider authenticates, serves normally, and the lanes go on publishing
+`zero` to every customer who lists models. **There is no failure to notice.**
+The only thing standing between a misconfigured account and a false
+customer-facing data claim is the person doing these steps.
+
+**Groq — switch something ON.**
+
+1. Create the Groq account/organization and open **Data Controls**
+   (`console.groq.com/settings/data-controls`). Only an organization admin can
+   change these.
+2. **Enable Zero Data Retention, and confirm it covers Inference.** Groq allows
+   ZDR "globally or on a per-feature basis", so *"ZDR is enabled"* is not the
+   claim that matters — the claim that matters is that the **Inference** row
+   (`/openai/v1/chat/completions`) is covered. Enabling it globally is the
+   recommended form because it is the one that cannot be read wrong. Without
+   ZDR, Groq may temporarily log inputs and outputs for reliability
+   troubleshooting or abuse investigation and retain them **up to 30 days** —
+   which is precisely the carve-out the `zero` label denies.
+3. Note what enabling ZDR turns off: batch processing and fine-tuning stop
+   working, because they require retention to function. ZeroRouter dials
+   neither, so this costs nothing here — but do not let someone re-enable them
+   to unblock an unrelated project without revisiting `[retention.groq]`.
+4. Only then mint the API key and load it into Secrets Manager as
+   `groq-api-key`.
+
+**Together — confirm nobody switched something ON.**
+
+1. Create the Together organization. Together does **not** store inputs or
+   outputs by default, so the guarantee is already in force at this point; the
+   work is confirming it has not been given away.
+2. Open **Organization Settings → Privacy** (admin-only) and confirm all three
+   toggles are **OFF**:
+   - *Store prompts and model responses* — must stay off. This is the one that
+     matters most, and it is load-bearing twice: it is the retention opt-in, and
+     Together requires it to be on before passthrough models can be enabled at
+     all. Leaving it off makes the passthrough hazard structurally unreachable
+     rather than merely unused.
+   - *Allow organization's data for training* — must stay off.
+   - *Allow passthrough models* — must stay off. Passthrough forwards prompts to
+     a third-party provider under **that** provider's policy, which
+     `[retention.together]` does not cover.
+3. Confirm you are reading the **organization** settings, not a personal
+   profile. Together is explicit that when a request uses an organization's API
+   key, the organization setting is what applies — so a correct personal toggle
+   over a wrong organization one guarantees nothing.
+4. Mint the key under that organization and load it as `together-api-key`.
+
+**One caveat that is disclosed rather than solved.** Together states that
+"temporary caching may be used to improve performance unless otherwise
+configured", and publishes no detail on what that cache holds or how long it
+lives, and no switch to disable it on the serverless product. That sentence is
+quoted in the customer-facing description on purpose. If a customer needs a
+stronger statement than "not stored, with an unquantified performance cache",
+the honest answer is a dedicated endpoint or a different lane — not a re-reading
+of this one.
+
 The one exception that needs no vendor at all: a **local rung on your own
 hardware** (see `examples/edge/tiers.toml`). Even there, confirm your inference
 server is not writing prompts to a request log before you label it — several do
@@ -900,6 +982,18 @@ disagreement there. Note also that `google` corroborates against
 policies, and the slug is pinned explicitly in the file for exactly that reason.
 `bedrock` has the same trap: it joins `amazon-bedrock`, **not** `claude-on-aws`,
 which is Anthropic's own managed capacity on AWS and reports 30-day retention.
+
+`groq` and `together` (2026-08-22) are the first `zero` pins expected to
+corroborate **green** — OpenRouter reports `retainsPrompts: false` and
+`training: false` for both — and it is worth knowing how little that is worth
+before anyone treats a green row as confirmation. For `together` the agreement is
+real but thin: OpenRouter is describing the same published default the pin rests
+on, so it is a second reading of one source rather than a second source. For
+`groq` the agreement is actively misleading: OpenRouter can only see Groq's
+*default* posture, and this pin exists precisely to escape a carve-out in that
+default (up to 30 days of abuse-monitoring logs). It agrees with the pin for a
+weaker reason than the pin's own. Corroboration is a smoke alarm, not an audit,
+in both directions.
 
 ### The live half of the Bedrock claim
 

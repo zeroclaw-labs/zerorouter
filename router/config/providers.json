@@ -60,6 +60,21 @@
       "base_url": "https://aiplatform.googleapis.com/v1/projects/{project}/locations/global/endpoints/openapi/chat/completions",
       "project_env": "VERTEX_PROJECT_ID",
       "source_provider_key": "google-vertex"
+    },
+    {
+      "key": "groq",
+      "adapter": "chat_completions",
+      "credential_env": "GROQ_API_KEY",
+      "secret_name": "groq-api-key",
+      "base_url": "https://api.groq.com/openai/v1/chat/completions"
+    },
+    {
+      "key": "together",
+      "adapter": "chat_completions",
+      "credential_env": "TOGETHER_API_KEY",
+      "secret_name": "together-api-key",
+      "base_url": "https://api.together.xyz/v1/chat/completions",
+      "source_provider_key": "togetherai"
     }
   ]
 }

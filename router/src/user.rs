@@ -1137,25 +1137,35 @@ mod tests {
         assert_eq!(posture("fireworks/kimi-k3"), "zero");
 
         // The footnote's counts. Stated as literals on purpose: this is the
-        // arithmetic a customer reads as "14 lane(s) zero-retention", and an
+        // arithmetic a customer reads as "18 lane(s) zero-retention", and an
         // override silently stopping working would show up here as a lane
         // moving from one side of the sentence to the other.
         //
-        // Zero: four Bedrock, five open-weight Fireworks, two xAI. Standard:
-        // four Anthropic, three Google, three OpenAI, three Vertex, and the
-        // one overridden Fireworks lane this test is about.
+        // Zero: four Bedrock, five open-weight Fireworks, two xAI, three Groq
+        // and four Together. Standard: four Anthropic, three Google, three
+        // OpenAI, three Vertex, and the one overridden Fireworks lane this
+        // test is about.
+        //
+        // The zero side grew by seven on 2026-08-22 and the standard side did
+        // not move, which is worth a sentence because it is the first time the
+        // catalog's majority became zero-retention. Both new providers pin
+        // `zero` on an operator-controlled setting (Groq's Data Controls
+        // toggle) or an operator-preserved default (Together's Privacy
+        // toggles, which must stay off), so every one of those seven lanes is
+        // a lane whose label a console change elsewhere could falsify. That is
+        // an argument for the DEPLOY.md runbook, not against the count.
         //
         // The three Vertex lanes sit on the STANDARD side as an interim
         // posture: their zero pin flips back when Google approves the
         // abuse-monitoring exception filed 2026-08-21 (see the pin's comment
-        // in tiers.toml). When that lands, these tallies become 14/11 again.
+        // in tiers.toml). When that lands, these tallies become 21/11.
         // Until then the three Google lanes and three Vertex lanes are the
         // same models under two data-policy configurations, both currently
         // labelled standard — the Vertex ones because one precondition of
         // their zero posture awaits Google's approval, not because the
         // configurations are equivalent.
-        assert_eq!(posture_count(rows, "zero"), 11);
+        assert_eq!(posture_count(rows, "zero"), 18);
         assert_eq!(posture_count(rows, "standard"), 14);
-        assert_eq!(rows.len(), 25, "every shipped lane is counted exactly once");
+        assert_eq!(rows.len(), 32, "every shipped lane is counted exactly once");
     }
 }

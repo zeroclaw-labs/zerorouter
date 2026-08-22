@@ -219,7 +219,7 @@ openai/gpt-5.6-luna                    0.20          1.20     1050000  standard
 
 4 model(s) reprice above a prompt-size threshold; the rates above are the base band. Use --json for the full schedule.
 
-Retention: 11 lane(s) zero-retention, listed first; 14 where the provider retains data.
+Retention: 18 lane(s) zero-retention, listed first; 14 where the provider retains data.
 Use --json for each lane's full retention statement and the date it was verified.
 ```
 
