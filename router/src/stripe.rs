@@ -1622,8 +1622,11 @@ fn checkout_session_form(
     //
     // `billing_address_collection=required` makes the form ALWAYS collect a
     // full billing address. This was deliberately left at the default `auto`
-    // until ZeroRouter registered for California sales tax, and the
-    // registration is what changed the answer. Under `auto`, Stripe decides how
+    // until a district-tax state entered the picture (a CA registration was
+    // planned when this shipped; MA — a flat-rate state — remains the only
+    // collecting jurisdiction, and the full address stays because the next
+    // registration will want it and precision never hurts a flat rate).
+    // Under `auto`, Stripe decides how
     // much address to ask for: the API reference's own words are that with
     // `automatic_tax` enabled Checkout "will collect the minimum number of
     // fields required for tax calculation". California is a district-tax state
