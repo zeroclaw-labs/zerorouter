@@ -51,6 +51,19 @@ export function Terms() {
           minimum) applies at the time of purchase to cover payment-processing and handling costs. You
           are charged the gross amount and credited the net amount after the fee. The exact fee is
           shown before you confirm a purchase, and the amount charged at checkout is authoritative.
+          Where stablecoin payment is offered, the deposit fee for that payment method is 5% with no
+          minimum.
+        </li>
+        <li>
+          <strong>Stablecoin payments.</strong> Where offered, credits may be purchased with
+          supported stablecoins through Stripe. Such payments settle to us in US dollars; we do not
+          hold, custody, transmit, or exchange digital assets, and we do not accept payment in any
+          asset Stripe does not settle. Amounts are denominated and payable in US dollars, and the
+          US dollar amount shown at checkout is authoritative. Stablecoin payments are subject to
+          the payment processor’s limits, including a maximum per transaction. Because such
+          payments are not reversible by the payment network, the chargeback and dispute provisions
+          below do not apply to them; requests for adjustment are handled under Refunds above and
+          remain at our discretion.
         </li>
         <li>
           <strong>Pass-through pricing.</strong> Inference is billed on a pass-through basis at the

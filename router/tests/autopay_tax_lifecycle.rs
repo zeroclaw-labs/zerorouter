@@ -148,6 +148,8 @@ fn settings(api_base: &str) -> StripeSettings {
         checkout_min_usd: Decimal::from(5),
         checkout_max_usd: Decimal::from(1000),
         api_base: api_base.to_owned(),
+        // A card-only deployment, which is what this harness describes.
+        crypto_rail: false,
     }
 }
 

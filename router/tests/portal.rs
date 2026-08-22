@@ -454,6 +454,8 @@ async fn me_carries_the_stripe_publishable_key_but_never_the_secret() {
         checkout_min_usd: Decimal::from(5),
         checkout_max_usd: Decimal::from(1000),
         api_base: "https://api.stripe.invalid".to_owned(),
+        // A card-only deployment, which is what this harness describes.
+        crypto_rail: false,
     });
     let app = portal::router().with_state(WebCtx::new(pool.clone(), config));
 

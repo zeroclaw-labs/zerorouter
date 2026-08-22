@@ -5,7 +5,7 @@ import { EmbeddedCheckout, EmbeddedCheckoutProvider } from '@stripe/react-stripe
 import { loadStripe } from '@stripe/stripe-js'
 import type { Stripe } from '@stripe/stripe-js'
 import { api, ApiError } from '../api'
-import type { AutopayStatus, Quote } from '../api'
+import type { AutopayStatus, Quote, Rail } from '../api'
 import {
   Badge,
   Banner,
@@ -114,6 +114,10 @@ export function Credits() {
   // mounted session was created for, and keys the provider so that going back
   // and choosing a different amount tears the old session's iframe down.
   const [modalOpen, setModalOpen] = useState(false)
+  // Which rail the customer is buying on. Card is the default and stays the
+  // primary path; crypto is opt-in per purchase and resets every time the modal
+  // opens, so nobody is silently returned to a rail they used once.
+  const [rail, setRail] = useState<Rail>('card')
   const [stage, setStage] = useState<'amount' | 'pay'>('amount')
   const [payingAmount, setPayingAmount] = useState<string | null>(null)
   const [clientSecret, setClientSecret] = useState<string | null>(null)
@@ -196,19 +200,28 @@ export function Credits() {
     if (normalized === null) return
     let active = true
     api
-      .quote(normalized)
+      .quote(normalized, rail)
       .then((q) => {
-        if (active) setQuote(q)
+        // Guard against an out-of-order response: switching rails fires a
+        // second request, and the first can still land after it. Showing a card
+        // fee against a crypto purchase would misstate the price the customer
+        // is about to pay, so a quote for a rail we are no longer on is
+        // discarded rather than rendered.
+        if (active && (q.rail === undefined || q.rail === rail)) setQuote(q)
       })
       .catch(() => {})
     return () => {
       active = false
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [normalized])
+  }, [normalized, rail])
 
   // The key is server configuration, so Stripe.js can only be loaded once the
   // session has. `null` means this deployment has no Stripe billing at all.
+  // Ships dark: absent or false renders no crypto option at all. `?? false`
+  // rather than `?? true` because an older router that does not send the field
+  // has no crypto rail to offer.
+  const cryptoAvailable = user?.crypto_rail ?? false
   const publishableKey = user?.stripe_publishable_key ?? null
   const stripePromise = useMemo(
     () => (publishableKey === null ? null : stripeFor(publishableKey)),
@@ -231,7 +244,7 @@ export function Credits() {
     setMount({ state: 'creating', error: null })
     setClientSecret(null)
     api
-      .checkout(payingAmount)
+      .checkout(payingAmount, rail)
       .then((session) => {
         if (!active) return
         setClientSecret(session.client_secret)
@@ -255,7 +268,7 @@ export function Credits() {
     return () => {
       active = false
     }
-  }, [stage, payingAmount, retryCount])
+  }, [stage, payingAmount, rail, retryCount])
 
   // Stripe.js can fail to mount with no error we can observe: js.stripe.com
   // blocked by a network or an extension, or a publishable key from the wrong
@@ -307,6 +320,7 @@ export function Credits() {
     setStage('amount')
     setPayingAmount(null)
     setClientSecret(null)
+    setRail('card')
     setMount({ state: 'idle', error: null })
   }
 
@@ -442,6 +456,7 @@ export function Credits() {
                   setFormError(null)
                   setStage('amount')
                   setPayingAmount(null)
+                  setRail('card')
                   setModalOpen(true)
                 }}
               >
@@ -495,6 +510,46 @@ export function Credits() {
                   enter a VAT or tax ID there for reverse charge.
                 </p>
               )}
+
+              {/* The crypto rail, deliberately secondary: a plain toggle under
+                  the amount rather than a second button beside "Continue", so
+                  the card path stays the obvious one. Rendered only when the
+                  operator has enabled stablecoin acceptance — otherwise this
+                  block does not exist and the page is exactly what it was. */}
+              {cryptoAvailable && (
+                <div className="rail-choice" role="group" aria-label="Payment method">
+                  <label className="rail-option">
+                    <input
+                      type="radio"
+                      name="rail"
+                      value="card"
+                      checked={rail === 'card'}
+                      onChange={() => setRail('card')}
+                    />
+                    <span>Card</span>
+                  </label>
+                  <label className="rail-option">
+                    <input
+                      type="radio"
+                      name="rail"
+                      value="crypto"
+                      checked={rail === 'crypto'}
+                      onChange={() => setRail('crypto')}
+                    />
+                    <span>Stablecoin (USDC)</span>
+                  </label>
+                </div>
+              )}
+              {cryptoAvailable && rail === 'crypto' && (
+                <p className="field-hint">
+                  The processing fee is 5% on stablecoin instead of 5.5% with a $0.80 minimum, so
+                  small top-ups cost noticeably less. You will be sent to Stripe to connect a wallet
+                  and pay in USDC; we settle in dollars and never hold the coin. Sales tax is
+                  calculated the same way as on a card. Stripe settles at most $10,000 per crypto
+                  payment. Crypto payments cannot be charged back, so please check the amount before
+                  you pay.
+                </p>
+              )}
               {formError !== null && <Banner kind="error">{formError}</Banner>}
               <div className="modal-actions">
                 <button className="btn btn-ghost" type="button" onClick={closeCheckout}>
@@ -516,7 +571,8 @@ export function Credits() {
                   {quote !== null ? (
                     <>
                       {formatUsd(quote.gross)} (includes {formatUsd(quote.fee)} processing fee) plus
-                      tax → {formatUsd(quote.credit)} credit.
+                      tax → {formatUsd(quote.credit)} credit
+                      {rail === 'crypto' ? ', paid in stablecoin' : ''}.
                     </>
                   ) : (
                     <>Paying for {formatUsd(payingAmount)} of credits.</>
@@ -530,8 +586,15 @@ export function Credits() {
                   address field appears without explanation otherwise. */}
               <p className="checkout-note">
                 A billing address is required to verify your identity, help prevent fraud, and
-                calculate any sales tax due. We never see your card details — the form below is
-                Stripe's.
+                calculate any sales tax due.{' '}
+                {rail === 'crypto' ? (
+                  <>
+                    We never see your wallet or its keys — the form below is Stripe's, and it will
+                    hand you to Stripe's wallet connection to complete the payment.
+                  </>
+                ) : (
+                  <>We never see your card details — the form below is Stripe's.</>
+                )}
               </p>
               {mount.state === 'failed' ? (
                 <div className="checkout-embed">

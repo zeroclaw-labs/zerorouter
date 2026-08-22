@@ -92,6 +92,8 @@ fn webhook_app(pool: &PgPool) -> axum::Router {
             checkout_min_usd: Decimal::from(5),
             checkout_max_usd: Decimal::from(1000),
             api_base: "https://api.stripe.com".to_owned(),
+            // A card-only deployment, which is what this harness describes.
+            crypto_rail: false,
         }),
         signup_credit_usd: Decimal::ZERO,
         portal_dist_path: PathBuf::from("portal/dist"),
