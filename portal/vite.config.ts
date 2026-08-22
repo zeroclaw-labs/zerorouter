@@ -14,6 +14,12 @@ export default defineConfig({
       '/auth': backend,
       '/webhooks': backend,
       '/.well-known': backend,
+      // The inference plane. Two pages read it — the storefront's catalog and
+      // the playground, which posts its completions here — and neither works
+      // under `vite dev` without this. It was missing while only `/v1/models`
+      // needed it, so the dev server rendered an empty catalog and nobody
+      // noticed; the playground would have failed more loudly.
+      '/v1': backend,
     },
   },
 })

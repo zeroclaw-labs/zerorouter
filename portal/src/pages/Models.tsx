@@ -13,15 +13,37 @@ function perMtok(price: string): string {
  *
  * Mirrors `RetentionPosture::ordering_rank` in the router. An unknown or absent
  * posture ranks with the retaining lanes, never with the zero ones — a row this
- * page cannot read must not be promoted to the flattering half of the catalog. */
-function retentionRank(model: Model): number {
+ * page cannot read must not be promoted to the flattering half of the catalog.
+ *
+ * Exported because the playground groups its lane picker on the same rule. Two
+ * copies of "which half of the catalog is this lane in" would eventually
+ * disagree, and the direction they would disagree in is the flattering one. */
+export function retentionRank(model: Model): number {
   return model.retention?.posture === 'zero' ? 0 : 1
 }
 
-/** The full retention statement, for the cell's tooltip. */
-function retentionTitle(model: Model): string {
+/** The full retention statement, for a tooltip. Shared with the playground,
+ * which puts the same claim on every response it renders. */
+export function retentionTitle(model: Model): string {
   if (!model.retention) return 'This router did not publish a retention posture for this lane.'
   return `${model.retention.description} (verified ${model.retention.verified})`
+}
+
+/** The retention label as the storefront states it.
+ *
+ * One definition, used by the catalog table and by the badge the playground
+ * stamps on every response. The wording is a claim ZeroRouter makes about a
+ * customer's data, so it must read identically wherever it appears — a
+ * playground that said "zero retention" where the catalog said something else
+ * would be the worst kind of drift to ship. */
+export function RetentionBadge({ model }: { model: Model }) {
+  return model.retention?.posture === 'zero' ? (
+    <Badge tone="good">zero retention</Badge>
+  ) : model.retention?.posture === 'standard' ? (
+    <Badge tone="neutral">provider retains data</Badge>
+  ) : (
+    <Badge tone="neutral">unstated</Badge>
+  )
 }
 
 function formatContext(tokens: number): string {
@@ -126,13 +148,7 @@ export function Models() {
                       page cannot read says so plainly rather than defaulting to
                       the favourable answer. */}
                   <td title={retentionTitle(m)}>
-                    {m.retention?.posture === 'zero' ? (
-                      <Badge tone="good">zero retention</Badge>
-                    ) : m.retention?.posture === 'standard' ? (
-                      <Badge tone="neutral">provider retains data</Badge>
-                    ) : (
-                      <Badge tone="neutral">unstated</Badge>
-                    )}
+                    <RetentionBadge model={m} />
                   </td>
                 </tr>
               ))}

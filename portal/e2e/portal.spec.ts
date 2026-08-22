@@ -542,3 +542,180 @@ test('a provider key can be attached, is shown only by fingerprint, and is never
   await row.getByRole('button', { name: /confirm remove/i }).click()
   await expect(page.getByText(/no provider keys attached/i)).toBeVisible({ timeout: 10_000 })
 })
+
+// The lane the playground round-trip drives. `google` is the upstream
+// global-setup redirects to the mock, and this is its cheapest lane — the one
+// whose reservation leaves the most of the e2e grant intact for the specs after
+// it. Its posture is `standard`, which is what makes the badge assertion below
+// worth making: the page shows the real claim, not a flattering default.
+const MOCK_LANE = 'google/gemini-3.5-flash-lite'
+// A lane that DECLARES text-only input, for the capability gate.
+const TEXT_ONLY_LANE = 'fireworks/glm-5.2'
+
+test('the playground groups its lane picker by retention posture, zero first', async ({ page }) => {
+  await signIn(page)
+  const nav = page
+    .getByRole('navigation', { name: 'Portal' })
+    .getByRole('link', { name: 'Playground' })
+  await expect(nav).toBeVisible()
+  await nav.click()
+  await expect(page).toHaveURL(/\/playground$/)
+  await expect(page.getByRole('heading', { name: 'Playground', exact: true })).toBeVisible()
+
+  // The two groups exist and are in the catalog's order. This is the same claim
+  // the storefront makes by sorting its table; a picker has room to name it, so
+  // it does, and the naming has to stay honest.
+  const groups = page.locator('.lane-group')
+  await expect(groups).toHaveCount(2, { timeout: 15_000 })
+  const postures = await groups.evaluateAll((nodes) =>
+    nodes.map((node) => node.getAttribute('data-posture')),
+  )
+  expect(postures).toEqual(['zero', 'standard'])
+  await expect(groups.nth(0).locator('.lane-group-title')).toContainText('Zero retention')
+  await expect(groups.nth(1).locator('.lane-group-title')).toContainText('Provider retains data')
+
+  // And every lane really sits in the group its own badge claims. Ordering the
+  // headings correctly while filing lanes under the wrong one would be the
+  // worse bug — a reader picks a lane by the heading above it — so this is
+  // asserted per row rather than per group.
+  for (const [index, label] of [
+    [0, 'zero retention'],
+    [1, 'provider retains data'],
+  ] as const) {
+    const lanes = groups.nth(index).locator('.lane')
+    const count = await lanes.count()
+    expect(count, `the ${label} group must not be empty`).toBeGreaterThan(0)
+    for (let i = 0; i < count; i += 1) {
+      await expect(lanes.nth(i).locator('.badge').first()).toHaveText(label)
+    }
+  }
+
+  // The ZDR promise, stated where the question occurs to a reader.
+  await expect(page.getByText(/conversations live in this tab only/i)).toBeVisible()
+
+  // Search narrows the picker without breaking the grouping.
+  await page.getByLabel(/search models/i).fill('deepseek')
+  await expect(page.locator('.lane')).toHaveCount(
+    await page.locator('.lane-id', { hasText: 'deepseek' }).count(),
+  )
+})
+
+test('a completion round-trips through the real router and mints the playground key', async ({
+  page,
+}) => {
+  await signIn(page)
+  // The playground spends real credits, so the account needs some. Same admin
+  // path production uses, same one the credits spec funds through.
+  execFileSync(routerBin, ['admin', 'grant-credit', '--email', E2E_EMAIL, '--amount-usd', '5'], {
+    env: process.env,
+  })
+
+  await page.getByRole('link', { name: /playground/i }).click()
+  await expect(page.getByRole('heading', { name: 'Playground', exact: true })).toBeVisible()
+
+  // Pick the lane the mock upstream stands behind.
+  await page.getByLabel(/search models/i).fill(MOCK_LANE)
+  await page.locator('.lane', { hasText: MOCK_LANE }).click()
+
+  // No key has been minted for this browser yet — the mint happens on the first
+  // send, which is the moment the credential is actually needed.
+  await page.getByLabel('Prompt').fill('Say the thing.')
+  await page.getByRole('button', { name: /^send$/i }).click()
+
+  // The reply streamed back through the REAL router: real key auth, real
+  // admission against a real balance, real dispatch over the chat-completions
+  // wire, real settlement on the usage the far end reported. Only the model is
+  // a stand-in.
+  const assistant = page.locator('.turn-assistant').last()
+  await expect(assistant.locator('.turn-body')).toHaveText(/Zero retention acknowledged\./, {
+    timeout: 20_000,
+  })
+
+  // The token counts are the upstream's, carried on the final usage frame —
+  // which arrives only because the page asks for `stream_options.include_usage`.
+  await expect(assistant.locator('.turn-usage')).toContainText('41 in')
+  await expect(assistant.locator('.turn-usage')).toContainText('7 out')
+
+  // A cost, computed from the catalog's decimal-string rates, and labelled for
+  // what it is. The figure is deliberately not pinned to the digit here: the
+  // arithmetic is exact and tested by construction, while the rate it multiplies
+  // is a catalog value that may legitimately be repriced.
+  const cost = assistant.locator('.turn-cost')
+  await expect(cost).toContainText('estimated')
+  await expect(cost).toHaveText(/\$0\.\d+/)
+
+  // THE RETENTION BADGE, ON THE RESPONSE. `google` is a retaining lane and the
+  // page says so — the failure worth catching is a playground that renders the
+  // brand's favourite label regardless of which lane answered.
+  await expect(assistant.locator('.turn-lane')).toContainText(MOCK_LANE)
+  await expect(assistant.locator('.turn-lane .badge')).toHaveText('provider retains data')
+
+  // The balance moved, and the page re-read it from the server rather than
+  // subtracting its own estimate.
+  await expect(page.getByText(/credit balance/i)).toBeVisible()
+
+  // THE IMPLICIT KEY IS VISIBLE AND REVOCABLE. This is the whole reason the
+  // design is an ordinary key rather than a hidden credential: a customer can
+  // find it, and taking it away really does turn the page off.
+  await page.getByRole('link', { name: /keys/i }).click()
+  // Scoped to the LIVE row on purpose. Keys are disabled, never deleted, so a
+  // database that has run this suite before carries the playground keys of
+  // every previous run — and "exactly one of them is active" is the property
+  // worth asserting anyway.
+  const live = page.getByRole('row', { name: /playground/ }).filter({ hasText: 'active' })
+  await expect(live).toHaveCount(1)
+  await expect(live).toBeVisible()
+
+  // And the server agrees, which is what actually makes the row above the key
+  // this page is using rather than a leftover.
+  const named = await page.evaluate(async () => {
+    const keys = await (await fetch('/api/keys')).json()
+    return (keys.keys as Array<{ name: string; disabled: boolean }>).filter(
+      (key) => key.name === 'playground' && !key.disabled,
+    ).length
+  })
+  expect(named).toBe(1)
+})
+
+test('the capability gate is rendered when a text-only lane is sent an image', async ({ page }) => {
+  await signIn(page)
+  execFileSync(routerBin, ['admin', 'grant-credit', '--email', E2E_EMAIL, '--amount-usd', '5'], {
+    env: process.env,
+  })
+  await page.getByRole('link', { name: /playground/i }).click()
+  await expect(page.getByRole('heading', { name: 'Playground', exact: true })).toBeVisible()
+
+  // A one-pixel PNG is enough: the gate reads the request's content PARTS, not
+  // the image, and refuses before anything is reserved or dialled.
+  await page.setInputFiles('input[type="file"]', {
+    name: 'pixel.png',
+    mimeType: 'image/png',
+    buffer: Buffer.from(
+      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==',
+      'base64',
+    ),
+  })
+  await expect(page.locator('.attachment-thumb')).toBeVisible()
+
+  // The picker is deliberately NOT filtered — an absent `input_modalities` means
+  // unknown, and the router serves those, so hiding lanes here would make the
+  // page stricter than the product. A lane that DECLARES text-only is warned
+  // about instead, and the send still goes through to the server's verdict.
+  await page.getByLabel(/search models/i).fill(TEXT_ONLY_LANE)
+  await page.locator('.lane', { hasText: TEXT_ONLY_LANE }).click()
+  await expect(page.locator('.attachment-warn')).toContainText(/lists no image input/i)
+
+  await page.getByLabel('Prompt').fill('What is in this image?')
+  await page.getByRole('button', { name: /^send$/i }).click()
+
+  // The router's own words, rendered as a banner rather than swallowed: it names
+  // what the lane accepts and states that nothing was reserved, which is the
+  // difference between "try another model" and "am I being charged for this?"
+  const banner = page.getByRole('alert')
+  await expect(banner).toContainText(/does not accept image input/i, { timeout: 20_000 })
+  await expect(banner).toContainText(/Nothing was reserved and no upstream was contacted/i)
+
+  // And the prompt survived the refusal — a rejected send must not cost the
+  // customer what they typed.
+  await expect(page.getByLabel('Prompt')).toHaveValue('What is in this image?')
+})
