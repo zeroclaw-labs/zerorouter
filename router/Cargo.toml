@@ -35,7 +35,7 @@ axum = { version = "0.8", default-features = false, features = ["http1", "json",
 # is subtly wrong does not fail loudly, it hands the billing machine a corrupted
 # token count. A vetted implementation of each primitive is the cheaper risk,
 # and the decoder ABOVE them is where this repo's own tests earn their keep.
-base64 = "0.22"
+base64 = "0.23"
 chrono = { version = "0.4", features = ["clock", "serde"] }
 # Needed only by `src/gcp_auth.rs`, which mints the short-lived OAuth2 access
 # tokens the `vertex` lane dispatches on. Google's OpenAI-compatible surface
