@@ -39,7 +39,7 @@
 
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { FormEvent } from 'react'
-import { Link } from 'react-router-dom'
+import { Link } from 'react-router'
 import { ApiError, api } from '../api'
 import type { ApiKey, Model } from '../api'
 import {

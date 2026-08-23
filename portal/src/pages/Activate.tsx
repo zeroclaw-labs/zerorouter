@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import type { FormEvent } from 'react'
-import { useSearchParams } from 'react-router-dom'
+import { useSearchParams } from 'react-router'
 import { api } from '../api'
 import type { DeviceLookup } from '../api'
 import { Banner, formatTime } from '../ui'

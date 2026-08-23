@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
-import { BrowserRouter, Navigate, NavLink, Route, Routes, useLocation } from 'react-router-dom'
+import { BrowserRouter, Navigate, NavLink, Route, Routes, useLocation } from 'react-router'
 import { api, ApiError, onSessionRequired } from './api'
 import type { Me } from './api'
 import { AuthContext, Banner, ToastContext, useAuth } from './ui'

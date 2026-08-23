@@ -29,11 +29,17 @@ cd "${PORTAL_DIR}"
 # An entry here needs a reason that answers "why can this not be fixed, and why
 # is the exposure acceptable?" — not merely "this is noisy". Anything fixable by
 # a version bump inside the declared semver range MUST be bumped instead.
+#
+# The list is EMPTY, and that is the intended steady state rather than an
+# oversight. It held one entry — GHSA-fx2h-pf6j-xcff, vite's `server.fs.deny`
+# bypass — whose reason ended "TODO: revisit as part of a deliberate vite 5 -> 6
+# upgrade". That upgrade has now happened: the portal declares vite ^6.4.3, and
+# 6.4.3 is the release that carries the fix, so the advisory is no longer
+# reported and the entry had to go with it. Leaving it would have failed this
+# gate on its own stale-entry check, which is exactly what that check is for.
 # ---------------------------------------------------------------------------
 read -r -d '' ACCEPTED_JSON <<'JSON' || true
-{
-  "GHSA-fx2h-pf6j-xcff": "vite <=6.4.2 — `server.fs.deny` bypass on Windows alternate paths. NOT FIXABLE IN RANGE: the fix ships in vite 6.4.3 and there is no patched release on the 5.x line the portal declares (^5.4.20), so clearing it requires a MAJOR vite upgrade — a change to the portal's build toolchain that belongs in its own reviewed pull request, not in a CI change. Exposure: the flaw is in vite's DEV SERVER (`pnpm dev`), on Windows. Production never runs it — `pnpm build` emits static files that the Rust binary serves from /srv/portal (see Dockerfile), and vite is absent from the runtime image entirely. CI runs Linux. TODO: revisit as part of a deliberate vite 5 -> 6 upgrade."
-}
+{}
 JSON
 
 echo "==> pnpm audit (portal)"
