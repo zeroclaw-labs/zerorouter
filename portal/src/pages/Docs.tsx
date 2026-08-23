@@ -17,7 +17,7 @@
 // (`router/tests/http.rs::models_are_materialized_from_tiers_toml`), so if it
 // ever leaves the catalog that test fails first.
 
-import { Link } from 'react-router-dom'
+import { Link } from 'react-router'
 import { CodeBlock } from '../ui'
 
 /** The base URL every example uses. Same origin as this portal in production. */

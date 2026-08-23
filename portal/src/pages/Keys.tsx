@@ -2,7 +2,7 @@ import { Fragment, useState } from 'react'
 import type { FormEvent } from 'react'
 import { api } from '../api'
 import type { ApiKey, CreatedKey, CreditLimitWindow, KeyEdit, NewKey } from '../api'
-import { Link } from 'react-router-dom'
+import { Link } from 'react-router'
 import { ByokSection } from './ByokSection'
 import { EXAMPLE_MODEL } from './Docs'
 import {

@@ -23,6 +23,52 @@ test('login lands in the portal via the multi-audience OIDC flow', async ({ page
   await expect(page.getByRole('heading', { name: /overview/i })).toBeVisible()
 })
 
+// The bundler's output shape is a contract with the Rust server, and until now
+// nothing asserted it from the built artifact. `spa_router` in
+// router/src/portal.rs serves everything under `/assets/` as immutable for a
+// year and revalidates everything else, which is only correct while the build
+// really does content-hash every asset and put it under that prefix. A toolchain
+// upgrade that changed `build.assetsDir`, or dropped hashing, would keep this
+// suite green and strand returning browsers on a stale bundle in production —
+// the exact failure the cache-control comment in portal.rs records as having
+// already happened once.
+//
+// `router/tests/portal.rs` pins the server half against a synthetic dist. This
+// pins the other half: that the dist Vite actually emits is the shape that
+// server half assumes.
+test('the built SPA is hashed assets under /assets, behind a shell that revalidates', async ({
+  request,
+}) => {
+  const shell = await request.get('/')
+  expect(shell.status()).toBe(200)
+  expect(shell.headers()['cache-control']).toBe('no-cache')
+  const html = await shell.text()
+
+  const refs = [...html.matchAll(/(?:src|href)="(\/assets\/[^"]+)"/g)].map((m) => m[1])
+  const js = refs.filter((r) => r.endsWith('.js'))
+  const css = refs.filter((r) => r.endsWith('.css'))
+  expect(js, 'the shell must reference exactly one script bundle').toHaveLength(1)
+  expect(css, 'the shell must reference exactly one stylesheet').toHaveLength(1)
+
+  for (const ref of refs) {
+    // `name-HASH.ext`. The hash is what makes a year-long immutable cache safe.
+    expect(ref, `${ref} must carry a content hash`).toMatch(
+      /^\/assets\/[A-Za-z0-9_.-]+-[A-Za-z0-9_-]{8}\.(js|css)$/,
+    )
+    const asset = await request.get(ref)
+    expect(asset.status(), ref).toBe(200)
+    expect(asset.headers()['cache-control'], ref).toBe('public, max-age=31536000, immutable')
+  }
+
+  // And an unknown path is the shell again rather than a 404 — client-side
+  // routing rests on that fallback — served with the same revalidation, because
+  // a cached SPA route is a cached shell by another name.
+  const deep = await request.get('/keys')
+  expect(deep.status()).toBe(200)
+  expect(deep.headers()['cache-control']).toBe('no-cache')
+  expect(await deep.text()).toBe(html)
+})
+
 test('keys page creates a key, reveals it once, and hands over a runnable request', async ({
   page,
 }) => {
@@ -680,6 +726,18 @@ test('a per-tier retention override renders on the storefront, not the provider 
   expect(title).toMatch(/closed-weight/i)
 })
 
+/** The server's view of one provider's fallback opt-in, re-read on every call
+ * so it can be polled. Returns `undefined` when no key for that provider is
+ * attached, which is distinguishable from an attached key that is simply
+ * switched off. */
+async function byokFallbackEnabled(page: Page, provider: string): Promise<boolean | undefined> {
+  return page.evaluate(async (name) => {
+    const res = await fetch('/api/byok')
+    const body = (await res.json()) as { keys: Array<Record<string, unknown>> }
+    return body.keys.find((k) => k.provider === name)?.fallback_enabled as boolean | undefined
+  }, provider)
+}
+
 test('a provider key can be attached, is shown only by fingerprint, and is never re-displayed', async ({
   page,
 }) => {
@@ -758,17 +816,29 @@ test('a provider key can be attached, is shown only by fingerprint, and is never
 
   // Turning it on persists, and the server is the thing that says so — a
   // checkbox that only looked checked would be the failure worth catching.
+  //
+  // Polled, not read once. `toggleFallback` in ByokSection.tsx sets its
+  // optimistic override BEFORE awaiting the PATCH, so `toBeChecked()` is
+  // satisfied by local state while the request is still on the wire; a single
+  // `fetch('/api/byok')` fired straight after it races the PATCH and reads the
+  // pre-toggle row. That is a flake in the test, not a bug in the product —
+  // the optimistic render is deliberate (see the comment on
+  // `fallbackOverride`) — so the assertion has to wait for the server instead
+  // of assuming the write already landed. It cost a CI rerun on #122.
   await fallback.check()
   await expect(fallback).toBeChecked()
-  const attachedKeys = await page.evaluate(async () => {
-    const res = await fetch('/api/byok')
-    return (await res.json()) as { keys: Array<Record<string, unknown>> }
-  })
-  expect(attachedKeys.keys.find((k) => k.provider === 'anthropic')?.fallback_enabled).toBe(true)
+  await expect
+    .poll(() => byokFallbackEnabled(page, 'anthropic'), { timeout: 10_000 })
+    .toBe(true)
 
-  // And off again, because an opt-in you cannot withdraw is not one.
+  // And off again, because an opt-in you cannot withdraw is not one. Polled
+  // for the same reason, and additionally so the PATCH is known to have
+  // settled before the remove below deletes the row out from under it.
   await fallback.uncheck()
   await expect(fallback).not.toBeChecked()
+  await expect
+    .poll(() => byokFallbackEnabled(page, 'anthropic'), { timeout: 10_000 })
+    .toBe(false)
 
   // And it can be taken away again, which is the promise that makes attaching
   // one reasonable in the first place.

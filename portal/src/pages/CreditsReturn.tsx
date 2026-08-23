@@ -12,7 +12,7 @@
 // changes nothing but their own screen.
 
 import { useEffect } from 'react'
-import { useNavigate, useSearchParams } from 'react-router-dom'
+import { useNavigate, useSearchParams } from 'react-router'
 import { api } from '../api'
 import { Loading } from '../ui'
 
