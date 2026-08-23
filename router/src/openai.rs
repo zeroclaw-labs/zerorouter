@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::net::{IpAddr, Ipv4Addr};
 
 use crate::config::RequestNeeds;
 use crate::provider::ToolSpec;
@@ -458,6 +459,91 @@ impl ChatCompletionRequest {
 /// part; xAI's file attachments are `input_file` on `/v1/responses`, not on
 /// chat completions). `tiers.toml` was narrowed to match rather than left
 /// advertising a `pdf` no lane could accept.
+/// Whether a client-supplied `image_url` may be forwarded to an upstream.
+///
+/// A `data:` URI carrying inline base64 is admitted — the bytes travel inside
+/// the request body, so nothing is fetched. Every other form is a URL that some
+/// upstream may dereference server-side: a cloud vendor's vision endpoint, or a
+/// colocated vision server on the `chat_completions` lane sitting *inside* the
+/// operator's network. Forwarding an arbitrary URL there turns this gateway
+/// into a request-forgery lever, so a URL is admitted only when it is `https:`
+/// AND its host is not an internal address literal — loopback, link-local (the
+/// `169.254.169.254` cloud-metadata endpoint lives here), private, or
+/// unspecified. `http:`, `file:`, protocol-relative `//host`, and every other
+/// scheme are refused. This generalizes the URL refusal the Bedrock adapter
+/// already performs so it also covers the lanes that pass URLs through.
+///
+/// A hostname that *resolves* to an internal address is deliberately out of
+/// scope: a forward-only gateway does not perform DNS at admission, and a
+/// resolve-then-forward check would still race DNS rebinding. That residual
+/// belongs to whatever actually fetches the URL.
+fn image_url_is_admissible(url: &str) -> bool {
+    // Inline base64 data URI: no fetch, always safe. Classification mirrors
+    // `wire::image_part`, which routes exactly this shape to inline bytes.
+    if url
+        .strip_prefix("data:")
+        .and_then(|rest| rest.split_once(";base64,"))
+        .is_some()
+    {
+        return true;
+    }
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        // Not an absolute URL — protocol-relative `//host/x` and relative refs
+        // land here and are refused.
+        return false;
+    };
+    if parsed.scheme() != "https" {
+        return false;
+    }
+    match parsed.host_str() {
+        // `host_str` keeps brackets on an IPv6 literal; strip them before the
+        // `IpAddr` parse. A value that does not parse as an IP is a domain
+        // name, which a forward-only gateway cannot resolve here — allowed.
+        Some(host) => match host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<IpAddr>()
+        {
+            Ok(ip) => ip_literal_is_public(ip),
+            Err(_) => true,
+        },
+        None => false,
+    }
+}
+
+/// Whether an IP *literal* in an image URL points somewhere public. Internal
+/// ranges (loopback, link-local, private, CGNAT, unspecified, and their IPv6
+/// equivalents plus IPv4-mapped forms) are refused so a URL cannot name the
+/// metadata service or a neighbour on the operator's network.
+fn ip_literal_is_public(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => ipv4_is_public(v4),
+        IpAddr::V6(v6) => {
+            // `::ffff:a.b.c.d` reaches the same v4 host; re-check the embedding.
+            if let Some(mapped) = v6.to_ipv4_mapped() {
+                return ipv4_is_public(mapped);
+            }
+            let segments = v6.segments();
+            !(v6.is_loopback()
+                || v6.is_unspecified()
+                || (segments[0] & 0xfe00) == 0xfc00  // fc00::/7  unique-local
+                || (segments[0] & 0xffc0) == 0xfe80) // fe80::/10 link-local
+        }
+    }
+}
+
+fn ipv4_is_public(v4: Ipv4Addr) -> bool {
+    let [a, b, ..] = v4.octets();
+    !(v4.is_private()
+        || v4.is_loopback()
+        || v4.is_link_local()      // 169.254.0.0/16 — cloud metadata
+        || v4.is_unspecified()
+        || v4.is_broadcast()
+        || v4.is_documentation()
+        || a == 0                   // 0.0.0.0/8 "this network"
+        || (a == 100 && (b & 0xc0) == 64)) // 100.64.0.0/10 carrier-grade NAT
+}
+
 fn content_is_supported(role: &str, content: &Value) -> bool {
     match content {
         Value::String(_) | Value::Null => true,
@@ -487,7 +573,7 @@ fn part_is_supported(role: &str, part: &Value) -> bool {
                     image
                         .get("url")
                         .and_then(Value::as_str)
-                        .is_some_and(|url| !url.trim().is_empty())
+                        .is_some_and(|url| image_url_is_admissible(url.trim()))
                         && image.keys().all(|key| key == "url")
                 })
                 && part
@@ -2177,6 +2263,61 @@ mod tests {
                 "an image on a {role} turn must be refused"
             );
         }
+    }
+
+    #[test]
+    fn image_url_admissibility_allows_only_https_and_inline_data() {
+        // Admitted: public https and inline base64 data URIs.
+        for ok in [
+            "https://example.com/x.jpg",
+            "https://cdn.example.com:8443/a/b/c.png?token=1",
+            "data:image/png;base64,AAAA",
+        ] {
+            assert!(image_url_is_admissible(ok), "{ok} should be admitted");
+        }
+        // Refused: non-https schemes, protocol-relative, and internal hosts —
+        // including the cloud-metadata endpoint reached over either scheme,
+        // IPv6 loopback/link-local, and the IPv4-mapped form of the metadata IP.
+        for bad in [
+            "",
+            "http://example.com/x.jpg",
+            "http://169.254.169.254/latest/meta-data/iam/security-credentials/",
+            "https://169.254.169.254/",
+            "https://127.0.0.1/x.jpg",
+            "https://10.0.0.5/x.jpg",
+            "https://192.168.1.1/x.jpg",
+            "https://172.16.9.9/x.jpg",
+            "https://100.64.0.1/x.jpg",
+            "https://0.0.0.0/x.jpg",
+            "https://[::1]/x.jpg",
+            "https://[fe80::1]/x.jpg",
+            "https://[fc00::1]/x.jpg",
+            "https://[::ffff:169.254.169.254]/x.jpg",
+            "file:///etc/passwd",
+            "//169.254.169.254/x.jpg",
+            "ftp://example.com/x.jpg",
+            "not a url",
+        ] {
+            assert!(!image_url_is_admissible(bad), "{bad} should be refused");
+        }
+    }
+
+    #[test]
+    fn a_request_naming_an_internal_image_url_is_refused_at_admission() {
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "anthropic/claude-sonnet-5",
+            "messages": [{
+                "role": "user",
+                "content": [{"type": "image_url", "image_url": {
+                    "url": "http://169.254.169.254/latest/meta-data/"
+                }}],
+            }],
+        }))
+        .expect("it parses");
+        assert!(
+            request.contains_unsupported_extensions(),
+            "an SSRF-shaped image URL must be refused before dispatch"
+        );
     }
 
     /// The reserve arm. An `https://` image is ~60 bytes on the wire and

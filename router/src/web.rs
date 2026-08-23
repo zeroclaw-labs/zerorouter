@@ -38,11 +38,25 @@ const DEFAULT_SESSION_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const MAX_SESSION_TTL: Duration = Duration::from_secs(90 * 24 * 60 * 60);
 const DEFAULT_DEVICE_CLIENT_ID: &str = "zeroclaw";
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct OidcSettings {
     pub issuer_url: String,
     pub client_id: String,
     pub client_secret: String,
+}
+
+// Hand-written so the IdP `client_secret` cannot reach a log through a `{:?}`
+// on this struct or on the `WebConfig` that embeds it. Mirrors the scrub the
+// sibling `StripeSettings` already performs; `issuer_url` and `client_id` are
+// not secret and stay visible to keep a misconfiguration diagnosable.
+impl std::fmt::Debug for OidcSettings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OidcSettings")
+            .field("issuer_url", &self.issuer_url)
+            .field("client_id", &self.client_id)
+            .field("client_secret", &"<scrubbed>")
+            .finish()
+    }
 }
 
 #[derive(Clone)]
