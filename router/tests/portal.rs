@@ -800,11 +800,23 @@ fn post_playground_key(cookie: Option<&str>, csrf: bool) -> Request<Body> {
         .expect("playground key request should build")
 }
 
-/// The playground's key is an ORDINARY key, and this pins the two halves of
-/// that claim a customer can actually see: it carries the caps the key dialog's
-/// untouched form would have given it, and it appears in the key list like any
-/// other row — which is what makes the Keys page a real revoke switch for the
-/// playground rather than a list that quietly omits one credential.
+/// The playground's key is an ORDINARY key, and this pins the halves of that
+/// claim a customer can actually see: it carries the OPERATOR ceilings the key
+/// dialog's untouched form would have given it, it appears in the key list like
+/// any other row — which is what makes the Keys page a real revoke switch for
+/// the playground rather than a list that quietly omits one credential — and it
+/// carries exactly one thing the dialog's key does not.
+///
+/// **The one difference, asserted as a difference.** A playground key gets a
+/// default `credit_limit_usd` because it is written to `localStorage` and is
+/// therefore the account's most exposed credential; the dialog's key does not,
+/// because the customer chose its terms. The dialog mint is checked here to
+/// still be unlimited so the default cannot creep into the general mint path
+/// unnoticed — that would silently cap every key every customer creates.
+///
+/// The budget is a CUSTOMER limit, not an operator one, which is what makes it
+/// shippable: `PATCH /api/keys/{id}` can raise it. A cap on a key minted for
+/// someone without asking, that they could not then lift, would be a footgun.
 #[tokio::test]
 async fn the_playground_key_is_an_ordinary_key_with_default_caps() {
     let Some(pool) = connect().await else {
@@ -843,15 +855,40 @@ async fn the_playground_key_is_an_ordinary_key_with_default_caps() {
             "{field} must match the key the dialog mints with its defaults"
         );
     }
-    // Null rather than a value: no expiry, no per-key credit limit, and so
-    // nothing spent against one.
+    // No expiry. The page re-mints only when the browser finds it has no key,
+    // so a lapsing playground key would present as an unexplained failure on a
+    // page that had been working.
+    assert_eq!(
+        playground["expires_at"],
+        Value::Null,
+        "the playground key must not expire"
+    );
+    // The blast-radius bound on a `localStorage`-resident credential, and a
+    // monthly one so it heals on its own rather than stranding the page.
+    assert_eq!(
+        playground["credit_limit_usd"], "5.00",
+        "a playground key carries its default budget: {playground}"
+    );
+    assert_eq!(playground["credit_limit_window"], "monthly");
+    assert_eq!(
+        playground["credit_limit_used_usd"], "0",
+        "and has spent none of it a moment after minting"
+    );
+
+    // The dialog's key is UNLIMITED, and stays that way. The default belongs to
+    // the one key the customer did not choose the terms of; leaking it into
+    // `POST /api/keys` would silently cap every key every customer creates.
     for field in [
         "expires_at",
         "credit_limit_usd",
         "credit_limit_window",
         "credit_limit_used_usd",
     ] {
-        assert_eq!(playground[field], Value::Null, "{field} must be unset");
+        assert_eq!(
+            dialog[field],
+            Value::Null,
+            "{field} must stay unset on a name-only dialog mint: {dialog}"
+        );
     }
 
     // And it is listed. The revoke path is the ordinary one — nothing about the
@@ -867,6 +904,20 @@ async fn the_playground_key_is_an_ordinary_key_with_default_caps() {
     assert_eq!(named.len(), 1, "one playground row: {listed}");
     assert_eq!(named[0]["id"], playground["id"]);
     assert_eq!(named[0]["disabled"], json!(false));
+
+    // **The budget is asserted again HERE, from the listing, and that repetition
+    // is deliberate.** The mint response is assembled in Rust from the same
+    // constants the INSERT binds, so it would go on reporting a $5 limit even if
+    // the INSERT stopped writing one — the echo is not evidence that the row
+    // carries what the customer was told. The listing reads the row, so this is
+    // the assertion that cannot be satisfied by a well-meaning response builder.
+    // (Found by disabling the mint's limit and watching this test pass anyway.)
+    for field in ["credit_limit_usd", "credit_limit_window"] {
+        assert_eq!(
+            named[0][field], playground[field],
+            "the stored row must carry the {field} the mint reported: {listed}"
+        );
+    }
 }
 
 /// The mint is session-gated and CSRF-gated exactly like every other mutating

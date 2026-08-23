@@ -748,6 +748,57 @@ async fn create_key(
 /// the one it is replacing.
 pub const PLAYGROUND_KEY_NAME: &str = "playground";
 
+/// The default `credit_limit_usd` a freshly minted playground key carries, and
+/// the cadence it resets on.
+///
+/// # Why this key gets a default budget when no other mint path does
+///
+/// This is the account's most exposed credential. It is written to
+/// `localStorage` on the portal origin so the page can present it as a real
+/// `Authorization: Bearer` — see the header of `portal/src/pages/Playground.tsx`
+/// for why that is defensible (anyone who can run script on this origin can
+/// already `POST /api/keys` with the session cookie and mint one). "Defensible"
+/// is not "unbounded", though: a browser-resident key is the one an XSS, a
+/// hostile extension or a shared machine reaches first, and it is the only key
+/// a customer never chose the terms of. So it carries a blast-radius bound the
+/// key dialog does not impose, because the dialog's user picked their own.
+///
+/// # Why $5.00, and why monthly
+///
+/// $5 is enough to explore every lane in the catalog many times over at
+/// published rates — the e2e suite funds its whole playground round-trip with
+/// exactly this much — and small enough that losing all of it is an annoyance
+/// rather than an incident. It sits well under the operator's own default
+/// `spend_cap_usd` of 20, so the customer's budget is what binds and the
+/// anti-abuse ceiling is untouched.
+///
+/// Monthly rather than daily, weekly or lifetime, for two reasons. A LIFETIME
+/// cap would eventually strand the page: the budget runs out once and never
+/// comes back, and the only remedy is an edit the customer has no reason to
+/// expect they need. A calendar month heals on its own. And monthly is the one
+/// cadence that is FREE on the hot path — admission already reads
+/// `usage_key_month_spend` for the `spend_cap_usd` gate, so this cadence adds
+/// no counter read at all, where daily or weekly would add one (migration
+/// 0023's own accounting of the four cadences).
+///
+/// # It is a default, not a wall
+///
+/// The bound is only acceptable because `PATCH /api/keys/{id}` can raise it: a
+/// cap the customer cannot lift on a key the page mints for them without asking
+/// would be a footgun, not a guardrail. The two shipped together for exactly
+/// this reason.
+///
+/// # Keys minted before this existed are left alone
+///
+/// There is deliberately no backfill over live playground rows. Retroactively
+/// capping a key a customer may already be driving traffic through is a silent
+/// behavior change, and it would arrive as an unexplained 402 rather than as
+/// anything they did. The default applies to keys minted from here on; an
+/// existing capless playground key stays capless until this endpoint replaces
+/// it, at which point its replacement is an ordinary new key with the default.
+const PLAYGROUND_KEY_CREDIT_LIMIT_USD: Decimal = Decimal::from_parts(500, 0, 0, false, 2);
+const PLAYGROUND_KEY_CREDIT_LIMIT_WINDOW: CreditLimitWindow = CreditLimitWindow::Monthly;
+
 /// Ensure this account holds exactly one live playground key, and hand back its
 /// plaintext.
 ///
@@ -811,18 +862,36 @@ async fn ensure_playground_key(
 
     let api_key = generate_api_key();
     let key_id = Uuid::new_v4();
-    // Default caps, stated by omission: no expiry, no per-key credit limit, and
-    // the column defaults for `spend_cap_usd` and `velocity_cap_tokens_per_min`
-    // — the same key `POST /api/keys` mints when the dialog is left alone. The
-    // playground is a client, not a privileged one, and must not be a cheaper
-    // one either.
-    sqlx::query("INSERT INTO api_keys (id, user_id, key_hash, name) VALUES ($1, $2, $3, $4)")
-        .bind(key_id)
-        .bind(user.user_id)
-        .bind(hash_api_key(&api_key))
-        .bind(PLAYGROUND_KEY_NAME)
-        .execute(&mut *transaction)
-        .await?;
+    // The OPERATOR ceilings are stated by omission — the column defaults for
+    // `spend_cap_usd` and `velocity_cap_tokens_per_min`, the same ones
+    // `POST /api/keys` gives a key when the dialog is left alone. The playground
+    // is a client, not a privileged one, and must not be a cheaper one either.
+    //
+    // The CUSTOMER budget is stated explicitly, and it is the one way this mint
+    // differs from the dialog's: a key that lands in `localStorage` without the
+    // customer choosing its terms gets a blast-radius bound, raisable from the
+    // Keys page. See [`PLAYGROUND_KEY_CREDIT_LIMIT_USD`] for the whole argument,
+    // including why existing capless playground keys are not backfilled.
+    //
+    // No expiry: the page re-mints only when the browser finds it has no key, so
+    // a lapsing playground key would present as an unexplained failure on a page
+    // that had been working, with nothing on screen saying why.
+    sqlx::query(
+        r#"
+        INSERT INTO api_keys (
+            id, user_id, key_hash, name, credit_limit_usd, credit_limit_window
+        )
+        VALUES ($1, $2, $3, $4, $5, $6)
+        "#,
+    )
+    .bind(key_id)
+    .bind(user.user_id)
+    .bind(hash_api_key(&api_key))
+    .bind(PLAYGROUND_KEY_NAME)
+    .bind(PLAYGROUND_KEY_CREDIT_LIMIT_USD)
+    .bind(PLAYGROUND_KEY_CREDIT_LIMIT_WINDOW.as_str())
+    .execute(&mut *transaction)
+    .await?;
     let (spend_cap_usd, velocity_cap_tokens_per_min, created_at) =
         sqlx::query_as::<_, (Decimal, i32, DateTime<Utc>)>(
             r#"
@@ -847,9 +916,12 @@ async fn ensure_playground_key(
             velocity_cap_tokens_per_min,
             default_priority: None,
             expires_at: None,
-            credit_limit_usd: None,
-            credit_limit_window: None,
-            credit_limit_used_usd: None,
+            credit_limit_usd: Some(PLAYGROUND_KEY_CREDIT_LIMIT_USD),
+            credit_limit_window: Some(PLAYGROUND_KEY_CREDIT_LIMIT_WINDOW),
+            // Zero, not null: the key was minted a moment ago and has a limit,
+            // so it has spent none of it. The playground page reads this to show
+            // the customer the budget it just gave them.
+            credit_limit_used_usd: Some(Decimal::ZERO),
             created_at,
             last_used_at: None,
         }),
@@ -1049,30 +1121,149 @@ async fn disable_key(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// `PATCH /api/keys/{id}` — the portal's first post-mint key mutation
-/// (rollout stage 3a), accepting `default_priority` alone until a second
-/// field earns its place.
+/// `PATCH /api/keys/{id}` — post-mint editing of a key's routing default, its
+/// budget and its lifetime.
 ///
-/// PATCH semantics are field-presence semantics, so the field is a double
+/// PATCH semantics are field-presence semantics, so every field is a double
 /// `Option`: absent = leave unchanged (a `{}` PATCH is a no-op that returns
-/// the current summary), `null` = clear back to balanced, a keyword = set.
+/// the current summary), `null` = clear, a value = set.
 /// `deny_unknown_fields` keeps a typo'd or premature field a loud 400, the
 /// same contract as the request-side `zerorouter` object.
+///
+/// # What is deliberately absent, and why absence is the enforcement
+///
+/// `spend_cap_usd` and `velocity_cap_tokens_per_min` are the OPERATOR's
+/// anti-abuse ceilings, and migration 0023 spells out why they are separate
+/// columns from the customer's own `credit_limit_usd` at all: the user-wide
+/// ceiling is derived as `MAX(spend_cap_usd)` over live keys, so a customer who
+/// could raise it on one key would raise it for every key they hold, and
+/// disable-and-remint would go back to multiplying a quota. `name` is the key's
+/// identity — usage history reads it, and `ensure_playground_key` finds the row
+/// it is replacing by it.
+///
+/// None of the three has a field here, so `deny_unknown_fields` refuses a
+/// request naming one before any handler code runs. That is a stronger
+/// guarantee than a handler that remembers to ignore them, because there is
+/// nothing to remember and nothing a later edit could accidentally wire up.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct UpdateKeyRequest {
     #[serde(default, deserialize_with = "present_field")]
     default_priority: Option<Option<Priority>>,
+    /// The customer's own budget for this key; `null` clears it to unlimited.
+    #[serde(default, deserialize_with = "present_field")]
+    credit_limit_usd: Option<Option<Decimal>>,
+    /// The cadence that budget resets on; `null` clears it to "never resets".
+    #[serde(default, deserialize_with = "present_field")]
+    credit_limit_window: Option<Option<CreditLimitWindow>>,
+    /// An absolute RFC 3339 instant, as at mint — the dialog resolves its
+    /// presets against the clock and sends the result, so a retried or replayed
+    /// edit lands on the date the customer was actually shown.
+    #[serde(default, deserialize_with = "present_field")]
+    expires_at: Option<Option<DateTime<Utc>>>,
 }
 
 /// Wrap a present-but-possibly-null field as `Some(inner)`, so absence
 /// (`None` via `serde(default)`) stays distinguishable from an explicit
 /// `null` (`Some(None)`).
-fn present_field<'de, D>(deserializer: D) -> Result<Option<Option<Priority>>, D::Error>
+fn present_field<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
 where
     D: Deserializer<'de>,
+    T: Deserialize<'de>,
 {
-    Option::<Priority>::deserialize(deserializer).map(Some)
+    Option::<T>::deserialize(deserializer).map(Some)
+}
+
+/// The four editable columns as they stand, plus the state a patch would leave
+/// them in. Kept as one struct so validation reads against the RESULTING row
+/// rather than against whichever fields the request happened to carry.
+struct KeyEdit {
+    default_priority: Option<String>,
+    expires_at: Option<DateTime<Utc>>,
+    credit_limit_usd: Option<Decimal>,
+    credit_limit_window: Option<String>,
+}
+
+/// Apply a patch to the current row and refuse any resulting state the schema
+/// or the product does not permit.
+///
+/// Everything is validated before anything is written, so a refusal never
+/// half-applies — a combined PATCH whose second field is bad leaves the first
+/// field alone too.
+fn validate_key_edit(request: &UpdateKeyRequest, current: KeyEdit) -> Result<KeyEdit, PortalError> {
+    let after = KeyEdit {
+        default_priority: match request.default_priority {
+            Some(value) => value.map(|priority| priority.as_str().to_owned()),
+            None => current.default_priority,
+        },
+        expires_at: match request.expires_at {
+            Some(value) => value,
+            None => current.expires_at,
+        },
+        credit_limit_usd: match request.credit_limit_usd {
+            Some(value) => value,
+            None => current.credit_limit_usd,
+        },
+        credit_limit_window: match request.credit_limit_window {
+            Some(value) => value.map(|window| window.as_str().to_owned()),
+            None => current.credit_limit_window,
+        },
+    };
+
+    if let Some(limit) = after.credit_limit_usd {
+        // The same bounds `validate_new_key` applies, stated once per path
+        // rather than shared, because the mint path validates a request and
+        // this validates a resulting row. Zero is refused for 0023's reason: a
+        // zero budget refuses every request including the free lane, which is a
+        // revocation wearing a budget's clothes, and `disabled` already says
+        // that in one place and reversibly.
+        if limit <= Decimal::ZERO {
+            return Err(PortalError::InvalidRequest(
+                "credit_limit_usd must be positive",
+            ));
+        }
+        if limit > Decimal::from(MAX_SPEND_CAP_USD) {
+            return Err(PortalError::InvalidRequest(
+                "credit_limit_usd cannot exceed 10000",
+            ));
+        }
+    }
+    // Checked against the row the patch WOULD leave, which is what makes this
+    // cover the dangerous direction as well as the obvious one. Setting a
+    // cadence on an unlimited key is the obvious mistake. Clearing the LIMIT out
+    // from under a live cadence is the subtle one — `{"credit_limit_usd": null}`
+    // on a $10-a-day key would leave a row still claiming "daily" with nothing
+    // to enforce, which is a budget feature quietly turning a budget off.
+    //
+    // Refused rather than silently clearing the cadence too: 0023 makes the
+    // state unrepresentable in the row, so the only alternatives are a 400 that
+    // says what to send or a 500 out of a CHECK violation.
+    if after.credit_limit_window.is_some() && after.credit_limit_usd.is_none() {
+        return Err(PortalError::InvalidRequest(
+            "credit_limit_window requires credit_limit_usd; send both as null to \
+             remove the budget entirely",
+        ));
+    }
+    // An expiry in the past is refused rather than accepted as an
+    // immediate-expiry idiom, and the message points at the thing that does
+    // mean that. Two ways to turn a key off would behave differently under the
+    // authenticator's 30-second cache and read differently in the key list
+    // ("expired" against "disabled"); and a date in the past is far more often
+    // a mistyped year than a request to kill the key. The mint path refuses the
+    // same shape for the same reason.
+    //
+    // Moving an expiry FORWARD is allowed even on a key that has already
+    // lapsed. Only the account holder can send this, expiry is a scheduled
+    // convenience rather than a revocation, and the alternative is a customer
+    // who mistyped "1 hour" losing a working key for good. `disabled` stays the
+    // one-way door.
+    if after.expires_at.is_some_and(|at| at <= Utc::now()) {
+        return Err(PortalError::InvalidRequest(
+            "expires_at must be in the future; to stop a key now, revoke it with \
+             DELETE /api/keys/{id}",
+        ));
+    }
+    Ok(after)
 }
 
 async fn update_key(
@@ -1081,21 +1272,85 @@ async fn update_key(
     Path(key_id): Path<Uuid>,
     Json(request): Json<UpdateKeyRequest>,
 ) -> Result<Json<KeySummary>, PortalError> {
-    if let Some(default_priority) = request.default_priority {
-        // Disabled keys stay patchable: the flag governs dispatch, not
-        // ownership, and a metadata edit on a disabled key is coherent (it
-        // stays disabled). The user_id predicate is the tenancy wall, as in
-        // `disable_key`.
-        let result =
-            sqlx::query("UPDATE api_keys SET default_priority = $3 WHERE id = $1 AND user_id = $2")
-                .bind(key_id)
-                .bind(user.user_id)
-                .bind(default_priority.map(Priority::as_str))
-                .execute(&ctx.pool)
-                .await?;
-        if result.rows_affected() == 0 {
-            return Err(PortalError::KeyNotFound);
-        }
+    // One transaction holding the key's own row lock, for three jobs at once:
+    // the tenancy check, the read-modify-write that the cadence rule needs
+    // (the rule is about the resulting row, so the current row has to be read),
+    // and the summary that answers the request.
+    //
+    // ONLY the `api_keys` row lock is taken — never the per-user advisory lock.
+    // That is this crate's lock discipline (`db::begin_usage_session`:
+    // advisory-then-row everywhere), and it is what keeps this path out of a
+    // deadlock cycle with admission: admission holds {advisory, row} and this
+    // holds {row} alone, so it can wait on admission but admission can never
+    // wait on it. Taking the advisory lock here to be "safe" would invert the
+    // order and create the cycle.
+    //
+    // Disabled keys stay patchable: the flag governs dispatch, not ownership,
+    // and a metadata edit on a disabled key is coherent (it stays disabled).
+    let mut transaction = ctx.pool.begin().await?;
+    let current = sqlx::query_as::<
+        _,
+        (
+            Option<String>,
+            Option<DateTime<Utc>>,
+            Option<Decimal>,
+            Option<String>,
+        ),
+    >(
+        r#"
+        SELECT default_priority, expires_at, credit_limit_usd, credit_limit_window
+        FROM api_keys
+        WHERE id = $1 AND user_id = $2
+        FOR UPDATE
+        "#,
+    )
+    .bind(key_id)
+    .bind(user.user_id)
+    .fetch_optional(&mut *transaction)
+    .await?
+    .ok_or(PortalError::KeyNotFound)?;
+
+    let after = validate_key_edit(
+        &request,
+        KeyEdit {
+            default_priority: current.0,
+            expires_at: current.1,
+            credit_limit_usd: current.2,
+            credit_limit_window: current.3,
+        },
+    )?;
+
+    // A `{}` PATCH writes nothing at all rather than writing every column back
+    // unchanged — the no-op stays a read, and the row's version does not churn
+    // for a request that changed nothing.
+    if request.default_priority.is_some()
+        || request.expires_at.is_some()
+        || request.credit_limit_usd.is_some()
+        || request.credit_limit_window.is_some()
+    {
+        // All four written together from the validated result, rather than a
+        // COALESCE per field: for these columns NULL is a VALUE ("balanced",
+        // "never expires", "unlimited") and not an absent override, so a
+        // COALESCE would make clearing any of them impossible. Writing back the
+        // unchanged ones is safe because they were read under this same lock.
+        sqlx::query(
+            r#"
+            UPDATE api_keys
+            SET default_priority = $3,
+                expires_at = $4,
+                credit_limit_usd = $5,
+                credit_limit_window = $6
+            WHERE id = $1 AND user_id = $2
+            "#,
+        )
+        .bind(key_id)
+        .bind(user.user_id)
+        .bind(after.default_priority.as_deref())
+        .bind(after.expires_at)
+        .bind(after.credit_limit_usd)
+        .bind(after.credit_limit_window.as_deref())
+        .execute(&mut *transaction)
+        .await?;
     }
     let row = sqlx::query_as::<
         _,
@@ -1124,9 +1379,14 @@ async fn update_key(
     ))
     .bind(key_id)
     .bind(user.user_id)
-    .fetch_optional(&ctx.pool)
+    // In the SAME transaction, so the summary describes the row this request
+    // just wrote rather than one a concurrent edit may have moved on from. The
+    // derived spend counters are read with a plain SELECT, which takes no row
+    // lock and so cannot deadlock against the accrual trigger's upserts.
+    .fetch_optional(&mut *transaction)
     .await?
     .ok_or(PortalError::KeyNotFound)?;
+    transaction.commit().await?;
     let (
         name,
         disabled,

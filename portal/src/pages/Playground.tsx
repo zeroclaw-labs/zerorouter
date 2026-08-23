@@ -27,13 +27,21 @@
 // attacker nothing they did not already have. What it does buy the customer is
 // that the credential is VISIBLE — it appears in their key list, carries the
 // ordinary caps, and revoking it there genuinely turns this page off.
+//
+// Because it lives in a browser, it is also the account's most EXPOSED key, so
+// the mint gives it a default credit limit the key dialog does not impose —
+// $5.00 a month, `PLAYGROUND_KEY_CREDIT_LIMIT_USD` in `router/src/portal.rs`.
+// This page shows that budget rather than leaving the customer to find it on the
+// Keys page, and when it runs out it says so in those words and points at the
+// edit that raises it. A cap the customer could not lift would be a footgun;
+// one they cannot even see is a mystery 402.
 // ---------------------------------------------------------------------------
 
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { FormEvent } from 'react'
 import { Link } from 'react-router-dom'
 import { ApiError, api } from '../api'
-import type { Model } from '../api'
+import type { ApiKey, Model } from '../api'
 import {
   Badge,
   Banner,
@@ -325,7 +333,22 @@ export function Playground() {
   // undoing what they just did on the Keys page.
   const [keyRevoked, setKeyRevoked] = useState(false)
   const [enabling, setEnabling] = useState(false)
+  // Set when the router refused with `key_credit_limit_exceeded` — the key's own
+  // budget, not the account balance. Kept apart from `error` because the two
+  // want different words and different next steps: one is "add credits", the
+  // other is "raise this key's limit", and telling a customer with $40 of credit
+  // that they are out of money is the failure worth avoiding here.
+  const [budgetSpent, setBudgetSpent] = useState(false)
   const transcriptRef = useRef<HTMLDivElement | null>(null)
+
+  // The playground key's budget, read from the server rather than remembered
+  // from the mint: the customer may have raised it on the Keys page since, and
+  // the used figure only exists server-side anyway (it comes from the same
+  // derived counters admission enforces against). Absent when this browser has
+  // never minted one, which is the state before the first send.
+  const keys = useLoad(() => api.keys(), [])
+  const playgroundRow: ApiKey | null =
+    keys.data?.find((key) => key.name === 'playground' && !key.disabled) ?? null
 
   useEffect(() => writeStored(DRAFT_STORAGE, draft === '' ? null : draft), [draft])
   useEffect(() => writeStored(SYSTEM_STORAGE, system === '' ? null : system), [system])
@@ -414,6 +437,7 @@ export function Playground() {
     if (prompt === '' || selected === undefined || streaming) return
 
     setError(null)
+    setBudgetSpent(false)
     // The key was minted before this browser ever had one, so the FIRST send is
     // where it happens — the customer asked to run something, which is the
     // moment the credential is actually needed.
@@ -474,6 +498,17 @@ export function Playground() {
           error?: { message?: string; code?: string }
         } | null
         const code = detail?.error?.code ?? `http_${response.status}`
+        // The router distinguishes "this key's own budget is gone" from "this
+        // account is out of credit" with two different codes, and the whole
+        // point of that distinction is that they need different sentences. A
+        // customer whose $5 playground budget ran out has not run out of money.
+        if (code === 'key_credit_limit_exceeded') {
+          setBudgetSpent(true)
+          setTurns(history)
+          setDraft(prompt)
+          keys.reload()
+          return
+        }
         if (code === 'invalid_api_key') {
           // The key in this browser no longer authenticates — revoked on the
           // Keys page, most likely. Drop it and ask; do not quietly mint.
@@ -510,10 +545,12 @@ export function Playground() {
         }
         return next
       })
-      // The balance moved. Re-read it from the server rather than subtracting
-      // an estimate here: what a request cost is the ledger's answer, and this
-      // page must not invent a second one.
+      // The balance moved, and so did the key's budget. Re-read BOTH from the
+      // server rather than subtracting an estimate here: what a request cost is
+      // the ledger's answer, and this page must not invent a second one — least
+      // of all for the number that decides whether the next send is refused.
       void refresh()
+      keys.reload()
     } catch (err) {
       setError(err instanceof Error ? err.message : 'The request failed.')
       // Drop the empty assistant turn; keep what the customer typed so a
@@ -562,6 +599,24 @@ export function Playground() {
         </Banner>
       )}
 
+      {/* The budget refusal, in its own words. Not an error banner: nothing went
+          wrong, a limit the customer's own account set did exactly what it was
+          set to do — and the remedy is one they own, on a page linked from
+          here. Stating the balance is untouched matters, because a 402 on a page
+          that spends credits reads as "out of money" unless it says otherwise. */}
+      {budgetSpent && (
+        <Banner kind="info">
+          This playground key has used its whole credit limit
+          {playgroundRow?.credit_limit_usd != null
+            ? ` of ${formatUsd(playgroundRow.credit_limit_usd)}`
+            : ''}
+          {playgroundRow?.credit_limit_window === 'monthly' ? ' for this month' : ''}. Your account
+          balance of {formatUsd(balance)} is untouched — this is the key&rsquo;s own budget, which
+          the playground sets to a modest default because the key lives in this browser. Raise it on
+          the <Link to="/keys">Keys</Link> page, or wait for the limit to reset.
+        </Banner>
+      )}
+
       {keyRevoked && (
         <Banner kind="info">
           Your playground key was revoked, so this page cannot run anything until it has a new one.
@@ -575,6 +630,35 @@ export function Playground() {
 
       <section className="stats">
         <Stat label="Credit balance" value={formatUsd(balance)} />
+        {/* THE KEY'S OWN BUDGET, beside the account balance and distinct from
+            it, because they are two different ceilings and only one of them is
+            about money the customer has. Rendered from the server's
+            `credit_limit_used_usd`, which is computed from the same counters
+            admission enforces against — so this tile can never show a figure
+            that disagrees with the one refusing a request.
+
+            Absent before this browser has minted a key, and "no limit" for a
+            playground key minted before the default existed: those are not
+            retroactively capped, so the page must not claim they are. */}
+        {playgroundRow !== null && (
+          <Stat
+            label="Playground key budget"
+            value={
+              playgroundRow.credit_limit_usd === null
+                ? 'no limit'
+                : `${formatUsd(playgroundRow.credit_limit_used_usd ?? '0')} of ${formatUsd(
+                    playgroundRow.credit_limit_usd,
+                  )}`
+            }
+            sub={
+              playgroundRow.credit_limit_usd === null
+                ? 'this key predates the default'
+                : playgroundRow.credit_limit_window === null
+                  ? 'does not reset'
+                  : `resets ${playgroundRow.credit_limit_window}`
+            }
+          />
+        )}
         <Stat
           label="Serving lane"
           value={selected === undefined ? '—' : <span className="mono">{selected.id}</span>}
