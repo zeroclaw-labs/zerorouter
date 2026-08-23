@@ -105,6 +105,68 @@ test('a key can be minted with an expiry and a credit limit', async ({ page }) =
   await page.getByLabel(/reset limit every/i).selectOption({ label: 'Daily' })
   await page.getByRole('button', { name: /create key/i }).click()
   await expect(page.getByText(/set a credit limit/i)).toBeVisible()
+
+  // ── EDITING THE KEY THAT WAS JUST MINTED ─────────────────────────────────
+  //
+  // Asserted in this test rather than a new one for the reason stated above: a
+  // fresh test would mint another key off the account's 24-hour creation
+  // throttle, and this is the same row, in the same table, one interaction
+  // later. Until the edit endpoint existed, changing any of these meant
+  // revoke-and-remint — a new secret and every client updated with it.
+  const dataRow = page.getByRole('row', { name: new RegExp(keyName) }).first()
+  await dataRow.getByRole('button', { name: new RegExp(`edit limits for ${keyName}`, 'i') }).click()
+
+  const editor = page.locator('.key-edit-row')
+  // The editor opens seeded with what the key ALREADY carries, and states the
+  // used-of-limit figure the server computed — so the customer is typing over a
+  // number they can see rather than one they have to remember.
+  await expect(editor).toContainText('Used $0.00 of $25.00')
+  await expect(page.getByLabel(`Credit limit for ${keyName}`)).toHaveValue('25')
+  await expect(page.getByLabel(`Reset limit for ${keyName}`)).toHaveValue('weekly')
+
+  // A cadence with nothing to reset is refused on the edit path exactly as it is
+  // on the mint path, and refusing does not close the editor or lose the rest of
+  // the form.
+  await page.getByLabel(`Credit limit for ${keyName}`).fill('')
+  await editor.getByRole('button', { name: /^save$/i }).click()
+  // `.last()`: the create form raised the same toast a moment ago and toasts
+  // stack, so an unqualified match finds both and fails on strictness rather
+  // than on anything about the edit.
+  await expect(page.getByText(/set a credit limit/i).last()).toBeVisible()
+  await expect(page.locator('.key-edit-row')).toHaveCount(1)
+
+  // The round trip: a new limit, a new cadence, and the expiry cleared — all in
+  // one PATCH, all reflected in the row afterwards.
+  await page.getByLabel(`Credit limit for ${keyName}`).fill('40')
+  await page.getByLabel(`Reset limit for ${keyName}`).selectOption({ label: 'Monthly' })
+  await page.getByLabel(`Expiration for ${keyName}`).selectOption({ label: 'Expiry: never' })
+  await editor.getByRole('button', { name: /^save$/i }).click()
+
+  // The editor closes and the row carries the edit. The expiry column moving
+  // from a date to "never" is the half that proves an ABSENT field and a NULL
+  // field are different things on this wire: the cadence select was sent as a
+  // value, the expiry as an explicit null.
+  await expect(page.locator('.key-edit-row')).toHaveCount(0)
+  await expect(dataRow).toContainText('$0.00 of $40.00/mo')
+  await expect(dataRow).toContainText('never')
+  await expect(dataRow).toContainText('active')
+
+  // And the server agrees — the row is not merely re-rendered from what the form
+  // hoped it sent.
+  const stored = await page.evaluate(async (name) => {
+    const keys = await (await fetch('/api/keys')).json()
+    return (
+      keys.keys as Array<{
+        name: string
+        credit_limit_usd: string | null
+        credit_limit_window: string | null
+        expires_at: string | null
+      }>
+    ).find((key) => key.name === name)
+  }, keyName)
+  expect(stored?.credit_limit_usd).toBe('40')
+  expect(stored?.credit_limit_window).toBe('monthly')
+  expect(stored?.expires_at).toBeNull()
 })
 
 test('the api documentation is readable without an account', async ({ page }) => {
@@ -761,6 +823,14 @@ test('a completion round-trips through the real router and mints the playground 
   // subtracting its own estimate.
   await expect(page.getByText(/credit balance/i)).toBeVisible()
 
+  // THE KEY'S OWN BUDGET, shown beside the balance. The key this page just
+  // minted lives in `localStorage`, so it carries a default credit limit the key
+  // dialog does not impose — and a cap the customer cannot see is a mystery 402
+  // waiting to happen, so the page names it and names its cadence.
+  const budget = page.locator('.stat', { hasText: /playground key budget/i })
+  await expect(budget).toContainText('of $5.00')
+  await expect(budget).toContainText('resets monthly')
+
   // THE IMPLICIT KEY IS VISIBLE AND REVOCABLE. This is the whole reason the
   // design is an ordinary key rather than a hidden credential: a customer can
   // find it, and taking it away really does turn the page off.
@@ -825,4 +895,96 @@ test('the capability gate is rendered when a text-only lane is sent an image', a
   // And the prompt survived the refusal — a rejected send must not cost the
   // customer what they typed.
   await expect(page.getByLabel('Prompt')).toHaveValue('What is in this image?')
+})
+
+test('a spent playground budget is explained as the key’s own limit, and is raisable', async ({
+  page,
+}) => {
+  await signIn(page)
+  execFileSync(routerBin, ['admin', 'grant-credit', '--email', E2E_EMAIL, '--amount-usd', '5'], {
+    env: process.env,
+  })
+
+  // A real completion first, so the key has settled spend to be measured
+  // against. This also mints the key if an earlier spec has not.
+  await page.getByRole('link', { name: /playground/i }).click()
+  await page.getByLabel(/search models/i).fill(MOCK_LANE)
+  await page.locator('.lane', { hasText: MOCK_LANE }).click()
+  await page.getByLabel('Prompt').fill('Say the thing.')
+  await page.getByRole('button', { name: /^send$/i }).click()
+  await expect(page.locator('.turn-assistant').last().locator('.turn-body')).toHaveText(
+    /Zero retention acknowledged\./,
+    { timeout: 20_000 },
+  )
+
+  // Read what the key has actually spent and aim BELOW it. Picking a fixed
+  // "small" limit would be a race against the catalog's rates and the
+  // reservation's size; a limit strictly under the settled spend refuses on
+  // `committed < cap` before the projection is even considered, whatever a
+  // request happens to reserve. This is the browser-level statement of the same
+  // property `lowering_a_limit_below_what_is_already_spent_refuses_immediately`
+  // pins in the router suite.
+  const playgroundKey = await page.evaluate(async () => {
+    const keys = await (await fetch('/api/keys')).json()
+    return (
+      keys.keys as Array<{ name: string; disabled: boolean; credit_limit_used_usd: string | null }>
+    ).find((key) => key.name === 'playground' && !key.disabled)
+  })
+  const used = Number(playgroundKey?.credit_limit_used_usd ?? '0')
+  expect(used, 'the completion above must have settled some spend').toBeGreaterThan(0)
+  const underwater = (used / 2).toFixed(8)
+  expect(Number(underwater)).toBeGreaterThan(0)
+
+  // Lower it from the Keys page — the customer's own affordance, not a fixture.
+  await page.getByRole('link', { name: /keys/i }).click()
+  const live = page.getByRole('row', { name: /playground/ }).filter({ hasText: 'active' }).first()
+  await live.getByRole('button', { name: /edit limits for playground/i }).click()
+  const editor = page.locator('.key-edit-row')
+  await page.getByLabel('Credit limit for playground').fill(underwater)
+  // The form warns before saving, because a limit under what is already spent
+  // takes effect on the very next request rather than at the next reset.
+  await expect(editor.locator('.key-edit-warn')).toContainText(/refuse its next request/i)
+  await editor.getByRole('button', { name: /^save$/i }).click()
+  await expect(page.locator('.key-edit-row')).toHaveCount(0)
+
+  // THE REFUSAL, IN ITS OWN WORDS. The router answers a spent key budget with
+  // `key_credit_limit_exceeded` rather than `insufficient_credits`, and the
+  // whole point of that separate code is that a customer with $5 of credit must
+  // not be told they are out of money.
+  await page.getByRole('link', { name: /playground/i }).click()
+  await page.getByLabel(/search models/i).fill(MOCK_LANE)
+  await page.locator('.lane', { hasText: MOCK_LANE }).click()
+  await page.getByLabel('Prompt').fill('Say it again.')
+  await page.getByRole('button', { name: /^send$/i }).click()
+
+  const banner = page.getByText(/used its whole credit limit/i)
+  await expect(banner).toBeVisible({ timeout: 20_000 })
+  await expect(page.getByText(/account balance of \$[\d.]+ is untouched/i)).toBeVisible()
+  // And it points at the page that fixes it.
+  await expect(
+    page.locator('.banner').getByRole('link', { name: /keys/i }).first(),
+  ).toBeVisible()
+  // The prompt survived the refusal — a budget stop must not cost the customer
+  // what they typed.
+  await expect(page.getByLabel('Prompt')).toHaveValue('Say it again.')
+
+  // Put the default back, so this spec leaves the shared e2e account as it found
+  // it and the budget stays raisable rather than a wall.
+  //
+  // Scoped to the NAV: the banner still on screen carries its own link to the
+  // same page, which is the point of the banner and a strictness collision for
+  // an unqualified match.
+  await page
+    .getByRole('navigation', { name: 'Portal' })
+    .getByRole('link', { name: 'Keys' })
+    .click()
+  const stillLive = page
+    .getByRole('row', { name: /playground/ })
+    .filter({ hasText: 'active' })
+    .first()
+  await stillLive.getByRole('button', { name: /edit limits for playground/i }).click()
+  await page.getByLabel('Credit limit for playground').fill('5.00')
+  await page.locator('.key-edit-row').getByRole('button', { name: /^save$/i }).click()
+  await expect(page.locator('.key-edit-row')).toHaveCount(0)
+  await expect(stillLive).toContainText('of $5.00/mo')
 })

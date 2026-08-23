@@ -121,6 +121,25 @@ export interface NewKey {
   credit_limit_window?: CreditLimitWindow
 }
 
+/** What the per-row edit form sends to `PATCH /api/keys/{id}`.
+ *
+ * PATCH is field-PRESENCE semantics: an absent field is left alone, an explicit
+ * `null` clears it, a value sets it. `{}` is a no-op that answers with the key's
+ * current state. Optional-and-nullable in TypeScript is exactly that contract,
+ * which is why every field here is `T | null` AND optional.
+ *
+ * There is deliberately no field for `spend_cap_usd`,
+ * `velocity_cap_tokens_per_min` or `name`. The first two are the operator's
+ * anti-abuse ceilings — a customer may narrow what they spend, never widen what
+ * they are allowed to — and the third is the key's identity. The server has no
+ * field for them either and refuses a request that names one, so this type is a
+ * mirror of that refusal rather than the thing enforcing it. */
+export interface KeyEdit {
+  credit_limit_usd?: string | null
+  credit_limit_window?: CreditLimitWindow | null
+  expires_at?: string | null
+}
+
 export interface CreatedKey extends ApiKey {
   api_key: string
 }
@@ -338,6 +357,11 @@ export const api = {
   // untestable in a browser until OIDC existed).
   keys: () => request<{ keys: ApiKey[] }>('GET', '/api/keys').then((r) => r.keys),
   createKey: (key: NewKey) => request<CreatedKey>('POST', '/api/keys', key),
+  // Answers with the key's full summary, including the recomputed
+  // `credit_limit_used_usd` — a cadence change moves which window "used" is
+  // measured over, so the figure after an edit is not the figure before it.
+  updateKey: (id: string, edit: KeyEdit) =>
+    request<ApiKey>('PATCH', `/api/keys/${encodeURIComponent(id)}`, edit),
   deleteKey: (id: string) => request<void>('DELETE', `/api/keys/${encodeURIComponent(id)}`),
   // The public catalog — same endpoint any OpenAI-compatible client reads, so
   // the storefront shows exactly what callers get. No auth: a prospective

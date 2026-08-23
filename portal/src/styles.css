@@ -944,6 +944,42 @@ input {
   margin: 0;
 }
 
+/* The per-row limit editor. It expands INSIDE the table as a second row rather
+   than opening a dialog: the numbers being edited are the ones in the row above,
+   and a modal would cover them at the moment they matter most. */
+.key-edit {
+  padding: 4px 0 10px;
+}
+
+.key-edit-row > td {
+  background: var(--surface-2);
+}
+
+.key-edit-fields {
+  display: flex;
+  gap: 10px;
+  /* Same wrapping contract as the create form, for the same reason: four
+     controls do not fit one line on a narrow viewport, and shrinking them all
+     toward illegible is worse than letting them stack. */
+  flex-wrap: wrap;
+  align-items: center;
+}
+
+.key-edit-fields .field {
+  max-width: 220px;
+  width: auto;
+  flex: 1 1 150px;
+}
+
+.key-edit .field-hint {
+  padding: 8px 0 0;
+  margin: 0;
+}
+
+.key-edit-warn {
+  color: var(--bad);
+}
+
 /* ── activate ────────────────────────────────────────────────────────── */
 
 .activate {

@@ -2315,3 +2315,656 @@ async fn the_portal_mints_keys_with_expiry_and_a_credit_limit() {
         "an expiry in the past must be refused at mint"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Editing a key's limits after it is minted (`PATCH /api/keys/{id}`)
+//
+// Before this, changing a budget meant revoke-and-remint: a new secret, a
+// client to update, and a slot off the creation throttle. The tests below are
+// written around the one property that makes editing safe to offer at all —
+// **a customer's PATCH can only ever narrow what the operator allowed** — and
+// around the one that makes it useful: admission reads the limit off the row it
+// already locks, so an edit binds on the very next request with nothing to
+// restart and no cache to wait out.
+// ---------------------------------------------------------------------------
+
+/// The stored operator ceiling and identity of a key, for the assertions that a
+/// refused PATCH changed nothing.
+async fn stored_key_ceiling(pool: &PgPool, key_id: Uuid) -> (String, Decimal, i32) {
+    let name = query_scalar::<_, String>("SELECT name FROM api_keys WHERE id = $1")
+        .bind(key_id)
+        .fetch_one(pool)
+        .await
+        .expect("name must query");
+    let cap = query_scalar::<_, Decimal>("SELECT spend_cap_usd FROM api_keys WHERE id = $1")
+        .bind(key_id)
+        .fetch_one(pool)
+        .await
+        .expect("spend cap must query");
+    let velocity =
+        query_scalar::<_, i32>("SELECT velocity_cap_tokens_per_min FROM api_keys WHERE id = $1")
+            .bind(key_id)
+            .fetch_one(pool)
+            .await
+            .expect("velocity cap must query");
+    (name, cap, velocity)
+}
+
+/// The stored 0023 triple, for asserting a refused PATCH did not half-apply.
+async fn stored_key_limits(
+    pool: &PgPool,
+    key_id: Uuid,
+) -> (Option<Decimal>, Option<String>, Option<String>) {
+    let limit =
+        query_scalar::<_, Option<Decimal>>("SELECT credit_limit_usd FROM api_keys WHERE id = $1")
+            .bind(key_id)
+            .fetch_one(pool)
+            .await
+            .expect("limit must query");
+    let window =
+        query_scalar::<_, Option<String>>("SELECT credit_limit_window FROM api_keys WHERE id = $1")
+            .bind(key_id)
+            .fetch_one(pool)
+            .await
+            .expect("window must query");
+    let expires = query_scalar::<_, Option<String>>(
+        "SELECT to_char(expires_at AT TIME ZONE 'UTC', 'YYYY') FROM api_keys WHERE id = $1",
+    )
+    .bind(key_id)
+    .fetch_one(pool)
+    .await
+    .expect("expiry must query");
+    (limit, window, expires)
+}
+
+/// **The point of the feature.** A limit raised through the portal binds on the
+/// next request, with no restart, no re-mint and no cache to wait out.
+///
+/// Asserted in both directions around the same reservation: the amount is
+/// refused before the edit and admitted after it. A test that only checked the
+/// "after" would pass against a router that had always allowed it, and would be
+/// pinning nothing about the edit at all.
+///
+/// What makes this work is that [`begin_usage_session`] reads
+/// `credit_limit_usd` and `credit_limit_window` out of the `api_keys` row in
+/// the conditional UPDATE it already runs under the per-user advisory lock —
+/// they are not carried on the authenticated identity and not cached, unlike
+/// `default_priority`. This test is the tripwire for anyone who later moves
+/// them onto the 30-second `KeyAuthenticator` cache to save a column read.
+#[tokio::test]
+async fn a_patched_credit_limit_binds_on_the_very_next_request() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let user_id = create_user(&pool, "limit-patch-binds").await;
+    let app = portal_app(&pool);
+    let cookie = portal_cookie(&pool, user_id).await;
+    // A lifetime limit, and an operator ceiling deliberately far above it, so
+    // every refusal below is unambiguously the CUSTOMER's own limit.
+    let key = create_limited_key(&pool, user_id, "NULL", Some(Decimal::from(10)), None).await;
+
+    assert!(
+        matches!(
+            admit(&pool, &key, 100, Decimal::from(20)).await,
+            UsageAdmission::KeyCreditLimitExceeded
+        ),
+        "$20 must not fit a $10 limit before the edit"
+    );
+
+    let (status, body) = send(
+        &app,
+        patch_json(
+            &format!("/api/keys/{}", key.id),
+            &cookie,
+            json!({ "credit_limit_usd": "30" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["credit_limit_usd"].as_str(), Some("30"));
+    assert_eq!(
+        body["credit_limit_used_usd"].as_str(),
+        Some("0"),
+        "an unused key has spent none of its new limit"
+    );
+
+    assert!(
+        matches!(
+            admit(&pool, &key, 100, Decimal::from(20)).await,
+            UsageAdmission::Allowed(_)
+        ),
+        "the same $20 must fit once the limit is $30 — admission reads the row, \
+         not a cached copy of it"
+    );
+}
+
+/// Lowering a limit BELOW what the key has already spent refuses the next
+/// request immediately rather than waiting for the window to turn over.
+///
+/// This is the case an edit feature gets wrong: the derived window counters are
+/// keyed by key id and are untouched by an edit, so the key wakes up already
+/// over its new budget. `spend_within_cap` refuses on `committed < cap` before
+/// it ever considers the projection, which is what makes "already over" a
+/// refusal rather than an off-by-one that admits one more request.
+///
+/// The portal is asserted to report the over-budget figure honestly — $5 used
+/// of a $1 limit — rather than clamping the display to the limit. A clamped
+/// number would read as "spent it exactly" and hide why the key is refusing.
+#[tokio::test]
+async fn lowering_a_limit_below_what_is_already_spent_refuses_immediately() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let user_id = create_user(&pool, "limit-patch-underwater").await;
+    let app = portal_app(&pool);
+    let cookie = portal_cookie(&pool, user_id).await;
+    let key = create_limited_key(
+        &pool,
+        user_id,
+        "NULL",
+        Some(Decimal::from(10)),
+        Some("daily"),
+    )
+    .await;
+    spend(&pool, &key, Decimal::from(5)).await;
+
+    let (status, body) = send(
+        &app,
+        patch_json(
+            &format!("/api/keys/{}", key.id),
+            &cookie,
+            json!({ "credit_limit_usd": "1" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["credit_limit_usd"].as_str(), Some("1"));
+    assert_eq!(
+        Decimal::from_str(
+            body["credit_limit_used_usd"]
+                .as_str()
+                .expect("used must be reported")
+        )
+        .expect("used must parse"),
+        Decimal::from(5),
+        "the spend that already happened is reported as it is, over the new limit"
+    );
+
+    assert!(
+        matches!(
+            admit(&pool, &key, 100, Decimal::new(1, 2)).await,
+            UsageAdmission::KeyCreditLimitExceeded
+        ),
+        "a key already past its new limit must refuse the very next request, \
+         however small"
+    );
+}
+
+/// **A customer may not loosen the operator's abuse ceiling through this
+/// endpoint, and the enforcement is that there is no field to loosen it with.**
+///
+/// `spend_cap_usd` and `velocity_cap_tokens_per_min` are the operator's
+/// guardrails — `spend_cap_usd` is also what the USER ceiling is derived as a
+/// MAX over, so a customer who could raise it on one key would raise it for
+/// every key they hold (migration 0023 states why the two columns are separate
+/// in the first place). `name` is the key's identity, which usage history and
+/// the playground's own lookup read by value.
+///
+/// None of the three appear in `UpdateKeyRequest`, and `deny_unknown_fields`
+/// turns naming one into a 400 before any handler code runs. That is a stronger
+/// guarantee than a handler that remembers to ignore them, because there is
+/// nothing to remember: the field cannot be deserialized at all.
+#[tokio::test]
+async fn the_key_patch_cannot_touch_the_operator_ceiling_or_the_key_name() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let user_id = create_user(&pool, "limit-patch-ceiling").await;
+    let app = portal_app(&pool);
+    let cookie = portal_cookie(&pool, user_id).await;
+
+    let (status, body) = send(
+        &app,
+        post_json("/api/keys", &cookie, json!({ "name": "ceilinged" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let key_id: Uuid = body["id"]
+        .as_str()
+        .expect("created key has an id")
+        .parse()
+        .expect("the id must be a uuid");
+    let before = stored_key_ceiling(&pool, key_id).await;
+
+    for forbidden in [
+        json!({ "spend_cap_usd": "10000" }),
+        json!({ "velocity_cap_tokens_per_min": 2_000_000 }),
+        json!({ "name": "renamed" }),
+        // The combination is refused too: a valid edit riding alongside a
+        // forbidden one must not smuggle the forbidden half through.
+        json!({ "credit_limit_usd": "5", "spend_cap_usd": "10000" }),
+    ] {
+        // Status only: axum's Json extractor rejects an unknown field with a
+        // PLAIN TEXT body, which the JSON-insisting `send` helper cannot read.
+        let status = app
+            .clone()
+            .oneshot(patch_json(
+                &format!("/api/keys/{key_id}"),
+                &cookie,
+                forbidden.clone(),
+            ))
+            .await
+            .expect("request should complete")
+            .status();
+        assert!(
+            status.is_client_error(),
+            "{forbidden} must be refused, got {status}"
+        );
+    }
+
+    assert_eq!(
+        stored_key_ceiling(&pool, key_id).await,
+        before,
+        "no refused PATCH may move the operator ceiling or the key's name"
+    );
+    assert_eq!(
+        stored_key_limits(&pool, key_id).await,
+        (None, None, None),
+        "and the valid half of a refused combined PATCH must not land either"
+    );
+}
+
+/// A reset cadence with no limit to reset is refused on the EDIT path for the
+/// same reason it is refused at mint: it reads as a configured budget and
+/// enforces nothing.
+///
+/// PATCH is where this rule earns its keep, because the bad state is reachable
+/// two ways rather than one. Setting a cadence on an unlimited key is the
+/// obvious one. Clearing the LIMIT on a key that has a cadence is the subtle
+/// one, and it is the dangerous direction: `{"credit_limit_usd": null}` on a
+/// $10-a-day key would leave a row claiming "daily" with nothing to enforce —
+/// a budget feature silently turning a budget off. Both are refused against the
+/// state the row would be left in, not against the fields the request happened
+/// to carry.
+///
+/// Migration 0023's CHECK makes the state unrepresentable, so neither could
+/// actually be written; without this the customer would get a 500 out of a
+/// constraint violation instead of a sentence telling them what to send.
+#[tokio::test]
+async fn the_key_patch_refuses_a_cadence_with_nothing_to_reset() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let user_id = create_user(&pool, "limit-patch-cadence").await;
+    let app = portal_app(&pool);
+    let cookie = portal_cookie(&pool, user_id).await;
+
+    // (a) A cadence on an unlimited key.
+    let unlimited = create_limited_key(&pool, user_id, "NULL", None, None).await;
+    let (status, body) = send(
+        &app,
+        patch_json(
+            &format!("/api/keys/{}", unlimited.id),
+            &cookie,
+            json!({ "credit_limit_window": "daily" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"]["code"], "invalid_request");
+    assert_eq!(
+        stored_key_limits(&pool, unlimited.id).await,
+        (None, None, None),
+        "a refused cadence must not land"
+    );
+
+    // (b) Clearing the limit out from under a cadence.
+    let limited = create_limited_key(
+        &pool,
+        user_id,
+        "NULL",
+        Some(Decimal::from(10)),
+        Some("daily"),
+    )
+    .await;
+    let (status, body) = send(
+        &app,
+        patch_json(
+            &format!("/api/keys/{}", limited.id),
+            &cookie,
+            json!({ "credit_limit_usd": null }),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "clearing the limit under a live cadence must be refused, not dropped: {body}"
+    );
+    assert_eq!(
+        stored_key_limits(&pool, limited.id).await,
+        (Some(Decimal::from(10)), Some("daily".to_owned()), None),
+        "the key must be exactly as it was"
+    );
+
+    // (c) Clearing BOTH is how a customer says "no budget", and it works.
+    let (status, body) = send(
+        &app,
+        patch_json(
+            &format!("/api/keys/{}", limited.id),
+            &cookie,
+            json!({ "credit_limit_usd": null, "credit_limit_window": null }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body["credit_limit_usd"].is_null());
+    assert!(body["credit_limit_window"].is_null());
+    assert!(
+        body["credit_limit_used_usd"].is_null(),
+        "an unlimited key has no window to have used any of"
+    );
+
+    // (d) And setting both back on in one request is the ordinary edit.
+    let (status, body) = send(
+        &app,
+        patch_json(
+            &format!("/api/keys/{}", limited.id),
+            &cookie,
+            json!({ "credit_limit_usd": "5", "credit_limit_window": "weekly" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["credit_limit_usd"].as_str(), Some("5"));
+    assert_eq!(body["credit_limit_window"].as_str(), Some("weekly"));
+
+    // (e) The bounds the mint path enforces are the same ones the edit does.
+    // Zero is a revocation wearing a budget's clothes, and 0023 CHECKs it out
+    // of existence; the ceiling keeps a typo from becoming a $200,000 budget.
+    for out_of_bounds in [
+        json!({ "credit_limit_usd": "0" }),
+        json!({ "credit_limit_usd": "20000" }),
+    ] {
+        let (status, body) = send(
+            &app,
+            patch_json(
+                &format!("/api/keys/{}", limited.id),
+                &cookie,
+                out_of_bounds.clone(),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{out_of_bounds} must be refused: {body}"
+        );
+    }
+    assert_eq!(
+        stored_key_limits(&pool, limited.id).await,
+        (Some(Decimal::from(5)), Some("weekly".to_owned()), None),
+        "a refused bound must leave the previous edit standing"
+    );
+}
+
+/// Expiry can be moved in either direction and cleared, but never set into the
+/// past — that spelling belongs to revoke, which is the one-way door.
+///
+/// **The decision this pins.** `PATCH {"expires_at": <past>}` is REFUSED rather
+/// than accepted as an immediate-expiry idiom, and it points at
+/// `DELETE /api/keys/{id}`. Two reasons. There would otherwise be two ways to
+/// turn a key off that behave differently under the 30-second
+/// `KeyAuthenticator` cache and read differently in the key list ("expired" vs
+/// "disabled") — and a customer reaching for a date in the past has usually
+/// mistyped a year, which a 400 catches and a silently dead key does not. It
+/// also keeps the edit path's rule identical to the mint path's, which already
+/// refuses a past expiry for the same reason.
+///
+/// Extending a LAPSED key is deliberately allowed, and the middle of this test
+/// is where that shows: only the account holder can send this PATCH, expiry is
+/// a scheduled convenience rather than a revocation, and the alternative is a
+/// customer who mistyped "1 hour" losing a key permanently. `disabled` remains
+/// the irreversible state; `expires_at` remains reversible.
+#[tokio::test]
+async fn the_key_patch_moves_expiry_but_never_into_the_past() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let user_id = create_user(&pool, "expiry-patch").await;
+    let app = portal_app(&pool);
+    let cookie = portal_cookie(&pool, user_id).await;
+    let key = create_limited_key(&pool, user_id, "NOW() - INTERVAL '1 second'", None, None).await;
+
+    assert!(
+        matches!(
+            admit(&pool, &key, 100, Decimal::new(1, 2)).await,
+            UsageAdmission::Unauthorized
+        ),
+        "the key starts lapsed"
+    );
+
+    let (status, body) = send(
+        &app,
+        patch_json(
+            &format!("/api/keys/{}", key.id),
+            &cookie,
+            json!({ "expires_at": "2099-01-01T00:00:00Z" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        body["expires_at"]
+            .as_str()
+            .is_some_and(|at| at.starts_with("2099")),
+        "the new expiry is echoed as recorded: {body}"
+    );
+    assert!(
+        matches!(
+            admit(&pool, &key, 100, Decimal::new(1, 2)).await,
+            UsageAdmission::Allowed(_)
+        ),
+        "admission reads the edited expiry from the row it already locks"
+    );
+
+    // Shortening is fine as long as the key is still alive afterwards.
+    let (status, body) = send(
+        &app,
+        patch_json(
+            &format!("/api/keys/{}", key.id),
+            &cookie,
+            json!({ "expires_at": "2098-01-01T00:00:00Z" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        body["expires_at"]
+            .as_str()
+            .is_some_and(|at| at.starts_with("2098"))
+    );
+
+    // Into the past is refused, and refused without half-applying.
+    let (status, body) = send(
+        &app,
+        patch_json(
+            &format!("/api/keys/{}", key.id),
+            &cookie,
+            json!({ "expires_at": "2000-01-01T00:00:00Z" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"]["code"], "invalid_request");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("revoke")),
+        "the refusal must name the thing the customer actually wants: {body}"
+    );
+    assert_eq!(
+        stored_key_limits(&pool, key.id).await.2,
+        Some("2098".to_owned()),
+        "the refused expiry must not have landed"
+    );
+
+    // And an explicit null is "never expires".
+    let (status, body) = send(
+        &app,
+        patch_json(
+            &format!("/api/keys/{}", key.id),
+            &cookie,
+            json!({ "expires_at": null }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body["expires_at"].is_null());
+    assert_eq!(stored_key_limits(&pool, key.id).await.2, None);
+}
+
+/// Changing the CADENCE changes which counter answers "used", and the portal
+/// and admission move to the new one together.
+///
+/// A key with a lifetime limit that has spent $4 yesterday and $1 today reads
+/// $5 used. Switched to a daily cadence it reads $1 — not because anything was
+/// forgiven, but because the question changed. The failure this guards is the
+/// two readers moving at different times: the portal showing the lifetime total
+/// while admission enforces the daily one (or the reverse) leaves a customer
+/// staring at a number that does not explain their refusals.
+#[tokio::test]
+async fn changing_the_cadence_rebases_what_used_means_for_both_readers() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let remaining = seconds_to_utc_day_boundary(&pool).await;
+    assert!(
+        remaining > 60.0,
+        "this test reads a daily window either side of an edit and cannot be \
+         deterministic when the suite is running across a UTC day boundary \
+         ({remaining:.0}s remaining); re-run shortly"
+    );
+    let user_id = create_user(&pool, "cadence-rebase").await;
+    let app = portal_app(&pool);
+    let cookie = portal_cookie(&pool, user_id).await;
+    let key = create_limited_key(&pool, user_id, "NULL", Some(Decimal::from(10)), None).await;
+    seed_event_at(&pool, &key, "NOW() - INTERVAL '1 day'", Decimal::from(4)).await;
+    seed_event_at(&pool, &key, "NOW()", Decimal::ONE).await;
+
+    // Lifetime: both days count, so $9 does not fit under $10.
+    let (status, body) = send(
+        &app,
+        patch_json(&format!("/api/keys/{}", key.id), &cookie, json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        Decimal::from_str(body["credit_limit_used_usd"].as_str().expect("used")).expect("parse"),
+        Decimal::from(5),
+        "a lifetime limit counts every day the key has ever spent"
+    );
+    assert!(
+        matches!(
+            admit(&pool, &key, 100, Decimal::from(9)).await,
+            UsageAdmission::KeyCreditLimitExceeded
+        ),
+        "$5 spent plus $9 reserved is past a $10 lifetime limit"
+    );
+
+    let (status, body) = send(
+        &app,
+        patch_json(
+            &format!("/api/keys/{}", key.id),
+            &cookie,
+            json!({ "credit_limit_window": "daily" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        Decimal::from_str(body["credit_limit_used_usd"].as_str().expect("used")).expect("parse"),
+        Decimal::ONE,
+        "a daily cadence counts today and nothing before it"
+    );
+    assert!(
+        matches!(
+            admit(&pool, &key, 100, Decimal::from(9)).await,
+            UsageAdmission::Allowed(_)
+        ),
+        "and admission must be reading the same $1 the portal just showed"
+    );
+}
+
+/// The playground's key carries a DEFAULT CREDIT LIMIT, and it is a real one:
+/// admission refuses past it, and refuses with the customer-budget code rather
+/// than the operator-ceiling one.
+///
+/// The credential this mints lives in `localStorage` on the portal origin. That
+/// is defensible (anyone who can run script there can already mint a key with
+/// the session cookie) but it is still the account's most exposed key, so it
+/// gets a blast-radius bound the other mint paths do not impose. It is a
+/// CUSTOMER limit, not an operator one, which is precisely why it may ship at
+/// all: `PATCH /api/keys/{id}` can raise it, so the bound is a default rather
+/// than a wall.
+#[tokio::test]
+async fn the_playground_key_carries_a_default_budget_admission_enforces() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let user_id = create_user(&pool, "playground-budget").await;
+    let app = portal_app(&pool);
+    let cookie = portal_cookie(&pool, user_id).await;
+
+    let (status, body) = send(&app, post_json("/api/playground/key", &cookie, json!({}))).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(
+        body["credit_limit_usd"].as_str(),
+        Some("5.00"),
+        "the playground default, echoed as stored: {body}"
+    );
+    assert_eq!(body["credit_limit_window"].as_str(), Some("monthly"));
+    assert_eq!(body["credit_limit_used_usd"].as_str(), Some("0"));
+
+    let key = AuthenticatedKey {
+        id: body["id"].as_str().expect("id").parse().expect("uuid"),
+        user_id,
+        default_priority: None,
+    };
+    // $6 is under the operator's $20 default month-to-date ceiling and over the
+    // customer's $5 budget, so the code it refuses with says which one bound.
+    assert!(
+        matches!(
+            admit(&pool, &key, 100, Decimal::from(6)).await,
+            UsageAdmission::KeyCreditLimitExceeded
+        ),
+        "the playground default must actually bind, and bind as a key budget"
+    );
+    assert!(
+        matches!(
+            admit(&pool, &key, 100, Decimal::ONE).await,
+            UsageAdmission::Allowed(_)
+        ),
+        "and a request inside the budget must still run"
+    );
+
+    // The whole reason the default is safe to impose: the customer can raise it.
+    let (status, body) = send(
+        &app,
+        patch_json(
+            &format!("/api/keys/{}", key.id),
+            &cookie,
+            json!({ "credit_limit_usd": "50" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["credit_limit_usd"].as_str(), Some("50"));
+    assert!(
+        matches!(
+            admit(&pool, &key, 100, Decimal::from(6)).await,
+            UsageAdmission::Allowed(_)
+        ),
+        "the raised budget binds on the next request like any other edit"
+    );
+}

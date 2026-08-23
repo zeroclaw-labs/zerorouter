@@ -1274,9 +1274,13 @@ pub async fn begin_usage_session(
     // # How it composes with the rest of admission
     //
     // - The per-user advisory lock above is still taken first, so lock ordering
-    //   in this crate is advisory-then-row everywhere. Both revocation paths
-    //   ([`crate::portal`], [`crate::admin`]) take only the api_keys row lock and
-    //   never the advisory lock, so there is no cycle to deadlock on.
+    //   in this crate is advisory-then-row everywhere. Every portal-side writer
+    //   of an `api_keys` row — both revocation paths ([`crate::portal`],
+    //   [`crate::admin`]) and the key edit in [`crate::portal::update_key`],
+    //   which holds `SELECT ... FOR UPDATE` across its read-modify-write — takes
+    //   ONLY the api_keys row lock and never the advisory lock, so there is no
+    //   cycle to deadlock on. Anything added there that reaches for the advisory
+    //   lock inverts this order and creates one.
     // - `SET LOCAL lock_timeout = '5s'` covers this statement. Waiting behind a
     //   revocation that does not commit surfaces as an `Err`, and every error
     //   path out of this function refuses admission — fail-closed is preserved.
