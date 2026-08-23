@@ -28,8 +28,15 @@
 //! `openai::to_provider_message` produces — system and user plain text,
 //! assistant text (with optional reasoning), assistant tool-call packs,
 //! tool-result packs, and (since the compat surface accepted OpenAI-shape
-//! content arrays) user text carrying `[IMAGE:<url>]` markers — and are
-//! unit-tested against that packer, not against hypothetical inputs.
+//! content arrays) user turns carrying structured content in
+//! `ChatMessage::parts` — and are unit-tested against that packer, not against
+//! hypothetical inputs.
+//!
+//! One rule binds all four: a user turn's `content` STRING is text, entirely
+//! and literally, and no wire applies any grammar to it. Images arrive only
+//! through `parts`. The predecessor of that rule was an in-band `[IMAGE:<url>]`
+//! marker, and it could not distinguish ZeroRouter's packing from a customer
+//! who wrote the same characters — see `provider::ContentPart`.
 //!
 
 mod anthropic;
@@ -47,25 +54,15 @@ use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
-use crate::provider::{StreamError, TokenUsage};
+use crate::provider::{ChatMessage, ContentPart, StreamError, TokenUsage};
 use futures_util::StreamExt;
 
-/// The marker `openai::content_to_text` packs an OpenAI `image_url` part into
-/// when it flattens a structured content array into the one `String` the
-/// provider interface carries (`provider::ChatMessage::content`).
+/// One piece of a user turn, in the form a wire needs to emit it.
 ///
-/// It lives here rather than in each wire because THREE wires now decode it
-/// and a fourth (Bedrock classic) inherits Anthropic's decoder — a marker
-/// grammar spelled four times is a marker grammar that drifts in three of
-/// them.
-const IMAGE_MARKER_OPEN: &str = "[IMAGE:";
-
-/// One piece of a user turn after the image markers have been split back out.
-///
-/// Borrowed from the packed string rather than owned: a base64 data URI is
-/// routinely megabytes, and every wire re-serializes it into a request body
-/// immediately, so copying it once per split would double peak memory on
-/// exactly the requests that are already the largest.
+/// Borrowed from the message rather than owned: a base64 data URI is routinely
+/// megabytes, and every wire re-serializes it into a request body immediately,
+/// so copying it once per read would double peak memory on exactly the requests
+/// that are already the largest.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum UserPart<'a> {
     Text(&'a str),
@@ -78,43 +75,46 @@ pub(crate) enum UserPart<'a> {
     UrlImage(&'a str),
 }
 
-/// Split ZR's `[IMAGE:<url>]` markers back out of a packed user turn.
+/// Read a user turn the only way a wire is allowed to: structurally.
 ///
-/// The inverse of `openai::content_to_text`. Text runs that are empty or
-/// whitespace-only are dropped: Anthropic rejects empty text blocks outright,
-/// and a blank text part carries nothing on any dialect.
+/// This replaced an in-band `[IMAGE:<url>]` marker grammar that every wire
+/// applied to the `content` string. The grammar could not tell ZeroRouter's own
+/// packing from a customer who merely wrote the same characters, so prose
+/// became a picture — see `ChatMessage::parts` for the full argument. There is
+/// no grammar here any more: text is text, and an image is an image because the
+/// compat layer put a [`ContentPart::Image`] in `parts`, which no customer byte
+/// can reach.
 ///
-/// A malformed marker — one with no closing `]` — is deliberately NOT an
-/// error. It stays literal text, because the alternative is failing a request
-/// over a customer's prose that happens to contain the marker's opening
-/// bracket, and a wire is the wrong place to refuse a request.
-pub(crate) fn split_image_markers(text: &str) -> Vec<UserPart<'_>> {
-    let mut parts = Vec::new();
-    let mut rest = text;
-    while let Some(start) = rest.find(IMAGE_MARKER_OPEN) {
-        let before = &rest[..start];
-        if !before.trim().is_empty() {
-            parts.push(UserPart::Text(before));
-        }
-        let after_marker = &rest[start + IMAGE_MARKER_OPEN.len()..];
-        let Some(end) = after_marker.find(']') else {
-            // Unterminated: keep the remainder verbatim and stop scanning.
-            rest = &rest[start..];
-            break;
+/// Text runs that are empty or whitespace-only are dropped: Anthropic rejects
+/// empty text blocks outright, and a blank part carries nothing on any dialect.
+pub(crate) fn user_parts(message: &ChatMessage) -> Vec<UserPart<'_>> {
+    if message.parts.is_empty() {
+        // A plain-text turn. All of it is text, whatever it spells.
+        return if message.content.trim().is_empty() {
+            Vec::new()
+        } else {
+            vec![UserPart::Text(&message.content)]
         };
-        parts.push(image_part(&after_marker[..end]));
-        rest = &after_marker[end + 1..];
     }
-    if !rest.trim().is_empty() {
-        parts.push(UserPart::Text(rest));
-    }
-    parts
+    message
+        .parts
+        .iter()
+        .filter_map(|part| match part {
+            ContentPart::Text(text) if text.trim().is_empty() => None,
+            ContentPart::Text(text) => Some(UserPart::Text(text)),
+            ContentPart::Image(url) => Some(image_part(url)),
+        })
+        .collect()
 }
 
-/// Classify one marker payload. A `data:` URI whose base64 section is present
-/// splits into media type and payload; anything else — including a `data:`
-/// URI that is NOT base64-encoded, which no dialect here can carry as bytes —
-/// is treated as a URL and left for the upstream to fetch or reject.
+/// Classify one image URL. A `data:` URI whose base64 section is present splits
+/// into media type and payload; anything else — including a `data:` URI that is
+/// NOT base64-encoded, which no dialect here can carry as bytes — is treated as
+/// a URL and left for the upstream to fetch or reject.
+///
+/// It lives here rather than in each wire because three wires need the same
+/// split and a fourth (Bedrock classic) needs to detect the URL case to refuse
+/// it — a classification spelled four times is one that drifts in three of them.
 fn image_part(url: &str) -> UserPart<'_> {
     url.strip_prefix("data:")
         .and_then(|data_uri| data_uri.split_once(";base64,"))
@@ -481,6 +481,137 @@ fn find_event_boundary(buffer: &str) -> Option<(usize, usize)> {
         }
         (only, None) => only,
         (None, only) => only,
+    }
+}
+
+#[cfg(test)]
+mod structured_content_tests {
+    //! The contract that replaced the `[IMAGE:…]` marker, pinned across ALL
+    //! FOUR adapters at once — because the defect it closes was a property of
+    //! the shared grammar, not of any one dialect, and a per-wire test would
+    //! let three of them regress quietly.
+    //!
+    //! The rule: a user turn's `content` STRING is text, all of it, whatever it
+    //! happens to spell. Images arrive only through
+    //! [`crate::provider::ChatMessage::parts`], which the compat layer fills
+    //! structurally and no customer byte can forge.
+
+    use super::*;
+    use crate::provider::{ChatMessage, ContentPart};
+    use serde_json::json;
+
+    /// A customer's own prose that contains the exact byte sequence ZR used to
+    /// pack image parts into. Nothing here is an image: it is someone asking
+    /// about a log format, or pasting documentation, or quoting this very
+    /// comment back at the model.
+    ///
+    /// On the marker scheme this string was silently converted into a real
+    /// image block on three wires and got the request REFUSED before dial on
+    /// the fourth (Bedrock takes no URL sources). Both are wrong, and the
+    /// second is a customer-visible outage caused by prose.
+    const PROSE: &str =
+        "our log lines render attachments as [IMAGE:https://cdn.example.com/a.png] — explain that";
+
+    #[test]
+    fn user_prose_that_looks_like_a_marker_is_text_on_every_adapter() {
+        let messages = vec![ChatMessage::user(PROSE)];
+
+        // Every adapter is checked, and the failures are COLLECTED rather than
+        // asserted one at a time. A chain of `assert_eq!`s short-circuits on
+        // the first dialect that regresses, which would make a test named "on
+        // every adapter" prove it for one — and each wire reaches this
+        // guarantee by its own route, so they really can fail independently.
+        let mut wrong: Vec<String> = Vec::new();
+
+        // Anthropic: exactly one text block, carrying the prose verbatim.
+        let (_, turns) = anthropic::build_anthropic_messages(&messages);
+        let blocks = turns[0]["content"]
+            .as_array()
+            .expect("the user turn carries blocks");
+        if blocks.len() != 1 || blocks[0]["type"] != "text" || blocks[0]["text"] != PROSE {
+            wrong.push(format!("anthropic: {}", turns[0]["content"]));
+        }
+
+        // chat_completions: the content stays a PLAIN STRING, byte-identical.
+        let built = chat_completions::build_chat_completions_messages(&messages);
+        if built[0]["content"] != json!(PROSE) {
+            wrong.push(format!("chat_completions: {}", built[0]["content"]));
+        }
+
+        // Responses: one `input_text` item, nothing else.
+        let (_, input) = responses::build_responses_input(&messages);
+        let content = input[0]["content"]
+            .as_array()
+            .expect("the user item carries content");
+        if content.len() != 1 || content[0]["type"] != "input_text" || content[0]["text"] != PROSE {
+            wrong.push(format!("responses: {}", input[0]["content"]));
+        }
+
+        // Bedrock classic: prose is not an image source, so the plane does NOT
+        // refuse the request before dialing it. This arm is the loudest of the
+        // four — on the marker scheme a customer whose prompt mentioned an
+        // image URL had the whole candidate refused.
+        if let Some(refused) = BedrockRuntimeWire::unsupported_image_source(&messages) {
+            wrong.push(format!("bedrock refused the request over prose: {refused}"));
+        }
+
+        assert!(
+            wrong.is_empty(),
+            "a user's prose was treated as structured content by: {wrong:#?}"
+        );
+    }
+
+    #[test]
+    fn a_marker_inside_a_structured_text_part_is_still_only_text() {
+        // The same prose arriving through the content-ARRAY surface. The text
+        // part is customer bytes exactly as much as the string form is, so it
+        // gets the same guarantee: `parts` says which pieces are images, and a
+        // Text part is never re-examined for a grammar.
+        let messages = vec![ChatMessage::user_parts(vec![
+            ContentPart::Text(PROSE.to_owned()),
+            ContentPart::Image("https://example.com/real.jpg".to_owned()),
+        ])];
+
+        let (_, turns) = anthropic::build_anthropic_messages(&messages);
+        let blocks = turns[0]["content"].as_array().expect("blocks");
+        assert_eq!(blocks.len(), 2, "one text block and one real image block");
+        assert_eq!(blocks[0]["text"], PROSE);
+        assert_eq!(blocks[1]["type"], "image");
+        assert_eq!(blocks[1]["source"]["url"], "https://example.com/real.jpg");
+
+        let built = chat_completions::build_chat_completions_messages(&messages);
+        let parts = built[0]["content"].as_array().expect("parts");
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0]["text"], PROSE);
+        assert_eq!(parts[1]["image_url"]["url"], "https://example.com/real.jpg");
+
+        let (_, input) = responses::build_responses_input(&messages);
+        let content = input[0]["content"].as_array().expect("content");
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0]["text"], PROSE);
+        assert_eq!(content[1]["image_url"], "https://example.com/real.jpg");
+
+        // And the genuine URL image IS still refused by Bedrock — the guarantee
+        // runs in both directions, or it is just a way of dropping images.
+        assert_eq!(
+            BedrockRuntimeWire::unsupported_image_source(&messages),
+            Some("https://example.com/real.jpg")
+        );
+    }
+
+    #[test]
+    fn the_text_view_of_a_structured_turn_never_carries_a_marker() {
+        // `content` is a derived, text-only flattening of `parts` (see
+        // `ChatMessage::user_parts`). Anything reading it generically — a log
+        // line, a future caller — sees the customer's words and never a
+        // grammar that could be mistaken for one.
+        let message = ChatMessage::user_parts(vec![
+            ContentPart::Text("before".to_owned()),
+            ContentPart::Image("data:image/png;base64,AAAA".to_owned()),
+            ContentPart::Text("after".to_owned()),
+        ]);
+        assert_eq!(message.content, "before\nafter");
+        assert!(!message.content.contains("[IMAGE:"));
     }
 }
 

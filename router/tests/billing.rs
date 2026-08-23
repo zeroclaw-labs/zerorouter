@@ -274,6 +274,95 @@ async fn checkout_intents_are_immutable_quotes_that_settle_once() {
     );
 }
 
+/// The ledger's `byok` flag is READ from the metering row, per entry — and it
+/// is what the portal's Credits table renders its badge from.
+///
+/// The gap this closes: `usage_events.byok`, the LEFT JOIN in `ledger_entries`,
+/// and the serialized field were each covered by construction and none of them
+/// together. A query that lost the join, or a settle that stopped stamping the
+/// flag, would have shipped green — and the customer-visible symptom is a usage
+/// row charged at 5% with nothing to say why it is so small.
+///
+/// Both arms in one test on purpose: a badge that renders on every row is as
+/// wrong as one that renders on none, and only the pair proves the difference is
+/// coming from the data.
+#[tokio::test]
+async fn the_ledger_reports_byok_per_usage_row() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let _sweep_guard = SWEEP_LOCK.read().await;
+    let user_id = create_user(&pool, "ledger-byok").await;
+    let key = create_key(&pool, user_id).await;
+    credit_purchase(&pool, user_id, Decimal::TEN, &unique_session_id(), None)
+        .await
+        .expect("funding purchase must apply");
+
+    async fn settle(pool: &PgPool, key: &AuthenticatedKey, record: UsageRecord) {
+        let session = match begin_usage_session(
+            pool,
+            key,
+            cold_sizing(1_000, 500, Decimal::from(2)),
+            ByokReservation::default(),
+            test_signature(),
+            true,
+            MeteringLane::Reserved,
+        )
+        .await
+        .expect("funded admission must query")
+        {
+            UsageAdmission::Allowed(session) => session,
+            _ => panic!("funded admission should be allowed"),
+        };
+        session
+            .record(&record)
+            .await
+            .expect("settlement must succeed");
+    }
+
+    // A house-credential request. `byok` is absent, not false — `usage_record`
+    // describes a pre-BYOK settled row and the NULL arm is what the ledger must
+    // report for it.
+    settle(&pool, &key, usage_record(Decimal::ONE)).await;
+
+    // A request dispatched on the CUSTOMER's own credential. The catalog figure
+    // is deliberately above the $5,000 monthly allowance: below it the fee is
+    // zero, and a zero debit writes no `credit_ledger` row at all (see
+    // `settle_once` — "the ledger forbids zero amounts"), so there would be
+    // nothing for the ledger, or the badge, to show.
+    let mut byok_record = usage_record(Decimal::ONE);
+    byok_record.telemetry.byok = Some(true);
+    byok_record.byok_catalog_usd = Some(Decimal::from(6_000));
+    settle(&pool, &key, byok_record).await;
+
+    let entries = ledger_entries(&pool, user_id, 10)
+        .await
+        .expect("ledger must query");
+    let flags: Vec<Option<bool>> = entries
+        .iter()
+        .filter(|entry| entry.entry_type == "usage")
+        .map(|entry| entry.byok)
+        .collect();
+    assert_eq!(flags.len(), 2, "both settlements debited");
+    assert!(
+        flags.contains(&Some(true)),
+        "the BYOK settlement must report byok = true, got {flags:?}"
+    );
+    assert!(
+        flags.contains(&None),
+        "the house settlement must report byok = null, got {flags:?}"
+    );
+    // And the flag never leaks onto an entry that has no request behind it.
+    let purchase = entries
+        .iter()
+        .find(|entry| entry.entry_type == "purchase")
+        .expect("the funding purchase must be in the ledger");
+    assert_eq!(
+        purchase.byok, None,
+        "a purchase has no request, so it can carry no dispatch flag"
+    );
+}
+
 #[tokio::test]
 async fn usage_settlement_debits_the_balance_exactly_once() {
     let Some(pool) = connect().await else {

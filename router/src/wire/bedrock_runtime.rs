@@ -135,8 +135,14 @@ impl BedrockRuntimeWire {
     /// Bedrock and Google Cloud, only base64-encoded sources are currently
     /// available" (platform.claude.com, "Vision", read 2026-08-21). So the
     /// `{"type":"url"}` image source the Messages wire builds for an
-    /// `https://` marker is a shape THIS plane rejects, even though the body
+    /// `https://` image is a shape THIS plane rejects, even though the body
     /// is otherwise byte-identical to the one 1P accepts.
+    ///
+    /// Reads `parts` structurally, like every other adapter. When this scanned
+    /// the content STRING for a marker instead, a customer whose prose merely
+    /// mentioned an image URL in that shape had their request refused here
+    /// before it was ever dialed — prose causing an outage, which is the
+    /// sharpest form the marker ambiguity took.
     ///
     /// Refused here rather than silently rewritten because the only rewrite
     /// available is "fetch the URL and inline it", and a metering gateway
@@ -144,11 +150,11 @@ impl BedrockRuntimeWire {
     /// surface it did not have before. Refusing fails just this candidate;
     /// the walk moves to the next rung, which on a mixed tier may well be a
     /// lane that takes URL sources.
-    fn unsupported_image_source(messages: &[ChatMessage]) -> Option<&str> {
+    pub(super) fn unsupported_image_source(messages: &[ChatMessage]) -> Option<&str> {
         messages
             .iter()
             .filter(|message| message.role == "user")
-            .flat_map(|message| super::split_image_markers(&message.content))
+            .flat_map(super::user_parts)
             .find_map(|part| match part {
                 super::UserPart::UrlImage(url) => Some(url),
                 _ => None,
@@ -516,7 +522,7 @@ mod wire_contract_tests {
     //! an opaque AWS 400 if it regresses.
 
     use super::*;
-    use crate::provider::ToolSpec;
+    use crate::provider::{ContentPart, ToolSpec};
 
     fn wire() -> BedrockRuntimeWire {
         BedrockRuntimeWire::new(
@@ -532,31 +538,39 @@ mod wire_contract_tests {
     /// plane's image sources are base64-only. "On Amazon Bedrock and Google
     /// Cloud, only base64-encoded sources are currently available"
     /// (platform.claude.com, "Vision", read 2026-08-21), so the `url` source
-    /// the shared Messages builder produces for an `https://` marker is a
+    /// the shared Messages builder produces for an `https://` image is a
     /// shape AWS rejects — even though the body is otherwise byte-identical
     /// to the one Anthropic 1P accepts, which is exactly why this cannot be
     /// caught by the differential test below.
     #[test]
     fn a_url_image_source_is_refused_before_the_plane_is_dialled() {
         assert_eq!(
-            BedrockRuntimeWire::unsupported_image_source(&[ChatMessage::user(
-                "look [IMAGE:https://example.com/x.jpg]"
-            )]),
+            BedrockRuntimeWire::unsupported_image_source(&[ChatMessage::user_parts(vec![
+                ContentPart::Text("look".to_owned()),
+                ContentPart::Image("https://example.com/x.jpg".to_owned()),
+            ])]),
             Some("https://example.com/x.jpg"),
             "a URL image must be caught before dispatch, not discovered as an opaque AWS 400"
         );
         // base64 is the source this plane DOES take, and must not be refused.
         assert_eq!(
-            BedrockRuntimeWire::unsupported_image_source(&[ChatMessage::user(
-                "look [IMAGE:data:image/png;base64,AAAA]"
-            )]),
+            BedrockRuntimeWire::unsupported_image_source(&[ChatMessage::user_parts(vec![
+                ContentPart::Text("look".to_owned()),
+                ContentPart::Image("data:image/png;base64,AAAA".to_owned()),
+            ])]),
             None,
         );
-        // And plain text is untouched, marker-shaped prose included.
+        // And plain TEXT is untouched — including text that spells out the
+        // shape of the retired `[IMAGE:…]` marker. This arm is the one that
+        // used to be wrong: prose alone got the candidate refused here, before
+        // the plane was ever dialed.
         assert_eq!(
             BedrockRuntimeWire::unsupported_image_source(&[
                 ChatMessage::user("no images here"),
-                ChatMessage::user("broken [IMAGE:no-close"),
+                ChatMessage::user("docs render them as [IMAGE:https://example.com/x.jpg]"),
+                ChatMessage::user_parts(vec![ContentPart::Text(
+                    "and inside a text part too: [IMAGE:https://example.com/y.jpg]".to_owned(),
+                )]),
             ]),
             None,
         );

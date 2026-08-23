@@ -105,14 +105,14 @@ impl OpenAiResponsesWire {
 
 /// Build `(instructions, input)` from ZeroRouter's packed provider messages
 /// — exactly the shapes `openai::to_provider_message` emits, nothing more.
-fn build_responses_input(messages: &[ChatMessage]) -> (String, Vec<Value>) {
+pub(super) fn build_responses_input(messages: &[ChatMessage]) -> (String, Vec<Value>) {
     let mut system_parts: Vec<&str> = Vec::new();
     let mut input = Vec::new();
 
     for message in messages {
         match message.role.as_str() {
             "system" => system_parts.push(&message.content),
-            "user" => input.push(user_item(&message.content)),
+            "user" => input.push(user_item(message)),
             "assistant" => {
                 // ZR packs assistant turns that carry tool calls or
                 // reasoning as a JSON envelope; a plain string is a plain
@@ -191,8 +191,8 @@ fn message_item(role: &str, content_type: &str, text: &str) -> Value {
     })
 }
 
-/// One user turn, with any `[IMAGE:<url>]` markers decoded into this
-/// dialect's image parts.
+/// One user turn, with any structured image content mapped into this dialect's
+/// image parts.
 ///
 /// The Responses API does NOT reuse chat-completions' image shape, and the
 /// difference is easy to get wrong in both directions: here the part is
@@ -205,13 +205,18 @@ fn message_item(role: &str, content_type: &str, text: &str) -> Value {
 ///
 /// A turn with no image keeps exactly the single `input_text` item it built
 /// before, so every existing pin in this module is untouched.
-fn user_item(packed: &str) -> Value {
-    let parts = super::split_image_markers(packed);
+fn user_item(message: &ChatMessage) -> Value {
+    // No structured content: the string is the turn, verbatim. Checked before
+    // anything else so the plain-text path cannot be reached by any grammar.
+    if message.parts.is_empty() {
+        return message_item("user", "input_text", &message.content);
+    }
+    let parts = super::user_parts(message);
     if !parts
         .iter()
         .any(|part| !matches!(part, super::UserPart::Text(_)))
     {
-        return message_item("user", "input_text", packed);
+        return message_item("user", "input_text", &message.content);
     }
     let content: Vec<Value> = parts
         .into_iter()
@@ -815,6 +820,7 @@ mod tests {
 #[cfg(test)]
 mod review_fix_tests {
     use super::*;
+    use crate::provider::ContentPart;
 
     #[test]
     fn incomplete_is_a_terminal_event_shape() {
@@ -843,10 +849,13 @@ mod review_fix_tests {
     /// chat-completions' shape here, or this shape there, is the specific
     /// mistake this pin and its twin exist to catch.
     #[test]
-    fn image_markers_become_responses_input_image_parts_byte_for_byte() {
-        let messages = vec![ChatMessage::user(
-            "what is this? [IMAGE:data:image/png;base64,AAAA] and this? [IMAGE:https://example.com/x.jpg]",
-        )];
+    fn image_parts_become_responses_input_image_parts_byte_for_byte() {
+        let messages = vec![ChatMessage::user_parts(vec![
+            ContentPart::Text("what is this? ".to_owned()),
+            ContentPart::Image("data:image/png;base64,AAAA".to_owned()),
+            ContentPart::Text(" and this? ".to_owned()),
+            ContentPart::Image("https://example.com/x.jpg".to_owned()),
+        ])];
         let (_, input) = build_responses_input(&messages);
         assert_eq!(
             serde_json::to_string(&input).unwrap(),

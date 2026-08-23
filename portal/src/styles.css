@@ -399,6 +399,16 @@ input {
   letter-spacing: 0.02em;
 }
 
+/* Two badges in one table cell. `.table td` sets no gap and JSX collapses the
+   whitespace between sibling elements, so without this the pair renders touching.
+   Wrapping rather than widening: the Type column is narrow, and a cell that grew
+   to fit both badges side by side would push the money columns off. */
+.badge-stack {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
 .badge-good {
   color: var(--good);
   background: var(--good-soft);

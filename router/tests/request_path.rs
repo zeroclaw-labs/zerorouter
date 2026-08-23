@@ -509,7 +509,7 @@ async fn a_lane_with_no_credential_is_refused_by_name_and_reserves_nothing() {
     let (api_key_id, key) = create_funded_key(&pool, "uncredentialed").await;
     // The production constructor: no injected route, so `provider_route` builds
     // from the environment exactly as it does in a real deployment.
-    let state = RouterState::with_database(tier_config_path(), pool.clone(), true);
+    let state = RouterState::with_database(tier_config_path(), pool.clone(), true, None);
 
     // `zero/test-solo` runs on `openai`, whose key this process does not hold —
     // the same condition production hit with `bedrock`.

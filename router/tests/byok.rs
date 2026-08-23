@@ -763,8 +763,12 @@ async fn upstream_refusing_the_customer(attest: bool) -> (String, Arc<Mutex<Vec<
 
 /// Drive one completion and return whatever came back, refusing nothing.
 async fn attempt_completion(pool: &PgPool, plaintext: &str, model: &str) -> (StatusCode, Value) {
-    let state = RouterState::with_database(fixture("byok_tiers.toml"), pool.clone(), true)
-        .with_byok(Some(Arc::new(test_keyring())));
+    let state = RouterState::with_database(
+        fixture("byok_tiers.toml"),
+        pool.clone(),
+        true,
+        Some(Arc::new(test_keyring())),
+    );
     let response = app(state)
         .oneshot(
             Request::builder()
@@ -798,8 +802,12 @@ async fn attempt_completion(pool: &PgPool, plaintext: &str, model: &str) -> (Sta
 
 /// Drive one completion through the real HTTP path and return the response body.
 async fn one_completion(pool: &PgPool, plaintext: &str) -> Value {
-    let state = RouterState::with_database(fixture("byok_tiers.toml"), pool.clone(), true)
-        .with_byok(Some(Arc::new(test_keyring())));
+    let state = RouterState::with_database(
+        fixture("byok_tiers.toml"),
+        pool.clone(),
+        true,
+        Some(Arc::new(test_keyring())),
+    );
     let response = app(state)
         .oneshot(
             Request::builder()

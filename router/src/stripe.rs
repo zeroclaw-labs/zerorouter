@@ -433,8 +433,16 @@ pub enum WebhookVerifyError {
 /// Stripe signs `{t}.{payload}` with HMAC-SHA256 under the endpoint secret
 /// and sends `t=<unix>,v1=<hex>[,v1=<hex>...]`. Verification succeeds when
 /// the timestamp is within `tolerance` of `now_unix` and **any** `v1`
-/// candidate matches the recomputed digest (constant-time comparison via
-/// [`Mac::verify_slice`]). Every ambiguous input fails closed.
+/// candidate matches the recomputed digest, compared in constant time by
+/// [`constant_time_eq`]. Every ambiguous input fails closed.
+///
+/// This used to say the comparison went through `Mac::verify_slice`, and that
+/// stopped being true when the digest moved out of the candidate loop (see the
+/// note below on why it moved). `verify_slice` CONSUMES the `Mac`, so it cannot
+/// check a second candidate without recomputing the digest — which is the exact
+/// amplification the move removed. Whoever reads this next: the local
+/// comparator is the correct choice here, not a shortcut to be tidied back into
+/// `verify_slice`.
 pub fn verify_webhook_signature(
     payload: &[u8],
     signature_header: &str,

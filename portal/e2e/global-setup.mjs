@@ -6,6 +6,8 @@ import { mkdirSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
+import { recreateScratchDatabase } from './scratch-db.mjs'
+
 const here = path.dirname(fileURLToPath(import.meta.url))
 const repo = path.resolve(here, '..', '..')
 
@@ -40,8 +42,23 @@ async function waitForSocket(url, label, tries = 60) {
 }
 
 export default async function globalSetup() {
-  const dbUrl = process.env.DATABASE_URL
-  if (!dbUrl) throw new Error('DATABASE_URL is required for the e2e suite')
+  const suppliedUrl = process.env.DATABASE_URL
+  if (!suppliedUrl) throw new Error('DATABASE_URL is required for the e2e suite')
+
+  // Every run starts from an empty database. `DATABASE_URL` names the server
+  // and the database to derive a scratch name from; the scratch database beside
+  // it is dropped and recreated here, and the supplied one is never written to.
+  // See `scratch-db.mjs` for why the suite owns a database rather than
+  // borrowing one — in short, the per-user key-mint throttle made an
+  // accumulating database a hard limit on how many times the suite could run.
+  const dbUrl = await recreateScratchDatabase(suppliedUrl)
+
+  // Overwritten in this process so it is inherited by everything downstream:
+  // the router spawned below, and — the part that is easy to miss — the
+  // `zerorouter admin ...` invocations the specs make with `env: process.env`.
+  // A spec that granted credit to the SUPPLIED database while the router read
+  // the scratch one would fail in a thoroughly confusing way.
+  process.env.DATABASE_URL = dbUrl
 
   mkdirSync(path.join(here, '.state'), { recursive: true })
 

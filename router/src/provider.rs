@@ -26,6 +26,34 @@ use std::borrow::Cow;
 use async_trait::async_trait;
 use futures_util::stream::BoxStream;
 
+/// One piece of a user turn's content, carried OUT OF BAND from
+/// [`ChatMessage::content`].
+///
+/// This type exists because the alternative did not work. Structured content
+/// used to be flattened into the one `content` string with an in-band
+/// `[IMAGE:<url>]` marker, and the wires split that grammar back out — which
+/// meant a customer whose PROSE contained the same byte sequence had it
+/// silently promoted to a real image on three dialects, and had the request
+/// refused before dial on the fourth (Bedrock carries no URL image sources).
+/// No escaping scheme fixes that honestly: the escape would have to be applied
+/// to every user turn, including the overwhelming majority that carry no image
+/// at all, and a wire that forgot to reverse it would corrupt the customer's
+/// prompt rather than merely drop a picture. Carrying the structure separately
+/// makes the ambiguity unrepresentable instead of merely unlikely.
+///
+/// Only `user` turns ever carry parts: `image_url` content parts are user-only
+/// in the OpenAI schema, and `openai::content_is_supported` refuses them
+/// anywhere else before a `ChatMessage` is ever built.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ContentPart {
+    /// A run of the customer's text, verbatim. Never re-scanned for a grammar.
+    Text(String),
+    /// An image, as the `url` string the customer supplied — either an
+    /// `https://…` URL or a `data:<media-type>;base64,…` URI. Kept in the form
+    /// it arrived in; each wire decides how its own dialect carries it.
+    Image(String),
+}
+
 /// One turn of conversation, as the router hands it to an upstream.
 ///
 /// `role` is a plain string rather than an enum because ZeroRouter's compat
@@ -34,7 +62,25 @@ use futures_util::stream::BoxStream;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChatMessage {
     pub role: String,
+    /// The turn's TEXT. For every turn built by a constructor other than
+    /// [`ChatMessage::user_parts`] this is the whole turn, and it is literal:
+    /// no wire applies any grammar to it, whatever bytes it happens to spell.
+    ///
+    /// For a `user_parts` turn it is the text-only flattening of `parts` (the
+    /// text runs joined with `\n`, images contributing nothing), derived by the
+    /// constructor. It is a convenience view for anything reading a turn
+    /// generically — a log line, a length bound — and `parts` is authoritative.
+    /// The property that matters is that it can never contain a marker for a
+    /// reader to misinterpret, because nothing writes one any more.
     pub content: String,
+    /// The turn's structured content, when it had any.
+    ///
+    /// EMPTY for every turn whose content is plain text, which is the
+    /// overwhelming majority and the only shape that existed before the compat
+    /// surface accepted OpenAI content arrays. Non-empty ONLY when the customer
+    /// sent a content array carrying at least one image, and then it is the
+    /// authoritative, ordered content of the turn.
+    pub parts: Vec<ContentPart>,
 }
 
 impl ChatMessage {
@@ -42,6 +88,7 @@ impl ChatMessage {
         Self {
             role: "system".into(),
             content: content.into(),
+            parts: Vec::new(),
         }
     }
 
@@ -49,6 +96,29 @@ impl ChatMessage {
         Self {
             role: "user".into(),
             content: content.into(),
+            parts: Vec::new(),
+        }
+    }
+
+    /// A user turn whose content arrived as an OpenAI content ARRAY carrying at
+    /// least one image.
+    ///
+    /// `content` is derived here rather than supplied, so the text view and the
+    /// structured view cannot be handed in already disagreeing.
+    #[must_use]
+    pub fn user_parts(parts: Vec<ContentPart>) -> Self {
+        let content = parts
+            .iter()
+            .filter_map(|part| match part {
+                ContentPart::Text(text) => Some(text.as_str()),
+                ContentPart::Image(_) => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        Self {
+            role: "user".into(),
+            content,
+            parts,
         }
     }
 
@@ -56,6 +126,7 @@ impl ChatMessage {
         Self {
             role: "assistant".into(),
             content: content.into(),
+            parts: Vec::new(),
         }
     }
 
@@ -63,6 +134,7 @@ impl ChatMessage {
         Self {
             role: "tool".into(),
             content: content.into(),
+            parts: Vec::new(),
         }
     }
 }

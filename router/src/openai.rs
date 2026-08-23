@@ -3,7 +3,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::config::RequestNeeds;
 use crate::provider::ToolSpec;
 use crate::provider::{
-    ChatMessage, ChatResponse, ModelRates, RateSchedule, StopReason, TokenUsage, ToolCall,
+    ChatMessage, ChatResponse, ContentPart, ModelRates, RateSchedule, StopReason, TokenUsage,
+    ToolCall,
 };
 use chrono::Utc;
 use rust_decimal::{Decimal, prelude::FromPrimitive};
@@ -566,10 +567,59 @@ fn to_provider_message(message: &OpenAiMessage) -> ChatMessage {
         ),
         "system" => ChatMessage::system(content_to_text(&message.content)),
         "assistant" => ChatMessage::assistant(content_to_text(&message.content)),
-        _ => ChatMessage::user(content_to_text(&message.content)),
+        // Every remaining role is carried as `user` (an unrecognized role was
+        // always mapped here), and this is the ONE branch that can carry an
+        // image: `content_is_supported` refuses an `image_url` part on any
+        // other role before a request gets this far.
+        _ => match content_to_parts(&message.content) {
+            Some(parts) => ChatMessage::user_parts(parts),
+            None => ChatMessage::user(content_to_text(&message.content)),
+        },
     }
 }
 
+/// The structured content of a user turn, or `None` when the turn is plain
+/// text and the `content` string says everything.
+///
+/// `None` is returned for a text-only array too, not just for a string: a
+/// text-only array IS the joined string (`needs` says so, and every
+/// byte-stability pin in the wires was written against the string), so
+/// promoting it to structured parts would change bytes on the wire for a
+/// request whose meaning did not change. Only an actual image earns the
+/// structured path.
+fn content_to_parts(content: &Value) -> Option<Vec<ContentPart>> {
+    let Value::Array(raw) = content else {
+        return None;
+    };
+    let mut parts = Vec::with_capacity(raw.len());
+    let mut carries_image = false;
+    for part in raw {
+        match part.get("type").and_then(Value::as_str) {
+            Some("text") => {
+                if let Some(text) = part.get("text").and_then(Value::as_str) {
+                    parts.push(ContentPart::Text(text.to_owned()));
+                }
+            }
+            Some("image_url") => {
+                if let Some(url) = part
+                    .get("image_url")
+                    .and_then(|image| image.get("url"))
+                    .and_then(Value::as_str)
+                {
+                    carries_image = true;
+                    parts.push(ContentPart::Image(url.to_owned()));
+                }
+            }
+            _ => {}
+        }
+    }
+    carries_image.then_some(parts)
+}
+
+/// Flatten a content value to TEXT. Image parts contribute nothing — they are
+/// carried structurally by [`content_to_parts`], never spelled into this
+/// string. That is the whole of the fix for the marker ambiguity: there is no
+/// longer any byte sequence a wire treats as anything but the customer's words.
 fn content_to_text(content: &Value) -> String {
     match content {
         Value::String(text) => text.clone(),
@@ -577,11 +627,6 @@ fn content_to_text(content: &Value) -> String {
             .iter()
             .filter_map(|part| match part.get("type").and_then(Value::as_str) {
                 Some("text") => part.get("text").and_then(Value::as_str).map(str::to_owned),
-                Some("image_url") => part
-                    .get("image_url")
-                    .and_then(|image| image.get("url"))
-                    .and_then(Value::as_str)
-                    .map(|url| format!("[IMAGE:{url}]")),
                 _ => None,
             })
             .collect::<Vec<_>>()

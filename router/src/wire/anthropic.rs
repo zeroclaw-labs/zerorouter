@@ -192,22 +192,19 @@ fn push_anthropic_block(turns: &mut Vec<Value>, role: &str, block: Value) {
     turns.push(json!({ "role": role, "content": [block] }));
 }
 
-/// Split ZR's `[IMAGE:<url>]` markers (the compat layer's packing for OpenAI
-/// image parts, `openai::content_to_text`) back into native image blocks —
-/// the pinned adapter decoded these, so sending them as literal text would be
-/// a silent vision regression (sol review). `data:` URIs become base64
-/// sources, anything else a URL source; a malformed marker stays text.
+/// Turn a user message's structured content into native Anthropic blocks —
+/// sending an image as literal text would be a silent vision regression (sol
+/// review). `data:` URIs become base64 sources, anything else a URL source.
 ///
-/// The marker grammar itself moved to `wire::split_image_markers` when the
-/// chat-completions and Responses wires learned to decode it too; the block
-/// SHAPES below stay here because they are Anthropic's, and the byte pin in
-/// `image_markers_become_native_image_blocks` covers both halves.
+/// The structural read itself lives in `wire::user_parts`, shared by all four
+/// adapters; the block SHAPES below stay here because they are Anthropic's, and
+/// the byte pin in `image_parts_become_native_image_blocks` covers both halves.
 ///
 /// Verified against the Messages API image schema (platform.claude.com,
 /// "Vision", read 2026-08-21): `source.type` is one of `base64` (with
 /// `media_type` + `data`), `url`, or `file`.
-fn push_user_text_with_images(turns: &mut Vec<Value>, text: &str) {
-    for part in super::split_image_markers(text) {
+fn push_user_content(turns: &mut Vec<Value>, message: &ChatMessage) {
+    for part in super::user_parts(message) {
         let block = match part {
             super::UserPart::Text(text) => json!({ "type": "text", "text": text }),
             super::UserPart::Base64Image { media_type, data } => json!({
@@ -284,14 +281,14 @@ fn synthesize_missing_tool_results(turns: &mut Vec<Value>) {
 /// Responses wire's no-round-trip rule. Empty and whitespace-only text never
 /// becomes a block — the API rejects empty text blocks outright (sol
 /// review), and ZR's validation admits null/empty content.
-fn build_anthropic_messages(messages: &[ChatMessage]) -> (String, Vec<Value>) {
+pub(super) fn build_anthropic_messages(messages: &[ChatMessage]) -> (String, Vec<Value>) {
     let mut system_parts: Vec<&str> = Vec::new();
     let mut turns = Vec::new();
 
     for message in messages {
         match message.role.as_str() {
             "system" => system_parts.push(&message.content),
-            "user" => push_user_text_with_images(&mut turns, &message.content),
+            "user" => push_user_content(&mut turns, message),
             "assistant" => {
                 // Same envelope rule as the Responses wire: only ZR's own
                 // packing markers make an envelope; a model that merely
@@ -1222,6 +1219,7 @@ mod anthropic_tests {
 #[cfg(test)]
 mod anthropic_review_fix_tests {
     use super::*;
+    use crate::provider::ContentPart;
 
     #[test]
     fn partial_usage_survives_an_in_band_error() {
@@ -1365,10 +1363,13 @@ mod anthropic_review_fix_tests {
     }
 
     #[test]
-    fn image_markers_become_native_image_blocks() {
-        let messages = vec![ChatMessage::user(
-            "what is this? [IMAGE:data:image/png;base64,AAAA] and this? [IMAGE:https://example.com/x.jpg]",
-        )];
+    fn image_parts_become_native_image_blocks() {
+        let messages = vec![ChatMessage::user_parts(vec![
+            ContentPart::Text("what is this? ".to_owned()),
+            ContentPart::Image("data:image/png;base64,AAAA".to_owned()),
+            ContentPart::Text(" and this? ".to_owned()),
+            ContentPart::Image("https://example.com/x.jpg".to_owned()),
+        ])];
         let (_, turns) = build_anthropic_messages(&messages);
         let blocks = turns[0]["content"].as_array().unwrap();
         let kinds: Vec<&str> = blocks
@@ -1381,18 +1382,20 @@ mod anthropic_review_fix_tests {
         assert_eq!(blocks[1]["source"]["data"], "AAAA");
         assert_eq!(blocks[3]["source"]["type"], "url");
         assert_eq!(blocks[3]["source"]["url"], "https://example.com/x.jpg");
-        // A malformed marker stays literal text rather than vanishing (the
-        // preceding text and the unterminated marker land as text blocks in
-        // the same turn).
-        let messages = vec![ChatMessage::user("broken [IMAGE:no-close")];
+        // A plain string is one text block however it is spelled — including
+        // the exact shape of the retired `[IMAGE:…]` marker, which this test
+        // previously asserted became an image. It is prose; it stays prose.
+        let messages = vec![ChatMessage::user(
+            "docs write it [IMAGE:https://example.com/x.jpg] like so",
+        )];
         let (_, turns) = build_anthropic_messages(&messages);
-        let joined: String = turns[0]["content"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter_map(|block| block["text"].as_str())
-            .collect();
-        assert_eq!(joined, "broken [IMAGE:no-close");
+        let blocks = turns[0]["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0]["type"], "text");
+        assert_eq!(
+            blocks[0]["text"],
+            "docs write it [IMAGE:https://example.com/x.jpg] like so"
+        );
     }
 
     /// The byte pin for this dialect's image blocks, and the twin of the
@@ -1405,9 +1408,12 @@ mod anthropic_review_fix_tests {
     /// `media_type` precedes `data`'s sibling keys accordingly.
     #[test]
     fn image_blocks_are_byte_stable() {
-        let messages = vec![ChatMessage::user(
-            "look [IMAGE:data:image/png;base64,AAAA] and [IMAGE:https://example.com/x.jpg]",
-        )];
+        let messages = vec![ChatMessage::user_parts(vec![
+            ContentPart::Text("look ".to_owned()),
+            ContentPart::Image("data:image/png;base64,AAAA".to_owned()),
+            ContentPart::Text(" and ".to_owned()),
+            ContentPart::Image("https://example.com/x.jpg".to_owned()),
+        ])];
         let (_, turns) = build_anthropic_messages(&messages);
         assert_eq!(
             serde_json::to_string(&turns).unwrap(),

@@ -100,8 +100,12 @@ async fn serve() -> Result<()> {
         byok = byok.is_some(),
         "ZeroRouter listening"
     );
-    let state = RouterState::with_database(tier_config_path, pool.clone(), require_credits)
-        .with_byok(byok.clone());
+    let state = RouterState::with_database(
+        tier_config_path,
+        pool.clone(),
+        require_credits,
+        byok.clone(),
+    );
     // The durable backstop for settlements that failed in-request: replays the
     // intent persisted on the reservation row (migration 0006) so delivered
     // inference cannot go unbilled because one transaction lost a connection.

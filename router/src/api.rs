@@ -727,11 +727,31 @@ impl RouterState {
             .unwrap_or(&crate::providers::provider_is_dispatchable)
     }
 
+    /// Build the dispatching state, including the BYOK keyring this deployment
+    /// read from the environment (`None` on a deployment that provisioned no
+    /// encryption key — see [`RouterServices::byok`]).
+    ///
+    /// `byok` is a PARAMETER rather than a builder step, and that is the whole
+    /// point. It used to be `with_byok`, which reached back into the already-
+    /// constructed `Arc<RouterServices>` with `Arc::try_unwrap` to mutate it.
+    /// That worked only while the `Arc` was unshared, so calling it on a state
+    /// that had been cloned — after `app(state.clone())`, say, or after any
+    /// background task was spawned — silently attached NOTHING: BYOK customers
+    /// would quietly fall back to house dispatch and house billing, and the only
+    /// symptom was one log line. A constructor argument cannot be called too
+    /// late, so the failure mode does not exist rather than being merely
+    /// unlikely.
+    ///
+    /// Every construction site now states which deployment it describes, which
+    /// is the discipline the old builder's doc comment asked for and got only by
+    /// omission: passing `None` is a sentence, forgetting to call a builder is
+    /// not.
     #[must_use]
     pub fn with_database(
         tier_config_path: impl Into<PathBuf>,
         pool: PgPool,
         require_credits: bool,
+        byok: Option<Arc<crate::byok::Keyring>>,
     ) -> Self {
         Self {
             tier_config_path: Arc::new(tier_config_path.into()),
@@ -743,42 +763,11 @@ impl RouterState {
                 require_credits,
                 health: ProviderHealth::default(),
                 estimator: EstimatorState::default(),
-                byok: None,
+                byok,
                 #[cfg(feature = "testing")]
                 injected_route: None,
             })),
         }
-    }
-
-    /// Attach the BYOK keyring this deployment read from the environment.
-    ///
-    /// A builder rather than a fourth argument to [`Self::with_database`] for
-    /// the reason [`crate::web::WebCtx::with_byok`] gives: every existing
-    /// construction site describes a deployment without BYOK, which is what
-    /// they are, and a test that means otherwise has to say so.
-    #[must_use]
-    pub fn with_byok(mut self, byok: Option<Arc<crate::byok::Keyring>>) -> Self {
-        if let Some(services) = self.services.take() {
-            // `RouterServices` is behind an `Arc` that nothing else holds yet at
-            // construction time, so this unwraps rather than clones. Falling
-            // back to leaving the state untouched keeps the builder total: a
-            // caller that has already cloned the state gets no BYOK rather than
-            // a panic, and the only way to reach that is to call this after
-            // spawning background tasks, which `serve` does not do.
-            match Arc::try_unwrap(services) {
-                Ok(mut services) => {
-                    services.byok = byok;
-                    self.services = Some(Arc::new(services));
-                }
-                Err(shared) => {
-                    tracing::error!(
-                        "BYOK keyring could not be attached: the router state was already shared"
-                    );
-                    self.services = Some(shared);
-                }
-            }
-        }
-        self
     }
 
     /// Serve the walk over `route` instead of one built from upstream

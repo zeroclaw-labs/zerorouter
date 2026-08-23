@@ -39,12 +39,16 @@ test('keys page creates a key, reveals it once, and hands over a runnable reques
   await expect(page.locator('.keybox')).toHaveText(/^zcr_[a-f0-9]{64}$/)
   await expect(page.getByText(keyName)).toBeVisible()
 
-  // The snippet, asserted in the SAME test rather than a new one on purpose: a
-  // user may mint only 20 keys per 24 hours (`MAX_KEYS_CREATED_PER_WINDOW`) and
-  // this suite reuses one account, so every additional test that mints a key
-  // shortens how many times the suite can run against a given database before
-  // creation starts failing. Nothing is lost by asserting here — it is the same
-  // dialog, at the same moment.
+  // The snippet, asserted in the SAME test rather than a new one: nothing is
+  // lost by asserting here — it is the same dialog, at the same moment.
+  //
+  // This used to be a budget as well as a convenience. A user may mint only 20
+  // keys per 24 hours (`MAX_KEYS_CREATED_PER_WINDOW`), the suite reused one
+  // account, and nothing ever reset the database — so every test that minted a
+  // key shortened how many times the suite could run before creation started
+  // failing for reasons unrelated to the code. The harness now recreates its
+  // own database per run (`e2e/scratch-db.mjs`), so the throttle counts from
+  // zero every time and a new minting test costs nothing.
   //
   // The gap this closes: the dialog used to hand over a secret and leave the
   // customer to guess the base URL and the auth scheme.
@@ -259,6 +263,67 @@ test('credits page renders balance and promo ledger, and hides checkout when bil
   // complete.
   await expect(page.getByText(/billing is not enabled/i).first()).toBeVisible()
   await expect(page.getByRole('button', { name: /add credits/i })).toHaveCount(0)
+})
+
+// The ledger renders the `byok` flag the API sends, and renders it per ROW.
+//
+// This is the one spec in the suite that serves a stubbed API response, and the
+// reason is worth stating rather than leaving as an inconsistency. Producing a
+// genuine BYOK ledger row end to end needs two things this harness cannot
+// cheaply arrange: an attached provider credential that the mock upstream will
+// answer for, and BYOK usage above the $5,000 monthly allowance — below it the
+// fee is zero and a zero debit writes no ledger row at all. What is under test
+// here is a RENDERING binding, not a money path, so the honest split is: the
+// server half — that a BYOK settlement really surfaces `byok: true` out of the
+// database — is pinned in Rust by `the_ledger_reports_byok_per_usage_row`, and
+// this pins that the SPA reads that field rather than inventing the badge.
+//
+// Both rows in one response on purpose: a badge hardcoded onto every row would
+// pass a test that only ever looked at a BYOK row.
+test('the ledger badges only the rows the API marks as byok', async ({ page }) => {
+  await page.route('**/api/billing/ledger*', async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        limit: 50,
+        entries: [
+          {
+            id: 2,
+            created_at: '2026-08-21T12:00:00Z',
+            entry_type: 'usage',
+            amount_usd: '-0.0500',
+            balance_after_usd: '4.95',
+            note: null,
+            byok: true,
+          },
+          {
+            id: 1,
+            created_at: '2026-08-21T11:00:00Z',
+            entry_type: 'usage',
+            amount_usd: '-1.0000',
+            balance_after_usd: '5.00',
+            note: null,
+            byok: null,
+          },
+        ],
+      }),
+    })
+  })
+  await signIn(page)
+  await page.getByRole('link', { name: /credits/i }).click()
+  await expect(page.getByRole('heading', { name: 'Credits', exact: true })).toBeVisible()
+
+  const rows = page.locator('.table tbody tr')
+  await expect(rows).toHaveCount(2)
+  // The badge follows the flag: present on the row the API marked, absent on
+  // the one it did not.
+  await expect(rows.nth(0).getByText('your own key')).toBeVisible()
+  await expect(rows.nth(1).getByText('your own key')).toHaveCount(0)
+  // And it is additional to the entry type, not a replacement for it — a reader
+  // must still be able to see that both rows are usage debits.
+  await expect(rows.nth(0).getByText('usage')).toBeVisible()
+  await expect(rows.nth(1).getByText('usage')).toBeVisible()
 })
 
 test('the add-credits modal opens to our amount step when Stripe is configured', async ({
