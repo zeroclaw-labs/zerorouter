@@ -240,7 +240,7 @@ impl ChatCompletionsWire {
 /// has no such constraint, and it is what the customer's own request said.
 /// A user turn's `content`, as this dialect wants it.
 ///
-/// A turn with no image marker stays a PLAIN STRING rather than becoming a
+/// A turn carrying no image stays a PLAIN STRING rather than becoming a
 /// one-element `[{"type":"text",…}]` array. That is not a cosmetic choice: a
 /// text-only array and a string are semantically identical here, every
 /// existing byte-stability pin in this module was written against the string,
@@ -252,15 +252,20 @@ impl ChatCompletionsWire {
 /// "image_url":{"url":…}}`, where `url` is "either a URL of the image or the
 /// base64 encoded image data" (openai/openai-openapi,
 /// `ChatCompletionRequestMessageContentPartImage`, read 2026-08-21). A base64
-/// marker is re-assembled into the `data:` URI it arrived as, because that is
+/// image is re-assembled into the `data:` URI it arrived as, because that is
 /// the one form every upstream on this wire documents.
-fn user_content(packed: &str) -> Value {
-    let parts = super::split_image_markers(packed);
+fn user_content(message: &ChatMessage) -> Value {
+    // No structured content: the string is the turn, verbatim. Checked before
+    // anything else so the plain-text path cannot be reached by any grammar.
+    if message.parts.is_empty() {
+        return json!(message.content);
+    }
+    let parts = super::user_parts(message);
     if !parts
         .iter()
         .any(|part| !matches!(part, super::UserPart::Text(_)))
     {
-        return json!(packed);
+        return json!(message.content);
     }
     let parts: Vec<Value> = parts
         .into_iter()
@@ -279,14 +284,12 @@ fn user_content(packed: &str) -> Value {
     json!(parts)
 }
 
-fn build_chat_completions_messages(messages: &[ChatMessage]) -> Vec<Value> {
+pub(super) fn build_chat_completions_messages(messages: &[ChatMessage]) -> Vec<Value> {
     let mut out = Vec::with_capacity(messages.len());
     for message in messages {
         match message.role.as_str() {
             "system" => out.push(json!({ "role": "system", "content": message.content })),
-            "user" => {
-                out.push(json!({ "role": "user", "content": user_content(&message.content) }))
-            }
+            "user" => out.push(json!({ "role": "user", "content": user_content(message) })),
             "assistant" => {
                 // Same envelope rule as both sibling wires: only ZR's own
                 // packing markers make an envelope, so a model that merely
@@ -1575,6 +1578,7 @@ mod attestation_tests {
 #[cfg(test)]
 mod chat_completions_tests {
     use super::*;
+    use crate::provider::ContentPart;
 
     /// Drive the machine over a whole scripted stream and collect what a
     /// customer would have received, in order.
@@ -1688,17 +1692,20 @@ mod chat_completions_tests {
     /// (`ChatCompletionRequestMessageContentPartImage`): the part is
     /// `image_url` and `image_url` is an OBJECT with a `url` key — NOT the
     /// bare string the Responses dialect uses, which is the mistake this pin
-    /// exists to catch. A base64 marker is re-assembled into the `data:` URI
+    /// exists to catch. A base64 image is re-assembled into the `data:` URI
     /// it arrived as, because "either a URL of the image or the base64
     /// encoded image data" is what that `url` field takes.
     ///
     /// Keys serialize alphabetically (`serde_json` without `preserve_order`),
     /// which is why `image_url` precedes `type` below.
     #[test]
-    fn image_markers_become_openai_image_parts_byte_for_byte() {
-        let messages = vec![ChatMessage::user(
-            "what is this? [IMAGE:data:image/png;base64,AAAA] and this? [IMAGE:https://example.com/x.jpg]",
-        )];
+    fn image_parts_become_openai_image_parts_byte_for_byte() {
+        let messages = vec![ChatMessage::user_parts(vec![
+            ContentPart::Text("what is this? ".to_owned()),
+            ContentPart::Image("data:image/png;base64,AAAA".to_owned()),
+            ContentPart::Text(" and this? ".to_owned()),
+            ContentPart::Image("https://example.com/x.jpg".to_owned()),
+        ])];
         let built = build_chat_completions_messages(&messages);
         assert_eq!(
             serde_json::to_string(&built).unwrap(),
@@ -1724,12 +1731,15 @@ mod chat_completions_tests {
             serde_json::to_string(&built).unwrap(),
             r#"[{"content":"plain question","role":"user"}]"#
         );
-        // Including one whose text merely mentions the marker without closing
-        // it — a wire is the wrong place to refuse a customer's prose.
-        let built = build_chat_completions_messages(&[ChatMessage::user("broken [IMAGE:no-close")]);
+        // Including one whose text spells the retired marker EXACTLY, closing
+        // bracket and all. On the marker scheme this became a real image part;
+        // it is now what it always was, the customer's words.
+        let built = build_chat_completions_messages(&[ChatMessage::user(
+            "docs write it [IMAGE:https://example.com/x.jpg] like so",
+        )]);
         assert_eq!(
             serde_json::to_string(&built).unwrap(),
-            r#"[{"content":"broken [IMAGE:no-close","role":"user"}]"#
+            r#"[{"content":"docs write it [IMAGE:https://example.com/x.jpg] like so","role":"user"}]"#
         );
     }
 

@@ -789,7 +789,23 @@ export function Credits() {
                   <tr key={e.id}>
                     <td className="dim nowrap">{formatTime(e.created_at)}</td>
                     <td>
-                      <Badge tone={toneFor(e.entry_type)}>{e.entry_type}</Badge>
+                      <span className="badge-stack">
+                        <Badge tone={toneFor(e.entry_type)}>{e.entry_type}</Badge>
+                        {/* The debit on a BYOK row is 5% of what the same usage
+                            would have cost at catalog price, because the request
+                            ran on the customer's own provider credential. Without
+                            this the row is simply a usage charge that looks
+                            inexplicably small, and the customer has no way to tell
+                            it apart from one that was mispriced. Same wording the
+                            playground uses for the same fact, so the two surfaces
+                            cannot drift.
+
+                            `=== true` and not a truthy test: the field is
+                            `boolean | null` — null means "not a usage row, or
+                            usage settled before BYOK existed", which is not the
+                            same claim as false. */}
+                        {e.byok === true && <Badge tone="accent">your own key</Badge>}
+                      </span>
                     </td>
                     <td className={`num mono${positive ? ' amount-pos' : ''}`}>
                       {formatSignedUsd(e.amount_usd)}

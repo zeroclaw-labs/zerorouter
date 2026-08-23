@@ -60,6 +60,31 @@ clap = { version = "4.5", features = ["derive"] }
 crc = "3"
 futures-util = "0.3"
 hex = "0.4"
+# PINNED AT 0.12 DELIBERATELY. Dependabot will keep offering 0.13; the answer is
+# no until `rsa` ships a stable release on `digest` 0.11, and here is the whole
+# argument so it does not have to be re-derived each time.
+#
+# hmac 0.13 requires `digest` 0.11, which means the hash it is parameterized
+# over must be `sha2` 0.11. But `gcp_auth.rs` builds `rsa::pkcs1v15::SigningKey
+# <Sha256>` to sign Vertex service-account JWTs, and `rsa` 0.9 — its newest
+# STABLE release — is a `digest` 0.10 crate. Moving `sha2` to 0.11 therefore
+# fails to compile (verified: 8 trait-bound errors on `HashMarker`/`FixedOutput`
+# at gcp_auth.rs:135 and :226), and the only `rsa` that would fix it is
+# 0.10.0-rc.18 — a release candidate, on the path that signs a live GCP
+# credential.
+#
+# The alternative is aliasing a second `sha2` major just for HMAC. That
+# resolves, and it is still wrong: it adds `digest` 0.11, `sha2` 0.11,
+# `crypto-common` 0.2 and `hybrid-array` to a binary that moves money, in
+# exchange for nothing. Nothing, precisely: `hmac` 0.12.1 does not LEAVE the
+# build either way — `sqlx-postgres` (SCRAM) and `openidconnect` (via
+# hkdf/rfc6979/ecdsa) both require it — so the bump would mean two HMAC
+# implementations and two SHA-256 implementations compiled in, where today
+# there is one of each. 0.12.1 carries no advisory, and this crate's use of it
+# is two calls in `src/stripe.rs`.
+#
+# Revisit when `rsa` 0.10 is stable, and then move the whole RustCrypto stack
+# in one commit rather than one crate at a time.
 hmac = "0.12"
 openidconnect = "4"
 rand = "0.10"

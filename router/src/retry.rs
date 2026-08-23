@@ -680,6 +680,7 @@ mod tests {
         ChatMessage {
             role: role.to_owned(),
             content: content.to_owned(),
+            parts: Vec::new(),
         }
     }
 
