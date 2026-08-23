@@ -505,13 +505,25 @@ struct DeviceCodeResponse {
     interval: Option<i64>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 struct DeviceTokenResponse {
     access_token: String,
     #[serde(default)]
     token_type: Option<String>,
     #[serde(default)]
     scope: Option<String>,
+}
+
+// `access_token` is the minted ZeroRouter API key; scrub it so a future
+// `{:?}` on this response cannot spill the credential into CLI/log output.
+impl std::fmt::Debug for DeviceTokenResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeviceTokenResponse")
+            .field("access_token", &"<scrubbed>")
+            .field("token_type", &self.token_type)
+            .field("scope", &self.scope)
+            .finish()
+    }
 }
 
 async fn login_command(
