@@ -1957,6 +1957,14 @@ async fn run_non_streaming(
     // error and nothing else — the ledger, the settle path, and the status are
     // identical either way.
     let mut retention_attestation_failed = false;
+    // The first upstream parameter refusal this walk met
+    // (`retry::parameter_rejection`), latched like the retention flag: if the
+    // walk exhausts, a caller-fixable 400 is a materially better terminal than
+    // the generic 502 — the live case was `max_tokens: 5` against the
+    // Responses API's minimum, reported as an outage. First occurrence rather
+    // than last, so a later candidate's transient failure cannot bury the
+    // refusal that names the fix. Retention still outranks it at the terminal.
+    let mut parameter_rejection: Option<String> = None;
     // The last candidate this walk dispatched to, which is what a terminal
     // names instead of the `fallback-chain` sentinel. The sentinel means "no
     // candidate had been selected", and after the unroll that is only true
@@ -2211,6 +2219,12 @@ async fn run_non_streaming(
             if matches!(class, retry::FailureClass::RetentionAttestation) {
                 retention_attestation_failed = true;
             }
+            // Gated on `NonRetryable` — a parameter 400 always classifies
+            // there, and the gate keeps the JSON parse off every transient
+            // failure's path.
+            if parameter_rejection.is_none() && matches!(class, retry::FailureClass::NonRetryable) {
+                parameter_rejection = retry::parameter_rejection(&err);
+            }
             // The customer's own key just failed at the upstream. If they asked
             // for a house retry and this failure is one the opt-in covers, arm
             // the twin rung waiting behind this one
@@ -2333,8 +2347,13 @@ async fn run_non_streaming(
         features,
         attempts.into_rows(),
         started,
+        // Retention outranks the parameter refusal: "your data guarantee was
+        // not honoured" is the stronger fact, and its terminal must not be
+        // buried by a 400 met on some other rung of the same walk.
         if retention_attestation_failed {
             WalkTerminal::RetentionAttestation
+        } else if let Some(reason) = parameter_rejection {
+            WalkTerminal::ParameterRejected(reason)
         } else {
             WalkTerminal::Exhausted
         },
@@ -2345,10 +2364,10 @@ async fn run_non_streaming(
 /// How a walk ended with no completion to return.
 ///
 /// Each variant fixes the status the ledger records and the error the customer
-/// sees. All three settle the reservation at zero cost, because nothing reached
-/// the customer on any of them — a buffered handler either returns the body or
-/// returns an error, with no partial delivery to reason about.
-#[derive(Clone, Copy)]
+/// sees. All of them settle the reservation at zero cost, because nothing
+/// reached the customer on any of them — a buffered handler either returns the
+/// body or returns an error, with no partial delivery to reason about.
+#[derive(Clone)]
 enum WalkTerminal {
     /// Every candidate failed.
     Exhausted,
@@ -2363,6 +2382,14 @@ enum WalkTerminal {
     /// guarantee than you bought" are not the same message, and only one of
     /// them tells the customer their prompt was withheld on purpose.
     RetentionAttestation,
+    /// Every candidate failed and at least one refused a named request
+    /// parameter (`retry::parameter_rejection`).
+    ///
+    /// The second refinement of [`Self::Exhausted`], with one difference from
+    /// its sibling above: the ledger records the 400 the customer was sent,
+    /// not a 502, because the fault this terminal names is in the request. The
+    /// carried reason was scrubbed and bounded at extraction.
+    ParameterRejected(String),
     /// The request's shared upstream deadline elapsed.
     Timeout,
     /// The router is draining.
@@ -2370,29 +2397,36 @@ enum WalkTerminal {
 }
 
 impl WalkTerminal {
-    fn status(self) -> i16 {
+    fn status(&self) -> i16 {
         match self {
             // Same 502 as `Exhausted`, deliberately: the ledger records what
             // the customer was sent, and both terminals send a 502.
             Self::Exhausted | Self::RetentionAttestation => 502,
+            // The ledger records what the customer was sent, and this
+            // terminal sends the 400 that names their fix.
+            Self::ParameterRejected(_) => 400,
             Self::Timeout => 504,
             Self::Shutdown => 503,
         }
     }
 
-    fn api_error(self) -> ApiError {
+    fn api_error(&self) -> ApiError {
         match self {
             Self::Exhausted => ApiError::UpstreamUnavailable,
             Self::RetentionAttestation => ApiError::RetentionAttestationFailed,
+            Self::ParameterRejected(reason) => ApiError::UpstreamRejectedParameters {
+                reason: reason.clone(),
+            },
             Self::Timeout => ApiError::UpstreamTimeout,
             Self::Shutdown => ApiError::ServerShuttingDown,
         }
     }
 
-    fn label(self) -> &'static str {
+    fn label(&self) -> &'static str {
         match self {
             Self::Exhausted => "all upstream candidates failed",
             Self::RetentionAttestation => "upstream did not attest zero data retention",
+            Self::ParameterRejected(_) => "upstream rejected a request parameter",
             Self::Timeout => "upstream inference deadline exceeded",
             Self::Shutdown => "router draining",
         }
@@ -2717,6 +2751,10 @@ async fn stream_to_channel(
     // safe to convert into a customer-facing error here — there is no
     // half-delivered stream to reason about.
     let mut retention_attestation_failed = false;
+    // First upstream parameter refusal on this walk, exactly as the buffered
+    // walk latches it: only read at the nothing-delivered terminal, where a
+    // caller-fixable 400 beats the generic 502.
+    let mut parameter_rejection: Option<String> = None;
     let mut delivery = StreamDelivery::default();
     // The router-owned walk ledger: one row per walk position, drained into
     // the settle transaction at whichever terminal settles this request.
@@ -2934,6 +2972,11 @@ async fn stream_to_channel(
                     if matches!(class, retry::FailureClass::RetentionAttestation) {
                         retention_attestation_failed = true;
                     }
+                    if parameter_rejection.is_none()
+                        && matches!(class, retry::FailureClass::NonRetryable)
+                    {
+                        parameter_rejection = retry::parameter_rejection(&err);
+                    }
                     // Arms the opted-in house fallback, same rule as the
                     // buffered walk (migration 0028).
                     if candidate.is_byok() && class.permits_byok_fallback() {
@@ -3139,6 +3182,11 @@ async fn stream_to_channel(
                     if retry::is_retention_attestation_failure(&error) {
                         retention_attestation_failed = true;
                     }
+                    // A pre-stream 400 (the send() is refused before any body
+                    // opens) carries the same envelope the buffered walk sees.
+                    if parameter_rejection.is_none() {
+                        parameter_rejection = retry::parameter_rejection(&error);
+                    }
                     stream_rate_limited = retry::is_rate_limited(&error);
                     // The one failure the BYOK fallback opt-in does not cover:
                     // a 429 whose text says the ACCOUNT cannot pay. Read here
@@ -3341,7 +3389,17 @@ async fn stream_to_channel(
 
     let error = if let (Some(candidate), Some(session)) = (last_candidate, usage_session.take()) {
         // Every candidate failed before streaming any tokens; release the
-        // reservation without a charge.
+        // reservation without a charge. Terminal precedence mirrors the
+        // buffered walk: retention outranks a parameter refusal, and both
+        // outrank the generic exhaustion. The ledger records the status the
+        // customer is sent — the 400 names a request fault, not an outage.
+        let status = if retention_attestation_failed {
+            502
+        } else if parameter_rejection.is_some() {
+            400
+        } else {
+            502
+        };
         match persist_usage(
             session,
             &resolved.requested_model,
@@ -3356,12 +3414,15 @@ async fn stream_to_channel(
             None,
             attempts.take_rows(),
             started,
-            502,
+            status,
         )
         .await
         {
             Ok(()) if retention_attestation_failed => ApiError::RetentionAttestationFailed,
-            Ok(()) => ApiError::UpstreamUnavailable,
+            Ok(()) => match parameter_rejection.take() {
+                Some(reason) => ApiError::UpstreamRejectedParameters { reason },
+                None => ApiError::UpstreamUnavailable,
+            },
             Err(_) => ApiError::MeteringUnavailable,
         }
     } else {

@@ -25,6 +25,21 @@ use super::{
 /// Default endpoint for the OpenAI Responses API.
 const RESPONSES_URL: &str = "https://api.openai.com/v1/responses";
 
+/// The Responses API's enforced lower bound for `max_output_tokens`. A request
+/// below it is refused outright (`integer_below_min_value`: "Expected a value
+/// of at least 16"), so a client's `max_tokens: 5` — legal on every
+/// chat-completions upstream — would fail this whole lane. The wire floors
+/// rather than forwards: the constraint is this dialect's, not the client's,
+/// and belongs where the dialect is spoken. Found live 2026-08-26 (see the
+/// finding "BYOK failure was max_tokens below the Responses API minimum").
+///
+/// Billing note: admission reserves on the CLIENT's requested maximum, so a
+/// floored request can emit up to `16 - requested` tokens past its
+/// reservation. The settle clamp absorbs that on the house side — bounded at
+/// 15 output tokens per request, fractions of a cent — which is cheaper in
+/// every sense than refusing the request.
+const MIN_OUTPUT_TOKENS: u32 = 16;
+
 /// ZeroRouter's own Responses-API client: chat and streaming both on
 /// `/v1/responses`, usage lifted from the wire on both paths.
 pub struct OpenAiResponsesWire {
@@ -94,7 +109,7 @@ impl OpenAiResponsesWire {
             body["tool_choice"] = json!("auto");
         }
         if let Some(max_tokens) = self.max_tokens {
-            body["max_output_tokens"] = json!(max_tokens);
+            body["max_output_tokens"] = json!(max_tokens.max(MIN_OUTPUT_TOKENS));
         }
         if let Some(temperature) = temperature {
             body["temperature"] = json!(temperature);
@@ -631,6 +646,28 @@ impl ModelProvider for OpenAiResponsesWire {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The Responses API refuses `max_output_tokens` below 16
+    /// (`integer_below_min_value`), so the wire floors the client's request
+    /// at [`MIN_OUTPUT_TOKENS`] rather than forwarding a value the dialect
+    /// is guaranteed to reject. At and above the minimum the client's number
+    /// passes through untouched; absent stays absent.
+    #[test]
+    fn a_sub_minimum_max_tokens_is_floored_at_the_dialect_boundary() {
+        let body_for = |max_tokens: Option<u32>| {
+            OpenAiResponsesWire::new("openai", "k", None, max_tokens, 900).request_body(
+                "gpt-5.6-luna",
+                &[ChatMessage::user("hi")],
+                None,
+                None,
+                false,
+            )
+        };
+        assert_eq!(body_for(Some(5))["max_output_tokens"], 16);
+        assert_eq!(body_for(Some(16))["max_output_tokens"], 16);
+        assert_eq!(body_for(Some(4096))["max_output_tokens"], 4096);
+        assert!(body_for(None).get("max_output_tokens").is_none());
+    }
 
     fn packed(messages: &[(&str, &str)]) -> Vec<ChatMessage> {
         messages
