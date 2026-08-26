@@ -74,6 +74,25 @@ pub enum ApiError {
     DatabaseUnavailable,
     NoProviderAvailable,
     UpstreamUnavailable,
+    /// Every candidate failed AND at least one refused a request parameter —
+    /// an upstream 400 naming the parameter it would not take
+    /// ([`crate::retry::parameter_rejection`]).
+    ///
+    /// Its own variant rather than a reuse of [`Self::UpstreamUnavailable`],
+    /// for the same reason [`Self::RetentionAttestationFailed`] is: the remedy
+    /// differs and a caller acts on the code. "All upstream candidates failed"
+    /// reads as an outage and invites an identical retry — the one response
+    /// guaranteed to fail again here, because the fault is in the request. The
+    /// 400 family and the extracted reason hand the caller the fix instead.
+    /// The live case that bought this variant: `max_tokens: 5` against the
+    /// Responses API's minimum of 16, reported as a 502, cost a debugging
+    /// session that one sentence would have prevented.
+    ///
+    /// `reason` is composed from the upstream envelope's parsed fields only,
+    /// scrubbed and bounded before it is stored — never a raw upstream body.
+    UpstreamRejectedParameters {
+        reason: String,
+    },
     /// An upstream answered without attesting the zero-retention guarantee the
     /// requested lane is sold under, so the request was refused rather than
     /// served ([`crate::wire::ResponseAttestation`]).
@@ -305,6 +324,21 @@ impl ApiError {
                 "server_error",
                 None,
                 "upstream_unavailable",
+            ),
+            // 400 and in the `invalid_request_error` family: the fault is in
+            // the caller's request, and the message carries the upstream's
+            // parsed refusal so the caller can fix it instead of retrying a
+            // guaranteed failure. The reason was scrubbed and bounded at
+            // extraction (`retry::parameter_rejection`).
+            Self::UpstreamRejectedParameters { reason } => (
+                StatusCode::BAD_REQUEST,
+                Cow::Owned(format!(
+                    "An upstream provider rejected the request: {reason}. Adjust the request and \
+                     retry; an unchanged retry will fail the same way."
+                )),
+                "invalid_request_error",
+                None,
+                "upstream_rejected_parameters",
             ),
             // 502 and in the `server_error` family: nothing about the caller's
             // request is wrong, and the fault is upstream of ZeroRouter. The

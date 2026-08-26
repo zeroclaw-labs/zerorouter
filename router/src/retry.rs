@@ -567,6 +567,59 @@ pub fn sanitize_api_error(input: &str) -> String {
     format!("{}...", &scrubbed[..end])
 }
 
+/// The parameter an upstream 400 refused, extracted for the customer.
+///
+/// The walk's generic terminal — "all upstream candidates failed", a 502 —
+/// is the right message for an outage and the wrong one for a request the
+/// CALLER can fix: it sent a live BYOK test hunting through keys and dispatch
+/// paths when the actual fault was `max_tokens: 5` against the Responses
+/// API's minimum of 16, invisible because the router reported the upstream's
+/// crisp 400 as a generic upstream failure (see the finding "BYOK failure was
+/// max_tokens below the Responses API minimum").
+///
+/// Extraction is deliberately narrow, and each gate is load-bearing:
+///
+/// - the failure text must carry `HTTP 400` — the wires embed status digits
+///   verbatim, and only a 400 is a claim about the *request*;
+/// - the body after the status prefix must parse WHOLE as the OpenAI error
+///   envelope. Parsing the entire suffix — not scanning for a JSON-looking
+///   substring — means a body that merely echoes error-shaped text inside a
+///   prompt echo does not match;
+/// - `error.type` must be `invalid_request_error` and `error.param` must name
+///   a parameter. A content-policy refusal or an auth failure is not the
+///   caller's parameter to fix and stays on the generic terminal. (Anthropic's
+///   envelope carries no `param` field, so its 400s conservatively stay
+///   generic too.)
+///
+/// The reason returned is composed from the PARSED fields only, scrubbed and
+/// bounded by [`sanitize_api_error`]: what reaches the customer is their own
+/// request's refusal, never a raw upstream body.
+#[must_use]
+pub fn parameter_rejection(err: &anyhow::Error) -> Option<String> {
+    let text = err.to_string();
+    let after_status = text.split_once("HTTP 400")?.1;
+    let body = after_status.split_once(": ")?.1.trim();
+    let envelope: serde_json::Value = serde_json::from_str(body).ok()?;
+    let error = envelope.get("error")?;
+    if error.get("type").and_then(serde_json::Value::as_str) != Some("invalid_request_error") {
+        return None;
+    }
+    let param = error
+        .get("param")
+        .and_then(serde_json::Value::as_str)
+        .filter(|param| !param.trim().is_empty())?;
+    let message = error
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let sanitized = sanitize_api_error(message.trim());
+    Some(if sanitized.is_empty() {
+        format!("parameter '{param}' was refused")
+    } else {
+        format!("parameter '{param}': {sanitized}")
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Classifiers, owned
 // ---------------------------------------------------------------------------
@@ -674,6 +727,65 @@ mod tests {
 
     fn error(detail: &str) -> anyhow::Error {
         anyhow::anyhow!(detail.to_owned())
+    }
+
+    /// The live reproduction, verbatim: the composed wire error for the
+    /// Responses API's `max_output_tokens` refusal must surface the parameter
+    /// and OpenAI's own sentence, and nothing that is not a caller-fixable
+    /// parameter 400 may match.
+    #[test]
+    fn a_parameter_400_is_extracted_and_everything_else_stays_generic() {
+        let refusal = concat!(
+            "openai responses API error: HTTP 400 Bad Request: ",
+            r#"{"error":{"message":"Invalid 'max_output_tokens': integer below minimum value. Expected a value >= 16, but got 5 instead.","type":"invalid_request_error","param":"max_output_tokens","code":"integer_below_min_value"}}"#,
+        );
+        let reason = parameter_rejection(&error(refusal)).expect("the live repro must extract");
+        assert!(
+            reason.starts_with("parameter 'max_output_tokens':"),
+            "reason names the parameter: {reason}"
+        );
+        assert!(
+            reason.contains("Expected a value >= 16"),
+            "reason carries the upstream's own sentence: {reason}"
+        );
+
+        // A 500 carrying the same envelope is an upstream fault, not a
+        // request fault.
+        assert!(
+            parameter_rejection(&error(&refusal.replace("HTTP 400", "HTTP 500"))).is_none(),
+            "only a 400 is a claim about the request"
+        );
+        // Same status, no param: content policy, auth, model access — the
+        // caller cannot fix a parameter that is not named.
+        assert!(
+            parameter_rejection(&error(concat!(
+                "openai responses API error: HTTP 400 Bad Request: ",
+                r#"{"error":{"message":"refused","type":"invalid_request_error","param":null,"code":"policy"}}"#,
+            )))
+            .is_none(),
+            "a param-less 400 stays on the generic terminal"
+        );
+        // Anthropic's envelope has no `param` field at all — conservatively
+        // generic.
+        assert!(
+            parameter_rejection(&error(concat!(
+                "anthropic messages API error: HTTP 400 Bad Request: ",
+                r#"{"type":"error","error":{"type":"invalid_request_error","message":"max_tokens is too small"}}"#,
+            )))
+            .is_none(),
+        );
+        // Error-shaped text INSIDE a body that is not itself the envelope —
+        // a prompt echo — must not match: the whole suffix must parse.
+        assert!(
+            parameter_rejection(&error(concat!(
+                "openai responses API error: HTTP 400 Bad Request: ",
+                r#"the request mentioned {"error":{"type":"invalid_request_error","param":"x"}} in prose"#,
+            )))
+            .is_none(),
+            "a substring match would let a prompt echo forge a refusal"
+        );
+        // Transport failures carry no status digits and never match.
+        assert!(parameter_rejection(&error("connection reset by peer")).is_none());
     }
 
     fn message(role: &str, content: &str) -> ChatMessage {

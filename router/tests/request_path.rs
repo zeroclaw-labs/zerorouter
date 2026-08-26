@@ -931,6 +931,63 @@ async fn non_streaming_every_candidate_failing_releases_the_reservation_without_
     assert_eq!(open_reservations(&pool, api_key_id).await, 0);
 }
 
+/// The exact failure text the Responses wire composes for OpenAI's
+/// `max_output_tokens` refusal — the live case that bought the
+/// `upstream_rejected_parameters` terminal (finding
+/// `2026-08-26-byok-failure-was-max-tokens-below-the-responses-api-minimum...`).
+const PARAMETER_REFUSAL: &str = concat!(
+    "openai responses API error: HTTP 400 Bad Request: ",
+    r#"{"error":{"message":"Invalid 'max_output_tokens': integer below minimum value. Expected a value >= 16, but got 5 instead.","type":"invalid_request_error","param":"max_output_tokens","code":"integer_below_min_value"}}"#,
+);
+
+/// An upstream 400 that names the parameter it refused must reach the caller
+/// as the 400 it is — code `upstream_rejected_parameters`, the parameter in
+/// the message, the same status on the ledger — not as the generic
+/// `upstream_unavailable` 502 that reads as an outage and invites the retry
+/// guaranteed to fail identically. The reservation still releases at zero.
+#[tokio::test]
+async fn non_streaming_parameter_refusal_reaches_the_caller_as_a_400() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let (api_key_id, key) = create_funded_key(&pool, "paramrej").await;
+    let primary = FakeModelProvider::new("primary", vec![FakeOutcome::Failure(PARAMETER_REFUSAL)]);
+    // The second candidate fails for an ordinary transient reason AFTER the
+    // refusal: first-occurrence latching means the terminal still names the
+    // parameter instead of the later, less useful failure.
+    let secondary = FakeModelProvider::new("secondary", vec![FakeOutcome::Transport]);
+    let state = router(pool.clone(), vec![primary.clone(), secondary.clone()]);
+
+    let response = app(state.clone())
+        .oneshot(completion_request(
+            &key,
+            &completion_body("zero/test-pair", false),
+        ))
+        .await
+        .expect("completion request should complete");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = json_body(response).await;
+    state.wait_for_background_tasks().await;
+    assert_eq!(body["error"]["code"], "upstream_rejected_parameters");
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+    let message = body["error"]["message"].as_str().expect("message is text");
+    assert!(
+        message.contains("max_output_tokens") && message.contains("Expected a value >= 16"),
+        "the message hands the caller the fix: {message}"
+    );
+
+    // A parameter 400 is non-retryable for its candidate; the walk still
+    // tried the next rung before exhausting.
+    assert_eq!(primary.call_count(), 1);
+    assert_eq!(secondary.call_count(), 1);
+    // The ledger records the 400 the customer was sent, and the reservation
+    // released without a charge.
+    let (_, _, _, _, cost_usd, status) = settled_event(&pool, api_key_id).await;
+    assert_eq!(status, 400);
+    assert_eq!(cost_usd, Decimal::ZERO);
+    assert_eq!(open_reservations(&pool, api_key_id).await, 0);
+}
+
 /// The exact failure text the xAI wire produces when an upstream declines to
 /// attest zero data retention, leaked to `'static` so the scripted fake can
 /// report it verbatim.
