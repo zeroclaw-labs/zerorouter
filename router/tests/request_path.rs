@@ -954,8 +954,11 @@ async fn non_streaming_parameter_refusal_reaches_the_caller_as_a_400() {
     let primary = FakeModelProvider::new("primary", vec![FakeOutcome::Failure(PARAMETER_REFUSAL)]);
     // The second candidate fails for an ordinary transient reason AFTER the
     // refusal: first-occurrence latching means the terminal still names the
-    // parameter instead of the later, less useful failure.
-    let secondary = FakeModelProvider::new("secondary", vec![FakeOutcome::Transport]);
+    // parameter instead of the later, less useful failure. A 429 rather than
+    // a transport fault, deliberately — the walk abandons a rate-limited rung
+    // after exactly one call, where a retryable transport failure is retried
+    // on a backoff schedule and its call count depends on timing.
+    let secondary = FakeModelProvider::new("secondary", vec![FakeOutcome::RateLimited]);
     let state = router(pool.clone(), vec![primary.clone(), secondary.clone()]);
 
     let response = app(state.clone())
