@@ -1153,9 +1153,9 @@ mod tests {
         // override silently stopping working would show up here as a lane
         // moving from one side of the sentence to the other.
         //
-        // Zero: four Bedrock, five open-weight Fireworks, two xAI, three Groq
-        // and four Together. Standard: four Anthropic, three Google, three
-        // OpenAI, three Vertex, and the one overridden Fireworks lane this
+        // Zero: four Bedrock, five open-weight Fireworks, two xAI, three Groq,
+        // four Together and three Vertex. Standard: four Anthropic, three
+        // Google, three OpenAI, and the one overridden Fireworks lane this
         // test is about.
         //
         // The zero side grew by seven on 2026-08-22 and the standard side did
@@ -1167,17 +1167,16 @@ mod tests {
         // a lane whose label a console change elsewhere could falsify. That is
         // an argument for the DEPLOY.md runbook, not against the count.
         //
-        // The three Vertex lanes sit on the STANDARD side as an interim
-        // posture: their zero pin flips back when Google approves the
-        // abuse-monitoring exception filed 2026-08-21 (see the pin's comment
-        // in tiers.toml). When that lands, these tallies become 21/11.
-        // Until then the three Google lanes and three Vertex lanes are the
-        // same models under two data-policy configurations, both currently
-        // labelled standard — the Vertex ones because one precondition of
-        // their zero posture awaits Google's approval, not because the
-        // configurations are equivalent.
-        assert_eq!(posture_count(rows, "zero"), 18);
-        assert_eq!(posture_count(rows, "standard"), 14);
+        // The three Vertex lanes moved to the ZERO side on 2026-08-30, exactly
+        // as the interim comment that sat here predicted ("when that lands,
+        // these tallies become 21/11"): Google approved the abuse-monitoring
+        // exception for project number 416940592816 — confirmed to be
+        // zerorouter-vertex-prod — closing the one precondition that had held
+        // the pin at `standard`. The three Google lanes remain standard: same
+        // models, different product, different data policy, which is the whole
+        // reason both twins exist.
+        assert_eq!(posture_count(rows, "zero"), 21);
+        assert_eq!(posture_count(rows, "standard"), 11);
         assert_eq!(rows.len(), 32, "every shipped lane is counted exactly once");
     }
 }
