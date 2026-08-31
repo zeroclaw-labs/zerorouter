@@ -950,11 +950,15 @@ async fn every_shipped_lane_publishes_a_retention_posture() {
             "together/kimi-k2.7-code",
             "together/nemotron-3-ultra",
             "together/qwen3.6-plus",
-            // The three vertex lanes are DELIBERATELY absent: their provider
-            // pin sits at `standard` while Google's abuse-monitoring exception
-            // (filed 2026-08-21) is pending — see the pin's comment in
-            // tiers.toml. When approval lands and the pin flips back to zero,
-            // they rejoin this list. Do not add them here before that.
+            // Rejoined 2026-08-30, exactly as the comment that used to sit
+            // here prescribed: Google's abuse-monitoring exception (filed
+            // 2026-08-21) was approved for project number 416940592816 —
+            // confirmed to be zerorouter-vertex-prod, the project these lanes
+            // dispatch on — closing the one item that had held the pin at
+            // `standard`. See `[retention.vertex]` in tiers.toml.
+            "vertex/gemini-3.1-pro-preview",
+            "vertex/gemini-3.5-flash-lite",
+            "vertex/gemini-3.7-flash",
             "xai/grok-4.3",
             "xai/grok-4.6"
         ],

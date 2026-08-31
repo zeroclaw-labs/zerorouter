@@ -757,7 +757,14 @@ openrouter_slug = "xai"
 #   3. ABUSE MONITORING — "Google may log prompts to detect potential abuse
 #      [...] If you are in scope for prompt logging for abuse monitoring and
 #      want zero data retention, you can request an exception for abuse
-#      monitoring." This is the open item that keeps the posture `standard`.
+#      monitoring." GRANTED 2026-08-30: "The Generative AI Services team has
+#      approved ZeroClaw Labs for the exception to the prompt logging policy
+#      as outlined in the Abuse Monitoring documentation for Google Cloud
+#      project number(s) [416940592816]" — and 416940592816 was confirmed by
+#      `gcloud projects describe` to be zerorouter-vertex-prod, the exact
+#      project this lane dispatches on. This was the one open item that kept
+#      the posture `standard`; with it granted, all four facts hold and the
+#      pin below says `zero`.
 #   4. REQUEST-RESPONSE LOGGING — "This feature is disabled by default."
 #
 # NARROWED EVIDENCE, and this page needs it more than OpenAI's did: 38,000 of
@@ -775,10 +782,10 @@ openrouter_slug = "xai"
 # "Training Restriction", so case-insensitive matching would find it twice and
 # report an ambiguous anchor on a page nobody had touched.
 [retention.vertex]
-posture = "standard"
-description = "Vertex AI on ZeroRouter's dedicated Google Cloud project: in-memory caching disabled, no request-response logging, and Google does not train on customer data. Pending Google's approval of the project's abuse-monitoring exception, prompts flagged by Google's abuse systems can be retained by Google for up to 90 days — until that approval lands this lane is labelled as subject to provider retention."
+posture = "zero"
+description = "Vertex AI on ZeroRouter's dedicated Google Cloud project with zero data retention enforced end to end: Google approved the project's abuse-monitoring (prompt logging) exception on 2026-08-30, request-response logging is disabled and re-verified against the live project configuration, no context caching is used, and Google does not train on customer data."
 source_url = "https://docs.cloud.google.com/gemini-enterprise-agent-platform/resources/zero-data-retention"
-verified = "2026-08-21"
+verified = "2026-08-30"
 source_sha256 = "4f53b20a6c4e9810bcb035db83b997b604720cd21598e6f35341e63d1aaaeeca"
 source_extract_anchors = [
   "use your data to train or fine-tune any AI/ML models",
