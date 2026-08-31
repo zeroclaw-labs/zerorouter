@@ -34,7 +34,10 @@ use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use crate::{
     auth::{AuthenticatedKey, AuthenticationError, KeyAuthenticator},
     byok,
-    config::{RequestNeeds, ResolvedRoute, TierCandidate, TierCatalog, load_tier_catalog},
+    config::{
+        RequestNeeds, ResolvedRoute, RetentionPosture, TierCandidate, TierCatalog,
+        load_tier_catalog,
+    },
     db::{
         AttemptRecord, AttemptTokens, ByokReservation, MeteringLane, RequestTelemetry,
         ReservationSize, ReservationSizing, SegmentClampStats, SettlementRecovery, UsageAdmission,
@@ -56,9 +59,214 @@ use crate::{
     },
     priority::Priority,
     providers::{ByokCredentials, ProviderBuildError, ProviderCandidate, ProviderRoute},
+    responses::{ResponsesEcho, ResponsesRequest, ResponsesStream, SseFrame},
     retry,
     sqlx::PgPool,
 };
+
+/// Which client-facing dialect a request arrived on.
+///
+/// **One admission path, two serializers.** Everything between parsing the
+/// body and writing the answer — validation, the modality gate, reservation
+/// sizing, admission, candidate ordering, the walk, the retention attestation,
+/// every settle site — is shared, and this value reaches only the two points
+/// where the wires genuinely differ. A Responses request that could be
+/// admitted, priced, or settled by code a chat request does not run would be a
+/// second money path, which is the one thing this repo says a metering
+/// business must not grow.
+#[derive(Clone)]
+enum Wire {
+    ChatCompletions,
+    /// The [`ResponsesEcho`] is request data the envelope has to restate
+    /// (`instructions`, `tools`, `temperature`), carried because the request
+    /// itself is consumed by the walk.
+    Responses(ResponsesEcho),
+}
+
+impl Wire {
+    /// The stream-side twin, which additionally accumulates the output items
+    /// the Responses terminal envelope has to carry.
+    fn into_stream(self) -> StreamWire {
+        match self {
+            Self::ChatCompletions => StreamWire::ChatCompletions,
+            Self::Responses(echo) => StreamWire::Responses(ResponsesStream::new(echo)),
+        }
+    }
+}
+
+/// The dialect a STREAM is being written on, plus that dialect's serializer
+/// state.
+///
+/// A second SERIALIZER over the router's existing `StreamEvent` machinery, not
+/// a second stream path: the walk below is one loop, the delivery accounting
+/// is one `StreamDelivery`, and the headers-before-first-byte ordering the
+/// retention attestation depends on is unchanged. What differs is the bytes
+/// each event turns into.
+enum StreamWire {
+    ChatCompletions,
+    Responses(ResponsesStream),
+}
+
+impl StreamWire {
+    /// The frame that opens the assistant's turn, before any model output.
+    ///
+    /// Scaffolding on both dialects — chat completions' role primer and the
+    /// Responses `response.created` carry no output — so neither can on its
+    /// own make a request billable, and both are emitted at the same moment:
+    /// lazily, when the first output arrives. Emitting either one earlier
+    /// would commit the stream before the walk has an answer, which is exactly
+    /// what lets a candidate fail over with nothing delivered.
+    fn open(&mut self, metadata: &StreamMetadata) -> Event {
+        match self {
+            Self::ChatCompletions => sse(stream_delta_json(
+                metadata,
+                json!({ "role": "assistant", "content": null }),
+                None,
+            )),
+            Self::Responses(stream) => {
+                named_sse(stream.created(&metadata.request_id, &metadata.requested_model))
+            }
+        }
+    }
+
+    /// One model-output step: a content delta, a reasoning delta, or both.
+    ///
+    /// Both are passed as options rather than as two calls because the chat
+    /// dialect merges them into ONE delta object when a live stream carries
+    /// both, and splits them when the synthetic path replays a buffered
+    /// response — behavior this must reproduce byte for byte. The Responses
+    /// dialect has a separate event for each, so it emits one frame per
+    /// non-empty piece.
+    fn delta(
+        &mut self,
+        metadata: &StreamMetadata,
+        content: Option<&str>,
+        reasoning: Option<&str>,
+    ) -> Vec<Event> {
+        match self {
+            Self::ChatCompletions => {
+                let mut delta = serde_json::Map::new();
+                if let Some(content) = content {
+                    delta.insert("content".to_owned(), Value::String(content.to_owned()));
+                }
+                if let Some(reasoning) = reasoning {
+                    delta.insert(
+                        "reasoning_content".to_owned(),
+                        Value::String(reasoning.to_owned()),
+                    );
+                }
+                vec![sse(stream_delta_json(metadata, Value::Object(delta), None))]
+            }
+            Self::Responses(stream) => {
+                let mut frames = Vec::new();
+                // Reasoning first, matching the order the buffered envelope
+                // lists its items in: what the model thought, then what it
+                // said.
+                if let Some(reasoning) = reasoning.filter(|reasoning| !reasoning.is_empty()) {
+                    frames.push(named_sse(
+                        stream.reasoning_delta(&metadata.request_id, reasoning),
+                    ));
+                }
+                if let Some(content) = content.filter(|content| !content.is_empty()) {
+                    frames.push(named_sse(stream.text_delta(&metadata.request_id, content)));
+                }
+                frames
+            }
+        }
+    }
+
+    /// One tool call. `index` is the chat dialect's `tool_calls[].index`, which
+    /// the walk keeps; the Responses dialect numbers its own output items and
+    /// ignores it.
+    fn tool_call(
+        &mut self,
+        metadata: &StreamMetadata,
+        call: crate::provider::ToolCall,
+        index: u32,
+    ) -> Vec<Event> {
+        match self {
+            Self::ChatCompletions => vec![sse(stream_delta_json(
+                metadata,
+                stream_tool_call_delta(call, index),
+                None,
+            ))],
+            Self::Responses(stream) => stream
+                .tool_call(&metadata.request_id, &call)
+                .into_iter()
+                .map(named_sse)
+                .collect(),
+        }
+    }
+
+    /// The terminal frames. Every one of them is scaffolding sent AFTER the
+    /// request has settled, so none can affect a charge.
+    fn finish(
+        &mut self,
+        metadata: &StreamMetadata,
+        usage: OpenAiUsage,
+        finish_reason: &'static str,
+        zerorouter: Option<&ZeroRouterResponseMetadata>,
+    ) -> Vec<Event> {
+        match self {
+            Self::ChatCompletions => {
+                let mut frames = vec![sse(stream_delta_json(
+                    metadata,
+                    json!({}),
+                    Some(finish_reason),
+                ))];
+                if metadata.include_usage {
+                    frames.push(sse(stream_usage_json(metadata, usage, zerorouter)));
+                }
+                frames.push(sse(DONE_SENTINEL.to_owned()));
+                frames
+            }
+            // One frame, always carrying usage and the `zerorouter` block:
+            // this dialect's terminal restates the whole response, so there is
+            // no `include_usage` knob to honour and nothing to leave out.
+            Self::Responses(stream) => vec![named_sse(stream.completed(
+                &metadata.request_id,
+                &metadata.requested_model,
+                usage,
+                finish_reason,
+                zerorouter,
+            ))],
+        }
+    }
+
+    /// An in-band failure, in each dialect's own shape.
+    fn error(&mut self, error: &ApiError) -> Vec<Event> {
+        match self {
+            Self::ChatCompletions => vec![
+                sse(streaming_error_json(error)),
+                sse(DONE_SENTINEL.to_owned()),
+            ],
+            Self::Responses(stream) => vec![named_sse(stream.error(error))],
+        }
+    }
+}
+
+/// The chat dialect's terminal sentinel, and the reason only one arm of
+/// [`StreamWire`] sends it.
+///
+/// `[DONE]` is not valid JSON, and the Responses dialect's consumers —
+/// including ZeroRouter's own outbound parser, which deserializes every
+/// `data:` payload it receives (`wire::responses::stream_chat`) — read a
+/// payload they cannot parse as a broken stream. That dialect's terminal is
+/// `response.completed` (or `response.incomplete` for a clipped run), which is
+/// what the API it imitates actually sends, so the sentinel would be both
+/// unrecognized and harmful.
+const DONE_SENTINEL: &str = "[DONE]";
+
+/// A chat-dialect frame: no `event:` line, the type lives in the payload.
+fn sse(data: String) -> Event {
+    Event::default().data(data)
+}
+
+/// A Responses-dialect frame, which names its event on the wire as well as
+/// inside the payload.
+fn named_sse(frame: SseFrame) -> Event {
+    Event::default().event(frame.event).data(frame.data)
+}
 
 /// Raw request-shape features captured once per request and written onto the
 /// telemetry substrate at every settle site (migration 0004). Prompt content
@@ -446,11 +654,32 @@ struct StreamDelivery {
 impl StreamDelivery {
     /// Send one frame, recording it as a delivery only when it carries model
     /// output. Returns whether the channel accepted the frame.
-    async fn send(&mut self, sender: &mpsc::Sender<Event>, data: String, frame: Frame) -> bool {
-        let accepted = send_data(sender, data).await;
+    async fn send(&mut self, sender: &mpsc::Sender<Event>, event: Event, frame: Frame) -> bool {
+        let accepted = send_data(sender, event).await;
         self.model_output_attempted |= frame == Frame::ModelOutput;
         self.model_output_sent |= accepted && frame == Frame::ModelOutput;
         accepted
+    }
+
+    /// Send a run of frames that together carry ONE model-output step, and
+    /// report whether all of them were accepted.
+    ///
+    /// A run rather than a frame because the Responses dialect spends four
+    /// frames on a single tool call. It is still one delivery: `send` marks
+    /// the request delivered on the first accepted output frame, and stopping
+    /// at the first rejection is what the single-frame path already did.
+    async fn send_all(
+        &mut self,
+        sender: &mpsc::Sender<Event>,
+        events: Vec<Event>,
+        frame: Frame,
+    ) -> bool {
+        for event in events {
+            if !self.send(sender, event, frame).await {
+                return false;
+            }
+        }
+        true
     }
 
     /// Whether output the model produced failed to reach the client. This is
@@ -460,28 +689,22 @@ impl StreamDelivery {
         self.model_output_attempted && !self.model_output_sent
     }
 
-    /// Emit the role primer once, if it has not been emitted yet.
+    /// Emit the opening frame once, if it has not been emitted yet.
     ///
-    /// Scaffolding: it opens the assistant message and carries no output, so it
-    /// never marks the request as delivered.
-    async fn ensure_role(
+    /// Scaffolding on either dialect: it opens the assistant's turn and
+    /// carries no output, so it never marks the request as delivered.
+    async fn ensure_open(
         &mut self,
         sender: &mpsc::Sender<Event>,
         metadata: &StreamMetadata,
+        wire: &mut StreamWire,
         already_sent: bool,
     ) -> bool {
-        already_sent
-            || self
-                .send(
-                    sender,
-                    stream_delta_json(
-                        metadata,
-                        json!({ "role": "assistant", "content": null }),
-                        None,
-                    ),
-                    Frame::Scaffolding,
-                )
-                .await
+        if already_sent {
+            return true;
+        }
+        let opening = wire.open(metadata);
+        self.send(sender, opening, Frame::Scaffolding).await
     }
 
     /// The single implementation of the streaming billing policy: **bill only
@@ -1256,6 +1479,12 @@ pub fn app(state: RouterState) -> Router {
         .route("/transparency", get(crate::transparency::transparency))
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(chat_completions))
+        // Beside its sibling and on the same state, so authentication, the
+        // body-size ceiling, the body-read deadline and `BODY_READ_SLOTS` are
+        // the same code in the same order for both — they live inside
+        // `inference`, which both handlers delegate to before anything is
+        // parsed.
+        .route("/v1/responses", post(responses))
         .with_state(state)
 }
 
@@ -1287,6 +1516,62 @@ async fn chat_completions(
     headers: HeaderMap,
     body: Body,
 ) -> Result<Response, ApiError> {
+    inference(state, headers, body, Endpoint::ChatCompletions).await
+}
+
+/// `POST /v1/responses`, the dialect a modern Codex CLI speaks.
+///
+/// It is one line because that is the whole design: the body is parsed by
+/// [`crate::responses`] into the same [`ChatCompletionRequest`] its sibling
+/// builds, and every step after that — down to the settle transaction — is
+/// literally the same code. See [`Wire`].
+async fn responses(
+    State(state): State<RouterState>,
+    headers: HeaderMap,
+    body: Body,
+) -> Result<Response, ApiError> {
+    inference(state, headers, body, Endpoint::Responses).await
+}
+
+/// Which endpoint a body arrived on, and therefore how to parse it. The only
+/// thing that differs before admission.
+#[derive(Clone, Copy)]
+enum Endpoint {
+    ChatCompletions,
+    Responses,
+}
+
+impl Endpoint {
+    /// Parse a body into the router's internal request form, plus whatever the
+    /// answering serializer needs.
+    ///
+    /// Both arms end at the SAME `ChatCompletionRequest`, and both then run
+    /// the same three predicates below. That is what makes "one admission
+    /// path" a property of the code rather than a claim in a comment: there is
+    /// no branch after this function until the answer is serialized.
+    fn parse(self, payload: &[u8]) -> Result<(ChatCompletionRequest, Wire), ApiError> {
+        match self {
+            Self::ChatCompletions => Ok((
+                serde_json::from_slice::<ChatCompletionRequest>(payload)
+                    .map_err(|_| ApiError::InvalidRequest)?,
+                Wire::ChatCompletions,
+            )),
+            Self::Responses => {
+                let (request, echo) = serde_json::from_slice::<ResponsesRequest>(payload)
+                    .map_err(|_| ApiError::InvalidRequest)?
+                    .into_internal()?;
+                Ok((request, Wire::Responses(echo)))
+            }
+        }
+    }
+}
+
+async fn inference(
+    state: RouterState,
+    headers: HeaderMap,
+    body: Body,
+    endpoint: Endpoint,
+) -> Result<Response, ApiError> {
     let services = state.services()?;
     let token = bearer_token(&headers).ok_or(ApiError::Unauthorized)?;
     let authenticated = services
@@ -1306,8 +1591,7 @@ async fn chat_completions(
         .await
         .map_err(|_| ApiError::RequestTimeout)?
         .map_err(|_| ApiError::PayloadTooLarge)?;
-    let mut request = serde_json::from_slice::<ChatCompletionRequest>(&payload)
-        .map_err(|_| ApiError::InvalidRequest)?;
+    let (mut request, wire) = endpoint.parse(&payload)?;
     request.validate().map_err(|_| ApiError::InvalidRequest)?;
     if request.contains_cache_control() {
         return Err(ApiError::CacheControlUnsupported);
@@ -1484,6 +1768,14 @@ async fn chat_completions(
     } else {
         MeteringLane::Reserved
     };
+    // Read off the FINAL route, after ordering, because that is the list the
+    // walk will actually take — and only for a stream, whose head is written
+    // before any candidate has answered. The buffered path names the rung that
+    // actually served and never consults this.
+    let stream_transparency = request
+        .stream
+        .then(|| unanimous_transparency(&resolved, provider_route.candidates()))
+        .flatten();
     let usage_session = admit_usage(
         &services.pool,
         &authenticated,
@@ -1516,6 +1808,8 @@ async fn chat_completions(
             reservation_usage,
             priority,
             estimate,
+            wire,
+            stream_transparency,
         )
     } else {
         non_streaming_response(
@@ -1528,8 +1822,95 @@ async fn chat_completions(
             reservation_usage,
             priority,
             estimate,
+            wire,
         )
         .await
+    }
+}
+
+/// The three transparency labels for one served lane: which provider answered,
+/// whose credential it answered on, and what that lane does with the request
+/// afterwards.
+///
+/// The retention label is [`RetentionPosture::wire_token`] — the SAME token
+/// `/v1/models` publishes, resolved by the same
+/// `TierCatalog::candidate_retention` and carried on the route — with ONE
+/// exception. A request dispatched on the CUSTOMER's own credential is
+/// governed by the customer's agreement with the provider, and the catalog's
+/// labels describe ZeroRouter's (see `ZeroRouterResponseMetadata::byok`, and
+/// the per-response attestation that is deliberately not asserted on BYOK
+/// traffic). Publishing `zero` or `standard` there would attach ZeroRouter's
+/// guarantee to traffic it was never asserted on, so BYOK gets its own honest
+/// value.
+fn transparency_labels(
+    resolved: &ResolvedRoute,
+    candidate_id: &str,
+    byok: bool,
+) -> Option<&'static str> {
+    if byok {
+        return Some("byok");
+    }
+    resolved
+        .retention_posture(candidate_id)
+        .map(RetentionPosture::wire_token)
+}
+
+/// The transparency labels for a STREAM, or `None` when the route's rungs do
+/// not agree on them.
+///
+/// # Why a stream cannot simply read the served candidate
+///
+/// The SSE response head is written when the handler RETURNS, which is before
+/// the walk has dispatched anything — the body is a channel the walk fills
+/// afterwards. Delaying the head until the first token would make every
+/// streaming client wait for the model to think before it saw any bytes,
+/// including the keep-alives, which is the one latency an SSE client is least
+/// able to absorb. That is a worse trade than an absent header.
+///
+/// So the labels are published only when they cannot depend on which rung
+/// answers: every candidate on the route agreeing on provider, credential and
+/// posture makes the answer knowable before the walk starts. The shipped
+/// catalog is pins only — one candidate per tier — so this holds for every
+/// lane sold today. A future mixed-provider route publishes NOTHING rather
+/// than a label that might name the wrong lane, and its facts still ride the
+/// in-band `zerorouter` block, which is where streaming metadata has always
+/// gone (`openai::stream_usage_json`).
+fn unanimous_transparency(
+    resolved: &ResolvedRoute,
+    candidates: &[ProviderCandidate],
+) -> Option<(String, bool, &'static str)> {
+    let mut labels = candidates.iter().map(|candidate| {
+        let byok = candidate.is_byok();
+        transparency_labels(resolved, &candidate.definition().id, byok)
+            .map(|retention| (candidate.definition().provider.clone(), byok, retention))
+    });
+    let first = labels.next()??;
+    labels
+        .all(|label| label.as_ref() == Some(&first))
+        .then_some(first)
+}
+
+/// Attach the transparency labels to a response.
+///
+/// An unresolvable posture writes NO retention header rather than an empty or
+/// defaulted one, on the rule the catalog already follows: absent means
+/// unknown, and a customer must never read a blank as a guarantee. The catalog
+/// refuses to load with an unlabelled lane, so a served request cannot reach
+/// that arm.
+fn insert_transparency(
+    response: &mut Response,
+    provider: &str,
+    byok: bool,
+    retention: Option<&str>,
+) {
+    insert_header(response, "x-zerorouter-provider", provider);
+    insert_header(
+        response,
+        "x-zerorouter-byok",
+        if byok { "true" } else { "false" },
+    );
+    if let Some(retention) = retention {
+        insert_header(response, "x-zerorouter-retention", retention);
     }
 }
 
@@ -1902,6 +2283,7 @@ async fn non_streaming_response(
     reservation_usage: OpenAiUsage,
     priority: PriorityResolution,
     estimate: ZeroRouterEstimate,
+    wire: Wire,
 ) -> Result<Response, ApiError> {
     runtime
         .tasks
@@ -1915,6 +2297,7 @@ async fn non_streaming_response(
             reservation_usage,
             priority,
             estimate,
+            wire,
         ))
         .await
         .map_err(|_| ApiError::UpstreamUnavailable)?
@@ -1931,6 +2314,7 @@ async fn run_non_streaming(
     reservation_usage: OpenAiUsage,
     priority: PriorityResolution,
     estimate: ZeroRouterEstimate,
+    wire: Wire,
 ) -> Result<Response, ApiError> {
     let request_id = usage_session.request_id();
     // Taken before the walk so the marker can be fired from inside the same
@@ -2189,6 +2573,7 @@ async fn run_non_streaming(
                         attempt_no,
                         attempt_started,
                         started,
+                        wire,
                     )
                     .await;
                 }
@@ -2518,6 +2903,7 @@ async fn serve_completion(
     attempt_no: usize,
     attempt_started: Instant,
     started: Instant,
+    wire: Wire,
 ) -> Result<Response, ApiError> {
     let Some(usage) = OpenAiUsage::try_from_provider(response.usage.as_ref()) else {
         // The buffered twin of `complete_synthetic_stream`'s gap, settled by
@@ -2645,26 +3031,60 @@ async fn serve_completion(
         "chat completion served"
     );
 
-    let completion = ChatCompletionResponse::new(
-        request_id.clone(),
-        resolved.requested_model,
-        response,
-        usage,
-        max_tokens,
-        zerorouter,
-    );
-    let mut completion = Json(completion).into_response();
+    // Resolved before `resolved` is consumed below, and from the candidate
+    // that actually answered — the buffered path knows which rung served, so
+    // it never has to fall back on the route-wide agreement a stream needs.
+    let retention = transparency_labels(&resolved, &candidate.id, features.byok_served);
+
+    let mut completion = match wire {
+        Wire::ChatCompletions => Json(ChatCompletionResponse::new(
+            request_id.clone(),
+            resolved.requested_model,
+            response,
+            usage,
+            max_tokens,
+            zerorouter,
+        ))
+        .into_response(),
+        Wire::Responses(echo) => {
+            // The SYNTHESIZED finish reason, exactly as the chat body reports
+            // it, because it is the same fact told to the same agent loop —
+            // see `openai::AttemptFinishReason` for why the body keeps the
+            // synthesis while the ledger records the upstream's own word.
+            let body_finish_reason = finish_reason(emitted.has_tool_calls(), usage, max_tokens);
+            let items = crate::responses::items_from_completion(
+                response.text,
+                response.reasoning_content,
+                response.tool_calls,
+            );
+            Json(crate::responses::envelope(&crate::responses::Envelope {
+                request_id: &request_id,
+                model: &resolved.requested_model,
+                items: &items,
+                usage: Some(usage),
+                finish_reason: Some(body_finish_reason),
+                echo: &echo,
+                zerorouter: zerorouter.as_ref(),
+            }))
+            .into_response()
+        }
+    };
     insert_header(&mut completion, "x-request-id", &request_id);
-    insert_header(
-        &mut completion,
-        "x-zerorouter-provider",
-        &candidate.provider,
-    );
     insert_header(&mut completion, "x-zerorouter-model", &candidate.model);
     insert_header(
         &mut completion,
         "x-zerorouter-attempts",
         &walk_positions.to_string(),
+    );
+    // `x-zerorouter-provider` is set here rather than above so all three
+    // transparency labels are written by one call: a response that named a
+    // provider but not what that lane retains would be the half-disclosure
+    // this set exists to replace.
+    insert_transparency(
+        &mut completion,
+        &candidate.provider,
+        features.byok_served,
+        retention,
     );
     Ok(completion)
 }
@@ -2680,6 +3100,8 @@ fn streaming_response(
     reservation_usage: OpenAiUsage,
     priority: PriorityResolution,
     estimate: ZeroRouterEstimate,
+    wire: Wire,
+    transparency: Option<(String, bool, &'static str)>,
 ) -> Result<Response, ApiError> {
     let metadata = StreamMetadata::new(
         usage_session.request_id(),
@@ -2688,6 +3110,7 @@ fn streaming_response(
     );
     let response_request_id = metadata.request_id.clone();
     let (sender, receiver) = mpsc::channel(SSE_CHANNEL_CAPACITY);
+    let wire = wire.into_stream();
 
     runtime.tasks.spawn(async move {
         stream_to_channel(
@@ -2702,6 +3125,7 @@ fn streaming_response(
             reservation_usage,
             priority,
             estimate,
+            wire,
         )
         .await;
     });
@@ -2715,6 +3139,12 @@ fn streaming_response(
         )
         .into_response();
     insert_header(&mut response, "x-request-id", &response_request_id);
+    // Present only where the route's rungs cannot disagree about them — see
+    // [`unanimous_transparency`] for why a stream cannot wait to find out
+    // which rung answered.
+    if let Some((provider, byok, retention)) = transparency {
+        insert_transparency(&mut response, &provider, byok, Some(retention));
+    }
     Ok(response)
 }
 
@@ -2731,6 +3161,7 @@ async fn stream_to_channel(
     reservation_usage: OpenAiUsage,
     priority: PriorityResolution,
     estimate: ZeroRouterEstimate,
+    mut wire: StreamWire,
 ) {
     let messages = request.provider_messages();
     let tools = request.provider_tools();
@@ -2846,6 +3277,7 @@ async fn stream_to_channel(
         let Some(remaining) = remaining_upstream_time(started) else {
             settle_stream_interruption(
                 &sender,
+                &mut wire,
                 &mut usage_session,
                 &metadata,
                 &resolved,
@@ -2903,6 +3335,7 @@ async fn stream_to_channel(
                     };
                     settle_stream_interruption(
                         &sender,
+                        &mut wire,
                         &mut usage_session,
                         &metadata,
                         &resolved,
@@ -2940,6 +3373,7 @@ async fn stream_to_channel(
                 Ok(Ok(response)) => {
                     complete_synthetic_stream(
                         &sender,
+                        &mut wire,
                         &mut usage_session,
                         &mut delivery,
                         &metadata,
@@ -3009,6 +3443,7 @@ async fn stream_to_channel(
                     ));
                     settle_stream_interruption(
                         &sender,
+                        &mut wire,
                         &mut usage_session,
                         &metadata,
                         &resolved,
@@ -3109,29 +3544,23 @@ async fn stream_to_channel(
                     if !client_connected {
                         continue;
                     }
-                    // The role primer is scaffolding: accepting it opens the
-                    // assistant message but delivers no model output, so it
+                    // The opening frame is scaffolding: accepting it opens the
+                    // assistant's turn but delivers no model output, so it
                     // cannot on its own make this request billable. Only the
                     // delta below can.
-                    role_sent = delivery.ensure_role(&sender, &metadata, role_sent).await;
+                    role_sent = delivery
+                        .ensure_open(&sender, &metadata, &mut wire, role_sent)
+                        .await;
                     if !role_sent {
                         client_connected = false;
                         continue;
                     }
-                    let mut delta = serde_json::Map::new();
-                    if !chunk.delta.is_empty() {
-                        delta.insert("content".to_owned(), Value::String(chunk.delta));
-                    }
-                    if let Some(reasoning) = chunk.reasoning {
-                        delta.insert("reasoning_content".to_owned(), Value::String(reasoning));
-                    }
-                    let accepted = delivery
-                        .send(
-                            &sender,
-                            stream_delta_json(&metadata, Value::Object(delta), None),
-                            Frame::ModelOutput,
-                        )
-                        .await;
+                    let frames = wire.delta(
+                        &metadata,
+                        (!chunk.delta.is_empty()).then_some(chunk.delta.as_str()),
+                        chunk.reasoning.as_deref(),
+                    );
+                    let accepted = delivery.send_all(&sender, frames, Frame::ModelOutput).await;
                     client_connected &= accepted;
                 }
                 Ok(StreamEvent::ToolCall(call)) => {
@@ -3141,7 +3570,9 @@ async fn stream_to_channel(
                         tool_index = tool_index.saturating_add(1);
                         continue;
                     }
-                    role_sent = delivery.ensure_role(&sender, &metadata, role_sent).await;
+                    role_sent = delivery
+                        .ensure_open(&sender, &metadata, &mut wire, role_sent)
+                        .await;
                     if !role_sent {
                         client_connected = false;
                         tool_index = tool_index.saturating_add(1);
@@ -3150,17 +3581,8 @@ async fn stream_to_channel(
                     // A tool-call delta IS model output — it is what a
                     // tool-calling completion consists of — so it counts as a
                     // delivery exactly as a content delta does.
-                    let accepted = delivery
-                        .send(
-                            &sender,
-                            stream_delta_json(
-                                &metadata,
-                                stream_tool_call_delta(call, tool_index),
-                                None,
-                            ),
-                            Frame::ModelOutput,
-                        )
-                        .await;
+                    let frames = wire.tool_call(&metadata, call, tool_index);
+                    let accepted = delivery.send_all(&sender, frames, Frame::ModelOutput).await;
                     tool_index = tool_index.saturating_add(1);
                     client_connected &= accepted;
                 }
@@ -3230,6 +3652,7 @@ async fn stream_to_channel(
             ));
             settle_stream_interruption(
                 &sender,
+                &mut wire,
                 &mut usage_session,
                 &metadata,
                 &resolved,
@@ -3251,11 +3674,14 @@ async fn stream_to_channel(
 
         if completed {
             if client_connected {
-                let role_accepted = delivery.ensure_role(&sender, &metadata, role_sent).await;
+                let role_accepted = delivery
+                    .ensure_open(&sender, &metadata, &mut wire, role_sent)
+                    .await;
                 client_connected &= role_accepted;
             }
             finish_successful_stream(
                 &sender,
+                &mut wire,
                 &mut usage_session,
                 &metadata,
                 &resolved,
@@ -3286,7 +3712,7 @@ async fn stream_to_channel(
         client_connected &= !sender.is_closed();
         if delivery.model_output_sent || !client_connected {
             let Some(session) = usage_session.take() else {
-                send_stream_error(&sender, &ApiError::MeteringUnavailable).await;
+                send_stream_error(&sender, &mut wire, &ApiError::MeteringUnavailable).await;
                 return;
             };
             // Bill metered actuals only: the upstream's report when model
@@ -3353,7 +3779,7 @@ async fn stream_to_channel(
                 ApiError::MeteringUnavailable
             };
             if client_connected {
-                send_stream_error(&sender, &error).await;
+                send_stream_error(&sender, &mut wire, &error).await;
             }
             return;
         }
@@ -3428,7 +3854,7 @@ async fn stream_to_channel(
     } else {
         ApiError::NoProviderAvailable
     };
-    send_stream_error(&sender, &error).await;
+    send_stream_error(&sender, &mut wire, &error).await;
 }
 
 fn remaining_upstream_time(started: Instant) -> Option<Duration> {
@@ -3476,6 +3902,7 @@ impl StreamInterruption {
 #[allow(clippy::too_many_arguments)]
 async fn settle_stream_interruption(
     sender: &mpsc::Sender<Event>,
+    wire: &mut StreamWire,
     usage_session: &mut Option<UsageSession>,
     metadata: &StreamMetadata,
     resolved: &ResolvedRoute,
@@ -3546,13 +3973,14 @@ async fn settle_stream_interruption(
         "streaming inference interrupted"
     );
     if client_connected {
-        send_stream_error(sender, &error).await;
+        send_stream_error(sender, wire, &error).await;
     }
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn complete_synthetic_stream(
     sender: &mpsc::Sender<Event>,
+    wire: &mut StreamWire,
     usage_session: &mut Option<UsageSession>,
     // Threaded from the walk so the frames replayed here are classified by the
     // same rule as a live stream's. This site settles BEFORE it replays
@@ -3571,7 +3999,7 @@ async fn complete_synthetic_stream(
     started: Instant,
 ) {
     let Some(session) = usage_session.take() else {
-        send_stream_error(sender, &ApiError::MeteringUnavailable).await;
+        send_stream_error(sender, wire, &ApiError::MeteringUnavailable).await;
         return;
     };
     let Some(usage) = OpenAiUsage::try_from_provider(response.usage.as_ref()) else {
@@ -3621,7 +4049,7 @@ async fn complete_synthetic_stream(
             502,
         )
         .await;
-        send_stream_error(sender, &ApiError::MeteringUnavailable).await;
+        send_stream_error(sender, wire, &ApiError::MeteringUnavailable).await;
         return;
     };
     let completion_status = if sender.is_closed() { 499 } else { 200 };
@@ -3674,54 +4102,39 @@ async fn complete_synthetic_stream(
     .await
     .is_err()
     {
-        send_stream_error(sender, &ApiError::MeteringUnavailable).await;
+        send_stream_error(sender, wire, &ApiError::MeteringUnavailable).await;
         return;
     }
 
-    if !delivery.ensure_role(sender, metadata, false).await {
+    if !delivery.ensure_open(sender, metadata, wire, false).await {
         return;
     }
-    if let Some(text) = response.text
-        && !delivery
-            .send(
-                sender,
-                stream_delta_json(metadata, json!({ "content": text }), None),
-                Frame::ModelOutput,
-            )
-            .await
-    {
-        return;
+    // Replayed one piece at a time rather than merged, which is what this path
+    // has always done: the chat dialect's synthetic stream emits a `content`
+    // delta and a `reasoning_content` delta as SEPARATE chunks, and passing
+    // one side at a time reproduces that byte for byte.
+    if let Some(text) = response.text {
+        let frames = wire.delta(metadata, Some(&text), None);
+        if !delivery.send_all(sender, frames, Frame::ModelOutput).await {
+            return;
+        }
     }
-    if let Some(reasoning) = response.reasoning_content
-        && !delivery
-            .send(
-                sender,
-                stream_delta_json(metadata, json!({ "reasoning_content": reasoning }), None),
-                Frame::ModelOutput,
-            )
-            .await
-    {
-        return;
+    if let Some(reasoning) = response.reasoning_content {
+        let frames = wire.delta(metadata, None, Some(&reasoning));
+        if !delivery.send_all(sender, frames, Frame::ModelOutput).await {
+            return;
+        }
     }
     for (index, call) in response.tool_calls.into_iter().enumerate() {
-        if !delivery
-            .send(
-                sender,
-                stream_delta_json(
-                    metadata,
-                    stream_tool_call_delta(call, u32::try_from(index).unwrap_or(u32::MAX)),
-                    None,
-                ),
-                Frame::ModelOutput,
-            )
-            .await
-        {
+        let frames = wire.tool_call(metadata, call, u32::try_from(index).unwrap_or(u32::MAX));
+        if !delivery.send_all(sender, frames, Frame::ModelOutput).await {
             return;
         }
     }
     emit_stream_finish(
         sender,
         metadata,
+        wire,
         resolved,
         candidate,
         usage,
@@ -3734,6 +4147,7 @@ async fn complete_synthetic_stream(
 #[allow(clippy::too_many_arguments)]
 async fn finish_successful_stream(
     sender: &mpsc::Sender<Event>,
+    wire: &mut StreamWire,
     usage_session: &mut Option<UsageSession>,
     metadata: &StreamMetadata,
     resolved: &ResolvedRoute,
@@ -3754,7 +4168,7 @@ async fn finish_successful_stream(
     terminal: StreamFinal,
 ) {
     let Some(session) = usage_session.take() else {
-        send_stream_error(sender, &ApiError::MeteringUnavailable).await;
+        send_stream_error(sender, wire, &ApiError::MeteringUnavailable).await;
         return;
     };
     let Some(usage) = usage else {
@@ -3806,7 +4220,7 @@ async fn finish_successful_stream(
             502,
         )
         .await;
-        send_stream_error(sender, &ApiError::MeteringUnavailable).await;
+        send_stream_error(sender, wire, &ApiError::MeteringUnavailable).await;
         return;
     };
     // The terminal's own stop reason when the upstream sent one, the synthesis
@@ -3885,7 +4299,7 @@ async fn finish_successful_stream(
     .await
     .is_err()
     {
-        send_stream_error(sender, &ApiError::MeteringUnavailable).await;
+        send_stream_error(sender, wire, &ApiError::MeteringUnavailable).await;
         return;
     }
 
@@ -3903,6 +4317,7 @@ async fn finish_successful_stream(
     emit_stream_finish(
         sender,
         metadata,
+        wire,
         resolved,
         candidate,
         usage,
@@ -3916,30 +4331,20 @@ async fn finish_successful_stream(
 async fn emit_stream_finish(
     sender: &mpsc::Sender<Event>,
     metadata: &StreamMetadata,
+    wire: &mut StreamWire,
     resolved: &ResolvedRoute,
     candidate: &ProviderCandidate,
     usage: OpenAiUsage,
     finish_reason: &'static str,
     zerorouter: Option<ZeroRouterResponseMetadata>,
 ) {
-    if !send_data(
-        sender,
-        stream_delta_json(metadata, json!({}), Some(finish_reason)),
-    )
-    .await
-    {
-        return;
+    // Every one of these is scaffolding sent after the request has settled, so
+    // stopping early on a closed channel changes nothing about the charge.
+    for event in wire.finish(metadata, usage, finish_reason, zerorouter.as_ref()) {
+        if !send_data(sender, event).await {
+            break;
+        }
     }
-    if metadata.include_usage
-        && !send_data(
-            sender,
-            stream_usage_json(metadata, usage, zerorouter.as_ref()),
-        )
-        .await
-    {
-        return;
-    }
-    let _ = send_data(sender, "[DONE]".to_owned()).await;
     tracing::info!(
         request_id = metadata.request_id,
         requested_model = resolved.requested_model,
@@ -3952,9 +4357,15 @@ async fn emit_stream_finish(
     );
 }
 
-async fn send_stream_error(sender: &mpsc::Sender<Event>, error: &ApiError) {
-    if send_data(sender, streaming_error_json(error)).await {
-        let _ = send_data(sender, "[DONE]".to_owned()).await;
+/// Report a failure in band, in whichever dialect the client is reading.
+///
+/// The frames are dialect-specific and the stopping rule is not: a channel
+/// that refused the error frame will refuse whatever would have followed it.
+async fn send_stream_error(sender: &mpsc::Sender<Event>, wire: &mut StreamWire, error: &ApiError) {
+    for event in wire.error(error) {
+        if !send_data(sender, event).await {
+            return;
+        }
     }
 }
 
@@ -3967,8 +4378,8 @@ async fn send_stream_error(sender: &mpsc::Sender<Event>, error: &ApiError) {
 /// already settled, so none of them can affect a charge. Anything sent while a
 /// settle is still ahead goes through [`StreamDelivery::send`], which is where
 /// the classification lives.
-async fn send_data(sender: &mpsc::Sender<Event>, data: String) -> bool {
-    tokio::time::timeout(SSE_SEND_TIMEOUT, sender.send(Event::default().data(data)))
+async fn send_data(sender: &mpsc::Sender<Event>, event: Event) -> bool {
+    tokio::time::timeout(SSE_SEND_TIMEOUT, sender.send(event))
         .await
         .is_ok_and(|result| result.is_ok())
 }
@@ -4315,8 +4726,11 @@ mod tests {
         let (sender, _receiver) = mpsc::channel(8);
         let mut delivery = StreamDelivery::default();
 
+        let mut wire = StreamWire::ChatCompletions;
         assert!(
-            delivery.ensure_role(&sender, &metadata, false).await,
+            delivery
+                .ensure_open(&sender, &metadata, &mut wire, false)
+                .await,
             "the channel should accept the role primer"
         );
         assert!(
@@ -4328,7 +4742,11 @@ mod tests {
             delivery
                 .send(
                     &sender,
-                    stream_delta_json(&metadata, json!({ "content": "hi" }), None),
+                    sse(stream_delta_json(
+                        &metadata,
+                        json!({ "content": "hi" }),
+                        None
+                    )),
                     Frame::ModelOutput,
                 )
                 .await
@@ -4354,7 +4772,11 @@ mod tests {
             !delivery
                 .send(
                     &sender,
-                    stream_delta_json(&metadata, json!({ "content": "hi" }), None),
+                    sse(stream_delta_json(
+                        &metadata,
+                        json!({ "content": "hi" }),
+                        None
+                    )),
                     Frame::ModelOutput,
                 )
                 .await,
@@ -4529,6 +4951,10 @@ mod tests {
             .collect();
         let resolved = ResolvedRoute {
             requested_model: "zero/seam".to_owned(),
+            // The metering seam reads rates and freeness only; a posture is
+            // irrelevant to it, so this states the honest empty rather than
+            // inventing one.
+            retention: BTreeMap::new(),
             candidates: definitions,
             sell_rates,
         };
@@ -5608,6 +6034,17 @@ mod tests {
         sell_rates: RateSchedule,
     ) -> ResolvedRoute {
         ResolvedRoute {
+            // Every rung of the walk fixture serves under one posture, which
+            // is what the shipped catalog's pins-only shape looks like too.
+            retention: candidates
+                .iter()
+                .map(|candidate| {
+                    (
+                        candidate.id.clone(),
+                        crate::config::RetentionPosture::Standard,
+                    )
+                })
+                .collect(),
             requested_model: "zero/test".to_owned(),
             candidates,
             sell_rates,
@@ -5699,6 +6136,7 @@ mod tests {
             reservation_usage,
             PriorityResolution::new(None),
             ZeroRouterEstimate::cold(64),
+            StreamWire::ChatCompletions,
         )
         .await;
         assert!(
@@ -5800,6 +6238,7 @@ mod tests {
             reservation_usage,
             PriorityResolution::new(None),
             ZeroRouterEstimate::cold(64),
+            StreamWire::ChatCompletions,
         )
         .await;
         drop(receiver);
@@ -5901,6 +6340,7 @@ mod tests {
             reservation_usage,
             PriorityResolution::new(None),
             ZeroRouterEstimate::cold(64),
+            StreamWire::ChatCompletions,
         )
         .await;
         assert!(
@@ -6000,6 +6440,7 @@ mod tests {
             reservation_usage,
             PriorityResolution::new(None),
             ZeroRouterEstimate::cold(64),
+            StreamWire::ChatCompletions,
         )
         .await;
         client.await.expect("client task should join");

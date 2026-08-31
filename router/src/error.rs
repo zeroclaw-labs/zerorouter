@@ -24,6 +24,43 @@ pub enum ApiError {
     /// The client did not finish sending its request body in time.
     RequestTimeout,
     UnsupportedRequestFields,
+    /// [`Self::UnsupportedRequestFields`] with the offending keys named.
+    ///
+    /// The SAME `code`, deliberately, because the remedy is the same one —
+    /// stop sending those fields — and the code is what a caller branches on.
+    /// What differs is the message, and the reason it is worth a variant is
+    /// the same one [`Self::UpstreamRejectedParameters`] gives: an unnamed
+    /// refusal costs a debugging session that one sentence prevents. It is
+    /// raised by the `/v1/responses` surface, where a modern agent client
+    /// routinely sends five or six knobs at once and the fixed message would
+    /// not say which of them is the problem.
+    ///
+    /// `fields` is composed from the request's own top-level KEY NAMES and
+    /// item type tags, sorted and bounded — never a value, and so never
+    /// prompt content.
+    UnsupportedRequestFieldsNamed {
+        fields: String,
+    },
+    /// The request asked the router to STORE the response
+    /// (`/v1/responses`, `store: true`).
+    ///
+    /// Its own code rather than a reuse of [`Self::UnsupportedRequestFields`],
+    /// on the rule the rest of this enum follows: the remedy differs and a
+    /// caller acts on the code. "This router cannot preserve that field" reads
+    /// as a compatibility gap a future version might close; this one never
+    /// closes, because ZeroRouter's product is that it retains nothing. The
+    /// message says so and names the one-word fix, so a client stops asking
+    /// rather than trying a different spelling.
+    ResponsesStoreUnsupported,
+    /// The request referred to a stored server-side conversation
+    /// (`/v1/responses`, `previous_response_id`).
+    ///
+    /// Distinct from [`Self::ResponsesStoreUnsupported`] even though both come
+    /// from the same absence, because the remedies are different actions: one
+    /// is "send `store: false`", the other is "resend the full context on
+    /// every turn". A client told only that storage is unsupported would have
+    /// to guess what to do with the conversation it cannot reference.
+    ResponsesPreviousResponseUnsupported,
     /// The request carries an input modality the requested model does not
     /// take — an image sent to a text-only lane.
     ///
@@ -193,6 +230,46 @@ impl ApiError {
                 "invalid_request_error",
                 None,
                 "unsupported_request_fields",
+            ),
+            Self::UnsupportedRequestFieldsNamed { fields } => (
+                StatusCode::BAD_REQUEST,
+                Cow::Owned(format!(
+                    "The request contains fields or structured content that the pinned provider \
+                     interface cannot preserve: {fields}. Nothing was reserved and no upstream was \
+                     contacted. Remove them and retry — ZeroRouter refuses a field it cannot \
+                     forward rather than dropping it silently."
+                )),
+                "invalid_request_error",
+                None,
+                "unsupported_request_fields",
+            ),
+            // 400: the fault is in the request, and it is not a transient one.
+            // The message states the product fact rather than a limitation,
+            // because that is what it is — a router that retains nothing has
+            // nothing to hand back later.
+            Self::ResponsesStoreUnsupported => (
+                StatusCode::BAD_REQUEST,
+                Cow::Borrowed(
+                    "This router stores nothing, so a request asking it to store the response \
+                     cannot be honored. Send store: false. Responses are streamed or returned once \
+                     and never written to durable storage, which is the guarantee this service is \
+                     sold under.",
+                ),
+                "invalid_request_error",
+                Some("store"),
+                "responses_store_unsupported",
+            ),
+            Self::ResponsesPreviousResponseUnsupported => (
+                StatusCode::BAD_REQUEST,
+                Cow::Borrowed(
+                    "Server-side conversation state requires storing previous responses, which \
+                     this zero-retention router does not do, so previous_response_id cannot be \
+                     resolved. Send the full conversation as input on every request — the same \
+                     items you would have chained, in order.",
+                ),
+                "invalid_request_error",
+                Some("previous_response_id"),
+                "responses_previous_response_unsupported",
             ),
             // 400 and `invalid_request_error`: unlike `model_unavailable`,
             // nothing here is ZeroRouter's misconfiguration — the caller
@@ -410,18 +487,29 @@ impl IntoResponse for ApiError {
     }
 }
 
+/// The error OBJECT an in-band stream failure carries, without the envelope
+/// around it.
+///
+/// Extracted so the two client-facing dialects can wrap the same four fields
+/// their own way — chat completions nests it under `error`, the Responses
+/// dialect flattens it into a typed `error` EVENT — without either of them
+/// re-deriving the message, the type, or the code. A caller that sees
+/// `insufficient_credits` must see the same words whichever endpoint it asked
+/// on.
 #[must_use]
-pub fn streaming_error_json(error: &ApiError) -> String {
+pub fn streaming_error_object(error: &ApiError) -> serde_json::Value {
     let (_, message, error_type, param, code) = error.response_parts();
     serde_json::json!({
-        "error": {
-            "message": message,
-            "type": error_type,
-            "param": param,
-            "code": code,
-        }
+        "message": message,
+        "type": error_type,
+        "param": param,
+        "code": code,
     })
-    .to_string()
+}
+
+#[must_use]
+pub fn streaming_error_json(error: &ApiError) -> String {
+    serde_json::json!({ "error": streaming_error_object(error) }).to_string()
 }
 
 #[cfg(test)]

@@ -583,6 +583,7 @@ async fn a_byok_dispatch_carries_the_customers_key_and_never_the_houses() {
     // wholly inside the allowance is free, wholly outside is 5%, and the
     // request that straddles the boundary pays 5% of only the part above it.
     settles_free_inside_the_monthly_allowance(&plain_url).await;
+    a_byok_response_labels_its_retention_as_byok_not_the_house_posture(&plain_url).await;
     settles_at_five_percent_once_the_allowance_is_spent(&plain_url).await;
     settles_on_only_the_part_above_the_allowance(&plain_url).await;
     concurrent_settles_cannot_both_claim_the_last_of_the_allowance(&plain_url).await;
@@ -849,6 +850,71 @@ async fn settled_row(pool: &PgPool, user_id: Uuid) -> (Decimal, Option<bool>, Op
     .fetch_one(pool)
     .await
     .expect("a settled usage row must exist")
+}
+
+/// The transparency headers on a BYOK request, and the one value on them that
+/// is not simply the catalog's.
+///
+/// `x-zerorouter-retention` must read `byok` and NOT the lane's house posture.
+/// The catalog's labels describe ZeroRouter's agreement with the provider, and
+/// this file already pins that a BYOK dispatch is deliberately exempt from the
+/// per-response attestation those labels rest on — so publishing `standard`
+/// (or, worse, `zero`) here would attach ZeroRouter's claim to traffic
+/// governed entirely by the customer's own contract.
+///
+/// It lives in this file rather than beside its siblings in
+/// `tests/request_path.rs` because that harness cannot produce a BYOK
+/// candidate at all: `ProviderCandidate::with_provider` hardcodes
+/// `byok: false` (a test fake holds no credential), so the only place the flag
+/// is genuinely true is the real assembly path this test drives.
+async fn a_byok_response_labels_its_retention_as_byok_not_the_house_posture(upstream_url: &str) {
+    let Some((pool, _, plaintext)) = byok_customer("retention-label", upstream_url).await else {
+        return;
+    };
+    let state = RouterState::with_database(
+        fixture("byok_tiers.toml"),
+        pool.clone(),
+        true,
+        Some(Arc::new(test_keyring())),
+    );
+    let response = app(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("authorization", format!("Bearer {plaintext}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "zero/byok-plain",
+                        "messages": [{"role": "user", "content": "hello"}]
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("the request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    let header = |name: &str| {
+        response
+            .headers()
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_owned()
+    };
+    assert_eq!(header("x-zerorouter-provider"), "google");
+    assert_eq!(header("x-zerorouter-byok"), "true");
+    // The fixture pins `google` at `standard`. Reading that value here would
+    // mean the label had been taken from the catalog without asking whose
+    // credential served.
+    assert_eq!(
+        header("x-zerorouter-retention"),
+        "byok",
+        "a BYOK request is governed by the customer's own provider agreement, so ZeroRouter's \
+         catalog posture does not describe it"
+    );
 }
 
 /// A customer whose month is untouched pays NOTHING for a BYOK request.

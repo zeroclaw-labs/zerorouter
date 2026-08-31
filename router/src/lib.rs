@@ -20,6 +20,7 @@ pub mod priority;
 pub mod provider;
 pub mod providers;
 pub mod redemption_tax;
+pub mod responses;
 pub mod retention;
 pub mod retry;
 pub mod session;

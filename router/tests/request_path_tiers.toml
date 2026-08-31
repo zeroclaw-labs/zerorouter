@@ -133,6 +133,37 @@ input_per_mtok = 1.00
 cached_input_per_mtok = 0.20
 output_per_mtok = 2.00
 
+# A lane whose TIER overrides its provider's posture. `openai` is pinned
+# `standard` below, so a request for this tier must publish `zero` — which is
+# only true if the retention header resolves through
+# `TierCatalog::candidate_retention` (tier override beats provider pin) rather
+# than reading the provider map directly. That is the mutation this fixture
+# exists to catch.
+
+[tiers."zero/test-private"]
+
+[tiers."zero/test-private".rates]
+input_per_mtok = 3.00
+cached_input_per_mtok = 0.60
+output_per_mtok = 6.00
+
+[tiers."zero/test-private".retention]
+posture = "zero"
+description = "Fixture lane: a separate zero-retention agreement for this lane."
+source_url = "https://example.test/openai/private-retention"
+verified = "2026-08-20"
+source_sha256 = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+
+[[tiers."zero/test-private".candidates]]
+id = "openai/private"
+provider = "openai"
+model = "upstream/private"
+
+[tiers."zero/test-private".candidates.rates]
+input_per_mtok = 1.00
+cached_input_per_mtok = 0.20
+output_per_mtok = 2.00
+
 # ---------------------------------------------------------------------------
 # RETENTION POSTURE — required: `validate_tier_catalog` refuses a catalog in
 # which any candidate's provider has no resolvable posture, so a fixture must
