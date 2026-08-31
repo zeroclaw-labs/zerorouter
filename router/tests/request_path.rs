@@ -487,6 +487,616 @@ async fn open_reservations(pool: &PgPool, api_key_id: Uuid) -> i64 {
         .expect("reservation count must query")
 }
 
+// ---------------------------------------------------------------------------
+// `POST /v1/responses` — the second inbound dialect.
+//
+// These tests exist to prove ONE claim in particular: a Responses request is
+// admitted, priced, walked, attested and settled by exactly the same code a
+// chat-completions request is. So each of them asserts the ledger as well as
+// the envelope, and several assert the two endpoints answer identically where
+// the pipeline — not the serializer — decides the answer.
+// ---------------------------------------------------------------------------
+
+/// A user with one API key and NO credit, for the admission-parity test.
+async fn create_unfunded_key(pool: &PgPool, label: &str) -> (Uuid, String) {
+    let user_id = Uuid::new_v4();
+    query("INSERT INTO users (id, email) VALUES ($1, $2)")
+        .bind(user_id)
+        .bind(format!("request-path-{label}-{user_id}@example.invalid"))
+        .execute(pool)
+        .await
+        .expect("test user must insert");
+    let key_id = Uuid::new_v4();
+    let plaintext = generate_api_key();
+    query(
+        r#"
+        INSERT INTO api_keys (id, user_id, key_hash, name, spend_cap_usd, velocity_cap_tokens_per_min)
+        VALUES ($1, $2, $3, 'request-path', 20, 1000000)
+        "#,
+    )
+    .bind(key_id)
+    .bind(user_id)
+    .bind(hash_api_key(&plaintext))
+    .execute(pool)
+    .await
+    .expect("test API key must insert");
+    (key_id, plaintext)
+}
+
+fn responses_body(model: &str, stream: bool) -> Value {
+    json!({
+        "model": model,
+        "input": "hello",
+        "max_output_tokens": MAX_TOKENS,
+        "temperature": 0.25,
+        "stream": stream,
+        // What a Codex-shaped client sends and what this router can honour.
+        "store": false,
+    })
+}
+
+fn responses_request(key: &str, body: &Value) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri("/v1/responses")
+        .header("authorization", format!("Bearer {key}"))
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .expect("responses request should build")
+}
+
+/// The `(event, data)` pairs of an SSE body, in order.
+///
+/// The Responses dialect NAMES its events on the wire where chat completions
+/// leaves the line off, so this reads both — a frame with no `event:` line
+/// reports an empty name.
+async fn sse_events(response: axum::response::Response) -> Vec<(String, String)> {
+    let bytes = response
+        .into_body()
+        .collect()
+        .await
+        .expect("stream body should be readable")
+        .to_bytes();
+    let text = String::from_utf8(bytes.to_vec()).expect("stream body should be UTF-8");
+    let mut events = Vec::new();
+    let mut pending = String::new();
+    for line in text.lines() {
+        if let Some(name) = line.strip_prefix("event: ") {
+            pending = name.to_owned();
+        } else if let Some(data) = line.strip_prefix("data: ") {
+            events.push((std::mem::take(&mut pending), data.to_owned()));
+        }
+    }
+    events
+}
+
+/// The three transparency labels a response carries, as a tuple.
+fn transparency(response: &axum::response::Response) -> (String, String, String) {
+    (
+        header(response, "x-zerorouter-provider"),
+        header(response, "x-zerorouter-byok"),
+        header(response, "x-zerorouter-retention"),
+    )
+}
+
+#[tokio::test]
+async fn responses_non_streaming_serves_through_the_shared_pipeline_and_settles() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let (api_key_id, key) = create_funded_key(&pool, "responses-serve").await;
+    let solo = FakeModelProvider::new(
+        "solo",
+        vec![FakeOutcome::chat("hello from solo", served_usage())],
+    );
+    let state = router(pool.clone(), vec![solo.clone()]);
+
+    let response = app(state.clone())
+        .oneshot(responses_request(
+            &key,
+            &responses_body("zero/test-solo", false),
+        ))
+        .await
+        .expect("responses request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    let request_id = header(&response, "x-request-id");
+    assert!(request_id.starts_with("chatcmpl-"));
+    let body = json_body(response).await;
+    state.wait_for_background_tasks().await;
+
+    // The envelope, in this dialect's shape.
+    assert_eq!(body["object"], "response");
+    assert_eq!(body["status"], "completed");
+    assert_eq!(body["incomplete_details"], Value::Null);
+    assert_eq!(body["model"], "zero/test-solo");
+    // One identity: the body id embeds the id the ledger and `x-request-id`
+    // are keyed on, so a support ticket quoting either finds the settled row.
+    assert_eq!(body["id"], format!("resp_{request_id}"));
+    assert_eq!(body["output"][0]["type"], "message");
+    assert_eq!(body["output"][0]["role"], "assistant");
+    assert_eq!(body["output"][0]["content"][0]["text"], "hello from solo");
+    assert_eq!(body["usage"]["input_tokens"], 1_000);
+    assert_eq!(body["usage"]["output_tokens"], 20);
+    assert_eq!(body["usage"]["total_tokens"], 1_020);
+
+    // The request reached the upstream exactly as a chat request would: the
+    // candidate's pinned model, the request's temperature, one message.
+    let call = solo.calls().remove(0);
+    assert_eq!(call.model, "upstream/solo");
+    assert_eq!(call.temperature, Some(0.25));
+    assert_eq!(call.message_count, 1);
+    assert!(!call.streaming);
+
+    // And it settled through the same transaction, at the same price, as the
+    // chat-completions twin of this test.
+    assert_eq!(
+        settled_event(&pool, api_key_id).await,
+        (
+            "openai".to_owned(),
+            "upstream/solo".to_owned(),
+            1_000,
+            20,
+            served_sell_cost(),
+            200,
+        )
+    );
+    let (candidate_id, cost_basis_usd, attempt_count, finish_reason) =
+        settled_provenance(&pool, api_key_id).await;
+    assert_eq!(candidate_id.as_deref(), Some("openai/solo"));
+    assert_eq!(cost_basis_usd, Some(decimal("0.00104")));
+    assert_eq!(attempt_count, Some(1));
+    assert_eq!(finish_reason.as_deref(), Some("stop"));
+    assert_eq!(
+        attempt_rows(&pool, api_key_id).await,
+        [(1, "openai/solo".to_owned(), "ok".to_owned(), true)]
+    );
+    assert_eq!(
+        balance(&pool, user_of(&pool, api_key_id).await)
+            .await
+            .expect("balance must query"),
+        Decimal::from(50) - served_sell_cost()
+    );
+    assert_eq!(open_reservations(&pool, api_key_id).await, 0);
+}
+
+#[tokio::test]
+async fn responses_streaming_emits_the_dialect_events_and_settles_the_metered_row() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let (api_key_id, key) = create_funded_key(&pool, "responses-stream").await;
+    let solo = FakeModelProvider::new(
+        "solo",
+        vec![FakeOutcome::Stream(vec![
+            FakeStreamStep::text("hel"),
+            FakeStreamStep::text("lo"),
+            FakeStreamStep::Usage(served_usage()),
+            FakeStreamStep::Final,
+        ])],
+    );
+    let state = router(pool.clone(), vec![solo.clone()]);
+
+    let response = app(state.clone())
+        .oneshot(responses_request(
+            &key,
+            &responses_body("zero/test-solo", true),
+        ))
+        .await
+        .expect("stream request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    let request_id = header(&response, "x-request-id");
+    let events = sse_events(response).await;
+    state.wait_for_background_tasks().await;
+
+    let names: Vec<&str> = events.iter().map(|(name, _)| name.as_str()).collect();
+    assert_eq!(
+        names,
+        [
+            "response.created",
+            "response.output_text.delta",
+            "response.output_text.delta",
+            "response.completed",
+        ],
+        "and NO [DONE] sentinel: it is not valid JSON and this dialect does not send one"
+    );
+    let payloads: Vec<Value> = events
+        .iter()
+        .map(|(_, data)| serde_json::from_str(data).expect("every frame is JSON"))
+        .collect();
+    assert_eq!(payloads[0]["response"]["status"], "in_progress");
+    assert_eq!(payloads[0]["response"]["id"], format!("resp_{request_id}"));
+    assert_eq!(payloads[1]["delta"], "hel");
+    assert_eq!(payloads[2]["delta"], "lo");
+    // The terminal carries the whole answer and the settled usage, so a
+    // consumer that reads only it still gets the response.
+    let terminal = &payloads[3]["response"];
+    assert_eq!(terminal["status"], "completed");
+    assert_eq!(terminal["output"][0]["content"][0]["text"], "hello");
+    assert_eq!(terminal["usage"]["input_tokens"], 1_000);
+    assert_eq!(terminal["usage"]["output_tokens"], 20);
+
+    let call = solo.calls().remove(0);
+    assert!(call.streaming);
+    // The SAME settled row a chat stream writes: the serializer changed, the
+    // money path did not.
+    assert_eq!(
+        settled_event(&pool, api_key_id).await,
+        (
+            "openai".to_owned(),
+            "upstream/solo".to_owned(),
+            1_000,
+            20,
+            served_sell_cost(),
+            200,
+        )
+    );
+    assert_eq!(
+        attempt_rows(&pool, api_key_id).await,
+        [(1, "openai/solo".to_owned(), "ok".to_owned(), true)]
+    );
+    assert_eq!(open_reservations(&pool, api_key_id).await, 0);
+}
+
+#[tokio::test]
+async fn responses_tool_calls_round_trip_out_and_back_in() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let (api_key_id, key) = create_funded_key(&pool, "responses-tools").await;
+    let solo = FakeModelProvider::new(
+        "solo",
+        vec![
+            FakeOutcome::Chat {
+                text: None,
+                tool_calls: vec![ToolCall {
+                    id: "call_1".to_owned(),
+                    name: "shell".to_owned(),
+                    arguments: r#"{"command":"pwd"}"#.to_owned(),
+                    extra_content: None,
+                }],
+                usage: Some(served_usage()),
+                reasoning_content: None,
+                stop_reason: None,
+            },
+            FakeOutcome::chat("it is /home", served_usage()),
+        ],
+    );
+    let state = router(pool.clone(), vec![solo.clone()]);
+
+    let tools = json!([{
+        "type": "function",
+        "name": "shell",
+        "description": "run a command",
+        "strict": false,
+        "parameters": { "type": "object" },
+    }]);
+    let mut first = responses_body("zero/test-solo", false);
+    first["tools"] = tools.clone();
+    first["tool_choice"] = json!("auto");
+    first["input"] = json!([{ "role": "user", "content": "run pwd" }]);
+
+    let response = app(state.clone())
+        .oneshot(responses_request(&key, &first))
+        .await
+        .expect("first responses request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+
+    // OUT: the tool call as a `function_call` item, in this dialect's shape.
+    assert_eq!(body["output"][0]["type"], "function_call");
+    assert_eq!(body["output"][0]["call_id"], "call_1");
+    assert_eq!(body["output"][0]["name"], "shell");
+    assert_eq!(body["output"][0]["arguments"], r#"{"command":"pwd"}"#);
+    // The tools are echoed back FLAT, which is this dialect's shape rather
+    // than chat completions' nested one.
+    assert_eq!(body["tools"][0]["name"], "shell");
+    assert!(body["tools"][0].get("function").is_none());
+
+    // BACK IN: the client replays the whole history, including the router's
+    // own echoed item ids, and the result feeds the tool result to the model.
+    let mut second = responses_body("zero/test-solo", false);
+    second["tools"] = tools;
+    second["tool_choice"] = json!("auto");
+    second["input"] = json!([
+        { "type": "message", "role": "user",
+          "content": [{ "type": "input_text", "text": "run pwd" }] },
+        { "type": "function_call", "id": body["output"][0]["id"].clone(),
+          "status": "completed", "call_id": "call_1", "name": "shell",
+          "arguments": r#"{"command":"pwd"}"# },
+        { "type": "function_call_output", "call_id": "call_1", "output": "/home" },
+    ]);
+    let response = app(state.clone())
+        .oneshot(responses_request(&key, &second))
+        .await
+        .expect("second responses request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    state.wait_for_background_tasks().await;
+    assert_eq!(body["output"][0]["content"][0]["text"], "it is /home");
+
+    // Three internal messages, not four: the assistant's turn carries its tool
+    // call rather than sitting beside it, which is the shape every upstream
+    // wire models and the one Anthropic requires.
+    let calls = solo.calls();
+    assert_eq!(calls[1].message_count, 3);
+    assert_eq!(calls[1].tool_count, 1);
+    assert_eq!(settled_count(&pool, api_key_id).await, 2);
+    assert_eq!(open_reservations(&pool, api_key_id).await, 0);
+}
+
+/// The transparency labels, on both endpoints, from the lane that served.
+///
+/// `zero/test-private` overrides its provider's `standard` pin with `zero`, so
+/// this fails if the header ever stops resolving through
+/// `TierCatalog::candidate_retention` — reading the provider map directly
+/// would publish `standard` for a lane sold as zero retention.
+#[tokio::test]
+async fn transparency_headers_disclose_the_served_lane_on_both_endpoints() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let (_, key) = create_funded_key(&pool, "transparency").await;
+    let private = FakeModelProvider::new(
+        "private",
+        vec![
+            FakeOutcome::chat("a", served_usage()),
+            FakeOutcome::chat("b", served_usage()),
+        ],
+    );
+    let state = router(pool.clone(), vec![private.clone()]);
+
+    let chat = app(state.clone())
+        .oneshot(completion_request(
+            &key,
+            &completion_body("zero/test-private", false),
+        ))
+        .await
+        .expect("chat request should complete");
+    assert_eq!(chat.status(), StatusCode::OK);
+    assert_eq!(
+        transparency(&chat),
+        (
+            "openai".to_owned(),
+            "false".to_owned(),
+            // The TIER's override, not the `standard` its provider is pinned
+            // at — the same resolution `/v1/models` publishes.
+            "zero".to_owned()
+        )
+    );
+
+    let responses = app(state.clone())
+        .oneshot(responses_request(
+            &key,
+            &responses_body("zero/test-private", false),
+        ))
+        .await
+        .expect("responses request should complete");
+    assert_eq!(responses.status(), StatusCode::OK);
+    assert_eq!(
+        transparency(&responses),
+        ("openai".to_owned(), "false".to_owned(), "zero".to_owned()),
+        "the disclosure is a property of the lane, not of the dialect asking"
+    );
+    state.wait_for_background_tasks().await;
+}
+
+/// A route whose rungs disagree publishes nothing rather than a label that
+/// might name the wrong lane.
+///
+/// The buffered path never needs this — it knows which rung served — so the
+/// two halves of this test are deliberately asymmetric: the same two-rung
+/// tier discloses on `/v1/chat/completions` and withholds on the stream.
+#[tokio::test]
+async fn streaming_transparency_headers_are_withheld_when_the_route_disagrees() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let (_, key) = create_funded_key(&pool, "transparency-mixed").await;
+    let primary = FakeModelProvider::new(
+        "primary",
+        vec![
+            FakeOutcome::Stream(vec![
+                FakeStreamStep::text("hi"),
+                FakeStreamStep::Usage(served_usage()),
+                FakeStreamStep::Final,
+            ]),
+            FakeOutcome::chat("hi", served_usage()),
+        ],
+    );
+    let secondary = FakeModelProvider::new("secondary", Vec::new());
+    let state = router(pool.clone(), vec![primary.clone(), secondary.clone()]);
+
+    // `zero/test-pair` runs on two different providers, so which one answers
+    // decides the labels — and a stream's head is written before it does.
+    let streamed = app(state.clone())
+        .oneshot(completion_request(
+            &key,
+            &completion_body("zero/test-pair", true),
+        ))
+        .await
+        .expect("stream request should complete");
+    assert_eq!(streamed.status(), StatusCode::OK);
+    assert_eq!(
+        transparency(&streamed),
+        (String::new(), String::new(), String::new()),
+        "an unknowable label must be absent, never guessed"
+    );
+    let _ = sse_payloads(streamed).await;
+
+    // The same tier, buffered: here the served rung IS known.
+    let buffered = app(state.clone())
+        .oneshot(completion_request(
+            &key,
+            &completion_body("zero/test-pair", false),
+        ))
+        .await
+        .expect("buffered request should complete");
+    assert_eq!(buffered.status(), StatusCode::OK);
+    assert_eq!(
+        transparency(&buffered),
+        (
+            "openai".to_owned(),
+            "false".to_owned(),
+            "standard".to_owned()
+        )
+    );
+    state.wait_for_background_tasks().await;
+}
+
+/// The SSRF gate is the shared one, reached because a Responses `input_image`
+/// is translated into the chat content shape rather than carried separately.
+#[tokio::test]
+async fn responses_image_parts_meet_the_same_ssrf_gate_as_chat() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let (api_key_id, key) = create_funded_key(&pool, "responses-image").await;
+    let vision = FakeModelProvider::new("vision", vec![FakeOutcome::chat("a cat", served_usage())]);
+    let state = router(pool.clone(), vec![vision.clone()]);
+
+    let image_body = |url: &str| {
+        let mut body = responses_body("zero/test-vision", false);
+        body["input"] = json!([{
+            "role": "user",
+            "content": [
+                { "type": "input_text", "text": "what is this?" },
+                { "type": "input_image", "image_url": url },
+            ],
+        }]);
+        body
+    };
+
+    // The cloud-metadata endpoint. Refused BEFORE anything is reserved and
+    // before any upstream is dialled.
+    let refused = app(state.clone())
+        .oneshot(responses_request(
+            &key,
+            &image_body("https://169.254.169.254/latest/meta-data/"),
+        ))
+        .await
+        .expect("request should complete");
+    assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        json_body(refused).await["error"]["code"],
+        "unsupported_request_fields"
+    );
+    assert_eq!(vision.call_count(), 0, "no upstream may be dialled");
+    assert_eq!(
+        open_reservations(&pool, api_key_id).await,
+        0,
+        "a request refused at the SSRF gate must reserve nothing"
+    );
+    assert_eq!(settled_count(&pool, api_key_id).await, 0);
+
+    // ...and the gate is not a blanket refusal of images: an inline data URI
+    // is forwarded, because nothing is fetched.
+    let served = app(state.clone())
+        .oneshot(responses_request(
+            &key,
+            &image_body("data:image/png;base64,AAAA"),
+        ))
+        .await
+        .expect("request should complete");
+    assert_eq!(served.status(), StatusCode::OK);
+    state.wait_for_background_tasks().await;
+    assert_eq!(vision.call_count(), 1);
+    assert_eq!(settled_count(&pool, api_key_id).await, 1);
+}
+
+/// One admission path, proved by its refusals.
+///
+/// An unfunded key must meet the SAME 402 on both endpoints, because both
+/// reach the same `admit_usage` — and the walk must never start, because
+/// admission runs before it.
+#[tokio::test]
+async fn an_unfunded_key_is_refused_identically_on_both_endpoints() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let (api_key_id, key) = create_unfunded_key(&pool, "responses-unfunded").await;
+    let solo = FakeModelProvider::new("solo", Vec::new());
+    let state = router(pool.clone(), vec![solo.clone()]);
+
+    let chat = app(state.clone())
+        .oneshot(completion_request(
+            &key,
+            &completion_body("zero/test-solo", false),
+        ))
+        .await
+        .expect("chat request should complete");
+    assert_eq!(chat.status(), StatusCode::PAYMENT_REQUIRED);
+    let chat_body = json_body(chat).await;
+
+    let responses = app(state.clone())
+        .oneshot(responses_request(
+            &key,
+            &responses_body("zero/test-solo", false),
+        ))
+        .await
+        .expect("responses request should complete");
+    assert_eq!(responses.status(), StatusCode::PAYMENT_REQUIRED);
+    let responses_body = json_body(responses).await;
+
+    assert_eq!(chat_body["error"]["code"], "insufficient_credits");
+    assert_eq!(
+        responses_body, chat_body,
+        "the two endpoints share one admission path, so they share its refusal byte for byte"
+    );
+    assert_eq!(solo.call_count(), 0, "admission runs before the walk");
+    assert_eq!(open_reservations(&pool, api_key_id).await, 0);
+    assert_eq!(settled_count(&pool, api_key_id).await, 0);
+}
+
+/// The two storage refusals, over HTTP, with the codes a client branches on.
+#[tokio::test]
+async fn responses_storage_requests_are_refused_by_their_own_codes() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let (api_key_id, key) = create_funded_key(&pool, "responses-storage").await;
+    let solo = FakeModelProvider::new("solo", Vec::new());
+    let state = router(pool.clone(), vec![solo.clone()]);
+
+    for (field, value, code) in [
+        ("store", json!(true), "responses_store_unsupported"),
+        (
+            "previous_response_id",
+            json!("resp_1"),
+            "responses_previous_response_unsupported",
+        ),
+    ] {
+        let mut body = responses_body("zero/test-solo", false);
+        body[field] = value;
+        let refused = app(state.clone())
+            .oneshot(responses_request(&key, &body))
+            .await
+            .expect("request should complete");
+        assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+        let refused = json_body(refused).await;
+        assert_eq!(refused["error"]["code"], code, "for {field}");
+        assert_eq!(refused["error"]["param"], field);
+    }
+
+    // A knob the router cannot forward is refused BY NAME, which is the whole
+    // difference between a debuggable 400 and an afternoon lost.
+    let mut body = responses_body("zero/test-solo", false);
+    body["reasoning"] = json!({ "effort": "high" });
+    body["include"] = json!(["reasoning.encrypted_content"]);
+    let refused = app(state.clone())
+        .oneshot(responses_request(&key, &body))
+        .await
+        .expect("request should complete");
+    assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+    let refused = json_body(refused).await;
+    assert_eq!(refused["error"]["code"], "unsupported_request_fields");
+    let message = refused["error"]["message"].as_str().unwrap_or_default();
+    assert!(message.contains("include, reasoning"), "{message}");
+
+    assert_eq!(solo.call_count(), 0);
+    assert_eq!(open_reservations(&pool, api_key_id).await, 0);
+    assert_eq!(settled_count(&pool, api_key_id).await, 0);
+}
+
 /// Admission tells the same story the catalog does.
 ///
 /// This runs the REAL provider-construction path — no injected route — against
@@ -1264,9 +1874,16 @@ async fn streaming_happy_path_emits_deltas_then_usage_and_settles_the_metered_ro
         .expect("stream request should complete");
     assert_eq!(response.status(), StatusCode::OK);
     assert!(header(&response, "x-request-id").starts_with("chatcmpl-"));
-    // The streaming response carries no upstream attribution headers: the
-    // candidate is not known when the SSE head is written.
-    assert_eq!(header(&response, "x-zerorouter-provider"), "");
+    // CHANGED DELIBERATELY (retention transparency headers). This used to
+    // assert the streaming response carried NO attribution, because the served
+    // candidate is not known when the SSE head is written. That is still true;
+    // what changed is that a single-candidate route cannot disagree with
+    // itself, so the three labels are knowable before the walk starts and are
+    // published. `zero/test-pair` still publishes nothing — see
+    // `streaming_transparency_headers_are_withheld_when_the_route_disagrees`.
+    assert_eq!(header(&response, "x-zerorouter-provider"), "openai");
+    assert_eq!(header(&response, "x-zerorouter-byok"), "false");
+    assert_eq!(header(&response, "x-zerorouter-retention"), "standard");
     let payloads = sse_payloads(response).await;
     state.wait_for_background_tasks().await;
 

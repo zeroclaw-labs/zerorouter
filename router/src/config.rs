@@ -406,6 +406,22 @@ impl RetentionPosture {
         }
     }
 
+    /// The token this posture is published under, on `/v1/models` and on the
+    /// `x-zerorouter-retention` response header alike.
+    ///
+    /// Written out rather than derived, for the reason [`Self::ordering_rank`]
+    /// gives, and pinned against the serde spelling by
+    /// `the_published_posture_token_is_the_catalog_spelling` — a header and a
+    /// catalog row that disagreed about the same lane would be worse than
+    /// either of them alone.
+    #[must_use]
+    pub const fn wire_token(self) -> &'static str {
+        match self {
+            Self::Zero => "zero",
+            Self::Standard => "standard",
+        }
+    }
+
     /// The short label the catalog publishes for this posture.
     #[must_use]
     pub const fn label(self) -> &'static str {
@@ -4167,6 +4183,123 @@ output_per_mtok = 2.00
         assert!(
             RetentionPosture::Zero.ordering_rank() < RetentionPosture::Standard.ordering_rank(),
             "zero-retention lanes must sort before retaining ones"
+        );
+    }
+
+    /// `wire_token` is written out too, and it has a second reader — the
+    /// `x-zerorouter-retention` header — so it is pinned against the spelling
+    /// `/v1/models` publishes. A header and a catalog row that disagreed about
+    /// the same lane would be worse than either of them alone.
+    #[test]
+    fn the_published_posture_token_is_the_catalog_spelling() {
+        for posture in [RetentionPosture::Zero, RetentionPosture::Standard] {
+            assert_eq!(
+                serde_json::to_value(posture).expect("a posture serializes"),
+                serde_json::Value::String(posture.wire_token().to_owned()),
+                "the header token must be what the catalog prints"
+            );
+        }
+    }
+
+    /// The route carries a posture per candidate, resolved by the same
+    /// function the catalog publishes from — including a tier-level override,
+    /// which is the case a second copy of the rule would get wrong.
+    #[test]
+    fn a_resolved_route_carries_each_candidates_posture() {
+        // Two rungs on two providers with opposite provider pins, plus a
+        // SECOND tier that overrides the posture for its own lane. The
+        // override is the case a second copy of the resolution rule would get
+        // wrong, which is why the route reuses `candidate_retention` instead
+        // of re-deriving one.
+        let catalog: TierCatalog = toml::from_str(
+            r#"
+schema_version = 1
+[retention.openai]
+posture = "zero"
+description = "retains nothing"
+source_url = "https://example.test/openai"
+verified = "2026-08-20"
+source_sha256 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+[retention.anthropic]
+posture = "standard"
+description = "retains for 30 days"
+source_url = "https://example.test/anthropic"
+verified = "2026-08-20"
+source_sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+[tiers."zero/mixed"]
+[tiers."zero/mixed".rates]
+input_per_mtok = 5.00
+output_per_mtok = 10.00
+[[tiers."zero/mixed".candidates]]
+id = "openai/private"
+provider = "openai"
+model = "private"
+[tiers."zero/mixed".candidates.rates]
+input_per_mtok = 1.00
+output_per_mtok = 2.00
+[[tiers."zero/mixed".candidates]]
+id = "anthropic/retaining"
+provider = "anthropic"
+model = "retaining"
+[tiers."zero/mixed".candidates.rates]
+input_per_mtok = 1.00
+output_per_mtok = 2.00
+[tiers."zero/negotiated"]
+[tiers."zero/negotiated".rates]
+input_per_mtok = 5.00
+output_per_mtok = 10.00
+[tiers."zero/negotiated".retention]
+posture = "zero"
+description = "separate zero-retention agreement for this lane"
+source_url = "https://example.test/negotiated"
+verified = "2026-08-20"
+source_sha256 = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+[[tiers."zero/negotiated".candidates]]
+id = "anthropic/negotiated"
+provider = "anthropic"
+model = "negotiated"
+[tiers."zero/negotiated".candidates.rates]
+input_per_mtok = 1.00
+output_per_mtok = 2.00
+"#,
+        )
+        .expect("catalog should parse");
+        validate_tier_catalog(&catalog).expect("the fixture loads");
+
+        let mixed = catalog.resolve("zero/mixed").expect("the alias resolves");
+        assert_eq!(
+            mixed.retention_posture("openai/private"),
+            Some(RetentionPosture::Zero)
+        );
+        assert_eq!(
+            mixed.retention_posture("anthropic/retaining"),
+            Some(RetentionPosture::Standard),
+            "each rung answers for itself; only a catalog LISTING takes the weakest"
+        );
+        assert_eq!(
+            mixed.retention_posture("anthropic/negotiated"),
+            None,
+            "a rung that is not on this route has no posture to report"
+        );
+
+        // The tier override beats the provider pin — the whole reason this is
+        // resolved through `candidate_retention` and not from `self.retention`.
+        let negotiated = catalog
+            .resolve("zero/negotiated")
+            .expect("the negotiated tier resolves");
+        assert_eq!(
+            negotiated.retention_posture("anthropic/negotiated"),
+            Some(RetentionPosture::Zero),
+            "the tier's own agreement governs, not its provider's default"
+        );
+        // A pinned concrete candidate inherits the same override, exactly as
+        // it inherits the tier's rates.
+        let pinned = catalog
+            .resolve("anthropic/negotiated")
+            .expect("the pinned rung resolves");
+        assert_eq!(
+            pinned.retention_posture("anthropic/negotiated"),
+            Some(RetentionPosture::Zero)
         );
     }
 }
