@@ -6,6 +6,8 @@
 //   routes                 router/src/api.rs        `app()`
 //   error codes and shapes router/src/error.rs      `response_parts()`
 //   accepted request body  router/src/openai.rs     `ChatCompletionRequest`
+//   the Responses dialect  router/src/responses.rs  `ResponsesRequest`
+//   response headers       router/src/api.rs        `insert_transparency`
 //   key format             router/src/auth.rs       `generate_api_key`
 //   catalog row shape      router/src/openai.rs     `ModelObject`
 //   CLI                    docs/USER-CLI.md
@@ -88,6 +90,47 @@ data: {"id":"...","object":"chat.completion.chunk","created":1766000000,"model":
 data: {"id":"...","object":"chat.completion.chunk","created":1766000000,"model":"${EXAMPLE_MODEL}","choices":[],"usage":{"prompt_tokens":12,"completion_tokens":4,"total_tokens":16}}
 
 data: [DONE]`
+
+const RESPONSES_CURL = `curl ${BASE_URL}/v1/responses \\
+  -H "Authorization: Bearer $ZEROROUTER_API_KEY" \\
+  -H "Content-Type: application/json" \\
+  -d '{
+    "model": "${EXAMPLE_MODEL}",
+    "instructions": "Answer in five words.",
+    "input": "Say hello.",
+    "store": false
+  }'`
+
+const RESPONSES_BODY = `{
+  "id": "resp_chatcmpl-9f2c…",
+  "object": "response",
+  "status": "completed",
+  "model": "${EXAMPLE_MODEL}",
+  "output": [
+    {
+      "type": "message",
+      "id": "msg_chatcmpl-9f2c…_0",
+      "status": "completed",
+      "role": "assistant",
+      "content": [{"type": "output_text", "text": "Hello there, nice to meet you.", "annotations": []}]
+    }
+  ],
+  "usage": {"input_tokens": 12, "output_tokens": 8, "total_tokens": 20}
+}`
+
+const RESPONSES_STREAM = `event: response.created
+data: {"type":"response.created","sequence_number":0,"response":{"id":"resp_chatcmpl-9f2c…","status":"in_progress",…}}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","sequence_number":1,"item_id":"msg_chatcmpl-9f2c…_0","output_index":0,"content_index":0,"delta":"Hello"}
+
+event: response.completed
+data: {"type":"response.completed","sequence_number":2,"response":{"status":"completed","output":[…],"usage":{"input_tokens":12,"output_tokens":8,"total_tokens":20}}}`
+
+const RESPONSE_HEADERS = `x-request-id:            chatcmpl-9f2c…
+x-zerorouter-provider:   anthropic
+x-zerorouter-byok:       false
+x-zerorouter-retention:  standard`
 
 const ERROR_BODY = `{
   "error": {
@@ -236,7 +279,8 @@ export function Docs() {
     <article className="docs">
       <h1>API documentation</h1>
       <p className="docs-lede">
-        ZeroRouter speaks the OpenAI chat-completions wire. Point a client at{' '}
+        ZeroRouter speaks the OpenAI chat-completions wire, and — for clients that no longer do —
+        the OpenAI <Link to="/docs#responses">Responses wire</Link> beside it. Point a client at{' '}
         <span className="mono">{BASE_URL}/v1</span>, send a{' '}
         <span className="mono">zcr_</span> key as a bearer token, and request a model by its
         catalog id. Inference is billed at the provider’s own rate against a prepaid balance —
@@ -247,6 +291,7 @@ export function Docs() {
         <a href="#quickstart">Quickstart</a>
         <a href="#models">Models &amp; retention</a>
         <a href="#streaming">Streaming</a>
+        <a href="#responses">Responses API</a>
         <a href="#keys">Keys</a>
         <a href="#errors">Errors worth knowing</a>
         <a href="#billing">How you are charged</a>
@@ -483,6 +528,131 @@ export function Docs() {
       </p>
 
       <CodeBlock label="An error frame">{STREAM_ERROR}</CodeBlock>
+
+      {/* ── Responses API ───────────────────────────────────────────────── */}
+
+      <h2 id="responses">Responses API</h2>
+      <p>
+        <span className="mono">POST /v1/responses</span> speaks OpenAI’s Responses wire, for clients
+        that no longer speak chat completions — a modern Codex CLI configured with{' '}
+        <span className="mono">wire_api = &quot;responses&quot;</span> is the one that prompted it.
+        Authentication, pricing, the candidate walk, and settlement are the <em>same code</em> the
+        chat endpoint runs; only the request shape and the response envelope differ. Anything true
+        of one endpoint on this page is true of the other unless it says otherwise.
+      </p>
+
+      <CodeBlock label="curl">{RESPONSES_CURL}</CodeBlock>
+      <CodeBlock label="Response body">{RESPONSES_BODY}</CodeBlock>
+
+      <p>
+        <span className="mono">input</span> is either a string — one user turn — or an array of
+        items: <span className="mono">message</span> items with{' '}
+        <span className="mono">input_text</span>, <span className="mono">output_text</span>, or{' '}
+        <span className="mono">input_image</span> content, plus{' '}
+        <span className="mono">function_call</span> and{' '}
+        <span className="mono">function_call_output</span> items for tool use.{' '}
+        <span className="mono">instructions</span> becomes the system turn,{' '}
+        <span className="mono">max_output_tokens</span> is this dialect’s{' '}
+        <span className="mono">max_tokens</span>, and{' '}
+        <span className="mono">tools</span> are the flat Responses shape (
+        <span className="mono">name</span> and <span className="mono">parameters</span> at the top
+        level, not nested under <span className="mono">function</span>) with{' '}
+        <span className="mono">tool_choice: &quot;auto&quot;</span>. An{' '}
+        <span className="mono">input_image</span> takes{' '}
+        <span className="mono">detail: &quot;auto&quot;</span> or no{' '}
+        <span className="mono">detail</span> at all — any other value is refused, because ZeroRouter
+        cannot carry the hint and downgrading it silently would change what the image costs you.
+      </p>
+      <p>
+        The same strictness applies here as on chat completions, and the refusal{' '}
+        <strong>names the fields it refused</strong> — a Responses client typically sends half a
+        dozen knobs at once, so a generic 400 would tell you nothing you could act on. Two of them
+        have their own codes, because they are the two a Codex-shaped client sends by default and
+        neither will ever be supported:
+      </p>
+      <ul>
+        <li>
+          <span className="mono">400 responses_store_unsupported</span> —{' '}
+          <span className="mono">store: true</span>. This router writes no prompt or completion to
+          durable storage, so there is nothing to hand back later. Send{' '}
+          <span className="mono">store: false</span>. Omitting the field entirely is fine.
+        </li>
+        <li>
+          <span className="mono">400 responses_previous_response_unsupported</span> —{' '}
+          <span className="mono">previous_response_id</span>. Server-side conversation state is
+          stored conversation state. Send the full history as{' '}
+          <span className="mono">input</span> on every turn, which is what the items above are for.
+        </li>
+      </ul>
+      <p>
+        <strong>Streaming</strong> uses this dialect’s named events rather than chat completions’
+        chunks: <span className="mono">response.created</span>, then{' '}
+        <span className="mono">response.output_text.delta</span> per delta, then{' '}
+        <span className="mono">response.completed</span> carrying the whole response and the usage
+        the request was billed on. A tool call arrives as{' '}
+        <span className="mono">response.output_item.added</span>,{' '}
+        <span className="mono">response.function_call_arguments.delta</span> and{' '}
+        <span className="mono">.done</span>, then{' '}
+        <span className="mono">response.output_item.done</span>. A run clipped at{' '}
+        <span className="mono">max_output_tokens</span> terminates on{' '}
+        <span className="mono">response.incomplete</span> instead, with{' '}
+        <span className="mono">incomplete_details.reason</span> saying so. There is{' '}
+        <strong>no <span className="mono">[DONE]</span> sentinel</strong> on this endpoint — the
+        terminal event is the terminal — and in-band failures arrive as an{' '}
+        <span className="mono">error</span> event carrying the same body a non-streaming error
+        would have had.
+      </p>
+
+      <CodeBlock label="Streaming response">{RESPONSES_STREAM}</CodeBlock>
+
+      <p>
+        Chain-of-thought, where a model produces it, comes back as a{' '}
+        <span className="mono">reasoning</span> item carrying summary text. ZeroRouter does not
+        emit the encrypted reasoning blob some clients replay, and correspondingly does not accept
+        a <span className="mono">reasoning</span> item on <span className="mono">input</span> — it
+        is refused by name rather than dropped.
+      </p>
+
+      {/* ── Response headers ────────────────────────────────────────────── */}
+
+      <h2 id="headers">What the response tells you about the lane</h2>
+      <p>
+        Every successful completion — either endpoint, streaming or not — carries three headers
+        naming what actually served it. They are the disclosure half of the{' '}
+        <a href="#models">retention postures</a> above: the catalog says what a lane does with your
+        data, and these say which lane you got.
+      </p>
+
+      <CodeBlock label="Response headers">{RESPONSE_HEADERS}</CodeBlock>
+
+      <ul>
+        <li>
+          <span className="mono">x-zerorouter-provider</span> — the upstream that answered.
+        </li>
+        <li>
+          <span className="mono">x-zerorouter-byok</span> —{' '}
+          <span className="mono">true</span> when the request dispatched on{' '}
+          <a href="#byok">your own provider credential</a>.
+        </li>
+        <li>
+          <span className="mono">x-zerorouter-retention</span> —{' '}
+          <span className="mono">zero</span> or <span className="mono">standard</span>, the same
+          posture <span className="mono">/v1/models</span> publishes for that lane. When{' '}
+          <span className="mono">x-zerorouter-byok</span> is{' '}
+          <span className="mono">true</span> this reads <span className="mono">byok</span> instead,
+          because the catalog’s postures describe <em>ZeroRouter’s</em> agreement with the provider
+          and your own traffic is governed by yours.
+        </li>
+      </ul>
+      <p>
+        On a <strong>streaming</strong> response the three headers appear only when they cannot
+        depend on which candidate answers — the response head is written before the walk dispatches,
+        and holding it until the first token would mean a client sees nothing at all while a model
+        thinks. Every lane in the catalog today is a single pinned candidate, so they are present;
+        a future lane that could fail over between providers will omit them rather than name the
+        wrong one, and its walk detail still arrives in the{' '}
+        <span className="mono">zerorouter</span> object on the final usage chunk.
+      </p>
 
       {/* ── Keys ────────────────────────────────────────────────────────── */}
 

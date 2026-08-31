@@ -738,6 +738,134 @@ async fn responses_streaming_emits_the_dialect_events_and_settles_the_metered_ro
 }
 
 #[tokio::test]
+async fn responses_streaming_tool_calls_emit_the_four_item_frames() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let (api_key_id, key) = create_funded_key(&pool, "responses-stream-tools").await;
+    let solo = FakeModelProvider::new(
+        "solo",
+        vec![FakeOutcome::Stream(vec![
+            FakeStreamStep::Tool(ToolCall {
+                id: "call_1".to_owned(),
+                name: "shell".to_owned(),
+                arguments: r#"{"command":"pwd"}"#.to_owned(),
+                extra_content: None,
+            }),
+            FakeStreamStep::Usage(served_usage()),
+            FakeStreamStep::Final,
+        ])],
+    );
+    let state = router(pool.clone(), vec![solo.clone()]);
+
+    let mut body = responses_body("zero/test-solo", true);
+    body["tools"] = json!([{ "type": "function", "name": "shell", "parameters": {} }]);
+    body["tool_choice"] = json!("auto");
+    let response = app(state.clone())
+        .oneshot(responses_request(&key, &body))
+        .await
+        .expect("stream request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    let events = sse_events(response).await;
+    state.wait_for_background_tasks().await;
+
+    let names: Vec<&str> = events.iter().map(|(name, _)| name.as_str()).collect();
+    assert_eq!(
+        names,
+        [
+            "response.created",
+            "response.output_item.added",
+            "response.function_call_arguments.delta",
+            "response.function_call_arguments.done",
+            // The one ZeroRouter's own outbound parser reads a tool call from,
+            // so this router can consume its own stream.
+            "response.output_item.done",
+            "response.completed",
+        ]
+    );
+    let payloads: Vec<Value> = events
+        .iter()
+        .map(|(_, data)| serde_json::from_str(data).expect("every frame is JSON"))
+        .collect();
+    assert_eq!(payloads[1]["item"]["call_id"], "call_1");
+    assert_eq!(payloads[1]["item"]["arguments"], "");
+    assert_eq!(payloads[2]["delta"], r#"{"command":"pwd"}"#);
+    assert_eq!(payloads[3]["arguments"], r#"{"command":"pwd"}"#);
+    assert_eq!(payloads[4]["item"]["arguments"], r#"{"command":"pwd"}"#);
+    assert_eq!(payloads[4]["item"]["status"], "completed");
+    let terminal = &payloads[5]["response"];
+    assert_eq!(terminal["output"][0]["type"], "function_call");
+    assert_eq!(terminal["output"][0]["call_id"], "call_1");
+    assert_eq!(terminal["usage"]["output_tokens"], 20);
+
+    // A tool-call delta IS model output, so this is a delivered, billed
+    // request — the same rule the chat wire follows.
+    assert_eq!(
+        attempt_rows(&pool, api_key_id).await,
+        [(1, "openai/solo".to_owned(), "ok".to_owned(), true)]
+    );
+    assert_eq!(open_reservations(&pool, api_key_id).await, 0);
+}
+
+/// A candidate that cannot stream, answered as one synthetic stream — the
+/// router's own replay path, in this dialect.
+#[tokio::test]
+async fn responses_synthetic_stream_replays_a_non_streaming_candidate() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let (api_key_id, key) = create_funded_key(&pool, "responses-synthetic").await;
+    let solo = FakeModelProvider::without_streaming(
+        "solo",
+        vec![FakeOutcome::chat("hello from solo", served_usage())],
+    );
+    let state = router(pool.clone(), vec![solo.clone()]);
+
+    let response = app(state.clone())
+        .oneshot(responses_request(
+            &key,
+            &responses_body("zero/test-solo", true),
+        ))
+        .await
+        .expect("stream request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    let events = sse_events(response).await;
+    state.wait_for_background_tasks().await;
+
+    let names: Vec<&str> = events.iter().map(|(name, _)| name.as_str()).collect();
+    assert_eq!(
+        names,
+        [
+            "response.created",
+            "response.output_text.delta",
+            "response.completed",
+        ]
+    );
+    let terminal: Value = serde_json::from_str(&events[2].1).expect("terminal is JSON");
+    assert_eq!(
+        terminal["response"]["output"][0]["content"][0]["text"],
+        "hello from solo"
+    );
+    assert_eq!(terminal["response"]["usage"]["output_tokens"], 20);
+    assert!(
+        !solo.calls()[0].streaming,
+        "the fake was asked for a buffered completion"
+    );
+    assert_eq!(
+        settled_event(&pool, api_key_id).await,
+        (
+            "openai".to_owned(),
+            "upstream/solo".to_owned(),
+            1_000,
+            20,
+            served_sell_cost(),
+            200,
+        )
+    );
+    assert_eq!(open_reservations(&pool, api_key_id).await, 0);
+}
+
+#[tokio::test]
 async fn responses_tool_calls_round_trip_out_and_back_in() {
     let Some(pool) = connect().await else {
         return;
