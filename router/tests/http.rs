@@ -950,11 +950,15 @@ async fn every_shipped_lane_publishes_a_retention_posture() {
             "together/kimi-k2.7-code",
             "together/nemotron-3-ultra",
             "together/qwen3.6-plus",
-            // The three vertex lanes are DELIBERATELY absent: their provider
-            // pin sits at `standard` while Google's abuse-monitoring exception
-            // (filed 2026-08-21) is pending — see the pin's comment in
-            // tiers.toml. When approval lands and the pin flips back to zero,
-            // they rejoin this list. Do not add them here before that.
+            // Rejoined 2026-08-30, exactly as the comment that used to sit
+            // here prescribed: Google's abuse-monitoring exception (filed
+            // 2026-08-21) was approved for project number 416940592816 —
+            // confirmed to be zerorouter-vertex-prod, the project these lanes
+            // dispatch on — closing the one item that had held the pin at
+            // `standard`. See `[retention.vertex]` in tiers.toml.
+            "vertex/gemini-3.1-pro-preview",
+            "vertex/gemini-3.5-flash-lite",
+            "vertex/gemini-3.7-flash",
             "xai/grok-4.3",
             "xai/grok-4.6"
         ],
@@ -1899,7 +1903,10 @@ async fn the_shipped_catalog_withholds_no_tier_today() {
 const SHIPPED_CONDITIONAL_RATES: [(&str, u64, f64, f64, f64); 7] = [
     ("openai/gpt-5.6-luna", 272_000, 0.40, 0.04, 1.80),
     ("openai/gpt-5.6-terra", 272_000, 4.00, 0.40, 18.00),
-    ("openai/gpt-5.6-sol", 272_000, 10.00, 1.00, 45.00),
+    // Re-transcribed 2026-08-31: OpenAI cut sol across both bands (base
+    // 5/0.5/30 -> 4/0.4/20, long-context 10/1/45 -> 8/0.8/30) and the lane
+    // stays priced at cost, so the cut passed through.
+    ("openai/gpt-5.6-sol", 272_000, 8.00, 0.80, 30.00),
     ("google/gemini-3.1-pro-preview", 200_000, 4.00, 0.40, 18.00),
     ("xai/grok-4.6", 200_000, 4.00, 1.00, 12.00),
     ("xai/grok-4.3", 200_000, 2.50, 0.40, 5.00),

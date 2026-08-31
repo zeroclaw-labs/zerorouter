@@ -340,8 +340,8 @@ openrouter_slug = "openai"
 posture = "standard"
 description = "On paid Gemini API quota Google does not use prompts or responses to improve its products, but logs them for a limited, unstated period to detect Prohibited Use Policy violations."
 source_url = "https://ai.google.dev/gemini-api/terms"
-verified = "2026-08-20"
-source_sha256 = "820771399fff49b8d589a7e5830511175237c8b47fc541955092450e32c1cf92"
+verified = "2026-08-31"
+source_sha256 = "b1bf4b85c1eac7594fd594b8bd2fb2690230c4a92f653dc8179d6ec7e32545ce"
 openrouter_slug = "google-ai-studio"
 
 # THE FIRST ZERO-RETENTION LANE (2026-08-20), and the one pin here whose
@@ -480,10 +480,10 @@ openrouter_slug = "amazon-bedrock"
 # code; it just means something this time.
 [retention.fireworks]
 posture = "zero"
-description = "Fireworks has zero data retention by default: prompt and generation data exist only in volatile memory for the duration of the request and are never written to persistent storage. Only metadata such as token counts is logged."
+description = "Fireworks has zero data retention by default: prompt and generation data exist only in volatile memory — for the duration of the request, or for several minutes when prompt caching holds KV data — and are never written to persistent storage. Only metadata such as token counts is logged."
 source_url = "https://docs.fireworks.ai/guides/security_compliance/data_handling"
-verified = "2026-08-20"
-source_sha256 = "9ba1f724b75de399bc3ff239e52007ee7e9df602063532867e733202128918e7"
+verified = "2026-08-31"
+source_sha256 = "6db0700ed334b8d8de1a932de1d7f7d740c260ecb24ef9421e8381bb4ab3f4ab"
 openrouter_slug = "fireworks"
 
 # THE STRONGEST VERIFICATION STORY IN THIS TABLE, and it is worth saying plainly
@@ -757,7 +757,14 @@ openrouter_slug = "xai"
 #   3. ABUSE MONITORING — "Google may log prompts to detect potential abuse
 #      [...] If you are in scope for prompt logging for abuse monitoring and
 #      want zero data retention, you can request an exception for abuse
-#      monitoring." This is the open item that keeps the posture `standard`.
+#      monitoring." GRANTED 2026-08-30: "The Generative AI Services team has
+#      approved ZeroClaw Labs for the exception to the prompt logging policy
+#      as outlined in the Abuse Monitoring documentation for Google Cloud
+#      project number(s) [416940592816]" — and 416940592816 was confirmed by
+#      `gcloud projects describe` to be zerorouter-vertex-prod, the exact
+#      project this lane dispatches on. This was the one open item that kept
+#      the posture `standard`; with it granted, all four facts hold and the
+#      pin below says `zero`.
 #   4. REQUEST-RESPONSE LOGGING — "This feature is disabled by default."
 #
 # NARROWED EVIDENCE, and this page needs it more than OpenAI's did: 38,000 of
@@ -775,10 +782,10 @@ openrouter_slug = "xai"
 # "Training Restriction", so case-insensitive matching would find it twice and
 # report an ambiguous anchor on a page nobody had touched.
 [retention.vertex]
-posture = "standard"
-description = "Vertex AI on ZeroRouter's dedicated Google Cloud project: in-memory caching disabled, no request-response logging, and Google does not train on customer data. Pending Google's approval of the project's abuse-monitoring exception, prompts flagged by Google's abuse systems can be retained by Google for up to 90 days — until that approval lands this lane is labelled as subject to provider retention."
+posture = "zero"
+description = "Vertex AI on ZeroRouter's dedicated Google Cloud project with zero data retention enforced end to end: Google approved the project's abuse-monitoring (prompt logging) exception on 2026-08-30, request-response logging is disabled and re-verified against the live project configuration, no context caching is used, and Google does not train on customer data."
 source_url = "https://docs.cloud.google.com/gemini-enterprise-agent-platform/resources/zero-data-retention"
-verified = "2026-08-21"
+verified = "2026-08-30"
 source_sha256 = "4f53b20a6c4e9810bcb035db83b997b604720cd21598e6f35341e63d1aaaeeca"
 source_extract_anchors = [
   "use your data to train or fine-tune any AI/ML models",
@@ -953,8 +960,8 @@ openrouter_slug = "groq"
 posture = "zero"
 description = "Together does not store inputs or outputs by default — zero data retention is the platform default rather than a setting to negotiate — and this organization leaves all three Privacy toggles off, so prompts and responses are not stored, not used for training, and never forwarded to a third-party passthrough provider. Models run on Together's own infrastructure and the model authors receive nothing. Together does state that temporary caching may be used to improve performance unless otherwise configured, and publishes no further detail on it."
 source_url = "https://docs.together.ai/docs/privacy-and-security"
-verified = "2026-08-22"
-source_sha256 = "1f7216f9af9f36d711a2f83939ec52ada096879bf8d3caa38a9eb81694f6c9f9"
+verified = "2026-08-31"
+source_sha256 = "c12ecf3bc64c7e4628f19ac0eeee48a778fa362dc8d29beb8b6bf9d1a4c99ea8"
 # THREE ANCHORS, AND THE THIRD IS HERE BECAUSE IT WAS MEASURED TO BE MISSING.
 # Each anchor hashes 2,000 characters running forward from itself, so the set
 # has to be checked against the CLAIMS rather than eyeballed. The first two
@@ -1154,18 +1161,21 @@ output_per_mtok = 25.00
 [tiers."openai/gpt-5.6-sol"]
 
 [tiers."openai/gpt-5.6-sol".rates]
-input_per_mtok = 5.00
-cached_input_per_mtok = 0.50
-output_per_mtok = 30.00
+input_per_mtok = 4.00
+cached_input_per_mtok = 0.40
+output_per_mtok = 20.00
 
 # Note the output rate does NOT simply double the way input and cached do:
-# 30.00 becomes 45.00, not 60.00. Every number here is transcribed, not
-# derived — the family shares a boundary, not a multiplier.
+# 20.00 becomes 30.00, not 40.00. Every number here is transcribed, not
+# derived — the family shares a boundary, not a multiplier. (OpenAI cut this
+# model's rates across both bands on or before 2026-08-31: base 5/0.5/30 ->
+# 4/0.4/20, long-context 10/1/45 -> 8/0.8/30. The lane stays priced at cost,
+# so the cut passes through to the customer.)
 [[tiers."openai/gpt-5.6-sol".rates.conditional]]
 min_prompt_tokens = 272000
-input_per_mtok = 10.00
-cached_input_per_mtok = 1.00
-output_per_mtok = 45.00
+input_per_mtok = 8.00
+cached_input_per_mtok = 0.80
+output_per_mtok = 30.00
 
 [[tiers."openai/gpt-5.6-sol".candidates]]
 id = "openai/gpt-5.6-sol"
@@ -1179,15 +1189,15 @@ input_modalities = ["text", "image"]
 tool_call = true
 
 [tiers."openai/gpt-5.6-sol".candidates.rates]
-input_per_mtok = 5.00
-cached_input_per_mtok = 0.50
-output_per_mtok = 30.00
+input_per_mtok = 4.00
+cached_input_per_mtok = 0.40
+output_per_mtok = 20.00
 
 [[tiers."openai/gpt-5.6-sol".candidates.rates.conditional]]
 min_prompt_tokens = 272000
-input_per_mtok = 10.00
-cached_input_per_mtok = 1.00
-output_per_mtok = 45.00
+input_per_mtok = 8.00
+cached_input_per_mtok = 0.80
+output_per_mtok = 30.00
 
 [tiers."anthropic/claude-fable-5"]
 
@@ -1939,40 +1949,30 @@ input_per_mtok = 1.40
 cached_input_per_mtok = 0.14
 output_per_mtok = 4.40
 
-# THE UNDATED `deepseek-v4-pro` ID IS PINNED DELIBERATELY, AND THERE IS AN OPEN
-# QUESTION BEHIND IT — read this before "upgrading" it to the 0813 snapshot.
+# PINNED AT THE DATED `-0813` ID SINCE 2026-08-31, and the move happened exactly
+# the way the previous comment here said it would: the undated preview id was
+# retired first — models.dev dropped its row and a live probe of the undated id
+# stopped answering while `-0813` served 200 — and `catalog-drift` reported it
+# NOT IN SOURCE, which was the correct alarm. The tier keeps its customer-facing
+# `fireworks/deepseek-v4-pro` id; only the dispatched string and the rates moved.
 #
-# Fireworks serves both `deepseek-v4-pro` and `deepseek-v4-pro-0813`, and its own
-# sources disagree about them. The serverless PRICE LIST carries exactly one row,
-# "DeepSeek V4 Pro", at the 1.74/0.145/3.48 pinned here, and models.dev files the
-# undated id at those same three numbers. The 0813 model page describes itself as
-# "the official release ... superseding the preview version", has NO row in the
-# price list at all, and publishes 1.32/0.044/3.96 — cheaper input, DEARER
-# output, so it is not a discount and the difference does not net out.
-#
-# Pinning the id whose price the vendor actually publishes is the conservative
-# call: a pin at the 0813 rates would record a basis with no price-list
-# authority behind it, on a money path, from a page that could be describing a
-# promotional or preview rate. models.dev also marks 0813 closed-weight, which
-# if true would put it outside the retention sentence this provider's `zero` pin
-# rests on — a second reason not to reach for it casually.
-#
-# TO RESOLVE: once a key exists, send one real request to each id and read the
-# billing line. If 0813 is the surviving model and the price list catches up,
-# this tier moves to it with its own rates and its own re-verification date. If
-# the undated id is retired first, `catalog-drift` reports it NOT IN SOURCE and
-# fails, which is the correct alarm.
+# The 0813 rates are 1.32/0.044/3.96 — cheaper input and cache, DEARER output
+# than the preview's 1.74/0.145/3.48; the difference does not net out, it is a
+# different rate card for the official release. models.dev now files 0813 as
+# open-weight (its earlier closed-weight marking was corrected), so the lane
+# remains inside `[retention.fireworks]`'s open-model zero sentence — the
+# concern the previous comment raised is resolved by the source that raised it.
 [tiers."fireworks/deepseek-v4-pro"]
 
 [tiers."fireworks/deepseek-v4-pro".rates]
-input_per_mtok = 1.74
-cached_input_per_mtok = 0.145
-output_per_mtok = 3.48
+input_per_mtok = 1.32
+cached_input_per_mtok = 0.044
+output_per_mtok = 3.96
 
 [[tiers."fireworks/deepseek-v4-pro".candidates]]
 id = "fireworks/deepseek-v4-pro"
 provider = "fireworks"
-model = "accounts/fireworks/models/deepseek-v4-pro"
+model = "accounts/fireworks/models/deepseek-v4-pro-0813"
 
 # max_output_tokens IS OMITTED, and the omission is the honest answer rather than
 # an oversight. models.dev publishes 384000; Fireworks' model page shows 131072,
@@ -1986,9 +1986,9 @@ input_modalities = ["text"]
 tool_call = true
 
 [tiers."fireworks/deepseek-v4-pro".candidates.rates]
-input_per_mtok = 1.74
-cached_input_per_mtok = 0.145
-output_per_mtok = 3.48
+input_per_mtok = 1.32
+cached_input_per_mtok = 0.044
+output_per_mtok = 3.96
 
 # Flash is pinned at the DATED id while Pro is pinned undated, and the asymmetry
 # is deliberate: the rule applied to both was "pin the id whose price Fireworks
@@ -2164,8 +2164,8 @@ output_per_mtok = 1.20
 posture = "standard"
 description = "Fireworks' published zero-data-retention default is scoped to open models — it states that prompt and generation data are not logged or stored 'for any open models' — and Qwen 3.8 Max is closed-weight, so that commitment does not extend to this lane. Nothing Fireworks publishes states what is retained here, so ZeroRouter makes no zero-retention claim for it."
 source_url = "https://docs.fireworks.ai/guides/security_compliance/data_handling"
-verified = "2026-08-20"
-source_sha256 = "9ba1f724b75de399bc3ff239e52007ee7e9df602063532867e733202128918e7"
+verified = "2026-08-31"
+source_sha256 = "6db0700ed334b8d8de1a932de1d7f7d740c260ecb24ef9421e8381bb4ab3f4ab"
 
 [tiers."fireworks/qwen3.8-max".rates]
 input_per_mtok = 2.00
