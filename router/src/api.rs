@@ -4529,6 +4529,10 @@ mod tests {
             .collect();
         let resolved = ResolvedRoute {
             requested_model: "zero/seam".to_owned(),
+            // The metering seam reads rates and freeness only; a posture is
+            // irrelevant to it, so this states the honest empty rather than
+            // inventing one.
+            retention: BTreeMap::new(),
             candidates: definitions,
             sell_rates,
         };
@@ -5608,6 +5612,17 @@ mod tests {
         sell_rates: RateSchedule,
     ) -> ResolvedRoute {
         ResolvedRoute {
+            // Every rung of the walk fixture serves under one posture, which
+            // is what the shipped catalog's pins-only shape looks like too.
+            retention: candidates
+                .iter()
+                .map(|candidate| {
+                    (
+                        candidate.id.clone(),
+                        crate::config::RetentionPosture::Standard,
+                    )
+                })
+                .collect(),
             requested_model: "zero/test".to_owned(),
             candidates,
             sell_rates,

@@ -514,9 +514,38 @@ pub struct ResolvedRoute {
     /// sizes its reservation at [`RateSchedule::worst_case`] and settlement
     /// charges [`RateSchedule::at_prompt_tokens`] against the measured prompt.
     pub sell_rates: RateSchedule,
+    /// The posture each candidate on this route serves under, keyed by
+    /// candidate id.
+    ///
+    /// Resolved here, at route construction, by the SAME
+    /// [`TierCatalog::candidate_retention`] that `/v1/models` publishes from —
+    /// so the label a response header carries and the label the storefront
+    /// printed cannot disagree. Re-deriving it at the serve site would need
+    /// the tier definition, which the route deliberately does not carry, and a
+    /// second copy of "tier override beats provider pin" is a second thing to
+    /// get wrong.
+    ///
+    /// A map rather than one posture because a route may hold rungs on
+    /// different providers, and only the rung that ACTUALLY served may speak
+    /// for the request. The tier-wide weakest-of-all posture
+    /// ([`TierCatalog::tier_retention`]) is the right claim for a catalog
+    /// listing, where no rung has been chosen yet, and the wrong one here.
+    pub retention: BTreeMap<String, RetentionPosture>,
 }
 
 impl ResolvedRoute {
+    /// The posture the named candidate serves under, or `None` for a candidate
+    /// that is not on this route.
+    ///
+    /// Absent is never "standard": a catalog does not load with an unlabelled
+    /// lane ([`TierConfigError::UnlabelledLane`]), so a miss here means the
+    /// caller asked about the wrong route, and the honest answer is to say
+    /// nothing rather than to publish the weaker guess.
+    #[must_use]
+    pub fn retention_posture(&self, candidate_id: &str) -> Option<RetentionPosture> {
+        self.retention.get(candidate_id).copied()
+    }
+
     /// Whether serving this route bills the CUSTOMER nothing (edge mode,
     /// stage 3: `docs/design/edge-mode-local-rung.md`).
     ///
@@ -792,6 +821,7 @@ impl TierCatalog {
         {
             return Some(ResolvedRoute {
                 requested_model: requested_model.to_owned(),
+                retention: self.route_retention(tier, &tier.candidates),
                 candidates: tier.candidates.clone(),
                 sell_rates: tier.rates.clone(),
             });
@@ -810,9 +840,30 @@ impl TierCatalog {
                     // SCHEDULE is inherited, thresholds included, so a pin
                     // cannot dodge the tier's repricing either.
                     sell_rates: tier.rates.clone(),
+                    // The pin inherits the tier's retention OVERRIDE too, for
+                    // the same reason it inherits the rates: the override is a
+                    // statement about the lane, and a request that names the
+                    // rung directly lands on exactly that lane.
+                    retention: self.route_retention(tier, std::slice::from_ref(&candidate)),
                     candidates: vec![candidate],
                 })
         })
+    }
+
+    /// Each candidate's posture, by id, through the one resolution
+    /// [`TierCatalog::candidate_retention`] defines.
+    fn route_retention(
+        &self,
+        definition: &TierDefinition,
+        candidates: &[TierCandidate],
+    ) -> BTreeMap<String, RetentionPosture> {
+        candidates
+            .iter()
+            .filter_map(|candidate| {
+                let pin = self.candidate_retention(definition, candidate)?;
+                Some((candidate.id.clone(), pin.posture))
+            })
+            .collect()
     }
 
     /// The withheld tier a requested model belongs to, if any.
