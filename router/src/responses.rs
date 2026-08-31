@@ -961,19 +961,6 @@ impl ResponsesStream {
     pub fn error(&mut self, error: &crate::error::ApiError) -> SseFrame {
         self.frame("error", crate::error::streaming_error_object(error))
     }
-
-    /// Whether this dialect terminates its stream with `data: [DONE]`.
-    ///
-    /// It does not, and the difference is not cosmetic. `[DONE]` is not valid
-    /// JSON, and the Responses SSE consumers — including ZeroRouter's own
-    /// outbound parser, which deserializes every `data:` payload — treat a
-    /// payload they cannot parse as a broken stream. The terminal here is
-    /// `response.completed`/`response.incomplete`, which is what the API this
-    /// dialect imitates actually sends.
-    #[must_use]
-    pub const fn sends_done(&self) -> bool {
-        false
-    }
 }
 
 #[cfg(test)]
@@ -1491,13 +1478,12 @@ mod serialization_tests {
     }
 
     #[test]
-    fn an_error_is_a_typed_event_and_never_a_done_sentinel() {
+    fn an_in_band_error_is_a_typed_event_carrying_the_shared_error_object() {
         let mut stream = ResponsesStream::new(ResponsesEcho::default());
         let frame = stream.error(&ApiError::InsufficientCredits);
         assert_eq!(frame.event, "error");
         let payload: Value = serde_json::from_str(&frame.data).expect("JSON");
         assert_eq!(payload["type"], "error");
         assert_eq!(payload["code"], "insufficient_credits");
-        assert!(!stream.sends_done());
     }
 }

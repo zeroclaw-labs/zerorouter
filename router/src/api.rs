@@ -245,8 +245,16 @@ impl StreamWire {
     }
 }
 
-/// The chat dialect's terminal sentinel. Deliberately absent from the
-/// Responses dialect — see `responses::ResponsesStream::sends_done`.
+/// The chat dialect's terminal sentinel, and the reason only one arm of
+/// [`StreamWire`] sends it.
+///
+/// `[DONE]` is not valid JSON, and the Responses dialect's consumers —
+/// including ZeroRouter's own outbound parser, which deserializes every
+/// `data:` payload it receives (`wire::responses::stream_chat`) — read a
+/// payload they cannot parse as a broken stream. That dialect's terminal is
+/// `response.completed` (or `response.incomplete` for a clipped run), which is
+/// what the API it imitates actually sends, so the sentinel would be both
+/// unrecognized and harmful.
 const DONE_SENTINEL: &str = "[DONE]";
 
 /// A chat-dialect frame: no `event:` line, the type lives in the payload.
@@ -1761,10 +1769,13 @@ async fn inference(
         MeteringLane::Reserved
     };
     // Read off the FINAL route, after ordering, because that is the list the
-    // walk will actually take. Only used by the streaming response, whose head
-    // is written before a candidate has answered — the buffered path names the
-    // rung that actually served.
-    let stream_transparency = unanimous_transparency(&resolved, provider_route.candidates());
+    // walk will actually take — and only for a stream, whose head is written
+    // before any candidate has answered. The buffered path names the rung that
+    // actually served and never consults this.
+    let stream_transparency = request
+        .stream
+        .then(|| unanimous_transparency(&resolved, provider_route.candidates()))
+        .flatten();
     let usage_session = admit_usage(
         &services.pool,
         &authenticated,

@@ -952,6 +952,76 @@ async fn responses_tool_calls_round_trip_out_and_back_in() {
     assert_eq!(open_reservations(&pool, api_key_id).await, 0);
 }
 
+/// ZeroRouter's own request and response namespaces work identically on both
+/// endpoints.
+///
+/// The `zerorouter` request object carries the priority knob, and the
+/// `zerorouter` response block carries the resolved priority and the walk
+/// story. Both are the SAME field with the SAME content the chat wire uses —
+/// a customer must not have to learn a second place to look because they
+/// changed dialects.
+#[tokio::test]
+async fn the_zerorouter_namespace_is_the_same_on_both_endpoints() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let (api_key_id, key) = create_funded_key(&pool, "responses-namespace").await;
+    let solo = FakeModelProvider::new(
+        "solo",
+        vec![
+            FakeOutcome::chat("a", served_usage()),
+            FakeOutcome::chat("b", served_usage()),
+        ],
+    );
+    let state = router(pool.clone(), vec![solo.clone()]);
+
+    let mut chat = completion_body("zero/test-solo", false);
+    chat["zerorouter"] = json!({ "priority": "cost" });
+    let chat_block = json_body(
+        app(state.clone())
+            .oneshot(completion_request(&key, &chat))
+            .await
+            .expect("chat request should complete"),
+    )
+    .await["zerorouter"]
+        .clone();
+
+    let mut responses = responses_body("zero/test-solo", false);
+    responses["zerorouter"] = json!({ "priority": "cost" });
+    let responses_block = json_body(
+        app(state.clone())
+            .oneshot(responses_request(&key, &responses))
+            .await
+            .expect("responses request should complete"),
+    )
+    .await["zerorouter"]
+        .clone();
+    state.wait_for_background_tasks().await;
+
+    // Compared with the walk latencies dropped: they are wall-clock
+    // measurements of two different requests and would make this flaky, while
+    // every other member of the block is a property of the walk itself.
+    let comparable = |block: &Value| {
+        let mut block = block.clone();
+        for attempt in block["attempts"].as_array_mut().into_iter().flatten() {
+            attempt["latency_ms"] = Value::Null;
+        }
+        block
+    };
+    assert_eq!(chat_block["priority"], "cost");
+    assert_eq!(chat_block["attempts"][0]["candidate"], "openai/solo");
+    assert_eq!(chat_block["attempts"][0]["outcome"], "ok");
+    assert_eq!(
+        comparable(&responses_block),
+        comparable(&chat_block),
+        "the block is built by the shared walk, so the two dialects report it identically"
+    );
+    assert_eq!(
+        settled_priority(&pool, api_key_id).await.as_deref(),
+        Some("cost")
+    );
+}
+
 /// The transparency labels, on both endpoints, from the lane that served.
 ///
 /// `zero/test-private` overrides its provider's `standard` pin with `zero`, so
