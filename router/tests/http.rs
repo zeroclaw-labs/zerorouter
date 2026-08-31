@@ -1903,7 +1903,10 @@ async fn the_shipped_catalog_withholds_no_tier_today() {
 const SHIPPED_CONDITIONAL_RATES: [(&str, u64, f64, f64, f64); 7] = [
     ("openai/gpt-5.6-luna", 272_000, 0.40, 0.04, 1.80),
     ("openai/gpt-5.6-terra", 272_000, 4.00, 0.40, 18.00),
-    ("openai/gpt-5.6-sol", 272_000, 10.00, 1.00, 45.00),
+    // Re-transcribed 2026-08-31: OpenAI cut sol across both bands (base
+    // 5/0.5/30 -> 4/0.4/20, long-context 10/1/45 -> 8/0.8/30) and the lane
+    // stays priced at cost, so the cut passed through.
+    ("openai/gpt-5.6-sol", 272_000, 8.00, 0.80, 30.00),
     ("google/gemini-3.1-pro-preview", 200_000, 4.00, 0.40, 18.00),
     ("xai/grok-4.6", 200_000, 4.00, 1.00, 12.00),
     ("xai/grok-4.3", 200_000, 2.50, 0.40, 5.00),
