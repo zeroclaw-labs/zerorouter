@@ -109,6 +109,21 @@ pub struct ResponsesRequest {
     /// Present and non-null is refused: resolving it would require having
     /// stored the previous response.
     pub previous_response_id: Option<Value>,
+    /// `true` and absent are accepted — parallel tool calling is what the
+    /// walk's native tool path already delivers, so the client is asking for
+    /// exactly what it gets. `false` is refused by name: a serial-execution
+    /// guarantee no wire here forwards, and a caller who asked for one must
+    /// not be told it holds (the `strict: true` rule, applied to ordering).
+    pub parallel_tool_calls: Option<bool>,
+    /// Accepted only in its default shape: absent, `null`, `{}`, or an
+    /// explicit `{"format": {"type": "text"}}` — plain text is precisely what
+    /// this router returns, so the explicit spelling of the default is not a
+    /// request for anything. Any other member is refused by name:
+    /// `format.type = "json_schema"` is structured-output enforcement this
+    /// router does not forward, and `verbosity` changes how much a model
+    /// writes — accepting either silently would bill a customer for behavior
+    /// they did not get.
+    pub text: Option<Value>,
     /// ZeroRouter's own request namespace, identical to the chat surface's —
     /// typed before the flatten so serde consumes the key. Carried across so a
     /// request that works on one endpoint works on the other; the precedence
@@ -201,6 +216,22 @@ impl ResponsesRequest {
             .is_some_and(|value| !value.is_null())
         {
             return Err(ApiError::ResponsesPreviousResponseUnsupported);
+        }
+        if self.parallel_tool_calls == Some(false) {
+            return Err(unsupported(["parallel_tool_calls=false"]));
+        }
+        if let Some(text) = self.text.as_ref().filter(|text| !text.is_null()) {
+            let Some(object) = text.as_object() else {
+                return Err(unsupported(["text"]));
+            };
+            for (key, value) in object {
+                let default_format = key == "format"
+                    && value.get("type").and_then(Value::as_str) == Some("text")
+                    && value.as_object().is_some_and(|format| format.len() == 1);
+                if !(value.is_null() || default_format) {
+                    return Err(unsupported([format!("text.{key}")]));
+                }
+            }
         }
         if !self.extra.is_empty() {
             return Err(unsupported(self.extra.keys()));
@@ -1210,14 +1241,60 @@ mod translation_tests {
             "model": "zero/x",
             "input": "hi",
             "reasoning": { "effort": "high" },
-            "parallel_tool_calls": false,
+            "prompt_cache_key": "k1",
             "top_p": 0.1,
         }));
         let ApiError::UnsupportedRequestFieldsNamed { fields } = error else {
             panic!("expected the named refusal, got {error:?}");
         };
         // Sorted, so the message is stable whatever order serde saw them in.
-        assert_eq!(fields, "parallel_tool_calls, reasoning, top_p");
+        assert_eq!(fields, "prompt_cache_key, reasoning, top_p");
+    }
+
+    /// The two knobs a real Codex CLI sends whose DEFAULT spelling asks for
+    /// exactly what this router already does: parallel tool calling (the
+    /// walk's native tool path) and plain-text output. The default shapes are
+    /// accepted; every non-default member is refused by name, because each
+    /// one is a behavior or cost change no wire here forwards.
+    #[test]
+    fn default_shaped_parallel_tool_calls_and_text_are_accepted_the_rest_refused() {
+        for accepted in [
+            json!({ "model": "m", "input": "hi", "parallel_tool_calls": true }),
+            json!({ "model": "m", "input": "hi", "text": {} }),
+            json!({ "model": "m", "input": "hi", "text": Value::Null }),
+            json!({ "model": "m", "input": "hi",
+                    "text": { "format": { "type": "text" } } }),
+            json!({ "model": "m", "input": "hi",
+                    "parallel_tool_calls": true,
+                    "text": { "format": { "type": "text" }, "verbosity": Value::Null } }),
+        ] {
+            assert!(parse(accepted.clone()).is_ok(), "must accept {accepted}");
+        }
+        for (refused, named) in [
+            (
+                json!({ "model": "m", "input": "hi", "parallel_tool_calls": false }),
+                "parallel_tool_calls=false",
+            ),
+            (
+                json!({ "model": "m", "input": "hi", "text": { "verbosity": "low" } }),
+                "text.verbosity",
+            ),
+            (
+                json!({ "model": "m", "input": "hi",
+                        "text": { "format": { "type": "json_schema", "schema": {} } } }),
+                "text.format",
+            ),
+            (
+                json!({ "model": "m", "input": "hi", "text": "plain" }),
+                "text",
+            ),
+        ] {
+            let error = refuse(refused);
+            let ApiError::UnsupportedRequestFieldsNamed { fields } = error else {
+                panic!("expected the named refusal for {named}, got {error:?}");
+            };
+            assert_eq!(fields, named);
+        }
     }
 
     #[test]
