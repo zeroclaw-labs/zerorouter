@@ -41,6 +41,7 @@ fn test_signature(hex: &str) -> TaskSignature {
 
 fn test_rates() -> ModelRates {
     ModelRates {
+        cache_write_per_mtok: None,
         input_per_mtok: Some(2.0),
         output_per_mtok: Some(10.0),
         cached_input_per_mtok: Some(0.2),
@@ -336,6 +337,7 @@ async fn settled_row_carries_estimate_and_select_telemetry() {
     let session = admit(&pool, &key).await;
 
     let basis = ModelRates {
+        cache_write_per_mtok: None,
         input_per_mtok: Some(0.3),
         output_per_mtok: Some(1.2),
         cached_input_per_mtok: Some(0.06),
@@ -579,6 +581,7 @@ async fn a_partly_unknown_attempt_cogs_sum_reports_itself_as_a_lower_bound() {
         return;
     };
     let basis = ModelRates {
+        cache_write_per_mtok: None,
         input_per_mtok: Some(0.3),
         output_per_mtok: Some(1.2),
         cached_input_per_mtok: Some(0.06),
@@ -1286,16 +1289,17 @@ async fn migration_chain_applies_on_a_fresh_database() {
          a key attached under #103's no-fallback promise must not have it \
          revoked by a migration"
     );
-    // 28, not 24: 0013 (dispute resolution), 0014 (dispatched reservations),
+    // 29, not 25: 0013 (dispute resolution), 0014 (dispatched reservations),
     // 0015 (released reservations), 0016 (deposit fee), 0017 (stripe observed
     // reversals), 0018 (autopay withheld state), 0019 (monthly spend rollup),
     // 0020 (usage gap and real finish reason), 0021 (autopay tax), 0022
     // (checkout intent cleanup), 0023 (key expiry and credit limits), 0024
     // (autopay tax lifecycle), 0025 (redemption tax), 0026 (byok provider
-    // keys), 0027 (byok monthly allowance) and 0028 (byok fallback opt in) are
-    // numbered with a gap so 0010-0012 stay available to branches in flight.
+    // keys), 0027 (byok monthly allowance), 0028 (byok fallback opt in) and
+    // 0029 (cache write tokens) are numbered with a gap so 0010-0012 stay
+    // available to branches in flight.
     // The chain's head is the highest version applied, not a count of files.
-    assert_eq!(outcome.22, 28, "the chain reaches migration version 28");
+    assert_eq!(outcome.22, 29, "the chain reaches migration version 29");
 }
 
 /// Rewrite the database name in a Postgres URL, keeping any query string

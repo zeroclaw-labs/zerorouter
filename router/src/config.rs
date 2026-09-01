@@ -11,7 +11,10 @@ use thiserror::Error;
 use crate::{
     openai::{MAX_RATE_PER_MTOK, billable_rate},
     priority::Priority,
-    providers::{is_supported_provider, provider_has_surface, provider_settles_free},
+    providers::{
+        is_supported_provider, provider_carries_cache_control, provider_has_surface,
+        provider_settles_free,
+    },
 };
 
 pub const DEFAULT_TIER_CONFIG_PATH: &str = "config/tiers.toml";
@@ -607,7 +610,12 @@ struct RawModelRates {
     input_per_mtok: Option<f64>,
     output_per_mtok: Option<f64>,
     cached_input_per_mtok: Option<f64>,
-    /// Conditional rate tables, each replacing the three rates above for the
+    /// What a cache WRITE sells (or costs) per million tokens. Optional, and
+    /// its absence is load-bearing twice over — see
+    /// [`ModelRates::cache_write_per_mtok`]: the lane refuses client
+    /// `cache_control` and the biller charges writes at the input rate.
+    cache_write_per_mtok: Option<f64>,
+    /// Conditional rate tables, each replacing the four rates above for the
     /// whole request once the prompt reaches its `min_prompt_tokens`. Absent
     /// means the table charges one price at every size, which is what every
     /// rate table in this file meant before the key existed.
@@ -633,6 +641,7 @@ struct RawConditionalRate {
     input_per_mtok: Option<f64>,
     output_per_mtok: Option<f64>,
     cached_input_per_mtok: Option<f64>,
+    cache_write_per_mtok: Option<f64>,
 }
 
 fn deserialize_rate_schedule<'de, D>(deserializer: D) -> Result<RateSchedule, D::Error>
@@ -644,6 +653,7 @@ where
         input_per_mtok: raw.input_per_mtok,
         output_per_mtok: raw.output_per_mtok,
         cached_input_per_mtok: raw.cached_input_per_mtok,
+        cache_write_per_mtok: raw.cache_write_per_mtok,
     };
     if raw.conditional.is_empty() {
         return Ok(RateSchedule::flat(base));
@@ -658,6 +668,7 @@ where
                     input_per_mtok: conditional.input_per_mtok,
                     output_per_mtok: conditional.output_per_mtok,
                     cached_input_per_mtok: conditional.cached_input_per_mtok,
+                    cache_write_per_mtok: conditional.cache_write_per_mtok,
                 },
             })
             .collect(),
@@ -715,6 +726,18 @@ pub enum TierConfigError {
         tier: String,
         provider: String,
         surface: String,
+    },
+    #[error(
+        "candidate {candidate} in tier {tier} declares cache_write_per_mtok, but provider \
+         {provider} does not dispatch on the Anthropic Messages dialect: a cache-write price is a \
+         claim that this lane sells client prompt caching, and only the anthropic and \
+         bedrock/classic_runtime planes can carry a cache_control breakpoint upstream. Remove the \
+         rate, or point the candidate at a plane that can honour it"
+    )]
+    CacheWritePricedOffMessagesWire {
+        tier: String,
+        candidate: String,
+        provider: String,
     },
     #[error("duplicate concrete model id {0}")]
     DuplicateModelId(String),
@@ -1307,6 +1330,33 @@ fn validate_tier_catalog(
                     surface: surface.to_owned(),
                 });
             }
+            // A cache-write PRICE is a claim that this lane sells prompt
+            // caching, and admission reads it as exactly that: a request
+            // carrying `cache_control` is admitted against candidates that
+            // declare it and refused when none does. So the claim has to be
+            // true of the PLANE as well as of the price — only the two
+            // Anthropic-Messages adapters can carry a breakpoint upstream.
+            //
+            // STRUCTURAL, on the same reasoning as the surface check above:
+            // there is no honest way to serve such a candidate, and the
+            // plausible fallback is the dangerous one. Dropping the breakpoint
+            // and dialling anyway would charge the customer a 1.25x write
+            // premium for a cache the upstream never wrote — a wrong bill, not
+            // a degraded feature — and withholding just the tier would let the
+            // rest of the file serve while an operator's mistake stayed
+            // invisible.
+            if candidate.rates.base().prices_cache_writes()
+                && !provider_carries_cache_control(
+                    &candidate.provider,
+                    candidate.surface.as_deref(),
+                )
+            {
+                return Err(TierConfigError::CacheWritePricedOffMessagesWire {
+                    tier: tier_id.clone(),
+                    candidate: candidate.id.clone(),
+                    provider: candidate.provider.clone(),
+                });
+            }
             if !concrete_ids.insert(candidate.id.clone()) {
                 return Err(TierConfigError::DuplicateModelId(candidate.id.clone()));
             }
@@ -1526,6 +1576,18 @@ fn validate_candidate_margin(
                 "cached_input_per_mtok",
                 basis_rates.effective_cached_input_per_mtok(),
                 sell_rates.effective_cached_input_per_mtok(),
+            ),
+            // EFFECTIVE on both sides, for exactly the reason the cached
+            // dimension is: an absent cache-write rate is not unknown to the
+            // biller, it is the input rate. A candidate that transcribes
+            // Anthropic's 1.25x premium under a tier that forgot to would
+            // otherwise load happily and lose 25% of the input rate on every
+            // cache-writing token — the silent margin leak this whole function
+            // exists to refuse, in its newest spelling.
+            (
+                "cache_write_per_mtok",
+                basis_rates.effective_cache_write_per_mtok(),
+                sell_rates.effective_cache_write_per_mtok(),
             ),
         ] {
             let (Some(basis), Some(sell)) = (basis, sell) else {
@@ -1751,6 +1813,12 @@ fn validate_rates(tier: &str, rates: ModelRates) -> Result<(), TierConfigError> 
         "cached_input_per_mtok",
         rates.cached_input_per_mtok,
         false,
+    )?;
+    validate_rate(
+        tier,
+        "cache_write_per_mtok",
+        rates.cache_write_per_mtok,
+        false,
     )
 }
 
@@ -1764,16 +1832,27 @@ fn validate_rates(tier: &str, rates: ModelRates) -> Result<(), TierConfigError> 
 ///
 /// # Why this is enforced rather than merely expected
 ///
-/// It is the precondition that makes a worst-case reservation SUFFICIENT.
-/// Admission has no cache information — the reservation prices its entire
-/// prompt bound at the input rate ([`crate::openai::usage_cost`] with no
-/// `prompt_tokens_details`) — while settlement splits the measured prompt into
-/// a cached part and an uncached remainder and prices them separately. So for
-/// a reservation to cover every possible outcome, the cached rate must not
-/// exceed the input rate; otherwise a request that turns out to be almost
-/// entirely cache hits settles ABOVE what was held for it, and no amount of
-/// worst-casing over the BANDS repairs it, because the gap is inside a single
-/// band.
+/// It used to be the precondition that made a worst-case reservation
+/// SUFFICIENT, and the argument ran: admission has no cache information — the
+/// reservation prices its entire prompt bound at the input rate
+/// ([`crate::openai::usage_cost`] with no `prompt_tokens_details`) — while
+/// settlement splits the measured prompt and prices the parts separately, so
+/// no prompt-side rate may exceed the input rate or a heavily cached request
+/// settles ABOVE what was held for it, inside a single band where no amount of
+/// worst-casing over the BANDS repairs it.
+///
+/// **The cache-write dimension breaks that argument on purpose**: Anthropic
+/// bills a write at 1.25x input, so a prompt-side rate above the input rate is
+/// now the correct transcription rather than a transposition. Sufficiency
+/// moved to [`RateSchedule::reservation_rates`], which raises the reserved
+/// input rate to the dearest rate any prompt token could carry. The proof is
+/// the same shape; it is just no longer this rule that supplies it.
+///
+/// What this rule still does is catch a TRANSPOSED read/input pair, which is
+/// what it was really detecting all along — no vendor sells a cache hit for
+/// more than a fresh read, and a table that says otherwise was mistyped. It is
+/// deliberately NOT extended to the cache-write rate, because up there the
+/// inversion is the real price.
 ///
 /// Every schedule shipped today satisfies this, and the reservation invariant
 /// was checked against them one by one. This turns that arithmetic from an
@@ -3646,6 +3725,7 @@ output_per_mtok = 8.00
             model: "qwen3-8b".to_owned(),
             surface: None,
             rates: RateSchedule::flat(ModelRates {
+                cache_write_per_mtok: None,
                 input_per_mtok: input,
                 cached_input_per_mtok: cached,
                 output_per_mtok: output,

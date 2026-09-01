@@ -109,6 +109,12 @@ struct SecondSourcePricing {
     completion: Option<String>,
     #[serde(default)]
     input_cache_read: Option<String>,
+    /// The second source's spelling of the cache-WRITE rate. Carried for the
+    /// same reason the primary's is: a dimension the ledger bills on is a
+    /// dimension worth a second opinion. Corroboration never fails a run, so
+    /// an absent or differently-named key costs nothing.
+    #[serde(default)]
+    input_cache_write: Option<String>,
     /// Rate tables that REPLACE the flat ones above some threshold — the
     /// second source's spelling of `cost.tiers[]`, keyed on the same
     /// `min_prompt_tokens` field name ZeroRouter's own catalog uses.
@@ -132,6 +138,8 @@ struct SecondSourceOverride {
     completion: Option<String>,
     #[serde(default)]
     input_cache_read: Option<String>,
+    #[serde(default)]
+    input_cache_write: Option<String>,
 }
 
 impl SecondSourceOverride {
@@ -166,6 +174,7 @@ impl SecondSourceOverride {
             input_per_mtok: self.prompt.as_deref().and_then(per_mtok),
             output_per_mtok: self.completion.as_deref().and_then(per_mtok),
             cached_input_per_mtok: self.input_cache_read.as_deref().and_then(per_mtok),
+            cache_write_per_mtok: self.input_cache_write.as_deref().and_then(per_mtok),
         }
     }
 }
@@ -176,6 +185,7 @@ impl SecondSourcePricing {
             input_per_mtok: self.prompt.as_deref().and_then(per_mtok),
             output_per_mtok: self.completion.as_deref().and_then(per_mtok),
             cached_input_per_mtok: self.input_cache_read.as_deref().and_then(per_mtok),
+            cache_write_per_mtok: self.input_cache_write.as_deref().and_then(per_mtok),
         }
     }
 
@@ -602,6 +612,11 @@ fn push_deltas(
             primary.cached_input_per_mtok,
             second.cached_input_per_mtok,
         ),
+        (
+            "cache_write",
+            primary.cache_write_per_mtok,
+            second.cache_write_per_mtok,
+        ),
         ("output", primary.output_per_mtok, second.output_per_mtok),
     ];
     for (dimension, primary, second) in dimensions {
@@ -651,6 +666,7 @@ mod tests {
 
     fn rates(input: f64, cached: f64, output: f64) -> ModelRates {
         ModelRates {
+            cache_write_per_mtok: None,
             input_per_mtok: Some(input),
             cached_input_per_mtok: Some(cached),
             output_per_mtok: Some(output),
@@ -1140,6 +1156,7 @@ mod tests {
                     model: "qwen3-8b".to_owned(),
                     surface: None,
                     rates: RateSchedule::flat(ModelRates {
+                        cache_write_per_mtok: None,
                         input_per_mtok: Some(0.0),
                         cached_input_per_mtok: None,
                         output_per_mtok: Some(0.0),

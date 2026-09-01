@@ -291,6 +291,9 @@ impl ResponsesUsage {
             cached_input_tokens: self
                 .input_tokens_details
                 .and_then(|details| details.cached_tokens),
+            // No cache-write dimension on this dialect either; see the note in
+            // `wire::chat_completions`.
+            cache_write_input_tokens: None,
         })
     }
 }

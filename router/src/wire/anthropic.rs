@@ -5,13 +5,30 @@
 //! ZeroRouter's cost function (`openai::usage_cost`) prices `cached` as a
 //! subset of `input` — the OpenAI convention every other wire reports in.
 //! This client folds `cache_read_input_tokens` and
-//! `cache_creation_input_tokens` back into the input total and reports the
-//! read subset as `cached_input_tokens`, so an Anthropic response meters on
-//! the same axes as everything else. The wire sets its own `cache_control`
-//! breakpoints (system, last tool, last turn) exactly as the pinned adapter
-//! did, so the upstream cache discount survives the swap. (Cache WRITES
-//! bill at full input rate here; Anthropic charges 1.25× for them — a COGS
-//! rounding this router accepts.)
+//! `cache_creation_input_tokens` back into the input total and reports each as
+//! its own disjoint subset — `cached_input_tokens` and
+//! `cache_write_input_tokens` — so an Anthropic response meters on the same
+//! axes as everything else.
+//!
+//! # Cache breakpoints: the wire's three, or the client's
+//!
+//! By DEFAULT this wire sets three `cache_control` breakpoints of its own
+//! (system, last tool, last turn) exactly as the pinned adapter did, so the
+//! upstream cache discount survives the swap on traffic that asks for nothing.
+//!
+//! When the CLIENT places breakpoints — `cache_control: {"type":"ephemeral"}`
+//! on a chat-completions message or tool, admitted only on lanes that price
+//! the dimension — the wire forwards the client's placement and sets NONE of
+//! its own. It is one or the other and never both: Anthropic caps a request at
+//! four breakpoints, so adding three to a client's four would 400 the request,
+//! and silently merging them would mean the customer paying write premiums at
+//! boundaries they did not choose. A client that sends breakpoints owns the
+//! cache boundaries; a client that sends none gets the defaults it always got.
+//!
+//! Cache WRITES used to bill at the full input rate here while Anthropic
+//! charged 1.25x — a COGS rounding this module's header recorded as accepted.
+//! It is now a priced dimension (`cache_write_per_mtok`), so the premium is
+//! metered rather than absorbed on the lanes that transcribe it.
 
 use crate::provider::ChatMessage;
 use crate::provider::{
@@ -122,6 +139,19 @@ pub(super) fn messages_request_body(
     stream: Option<bool>,
     max_tokens: u32,
 ) -> Value {
+    // Whose breakpoints are these? A request in which the CLIENT placed any
+    // takes the client's placement and none of the wire's; a request that
+    // placed none gets the wire's three defaults, exactly as before.
+    //
+    // It is one or the other because Anthropic caps a request at four
+    // breakpoints: adding three defaults to a client's four would 400 the
+    // request outright, and adding them to a client's one would silently
+    // charge a write premium at three boundaries the customer did not choose.
+    // Neither is a merge worth having, and "the client owns the cache
+    // boundaries when it states any" is the rule a caching-aware agent
+    // expects.
+    let client_placed = messages.iter().any(|message| message.cache_control)
+        || tools.is_some_and(|tools| tools.iter().any(|tool| tool.cache_control));
     let (system, mut turns) = build_anthropic_messages(messages);
     // Cache breakpoints, matching what the pinned adapter set: the
     // system prompt, the last tool definition, and the last block of the
@@ -130,11 +160,12 @@ pub(super) fn messages_request_body(
     // review) — the discount the cached_input_tokens dimension exists to
     // meter. Three markers, under the API's limit of four.
     let cache_marker = json!({ "type": "ephemeral" });
-    if let Some(block) = turns
-        .last_mut()
-        .and_then(|turn| turn["content"].as_array_mut())
-        .and_then(|content| content.last_mut())
-        .and_then(Value::as_object_mut)
+    if !client_placed
+        && let Some(block) = turns
+            .last_mut()
+            .and_then(|turn| turn["content"].as_array_mut())
+            .and_then(|content| content.last_mut())
+            .and_then(Value::as_object_mut)
     {
         block.insert("cache_control".to_owned(), cache_marker.clone());
     }
@@ -148,25 +179,45 @@ pub(super) fn messages_request_body(
     if let Some(stream) = stream {
         body["stream"] = json!(stream);
     }
-    if !system.trim().is_empty() {
-        body["system"] = json!([{
+    if !system.text.trim().is_empty() {
+        let mut block = json!({
             "type": "text",
-            "text": system,
-            "cache_control": cache_marker.clone(),
-        }]);
+            "text": system.text,
+        });
+        // The system prompt is ONE block however many system turns produced
+        // it, so a breakpoint on any of them marks that block. Under the
+        // wire's own defaults it is always marked; under the client's, only
+        // when the client asked.
+        if if client_placed {
+            system.cache_control
+        } else {
+            true
+        } {
+            block["cache_control"] = cache_marker.clone();
+        }
+        body["system"] = json!([block]);
     }
     if let Some(tools) = tools.filter(|tools| !tools.is_empty()) {
         let mut tools_json = tools
             .iter()
             .map(|tool| {
-                json!({
+                let mut json = json!({
                     "name": tool.name,
                     "description": tool.description,
                     "input_schema": tool.parameters,
-                })
+                });
+                // A tool the client marked keeps its OWN position in the list.
+                // The default below marks the last tool; a client that marks
+                // the second of five means the second, because a breakpoint
+                // caches everything above it and moving one changes both the
+                // hit rate and the bill.
+                if client_placed && tool.cache_control {
+                    json["cache_control"] = cache_marker.clone();
+                }
+                json
             })
             .collect::<Vec<Value>>();
-        if let Some(last) = tools_json.last_mut().and_then(Value::as_object_mut) {
+        if !client_placed && let Some(last) = tools_json.last_mut().and_then(Value::as_object_mut) {
             last.insert("cache_control".to_owned(), cache_marker);
         }
         body["tools"] = json!(tools_json);
@@ -281,13 +332,24 @@ fn synthesize_missing_tool_results(turns: &mut Vec<Value>) {
 /// Responses wire's no-round-trip rule. Empty and whitespace-only text never
 /// becomes a block — the API rejects empty text blocks outright (sol
 /// review), and ZR's validation admits null/empty content.
-pub(super) fn build_anthropic_messages(messages: &[ChatMessage]) -> (String, Vec<Value>) {
+pub(super) fn build_anthropic_messages(messages: &[ChatMessage]) -> (SystemPrompt, Vec<Value>) {
     let mut system_parts: Vec<&str> = Vec::new();
+    let mut system_cache_control = false;
     let mut turns = Vec::new();
 
     for message in messages {
+        // Where the last block sat BEFORE this message contributed anything,
+        // so a client breakpoint can be placed on the block this message
+        // actually produced. A message that produces none — empty or
+        // whitespace-only content, which this builder deliberately drops —
+        // must not have its breakpoint land on the previous message's block,
+        // which would cache a boundary the client never named.
+        let before = block_cursor(&turns);
         match message.role.as_str() {
-            "system" => system_parts.push(&message.content),
+            "system" => {
+                system_parts.push(&message.content);
+                system_cache_control |= message.cache_control;
+            }
             "user" => push_user_content(&mut turns, message),
             "assistant" => {
                 // Same envelope rule as the Responses wire: only ZR's own
@@ -371,10 +433,57 @@ pub(super) fn build_anthropic_messages(messages: &[ChatMessage]) -> (String, Vec
             }
             _ => {}
         }
+        // A client breakpoint marks the LAST block this message produced,
+        // which is where the Messages API places the boundary for a turn:
+        // everything above it, inclusive, becomes the cached prefix.
+        if message.cache_control && block_cursor(&turns) != before {
+            mark_last_block(&mut turns);
+        }
     }
 
+    // Runs AFTER every marker is placed, and safely so: it only ever inserts
+    // synthesized `tool_result` blocks at the HEAD of a following user turn,
+    // so nothing it does displaces a block that is already last.
     synthesize_missing_tool_results(&mut turns);
-    (system_parts.join("\n\n"), turns)
+    (
+        SystemPrompt {
+            text: system_parts.join("\n\n"),
+            cache_control: system_cache_control,
+        },
+        turns,
+    )
+}
+
+/// The system prompt, plus whether the client asked for a breakpoint on it.
+///
+/// A struct rather than a tuple because the two travel together to exactly one
+/// caller and a bare `(String, bool)` at that call site would read as anybody's
+/// guess which bool it is.
+#[derive(Debug)]
+pub(super) struct SystemPrompt {
+    pub(super) text: String,
+    pub(super) cache_control: bool,
+}
+
+/// How many content blocks the turns hold in total — a monotonic cursor used
+/// only to answer "did this message contribute anything".
+fn block_cursor(turns: &[Value]) -> usize {
+    turns
+        .iter()
+        .map(|turn| turn["content"].as_array().map_or(0, Vec::len))
+        .sum()
+}
+
+/// Put a cache breakpoint on the last block of the last turn.
+fn mark_last_block(turns: &mut [Value]) {
+    if let Some(block) = turns
+        .last_mut()
+        .and_then(|turn| turn["content"].as_array_mut())
+        .and_then(|content| content.last_mut())
+        .and_then(Value::as_object_mut)
+    {
+        block.insert("cache_control".to_owned(), json!({ "type": "ephemeral" }));
+    }
 }
 
 /// Anthropic's usage block, as reported: `input_tokens` EXCLUDES the cache
@@ -391,6 +500,23 @@ struct AnthropicUsage {
 }
 
 impl AnthropicUsage {
+    /// Anthropic's three disjoint prompt buckets, normalized to the router's
+    /// one-total-plus-two-subsets convention.
+    ///
+    /// `input_tokens` stays the SUM of all three, because that is what
+    /// `prompt_tokens` means everywhere downstream — it is the figure the
+    /// customer sees, the figure a conditional rate band is selected from
+    /// ([`crate::provider::RateSchedule::at_prompt_tokens`]), and the figure
+    /// every other wire reports. Removing cache creation from it would make an
+    /// Anthropic prompt read shorter than it was and could select a cheaper
+    /// long-context band than the vendor charged.
+    ///
+    /// What CHANGED when cache writes gained a price of their own is only the
+    /// second half: the creation bucket is now carried out separately instead
+    /// of disappearing into the total. Before this it was indistinguishable
+    /// from a fresh read once summed, so `usage_cost` billed it at 1x while
+    /// Anthropic invoiced 1.25x — the COGS rounding this module's header used
+    /// to record as accepted. It is no longer accepted; it is metered.
     fn into_token_usage(self) -> Option<TokenUsage> {
         let cache_read = self.cache_read_input_tokens.unwrap_or(0);
         let cache_creation = self.cache_creation_input_tokens.unwrap_or(0);
@@ -404,6 +530,7 @@ impl AnthropicUsage {
             }),
             output_tokens: self.output_tokens,
             cached_input_tokens: (cache_read > 0).then_some(cache_read),
+            cache_write_input_tokens: (cache_creation > 0).then_some(cache_creation),
         })
     }
 }
@@ -926,7 +1053,11 @@ mod anthropic_tests {
             ChatMessage::assistant("done: /home"),
         ];
         let (system, turns) = build_anthropic_messages(&messages);
-        assert_eq!(system, "be terse");
+        assert_eq!(system.text, "be terse");
+        assert!(
+            !system.cache_control,
+            "no client asked for a breakpoint here, so the system prompt carries none of its own"
+        );
         let roles: Vec<&str> = turns
             .iter()
             .map(|turn| turn["role"].as_str().unwrap())
@@ -1268,6 +1399,7 @@ mod anthropic_review_fix_tests {
             ChatMessage::user("second question"),
         ];
         let spec = |name: &str, description: &str| crate::provider::ToolSpec {
+            cache_control: false,
             name: name.into(),
             description: description.into(),
             parameters: (json!({"type": "object"})),
@@ -1464,6 +1596,7 @@ mod request_body_characterization {
 
     fn fixture_tools() -> Vec<crate::provider::ToolSpec> {
         vec![crate::provider::ToolSpec {
+            cache_control: false,
             name: "shell".into(),
             description: "run a command".into(),
             parameters: json!({"type": "object", "properties": {"command": {"type": "string"}}}),

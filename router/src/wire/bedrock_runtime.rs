@@ -611,6 +611,7 @@ mod wire_contract_tests {
             ChatMessage::user("second question"),
         ];
         let tools = vec![ToolSpec {
+            cache_control: false,
             name: "shell".into(),
             description: "run a command".into(),
             parameters: json!({"type": "object", "properties": {"command": {"type": "string"}}}),

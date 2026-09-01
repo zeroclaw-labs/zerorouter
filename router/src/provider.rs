@@ -73,6 +73,20 @@ pub struct ChatMessage {
     /// The property that matters is that it can never contain a marker for a
     /// reader to misinterpret, because nothing writes one any more.
     pub content: String,
+    /// Whether the CLIENT asked for a prompt-cache breakpoint at the end of
+    /// this turn.
+    ///
+    /// A bool rather than a value, because the only breakpoint this router
+    /// accepts is `{"type": "ephemeral"}` — `openai::validate_cache_control`
+    /// refuses everything else at the edge, so by the time a turn exists there
+    /// is exactly one thing a breakpoint can say. Carrying the JSON instead
+    /// would invite a wire to forward an unvalidated object.
+    ///
+    /// `false` on every turn built before a client asked for anything, which is
+    /// almost all of them; the wires then place their own default breakpoints
+    /// exactly as they always have. See `wire::anthropic` for why it is the
+    /// client's placement or the wire's, never both.
+    pub cache_control: bool,
     /// The turn's structured content, when it had any.
     ///
     /// EMPTY for every turn whose content is plain text, which is the
@@ -89,6 +103,7 @@ impl ChatMessage {
             role: "system".into(),
             content: content.into(),
             parts: Vec::new(),
+            cache_control: false,
         }
     }
 
@@ -97,6 +112,7 @@ impl ChatMessage {
             role: "user".into(),
             content: content.into(),
             parts: Vec::new(),
+            cache_control: false,
         }
     }
 
@@ -119,7 +135,15 @@ impl ChatMessage {
             role: "user".into(),
             content,
             parts,
+            cache_control: false,
         }
+    }
+
+    /// The same turn, with a client-placed cache breakpoint at its end.
+    #[must_use]
+    pub fn with_cache_breakpoint(mut self) -> Self {
+        self.cache_control = true;
+        self
     }
 
     pub fn assistant(content: impl Into<String>) -> Self {
@@ -127,6 +151,7 @@ impl ChatMessage {
             role: "assistant".into(),
             content: content.into(),
             parts: Vec::new(),
+            cache_control: false,
         }
     }
 
@@ -135,6 +160,7 @@ impl ChatMessage {
             role: "tool".into(),
             content: content.into(),
             parts: Vec::new(),
+            cache_control: false,
         }
     }
 }
@@ -146,6 +172,9 @@ pub struct ToolSpec {
     pub description: String,
     /// JSON Schema for the tool's arguments.
     pub parameters: serde_json::Value,
+    /// Whether the CLIENT asked for a prompt-cache breakpoint on this tool.
+    /// See [`ChatMessage::cache_control`] for why it is a bool.
+    pub cache_control: bool,
 }
 
 /// A tool call the model emitted.
@@ -165,16 +194,27 @@ pub struct ToolCall {
 ///
 /// The contract is load-bearing for billing and is asserted by tests in
 /// `wire.rs` and `openai.rs`: `input_tokens` is the TOTAL prompt the model
-/// saw, and `cached_input_tokens` is the SUBSET of it served from the
-/// provider's prompt cache. So `cached <= input`, and the fresh portion is
-/// `input - cached`. Anthropic reports three disjoint buckets instead; the
-/// Anthropic wire folds them into this convention rather than leaking a
-/// second convention into the router.
+/// saw, and `cached_input_tokens` and `cache_write_input_tokens` are DISJOINT
+/// SUBSETS of it — tokens served from the provider's prompt cache, and tokens
+/// written INTO it under a cache breakpoint. So `cached + written <= input`,
+/// and the fresh portion is `input - cached - written`. Anthropic reports
+/// three disjoint buckets instead; the Anthropic wire folds them into this
+/// convention rather than leaking a second convention into the router.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TokenUsage {
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
     pub cached_input_tokens: Option<u64>,
+    /// Prompt tokens the upstream STORED under a cache breakpoint on this
+    /// request, which vendors bill at a premium over a fresh read.
+    ///
+    /// A subset of `input_tokens` and disjoint from `cached_input_tokens`:
+    /// a token is read from the cache or written to it, never both. `None`
+    /// means the upstream reported no such dimension, which is every wire but
+    /// the two that speak the Anthropic Messages dialect — and is why a
+    /// request that reports nothing here prices exactly as it did before this
+    /// dimension existed.
+    pub cache_write_input_tokens: Option<u64>,
 }
 
 /// Why an upstream stopped generating, in the ONE vocabulary this router
@@ -431,7 +471,7 @@ pub struct ProviderCapabilities {
     pub prompt_caching: bool,
 }
 
-/// Per-million-token prices for one model, on the three dimensions
+/// Per-million-token prices for one model, on the four dimensions
 /// ZeroRouter meters. `None` means "not priced here", which the cost
 /// function treats as unknown rather than free.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -439,6 +479,34 @@ pub struct ModelRates {
     pub input_per_mtok: Option<f64>,
     pub output_per_mtok: Option<f64>,
     pub cached_input_per_mtok: Option<f64>,
+    /// What a CACHE WRITE costs — a prompt token the upstream both read and
+    /// stored under a cache breakpoint, which Anthropic and Bedrock-Claude
+    /// bill at 1.25x the input rate for the 5-minute TTL this router uses.
+    ///
+    /// # Absence is the capability signal, and it is ALSO a billing fallback
+    ///
+    /// Those two readings sound contradictory and are not, because they answer
+    /// different questions at different times:
+    ///
+    /// - **Admission** reads the DECLARED value. A lane that does not price
+    ///   cache writes may not accept a client `cache_control` breakpoint at
+    ///   all — [`crate::error::ApiError::PromptCachingUnsupported`] — exactly
+    ///   the way an absent modality means a lane refuses images. A price
+    ///   nobody transcribed is not a price, and selling a dimension at a
+    ///   guessed rate is the one thing this catalog never does.
+    /// - **Settlement** reads [`Self::effective_cache_write_per_mtok`], which
+    ///   falls an absent rate back to the INPUT rate. That is not a licence to
+    ///   accept the request; it is what keeps a write the router did not ask
+    ///   for from billing at zero. The Anthropic wire sets three breakpoints of
+    ///   its own on every request (see `wire::anthropic`), so cache-creation
+    ///   tokens arrive on lanes that never declared the dimension, and pricing
+    ///   them at nothing would be a giveaway rather than a refusal.
+    ///
+    /// So the honest one-line summary is: **absent means "this lane does not
+    /// SELL cache writes", and the biller charges input for them anyway** —
+    /// which is precisely what it charged before this dimension existed, so
+    /// every lane that omits the key prices bit-for-bit as it did.
+    pub cache_write_per_mtok: Option<f64>,
 }
 
 impl ModelRates {
@@ -447,6 +515,7 @@ impl ModelRates {
         self.input_per_mtok.is_none()
             && self.output_per_mtok.is_none()
             && self.cached_input_per_mtok.is_none()
+            && self.cache_write_per_mtok.is_none()
     }
 
     /// The cached-input rate this table will actually be BILLED at.
@@ -467,6 +536,50 @@ impl ModelRates {
     #[must_use]
     pub fn effective_cached_input_per_mtok(&self) -> Option<f64> {
         self.cached_input_per_mtok.or(self.input_per_mtok)
+    }
+
+    /// The cache-write rate this table will actually be BILLED at.
+    ///
+    /// The same fallback [`Self::effective_cached_input_per_mtok`] applies, and
+    /// for the same reason: [`crate::openai::usage_cost`] prices a cache-write
+    /// token at the input rate when the dimension is unset, so every
+    /// comparison between two rate tables has to be made on this value rather
+    /// than on the declared one. See the field's own doc for why the DECLARED
+    /// value is nonetheless what admission reads.
+    #[must_use]
+    pub fn effective_cache_write_per_mtok(&self) -> Option<f64> {
+        self.cache_write_per_mtok.or(self.input_per_mtok)
+    }
+
+    /// Whether this table states a cache-write price of its own — the
+    /// capability question, asked on the DECLARED field.
+    #[must_use]
+    pub fn prices_cache_writes(&self) -> bool {
+        self.cache_write_per_mtok.is_some()
+    }
+
+    /// The dearest rate any PROMPT token can be billed at under this table.
+    ///
+    /// Admission knows nothing about how a prompt will split between fresh,
+    /// cached and written tokens — the upstream decides that, and says so only
+    /// in the response — so a reservation has to hold the worst of the three.
+    /// Before this dimension existed the worst was always the input rate,
+    /// because `validate_cache_is_a_discount` forbids a cached rate above it;
+    /// a cache-write rate is deliberately ABOVE it (1.25x), so the maximum has
+    /// to be taken rather than assumed.
+    ///
+    /// `None` only when the input rate is absent, which catalog validation
+    /// refuses before any request is priced.
+    #[must_use]
+    pub fn dearest_prompt_per_mtok(&self) -> Option<f64> {
+        let dearest = |a: Option<f64>, b: Option<f64>| match (a, b) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (rate, None) | (None, rate) => rate,
+        };
+        dearest(
+            dearest(self.input_per_mtok, self.effective_cached_input_per_mtok()),
+            self.effective_cache_write_per_mtok(),
+        )
     }
 
     /// Whether the two REQUIRED dimensions are declared and exactly zero.
@@ -493,17 +606,19 @@ impl ModelRates {
     /// [`crate::config::ResolvedRoute::sells_free`]). Those are different
     /// claims about different money; they are the same arithmetic.
     ///
-    /// Zero means all three EFFECTIVE rates are zero — so an absent
-    /// cached-input dimension is read as the input rate, exactly as
-    /// [`crate::openai::usage_cost`] reads it, and an absent cached rate over
-    /// a zero input rate therefore prices at zero. That is what lets the
-    /// commonest honest local config (no cache pricing at all, because the
-    /// server has no cache) be free without the operator writing `= 0` for a
-    /// dimension their server does not have. A DECLARED nonzero cached rate is
+    /// Zero means all four EFFECTIVE rates are zero — so an absent cached or
+    /// cache-write dimension is read as the input rate, exactly as
+    /// [`crate::openai::usage_cost`] reads it, and an absent rate over a zero
+    /// input rate therefore prices at zero. That is what lets the commonest
+    /// honest local config (no cache pricing at all, because the server has no
+    /// cache) be free without the operator writing `= 0` for dimensions their
+    /// server does not have. A DECLARED nonzero cached or cache-write rate is
     /// still money, and still disqualifies.
     #[must_use]
     pub fn are_zero(&self) -> bool {
-        self.required_rates_are_zero() && self.effective_cached_input_per_mtok() == Some(0.0)
+        self.required_rates_are_zero()
+            && self.effective_cached_input_per_mtok() == Some(0.0)
+            && self.effective_cache_write_per_mtok() == Some(0.0)
     }
 }
 
@@ -707,7 +822,52 @@ impl RateSchedule {
             input_per_mtok: dearest(|rates| rates.input_per_mtok),
             output_per_mtok: dearest(|rates| rates.output_per_mtok),
             cached_input_per_mtok: dearest(ModelRates::effective_cached_input_per_mtok),
+            cache_write_per_mtok: dearest(ModelRates::effective_cache_write_per_mtok),
         }
+    }
+
+    /// The rate table a RESERVATION must be sized at.
+    ///
+    /// [`Self::worst_case`] is the dearest table dimension by dimension, which
+    /// was sufficient while every prompt-side rate was capped by the input
+    /// rate. It is not sufficient any more. A reservation is priced by
+    /// [`crate::openai::usage_cost`] over a usage carrying no cache detail, so
+    /// EVERY prompt token in the bound is charged at `input_per_mtok` — and a
+    /// request that turns out to be entirely cache writes settles at 1.25x
+    /// that. The gap sits inside a single band, so no amount of maximising
+    /// over the bands closes it.
+    ///
+    /// This closes it by raising the input dimension to
+    /// [`ModelRates::dearest_prompt_per_mtok`]: the dearest rate any prompt
+    /// token could be billed at, anywhere in the schedule. The output
+    /// dimension is untouched — output tokens have exactly one rate.
+    ///
+    /// For every schedule that declares no cache-write rate this returns
+    /// [`Self::worst_case`] unchanged, because the fallback makes the dearest
+    /// prompt rate the input rate again. So a catalog written before this
+    /// dimension existed reserves bit-for-bit as it did, and only a lane that
+    /// SELLS cache writes holds more.
+    #[must_use]
+    pub fn reservation_rates(&self) -> ModelRates {
+        let worst = self.worst_case();
+        ModelRates {
+            input_per_mtok: worst.dearest_prompt_per_mtok(),
+            ..worst
+        }
+    }
+
+    /// Whether EVERY table in this schedule states a cache-write price.
+    ///
+    /// `all`, not "the base table": a band that omits the dimension prices its
+    /// writes at that band's INPUT rate (the fallback), so a schedule that
+    /// declares the price at the base and forgets it above a threshold would
+    /// sell long cache-writing requests at a rate nobody chose. Requiring every
+    /// band means the capability is true wherever the request lands. On a flat
+    /// schedule — which every lane that declares the dimension today is — this
+    /// is the base table's answer and nothing else.
+    #[must_use]
+    pub fn prices_cache_writes(&self) -> bool {
+        self.tables().all(|rates| rates.prices_cache_writes())
     }
 
     /// Whether EVERY rate this schedule could ever charge is zero.
@@ -802,6 +962,7 @@ mod tests {
 
     fn rates(input: f64, cached: Option<f64>, output: f64) -> ModelRates {
         ModelRates {
+            cache_write_per_mtok: None,
             input_per_mtok: Some(input),
             cached_input_per_mtok: cached,
             output_per_mtok: Some(output),
@@ -940,7 +1101,18 @@ mod tests {
                 rates: rates(4.0, Some(0.1), 8.0),
             }],
         );
-        assert_eq!(schedule.worst_case(), rates(4.0, Some(0.5), 20.0));
+        assert_eq!(
+            schedule.worst_case(),
+            ModelRates {
+                // Neither band declares a cache-write rate, so both contribute
+                // their own INPUT rate through the effective fallback and the
+                // dearest of those wins — the same rule the cached dimension
+                // has always followed here, and for the same reason: it is what
+                // `usage_cost` will bill a written token at.
+                cache_write_per_mtok: Some(4.0),
+                ..rates(4.0, Some(0.5), 20.0)
+            }
+        );
         for prompt_tokens in [0, 199_999, 200_000, u64::MAX] {
             let applied = schedule.at_prompt_tokens(prompt_tokens);
             let worst = schedule.worst_case();
@@ -948,7 +1120,9 @@ mod tests {
                 applied.input_per_mtok <= worst.input_per_mtok
                     && applied.output_per_mtok <= worst.output_per_mtok
                     && applied.effective_cached_input_per_mtok()
-                        <= worst.effective_cached_input_per_mtok(),
+                        <= worst.effective_cached_input_per_mtok()
+                    && applied.effective_cache_write_per_mtok()
+                        <= worst.effective_cache_write_per_mtok(),
                 "the band at {prompt_tokens} is dearer than the worst case on some dimension"
             );
         }
@@ -1021,6 +1195,7 @@ mod tests {
         // The one invariant every wire must normalize to, restated here
         // because this module is now its home rather than a git pin.
         let usage = TokenUsage {
+            cache_write_input_tokens: None,
             input_tokens: Some(1_000),
             output_tokens: Some(50),
             cached_input_tokens: Some(900),

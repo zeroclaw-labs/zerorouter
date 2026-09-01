@@ -65,6 +65,7 @@ const POOL_CONNECTIONS: u32 = 3;
 /// What the fakes report when they serve. Chosen well below the reservation.
 fn served_usage() -> TokenUsage {
     TokenUsage {
+        cache_write_input_tokens: None,
         input_tokens: Some(1_000),
         output_tokens: Some(20),
         cached_input_tokens: None,
@@ -5838,6 +5839,7 @@ async fn an_under_reserved_row_clamps_the_debit_and_records_the_loss() {
     };
     let (api_key_id, key) = create_funded_key(&pool, "learned-clamp").await;
     let overrun = TokenUsage {
+        cache_write_input_tokens: None,
         input_tokens: Some(1_000),
         cached_input_tokens: Some(0),
         output_tokens: Some(4_000),
@@ -6588,6 +6590,7 @@ async fn a_metered_stream_records_no_usage_gap() {
         vec![FakeOutcome::Stream(vec![
             FakeStreamStep::text("answer"),
             FakeStreamStep::Usage(TokenUsage {
+                cache_write_input_tokens: None,
                 input_tokens: Some(1_000),
                 output_tokens: Some(20),
                 cached_input_tokens: None,

@@ -790,6 +790,7 @@ mod tests {
 
     fn message(role: &str, content: &str) -> ChatMessage {
         ChatMessage {
+            cache_control: false,
             role: role.to_owned(),
             content: content.to_owned(),
             parts: Vec::new(),

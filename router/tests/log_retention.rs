@@ -73,6 +73,7 @@ const POOL_CONNECTIONS: u32 = 2;
 /// What the fakes report when they serve. Chosen well below the reservation.
 fn served_usage() -> TokenUsage {
     TokenUsage {
+        cache_write_input_tokens: None,
         input_tokens: Some(1_000),
         output_tokens: Some(20),
         cached_input_tokens: None,

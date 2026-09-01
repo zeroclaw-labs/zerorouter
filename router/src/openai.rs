@@ -168,6 +168,43 @@ pub const IMAGE_MODALITY: &str = "image";
 /// under-hold by two thirds on the Opus and Sonnet lanes this catalog sells.
 pub const MAX_IMAGE_PROMPT_TOKENS: u64 = 10_549;
 
+/// The most cache breakpoints one request may carry — Anthropic's documented
+/// maximum, and the number the upstream 400s past.
+pub const MAX_CACHE_BREAKPOINTS: usize = 4;
+
+/// Why a `cache_control` was refused. Each variant is a different mistake with
+/// a different fix, which is why they are not one string.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CacheControlFault {
+    /// Not `{"type": "ephemeral"}` — a missing or unknown `type`, or a value
+    /// that is not an object at all.
+    Shape,
+    /// A `ttl` was named. Refused by name because the 1-hour TTL is a
+    /// different price this catalog has not transcribed.
+    Ttl,
+    /// More breakpoints than the upstream accepts.
+    TooMany { count: usize },
+}
+
+/// Accept exactly `{"type": "ephemeral"}`.
+///
+/// Deliberately exact rather than lenient about extra keys. A breakpoint is a
+/// billing instruction — it decides which tokens are charged at 1.25x — so an
+/// unrecognized key is a client believing something about this request that
+/// ZeroRouter is not going to do.
+fn validate_cache_control(value: &Value) -> Result<(), CacheControlFault> {
+    let Some(object) = value.as_object() else {
+        return Err(CacheControlFault::Shape);
+    };
+    if object.contains_key("ttl") {
+        return Err(CacheControlFault::Ttl);
+    }
+    if object.len() != 1 || object.get("type").and_then(Value::as_str) != Some("ephemeral") {
+        return Err(CacheControlFault::Shape);
+    }
+    Ok(())
+}
+
 fn empty_object() -> Value {
     json!({})
 }
@@ -252,7 +289,17 @@ impl ChatCompletionRequest {
 
     #[must_use]
     pub fn provider_messages(&self) -> Vec<ChatMessage> {
-        self.messages.iter().map(to_provider_message).collect()
+        self.messages
+            .iter()
+            .map(|message| {
+                let turn = to_provider_message(message);
+                if message.extra.contains_key("cache_control") {
+                    turn.with_cache_breakpoint()
+                } else {
+                    turn
+                }
+            })
+            .collect()
     }
 
     #[must_use]
@@ -263,6 +310,7 @@ impl ChatCompletionRequest {
                 name: tool.function.name.clone(),
                 description: tool.function.description.clone(),
                 parameters: tool.function.parameters.clone(),
+                cache_control: tool.extra.contains_key("cache_control"),
             })
             .collect()
     }
@@ -290,6 +338,87 @@ impl ChatCompletionRequest {
                 .tools
                 .iter()
                 .any(|tool| tool.extra.contains_key("cache_control"))
+    }
+
+    /// A `cache_control` this surface cannot place, if the request carries one.
+    ///
+    /// Two spellings are refused, and both are refused because the router has
+    /// nowhere honest to put them rather than because caching is unsupported:
+    ///
+    /// - **Top level.** `cache_control` beside `model` and `messages` names no
+    ///   boundary at all. There is no content block it corresponds to.
+    /// - **Inside a content part.** This is the spelling OpenRouter documents,
+    ///   so it is the one a migrating client is most likely to send — but
+    ///   `ChatMessage` carries structured parts only for IMAGES (see
+    ///   `provider::ContentPart`), and a text-only content array is flattened
+    ///   back to one string before any wire sees it. A breakpoint on part 2 of
+    ///   4 would have to be hoisted to the message and would land at the end of
+    ///   the whole turn — a different boundary from the one the client asked
+    ///   for, at a different price. Refusing is the honest answer until parts
+    ///   can carry a breakpoint of their own.
+    ///
+    /// Returning the offending PLACEMENT rather than a bool so the refusal can
+    /// name it; the string is a fixed label from this function, never request
+    /// content.
+    #[must_use]
+    pub fn unplaceable_cache_control(&self) -> Option<&'static str> {
+        if self.extra.contains_key("cache_control") {
+            return Some("the top level of the request");
+        }
+        let in_a_part = self.messages.iter().any(|message| {
+            message.content.as_array().is_some_and(|parts| {
+                parts.iter().any(|part| {
+                    part.as_object()
+                        .is_some_and(|part| part.contains_key("cache_control"))
+                })
+            })
+        });
+        in_a_part.then_some("a message content part")
+    }
+
+    /// Every client-placed cache breakpoint, validated, or the reason the
+    /// request is refused.
+    ///
+    /// `Ok(0)` is the overwhelmingly common answer and means the request asked
+    /// for nothing — the wires then set their own default breakpoints exactly
+    /// as they always have.
+    ///
+    /// # What a breakpoint may say
+    ///
+    /// `{"type": "ephemeral"}` and nothing else. Anthropic also defines a
+    /// `ttl` of `"1h"`, which is priced at 2x input rather than the 1.25x this
+    /// catalog transcribes, so it is refused BY NAME: accepting it and quietly
+    /// writing a 5-minute entry would sell an hour of cache the upstream was
+    /// never asked for, and accepting it and forwarding it would bill the
+    /// customer 1.25x for a write ZeroRouter pays 2x on. Either way the fix is
+    /// a transcribed price, not a lenient parser.
+    ///
+    /// # Why the count is capped here
+    ///
+    /// Anthropic accepts at most four breakpoints per request and 400s the
+    /// fifth. Counting them at the edge turns that into a ZeroRouter 400 with
+    /// a number in it, before any reservation is taken — rather than an
+    /// upstream refusal after the walk has burned a dispatch, which arrives as
+    /// `upstream_rejected_parameters` and costs a debugging session.
+    pub fn cache_breakpoints(&self) -> Result<usize, CacheControlFault> {
+        let mut count = 0_usize;
+        for value in self
+            .messages
+            .iter()
+            .filter_map(|message| message.extra.get("cache_control"))
+            .chain(
+                self.tools
+                    .iter()
+                    .filter_map(|tool| tool.extra.get("cache_control")),
+            )
+        {
+            validate_cache_control(value)?;
+            count += 1;
+        }
+        if count > MAX_CACHE_BREAKPOINTS {
+            return Err(CacheControlFault::TooMany { count });
+        }
+        Ok(count)
     }
 
     #[must_use]
@@ -1096,18 +1225,68 @@ pub struct AssistantMessage {
     pub reasoning_content: Option<String>,
 }
 
-#[derive(Clone, Copy, Debug, Default, Serialize)]
+/// One request's metered usage, in the shape the customer is answered in.
+///
+/// `Serialize` is written by hand rather than derived, and the reason is that
+/// two audiences read this object and they want different things:
+///
+/// - The OpenAI-compatible half must stay EXACTLY OpenAI's. `prompt_tokens` is
+///   the whole prompt, and `prompt_tokens_details.cached_tokens` is the cached
+///   subset — nothing else belongs in that object, because a client parsing it
+///   against the vendor's schema must not meet a key the vendor never defined.
+/// - ZeroRouter's own dimension — cache-WRITE tokens, which no OpenAI response
+///   carries — goes under a namespaced `zerorouter` key, the same way the
+///   response body already namespaces its routing metadata.
+///
+/// A derive cannot express that split, because the write count has to live in
+/// the same struct the biller reads while being serialized somewhere else
+/// entirely. Both extension objects are omitted when they have nothing to say,
+/// so a response from a lane with no cache activity is byte-identical to what
+/// it was before this dimension existed.
+#[derive(Clone, Copy, Debug, Default)]
 pub struct OpenAiUsage {
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
     pub total_tokens: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_tokens_details: Option<PromptTokenDetails>,
 }
 
-#[derive(Clone, Copy, Debug, Serialize)]
+impl Serialize for OpenAiUsage {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        // Each extension appears only when it has something to report, and the
+        // two conditions are INDEPENDENT rather than both keyed on the details
+        // object being present. That is what keeps the OpenAI half unchanged: a
+        // first-turn Anthropic request writes cache and reads none, and
+        // emitting `prompt_tokens_details: {cached_tokens: 0}` for it would put
+        // a new object into a response that never carried one.
+        let cached = self.cached_input_tokens();
+        let written = self.cache_write_tokens();
+        let mut map = serializer.serialize_map(None)?;
+        map.serialize_entry("prompt_tokens", &self.prompt_tokens)?;
+        map.serialize_entry("completion_tokens", &self.completion_tokens)?;
+        map.serialize_entry("total_tokens", &self.total_tokens)?;
+        if cached > 0 {
+            map.serialize_entry("prompt_tokens_details", &json!({ "cached_tokens": cached }))?;
+        }
+        if written > 0 {
+            map.serialize_entry("zerorouter", &json!({ "cache_write_tokens": written }))?;
+        }
+        map.end()
+    }
+}
+
+/// The cache split of one prompt, as ZeroRouter meters it.
+///
+/// Both counts are subsets of `OpenAiUsage::prompt_tokens` and are disjoint
+/// from each other — a token is read from the cache, written to it, or neither.
+/// `cache_write_tokens` is deliberately NOT part of the serialized
+/// `prompt_tokens_details` object; see [`OpenAiUsage`]'s hand-written
+/// `Serialize` for where it surfaces instead.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PromptTokenDetails {
     pub cached_tokens: u64,
+    pub cache_write_tokens: u64,
 }
 
 impl OpenAiUsage {
@@ -1122,13 +1301,23 @@ impl OpenAiUsage {
         if input == 0 && output == 0 {
             return None;
         }
+        // Clamped in sequence, cached first: the two are disjoint subsets of
+        // the prompt, so what a write may claim is bounded by what is left
+        // after the reads. An upstream whose three numbers do not add up
+        // therefore loses the excess from the DEARER bucket rather than
+        // inflating the prompt, and the fresh remainder can never go negative.
         let cached = usage.cached_input_tokens.unwrap_or(0).min(input);
+        let written = usage
+            .cache_write_input_tokens
+            .unwrap_or(0)
+            .min(input - cached);
         Some(Self {
             prompt_tokens: input,
             completion_tokens: output,
             total_tokens: input.saturating_add(output),
-            prompt_tokens_details: (cached > 0).then_some(PromptTokenDetails {
+            prompt_tokens_details: (cached > 0 || written > 0).then_some(PromptTokenDetails {
                 cached_tokens: cached,
+                cache_write_tokens: written,
             }),
         })
     }
@@ -1142,6 +1331,14 @@ impl OpenAiUsage {
     pub fn cached_input_tokens(self) -> u64 {
         self.prompt_tokens_details
             .map_or(0, |details| details.cached_tokens)
+    }
+
+    /// Prompt tokens this request WROTE into the upstream's cache — billed at
+    /// [`ModelRates::cache_write_per_mtok`] where a lane prices the dimension.
+    #[must_use]
+    pub fn cache_write_tokens(self) -> u64 {
+        self.prompt_tokens_details
+            .map_or(0, |details| details.cache_write_tokens)
     }
 }
 
@@ -1718,8 +1915,30 @@ pub fn billable_rate(rate: f64) -> Option<Decimal> {
 /// that the guarantee does not depend on every future caller having come through
 /// a validated catalog.
 ///
-/// A dimension the rates leave unset prices at zero (cached input falls back to
-/// the uncached input rate first). That is long-standing behavior and unchanged.
+/// A dimension the rates leave unset prices at zero (cached input and cache
+/// writes both fall back to the uncached input rate first). That is
+/// long-standing behavior and unchanged.
+///
+/// # The prompt is split three ways, not two
+///
+/// `prompt_tokens` is the whole prompt. Out of it come the CACHED tokens (read
+/// back from the upstream's cache) and the WRITTEN tokens (stored into it under
+/// a breakpoint); what is left is fresh. The three are disjoint and are priced
+/// at three different rates, which on an Anthropic lane run roughly 0.1x, 1.25x
+/// and 1x of each other.
+///
+/// The split is taken in that order — cached, then written out of the
+/// remainder, then fresh — so the arithmetic is total for any numbers an
+/// upstream reports, including ones that do not add up. `OpenAiUsage`'s
+/// constructor has already applied the same clamp, so this is a second line
+/// rather than the only one, and it is here because `usage_cost` must be
+/// correct for a usage assembled anywhere, including a replayed settlement
+/// intent.
+///
+/// A usage carrying no `prompt_tokens_details` splits into fresh alone and
+/// prices exactly as it did before either cache dimension existed — which is
+/// every reservation, and every request on a wire that reports no cache
+/// numbers.
 #[must_use]
 pub fn usage_cost(rates: ModelRates, usage: OpenAiUsage) -> Option<Decimal> {
     let input_rate = billable_rate(rates.input_per_mtok.unwrap_or(0.0))?;
@@ -1729,9 +1948,20 @@ pub fn usage_cost(rates: ModelRates, usage: OpenAiUsage) -> Option<Decimal> {
             .cached_input_per_mtok
             .unwrap_or(rates.input_per_mtok.unwrap_or(0.0)),
     )?;
+    let write_rate = billable_rate(
+        rates
+            .cache_write_per_mtok
+            .unwrap_or(rates.input_per_mtok.unwrap_or(0.0)),
+    )?;
     let million = Decimal::from(1_000_000_u64);
     let cached = usage.cached_input_tokens().min(usage.prompt_tokens);
-    let uncached = usage.prompt_tokens.saturating_sub(cached);
+    let written = usage
+        .cache_write_tokens()
+        .min(usage.prompt_tokens.saturating_sub(cached));
+    let uncached = usage
+        .prompt_tokens
+        .saturating_sub(cached)
+        .saturating_sub(written);
 
     // Checked throughout: `Decimal`'s operators are the same routines with a
     // panic bolted on where these return `None`, so the arithmetic result is
@@ -1739,6 +1969,7 @@ pub fn usage_cost(rates: ModelRates, usage: OpenAiUsage) -> Option<Decimal> {
     Decimal::from(uncached)
         .checked_mul(input_rate)?
         .checked_add(Decimal::from(cached).checked_mul(cached_rate)?)?
+        .checked_add(Decimal::from(written).checked_mul(write_rate)?)?
         .checked_add(Decimal::from(usage.completion_tokens).checked_mul(output_rate)?)?
         .checked_div(million)
 }
@@ -1750,6 +1981,7 @@ mod tests {
     /// `openai/gpt-5.6-luna`'s published schedule.
     fn luna() -> crate::provider::RateSchedule {
         let rates = |input: f64, cached: f64, output: f64| ModelRates {
+            cache_write_per_mtok: None,
             input_per_mtok: Some(input),
             cached_input_per_mtok: Some(cached),
             output_per_mtok: Some(output),
@@ -1776,6 +2008,7 @@ mod tests {
             completion_tokens: 1_000,
             total_tokens: 281_000,
             prompt_tokens_details: Some(PromptTokenDetails {
+                cache_write_tokens: 0,
                 cached_tokens: 250_000,
             }),
         };
@@ -1844,6 +2077,7 @@ mod tests {
         // A provider reporting 0 input + 0 output must not meter as a free
         // success; it routes through the missing-usage path instead.
         let usage = TokenUsage {
+            cache_write_input_tokens: None,
             input_tokens: Some(0),
             output_tokens: Some(0),
             cached_input_tokens: None,
@@ -1854,6 +2088,7 @@ mod tests {
     #[test]
     fn nonzero_token_usage_is_accepted() {
         let usage = TokenUsage {
+            cache_write_input_tokens: None,
             input_tokens: Some(10),
             output_tokens: Some(0),
             cached_input_tokens: None,
@@ -1921,6 +2156,7 @@ mod tests {
     fn cost_separates_cached_and_uncached_input() {
         let cost = usage_cost(
             ModelRates {
+                cache_write_per_mtok: None,
                 input_per_mtok: Some(2.0),
                 cached_input_per_mtok: Some(0.2),
                 output_per_mtok: Some(10.0),
@@ -1930,6 +2166,7 @@ mod tests {
                 completion_tokens: 100_000,
                 total_tokens: 1_100_000,
                 prompt_tokens_details: Some(PromptTokenDetails {
+                    cache_write_tokens: 0,
                     cached_tokens: 900_000,
                 }),
             },
@@ -1944,6 +2181,7 @@ mod tests {
         assert_eq!(billable_rate(1e100), None);
         let cost = usage_cost(
             ModelRates {
+                cache_write_per_mtok: None,
                 input_per_mtok: Some(1e100),
                 cached_input_per_mtok: None,
                 output_per_mtok: Some(10.0),
@@ -1983,6 +2221,7 @@ mod tests {
         assert_eq!(
             usage_cost(
                 ModelRates {
+                    cache_write_per_mtok: None,
                     input_per_mtok: Some(overflowing),
                     cached_input_per_mtok: None,
                     output_per_mtok: Some(overflowing),
@@ -2009,6 +2248,7 @@ mod tests {
         );
         let cost = usage_cost(
             ModelRates {
+                cache_write_per_mtok: None,
                 input_per_mtok: Some(MAX_RATE_PER_MTOK),
                 cached_input_per_mtok: Some(MAX_RATE_PER_MTOK),
                 output_per_mtok: Some(MAX_RATE_PER_MTOK),
@@ -2018,6 +2258,7 @@ mod tests {
                 completion_tokens: u64::MAX,
                 total_tokens: u64::MAX,
                 prompt_tokens_details: Some(PromptTokenDetails {
+                    cache_write_tokens: 0,
                     cached_tokens: u64::MAX,
                 }),
             },
@@ -2801,6 +3042,7 @@ mod tests {
             text: Some(String::new()),
             tool_calls: Vec::new(),
             usage: Some(TokenUsage {
+                cache_write_input_tokens: None,
                 input_tokens: Some(10),
                 cached_input_tokens: None,
                 output_tokens: Some(500),

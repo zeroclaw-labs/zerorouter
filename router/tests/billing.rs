@@ -120,6 +120,7 @@ fn usage_record(cost_usd: Decimal) -> UsageRecord {
             candidate_id: None,
             basis_rates: None,
             sell_rates: ModelRates {
+                cache_write_per_mtok: None,
                 input_per_mtok: Some(2.0),
                 output_per_mtok: Some(10.0),
                 cached_input_per_mtok: Some(0.2),

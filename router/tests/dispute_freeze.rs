@@ -1825,6 +1825,7 @@ fn tier_config_path() -> PathBuf {
 
 fn served_usage() -> TokenUsage {
     TokenUsage {
+        cache_write_input_tokens: None,
         input_tokens: Some(1_000),
         output_tokens: Some(20),
         cached_input_tokens: None,
