@@ -1246,12 +1246,18 @@ async fn catalog_drift(args: CatalogDriftArgs) -> Result<()> {
         "{:<22} {:<32} {:<18} {:>26} {:>26} {:>13} {:>10}",
         "TIER", "CANDIDATE", "VERDICT", "RECORDED BASIS", "UPSTREAM COST", "UPSTREAM CTX", "MARKUP"
     );
+    // input / cached / WRITE / output. The write slot renders `-` on every
+    // lane that does not price the dimension, which is most of them, and it
+    // has to be shown rather than folded away: without it a cache-write
+    // disagreement prints as `BASIS DRIFT` beside two rate triples that look
+    // identical, and an operator reading the row cannot see what drifted.
     let rate = |r: crate::provider::ModelRates| {
         let show = |v: Option<f64>| v.map_or_else(|| "-".to_owned(), |v| format!("{v}"));
         format!(
-            "{}/{}/{}",
+            "{}/{}/{}/{}",
             show(r.input_per_mtok),
             show(r.cached_input_per_mtok),
+            show(r.cache_write_per_mtok),
             show(r.output_per_mtok)
         )
     };

@@ -7243,9 +7243,12 @@ async fn a_caching_lane_reserves_at_the_cache_write_rate_it_could_settle_at() {
     // into the cache would settle above it and ZeroRouter would silently fail
     // to collect the 25% premium it had just paid.
     //
-    // The lane's rates differ only in that it sells cache writes at 1.25x, so
-    // the two holds below are the same arithmetic on the same prompt bound and
-    // their RATIO is the multiplier.
+    // `zero/test-caching` and `zero/test-caching-twin` carry byte-for-byte the
+    // same rates except that only the first declares `cache_write_per_mtok`.
+    // Two tiers differing in exactly one field is what makes this an
+    // attribution rather than an observation: a comparison against a tier with
+    // a different input rate would show a larger hold whether or not the
+    // cache-write uplift existed at all.
     let Some(pool) = connect().await else {
         return;
     };
@@ -7259,16 +7262,10 @@ async fn a_caching_lane_reserves_at_the_cache_write_rate_it_could_settle_at() {
             // cost of the test, so it is kept as short as that margin allows.
             let stall =
                 FakeModelProvider::new("held", vec![FakeOutcome::Stall(Duration::from_secs(5))]);
-            let fakes = if tier == "zero/test-pair" {
-                vec![stall.clone(), FakeModelProvider::new("held2", vec![])]
-            } else {
-                vec![stall.clone()]
-            };
-            let state = router(pool.clone(), fakes);
+            let state = router(pool.clone(), vec![stall.clone()]);
             let request =
                 app(state.clone()).oneshot(completion_request(&key, &completion_body(tier, false)));
             let reader = async {
-                // Poll until admission has written the row.
                 for _ in 0..250 {
                     if let Some(cost) = reserved_cost(&pool, api_key_id).await {
                         return cost;
@@ -7282,15 +7279,32 @@ async fn a_caching_lane_reserves_at_the_cache_write_rate_it_could_settle_at() {
         }
     };
 
-    // `zero/test-caching` sells 4.00 input and 5.00 written; `zero/test-pair`
-    // sells 3.00 input and prices no writes at all. Both hold the same
-    // byte-derived prompt bound and the same output bound, so the caching
-    // lane's hold is strictly larger.
     let caching = hold_for("zero/test-caching", "hold-caching").await;
-    let plain = hold_for("zero/test-pair", "hold-plain").await;
+    let twin = hold_for("zero/test-caching-twin", "hold-twin").await;
     assert!(
-        caching > plain,
-        "a lane that can settle a prompt token at 1.25x must hold more than one that cannot: \
-         caching {caching}, plain {plain}"
+        caching > twin,
+        "the lane that can settle a prompt token at 1.25x must hold more than the one that \
+         cannot: caching {caching}, twin {twin}"
+    );
+
+    // The uplift is EXACTLY the write premium on the prompt side, and nothing
+    // else moved. Both holds price the same byte-derived prompt bound P and
+    // the same output bound, so:
+    //
+    //     caching = P * 5.00/1e6 + out        twin = P * 4.00/1e6 + out
+    //     caching - twin = P * 1.00/1e6       -> P is recoverable
+    //     twin - 4 * (caching - twin) = out
+    //
+    // and `out` is fully determined: MAX_TOKENS at the tier's 8.00 output
+    // rate. Asserting it pins that the uplift touched the prompt dimension
+    // alone — an output token has exactly one rate, and a reservation that
+    // inflated it would be over-holding for no reason.
+    let uplift = caching - twin;
+    assert!(uplift > Decimal::ZERO);
+    let output_component = twin - Decimal::from(4) * uplift;
+    assert_eq!(
+        output_component,
+        Decimal::from(MAX_TOKENS) * decimal("8.00") / Decimal::from(1_000_000),
+        "the cache-write uplift applies to the prompt bound only, never to the output bound"
     );
 }

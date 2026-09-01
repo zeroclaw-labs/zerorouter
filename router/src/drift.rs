@@ -379,12 +379,16 @@ fn upstream_tier_note(entry: &SourceModel) -> Option<String> {
     let mut notes: Vec<String> = Vec::new();
     for tier in &cost.tiers {
         let show = |rate: Option<f64>| rate.map_or_else(|| "-".to_owned(), |r| format!("{r}"));
+        // input / cached / write / output, the same four slots and the same
+        // order the report's main rate column uses, so a band note and a base
+        // row can be read against each other without counting positions.
         notes.push(format!(
-            "≥{} {}: {}/{}/{}",
+            "≥{} {}: {}/{}/{}/{}",
             tier.tier.size,
             tier.tier.kind,
             show(tier.input),
             show(tier.cache_read),
+            show(tier.cache_write),
             show(tier.output)
         ));
     }

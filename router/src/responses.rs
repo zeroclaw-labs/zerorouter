@@ -23,6 +23,26 @@
 //! arrived on. There is no bypass to keep in sync because there is no second
 //! path.
 //!
+//! # Prompt caching is the CHAT surface only
+//!
+//! Client-controlled prompt caching — `cache_control` breakpoints on messages
+//! and tools — is accepted on `/v1/chat/completions` and NOT here. This
+//! dialect's own caching spellings stay refused: `prompt_cache_key` is named
+//! in the unsupported-fields list, and a `cache_control` on a Responses tool
+//! is refused by the same rule.
+//!
+//! That is a scope decision rather than a limitation of the pipeline. The
+//! translation into [`ChatCompletionRequest`] would have to decide where a
+//! Responses item's breakpoint lands among the chat messages it becomes, and a
+//! breakpoint in the wrong place is not a cosmetic difference — it is a
+//! different set of tokens billed at 1.25x. Refusing is the honest answer
+//! until that mapping is written and tested; accepting and re-placing it would
+//! charge a customer for boundaries they did not choose.
+//!
+//! Note that a Responses request served by an Anthropic lane still gets the
+//! WIRE's own three default breakpoints, exactly as it always has. What is
+//! unavailable here is the client's control over them, not caching itself.
+//!
 //! # The mirror
 //!
 //! [`crate::wire::responses`] is the OUTBOUND client for the same API, and its

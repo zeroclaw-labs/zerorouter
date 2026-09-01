@@ -197,6 +197,27 @@ cached_input_per_mtok = 0.20
 cache_write_per_mtok = 2.50
 output_per_mtok = 4.00
 
+# The CONTROL for the reservation test: byte-for-byte the rates of
+# `zero/test-caching` except that it declares no cache-write price. Two tiers
+# differing in exactly one field is what lets a test attribute a difference in
+# hold size to that field, rather than to a higher input rate.
+[tiers."zero/test-caching-twin"]
+
+[tiers."zero/test-caching-twin".rates]
+input_per_mtok = 4.00
+cached_input_per_mtok = 0.40
+output_per_mtok = 8.00
+
+[[tiers."zero/test-caching-twin".candidates]]
+id = "anthropic/cacher-twin"
+provider = "anthropic"
+model = "upstream/cacher-twin"
+
+[tiers."zero/test-caching-twin".candidates.rates]
+input_per_mtok = 2.00
+cached_input_per_mtok = 0.20
+output_per_mtok = 4.00
+
 # A MIXED tier: the first rung cannot carry a breakpoint (no cache-write price,
 # and an OpenAI plane besides), the second can. A cache-bearing request must
 # skip the first rather than fall through to it and have its breakpoints
