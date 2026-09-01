@@ -1593,9 +1593,23 @@ async fn inference(
         .map_err(|_| ApiError::PayloadTooLarge)?;
     let (mut request, wire) = endpoint.parse(&payload)?;
     request.validate().map_err(|_| ApiError::InvalidRequest)?;
-    if request.contains_cache_control() {
-        return Err(ApiError::CacheControlUnsupported);
+    // Prompt caching, shape first. This used to be a blanket refusal of every
+    // `cache_control`; what survives of it are the two placements the router
+    // still cannot carry, and a shape check on the ones it can. Both run
+    // before the catalog is even loaded, because neither answer depends on
+    // which model was asked for — and `contains_unsupported_extensions` below
+    // whitelists the key, so nothing else would refuse a malformed one.
+    //
+    // WHICH LANES will honour a well-formed breakpoint is a separate question
+    // with a separate answer, decided after resolution by
+    // `unservable_prompt_caching` — the same split `modality_unsupported`
+    // makes, and for the same reason: "this router cannot carry that shape"
+    // and "that model does not sell it" are different facts with different
+    // fixes.
+    if let Some(placement) = request.unplaceable_cache_control() {
+        return Err(ApiError::CacheControlUnsupported { placement });
     }
+    let cache_breakpoints = request.cache_breakpoints().map_err(cache_control_error)?;
     if request.contains_unsupported_extensions() {
         return Err(ApiError::UnsupportedRequestFields);
     }
@@ -1645,6 +1659,27 @@ async fn inference(
     if let Some(refusal) = unservable_modality(&request, &resolved) {
         return Err(refusal);
     }
+    // The same gate for prompt caching, in the same place and for the same
+    // reasons — after resolution so the answer can name the model, before
+    // anything reserves, dials or mints a credential.
+    //
+    // It also NARROWS the route: on a tier whose rungs disagree about caching,
+    // the ones that cannot carry a breakpoint are dropped for this request
+    // rather than sunk, because falling through to one of them would deliver
+    // the request with the client's breakpoints silently discarded. Every
+    // shipped tier is a single pin, so today this either removes nothing or
+    // refuses outright; it is written for the mixed tier because that is the
+    // shape a routed `zero/*` alias will have.
+    let mut resolved = resolved;
+    if cache_breakpoints > 0 {
+        if let Some(refusal) = unservable_prompt_caching(&resolved) {
+            return Err(refusal);
+        }
+        resolved
+            .candidates
+            .retain(|candidate| candidate.rates.prices_cache_writes());
+    }
+    let resolved = resolved;
     let max_output_tokens = *request.max_tokens.get_or_insert(BASELINE_MAX_TOKENS);
     let reservation_usage = request.reservation_usage(max_output_tokens);
     // The user-scoped segmentation key (design: Engine "Task signature"),
@@ -2052,6 +2087,59 @@ fn unservable_modality(
         model: resolved.requested_model.clone(),
         modality: crate::openai::IMAGE_MODALITY,
         accepted,
+    })
+}
+
+/// Turn a validation fault on a `cache_control` into the refusal a client
+/// reads. Kept beside the gate rather than inside `error.rs` so the sentence a
+/// customer sees is written next to the rule that produced it.
+fn cache_control_error(fault: crate::openai::CacheControlFault) -> ApiError {
+    use crate::openai::{CacheControlFault, MAX_CACHE_BREAKPOINTS};
+    use std::borrow::Cow;
+    ApiError::CacheControlInvalid {
+        detail: match fault {
+            CacheControlFault::Shape => Cow::Borrowed(
+                "the only accepted value is {\"type\": \"ephemeral\"}, exactly — no other keys",
+            ),
+            CacheControlFault::Ttl => Cow::Borrowed(
+                "a ttl was named, and ZeroRouter serves only the default 5-minute cache. The \
+                 1-hour TTL is priced differently upstream and is not offered here, so it is \
+                 refused rather than quietly downgraded to 5 minutes you would still be billed \
+                 for. Drop the ttl field",
+            ),
+            CacheControlFault::TooMany { count } => Cow::Owned(format!(
+                "{count} breakpoints were placed and the upstream accepts at most \
+                 {MAX_CACHE_BREAKPOINTS}. Keep the ones that mark stable prefixes — a system \
+                 prompt, a tool list, the end of a long shared history — and drop the rest"
+            )),
+        },
+    }
+}
+
+/// Whether NO rung of this route sells client-controlled prompt caching.
+///
+/// The capability is read from the catalog rather than from the adapter,
+/// because the catalog is where the claim is made: a lane that prices cache
+/// writes has had that price transcribed by a human, and one that has not
+/// cannot bill the request it is being asked to serve. Catalog validation
+/// separately guarantees that a lane pricing the dimension really does dispatch
+/// on a plane that can carry a breakpoint
+/// (`TierConfigError::CacheWritePricedOffMessagesWire`), so one field answers
+/// both halves and there is no second list to drift.
+///
+/// Quantified over the CANDIDATES and not the tier's sell rates, because a
+/// candidate is what serves. The tier still has to price the dimension for the
+/// customer to be charged correctly, and it does: a candidate pricing cache
+/// writes above a tier that does not is a negative margin on the new dimension
+/// and `validate_candidate_margin` withholds the tier before any request
+/// arrives.
+fn unservable_prompt_caching(resolved: &ResolvedRoute) -> Option<ApiError> {
+    let any_can = resolved
+        .candidates
+        .iter()
+        .any(|candidate| candidate.rates.prices_cache_writes());
+    (!any_can).then(|| ApiError::PromptCachingUnsupported {
+        model: resolved.requested_model.clone(),
     })
 }
 
@@ -4436,8 +4524,23 @@ fn sized_reservation(
     byok_rate: Decimal,
 ) -> Result<ReservationSize, ApiError> {
     let usage = request.reservation_usage(output_bound);
-    let catalog_cost =
-        usage_cost(resolved.sell_rates.worst_case(), usage).ok_or(ApiError::MeteringUnavailable)?;
+    // `reservation_rates` rather than `worst_case`, and the difference is one
+    // dimension: a prompt token can now settle at the CACHE-WRITE rate, which
+    // is 1.25x input on the lanes that price it, so a hold sized at the input
+    // rate would be short by 25% of the prompt on a request that turns out to
+    // write its whole prompt into the cache. Settlement is clamped to the hold,
+    // so a short hold is not an overcharge — it is ZeroRouter quietly failing
+    // to collect what it just paid for.
+    //
+    // Sized UNCONDITIONALLY, not only when the request carries `cache_control`,
+    // and that is deliberate: the Anthropic wire sets three breakpoints of its
+    // own on every request it builds, so cache writes are not something a
+    // client has to ask for. A hold that engaged only on client-marked requests
+    // would be a guard that does not guard on the traffic that actually
+    // produces writes. On every lane that declares no cache-write rate this is
+    // `worst_case` exactly, so nothing else in the catalog holds a cent more.
+    let catalog_cost = usage_cost(resolved.sell_rates.reservation_rates(), usage)
+        .ok_or(ApiError::MeteringUnavailable)?;
     Ok(ReservationSize {
         total_tokens: i64::try_from(usage.total_tokens).map_err(|_| ApiError::InvalidRequest)?,
         output_tokens: i64::from(output_bound),
@@ -4801,6 +4904,7 @@ mod tests {
     #[test]
     fn provider_usage_is_not_retokenized() {
         let usage = TokenUsage {
+            cache_write_input_tokens: None,
             input_tokens: Some(1_000),
             cached_input_tokens: Some(900),
             output_tokens: Some(20),
@@ -4827,6 +4931,7 @@ mod tests {
             model: format!("upstream/{id}"),
             surface: None,
             rates: RateSchedule::flat(ModelRates {
+                cache_write_per_mtok: None,
                 input_per_mtok: Some(1.0),
                 output_per_mtok: Some(2.0),
                 cached_input_per_mtok: Some(0.2),
@@ -4849,6 +4954,7 @@ mod tests {
             model: format!("local/{id}"),
             surface: None,
             rates: RateSchedule::flat(ModelRates {
+                cache_write_per_mtok: None,
                 input_per_mtok: Some(0.0),
                 output_per_mtok: Some(0.0),
                 cached_input_per_mtok: None,
@@ -4967,6 +5073,7 @@ mod tests {
 
     fn free_sell_rates() -> ModelRates {
         ModelRates {
+            cache_write_per_mtok: None,
             input_per_mtok: Some(0.0),
             output_per_mtok: Some(0.0),
             cached_input_per_mtok: Some(0.0),
@@ -4975,6 +5082,7 @@ mod tests {
 
     fn priced_sell_rates() -> ModelRates {
         ModelRates {
+            cache_write_per_mtok: None,
             input_per_mtok: Some(3.0),
             output_per_mtok: Some(6.0),
             cached_input_per_mtok: Some(0.6),
@@ -5040,16 +5148,19 @@ mod tests {
         // something.
         for sell_rates in [
             ModelRates {
+                cache_write_per_mtok: None,
                 input_per_mtok: Some(0.0),
                 output_per_mtok: Some(6.0),
                 cached_input_per_mtok: Some(0.0),
             },
             ModelRates {
+                cache_write_per_mtok: None,
                 input_per_mtok: Some(3.0),
                 output_per_mtok: Some(0.0),
                 cached_input_per_mtok: Some(0.0),
             },
             ModelRates {
+                cache_write_per_mtok: None,
                 input_per_mtok: Some(0.0),
                 output_per_mtok: Some(0.0),
                 cached_input_per_mtok: Some(0.6),
@@ -5072,6 +5183,7 @@ mod tests {
         assert!(skips_metering(
             vec![local_rung("local/qwen", local_metadata())],
             ModelRates {
+                cache_write_per_mtok: None,
                 input_per_mtok: Some(0.0),
                 output_per_mtok: Some(0.0),
                 cached_input_per_mtok: None,
@@ -5389,6 +5501,7 @@ mod tests {
             model: format!("upstream/{id}"),
             surface: None,
             rates: RateSchedule::flat(ModelRates {
+                cache_write_per_mtok: None,
                 input_per_mtok: Some(1.0),
                 output_per_mtok: Some(2.0),
                 cached_input_per_mtok: None,
@@ -5506,6 +5619,7 @@ mod tests {
         walk_route_selling(
             candidates,
             RateSchedule::flat(ModelRates {
+                cache_write_per_mtok: None,
                 input_per_mtok: Some(3.0),
                 output_per_mtok: Some(6.0),
                 cached_input_per_mtok: None,
@@ -5522,6 +5636,7 @@ mod tests {
 
     fn banded(input: f64, cached: f64, output: f64) -> ModelRates {
         ModelRates {
+            cache_write_per_mtok: None,
             input_per_mtok: Some(input),
             cached_input_per_mtok: Some(cached),
             output_per_mtok: Some(output),
@@ -5695,6 +5810,7 @@ mod tests {
         // inflate anything on the tiers that ship today.
         let request = walk_request();
         let flat = ModelRates {
+            cache_write_per_mtok: None,
             input_per_mtok: Some(3.0),
             output_per_mtok: Some(6.0),
             cached_input_per_mtok: None,
@@ -5716,6 +5832,7 @@ mod tests {
         // must therefore stay on the metered path.
         let free_base_paid_band = RateSchedule::new(
             ModelRates {
+                cache_write_per_mtok: None,
                 input_per_mtok: Some(0.0),
                 output_per_mtok: Some(0.0),
                 cached_input_per_mtok: Some(0.0),
@@ -6197,6 +6314,7 @@ mod tests {
             vec![FakeOutcome::Stream(vec![
                 FakeStreamStep::text("partial"),
                 FakeStreamStep::Usage(TokenUsage {
+                    cache_write_input_tokens: None,
                     input_tokens: Some(1_000),
                     output_tokens: Some(20),
                     cached_input_tokens: None,
@@ -6298,6 +6416,7 @@ mod tests {
         let (session, request_id) = admit_walk(&pool, &key, &resolved, reservation_usage).await;
         let metadata = StreamMetadata::new(session.request_id(), "zero/test".to_owned(), false);
         let upstream_usage = TokenUsage {
+            cache_write_input_tokens: None,
             input_tokens: Some(1_000),
             output_tokens: Some(20),
             cached_input_tokens: None,

@@ -183,7 +183,11 @@ pub(super) async fn bounded_body(response: reqwest::Response) -> (String, bool) 
 /// missing-usage path, which is a known, handled state.
 pub(super) fn believable(usage: TokenUsage) -> Option<TokenUsage> {
     let over = |value: Option<u64>| value.is_some_and(|tokens| tokens > MAX_BELIEVABLE_TOKENS);
-    if over(usage.input_tokens) || over(usage.output_tokens) || over(usage.cached_input_tokens) {
+    if over(usage.input_tokens)
+        || over(usage.output_tokens)
+        || over(usage.cached_input_tokens)
+        || over(usage.cache_write_input_tokens)
+    {
         tracing::warn!(
             input = ?usage.input_tokens,
             output = ?usage.output_tokens,
@@ -1043,6 +1047,7 @@ mod wire_property_tests {
             (1, 0, u64::MAX),
         ] {
             let usage = TokenUsage {
+                cache_write_input_tokens: None,
                 input_tokens: Some(input),
                 output_tokens: Some(output),
                 cached_input_tokens: Some(cached),

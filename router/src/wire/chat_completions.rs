@@ -412,6 +412,10 @@ impl ChatCompletionsUsage {
             cached_input_tokens: self
                 .prompt_tokens_details
                 .and_then(|details| details.cached_tokens),
+            // This dialect reports no cache-write dimension. Absent, not zero:
+            // a zero here would assert the upstream measured no writes, which
+            // it never said.
+            cache_write_input_tokens: None,
         })
     }
 }
@@ -587,6 +591,7 @@ impl ChatUsageReport {
             input_tokens: self.prompt_tokens,
             output_tokens: self.completion_tokens,
             cached_input_tokens: self.cached_tokens,
+            cache_write_input_tokens: None,
         })
     }
 }
@@ -1787,6 +1792,7 @@ mod chat_completions_tests {
         let wire = ChatCompletionsWire::new("local", "k", None, Some(512), 900);
         let messages = vec![ChatMessage::user("hello")];
         let tools = vec![crate::provider::ToolSpec {
+            cache_control: false,
             name: "shell".into(),
             description: "run a command".into(),
             parameters: json!({"type": "object"}),

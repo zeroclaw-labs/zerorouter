@@ -448,6 +448,126 @@ async fn an_absent_cached_rate_may_not_bypass_a_comparison_billing_will_make() {
 /// The blocker the adversarial review found. `chat_completions` is dual-use by
 /// the design's own scope — the keyless local rung AND a credentialed hosted
 /// ZeroRouter taking metered burst traffic — so keying "may be $0" on the
+/// The cache-write dimension, held to the same margin rule as the other three
+/// — and to it on EFFECTIVE values, because an absent write rate is not
+/// unknown to the biller either: `usage_cost` prices it at the input rate.
+///
+/// Both directions are a silent margin leak and both were invisible to a
+/// declared-value comparison, exactly as the cached dimension's two were.
+#[tokio::test]
+async fn a_cache_write_rate_may_not_cost_more_than_the_tier_sells_it_for() {
+    operator_inventory();
+
+    // 1. The candidate transcribes Anthropic's 1.25x premium; the tier forgot
+    //    to. The tier therefore sells written tokens at its 3.00 input rate
+    //    while they cost 5.00 — on every request the wire's own breakpoints
+    //    produce, which is all of them.
+    let error = load_catalog_rates(
+        "cache-write-basis-above-fallback",
+        "anthropic",
+        "input_per_mtok = 3.00\noutput_per_mtok = 6.00",
+        "input_per_mtok = 1.00\noutput_per_mtok = 2.00\ncache_write_per_mtok = 5.00",
+    )
+    .await
+    .expect_err("a cache-write basis above the tier's effective rate must withhold the tier");
+    let detail = error.to_string();
+    assert!(detail.contains("cache_write_per_mtok"), "{detail}");
+    assert!(
+        detail.contains("costs more than the tier sells"),
+        "{detail}"
+    );
+
+    // 2. The mirror image, and the one a reader is likelier to get wrong: the
+    //    TIER declares a write rate and the candidate does not, so the
+    //    candidate bills its writes at its full input rate. Here that is 3.00
+    //    against a tier selling them at 2.00 — a loss on every written token,
+    //    produced by a rate table that looks conservative.
+    let error = load_catalog_rates(
+        "cache-write-sell-below-fallback",
+        "anthropic",
+        "input_per_mtok = 3.00\noutput_per_mtok = 6.00\ncache_write_per_mtok = 2.00",
+        "input_per_mtok = 3.00\noutput_per_mtok = 6.00",
+    )
+    .await
+    .expect_err("a write rate the candidate cannot honour must withhold the tier");
+    let detail = error.to_string();
+    assert!(detail.contains("cache_write_per_mtok"), "{detail}");
+
+    // The control, and the reason this is a comparison rather than a ban: when
+    // NEITHER side declares the dimension both fall back to their own input
+    // rate, an at-cost pin is still exactly at cost, and this is the shape
+    // every rate table in the catalog had before the dimension existed. It
+    // must keep loading, untouched.
+    load_catalog_rates(
+        "cache-write-absent-both-sides",
+        "anthropic",
+        "input_per_mtok = 3.00\noutput_per_mtok = 6.00",
+        "input_per_mtok = 3.00\noutput_per_mtok = 6.00",
+    )
+    .await
+    .expect("an absent cache-write dimension on both sides is at cost, not over it");
+
+    // And the shipped shape — 1.25x on both sides — is legal, since basis ==
+    // sell is the intended relationship for a pass-through pin.
+    load_catalog_rates(
+        "cache-write-at-cost",
+        "anthropic",
+        "input_per_mtok = 3.00\noutput_per_mtok = 6.00\ncache_write_per_mtok = 3.75",
+        "input_per_mtok = 3.00\noutput_per_mtok = 6.00\ncache_write_per_mtok = 3.75",
+    )
+    .await
+    .expect("a cache-write premium sold at cost is the flagship shape");
+}
+
+/// A cache-write price is a claim that the lane SELLS client prompt caching,
+/// and admission reads it as exactly that. So the claim has to be true of the
+/// plane as well as of the price: only the two Anthropic-Messages adapters can
+/// carry a `cache_control` breakpoint upstream.
+///
+/// STRUCTURAL — it refuses the whole file — because the plausible fallback is
+/// the dangerous one. Dropping the breakpoint and dialling anyway would charge
+/// the customer a 1.25x write premium for a cache the upstream never wrote,
+/// which is a wrong bill rather than a degraded feature.
+#[tokio::test]
+async fn a_cache_write_price_off_the_messages_wire_refuses_the_catalog() {
+    operator_inventory();
+
+    let error = load_catalog_rates(
+        "cache-write-wrong-plane",
+        "openai",
+        "input_per_mtok = 3.00\noutput_per_mtok = 6.00\ncache_write_per_mtok = 3.75",
+        "input_per_mtok = 3.00\noutput_per_mtok = 6.00\ncache_write_per_mtok = 3.75",
+    )
+    .await
+    .expect_err("a cache-write price on an OpenAI plane must refuse the file");
+    let detail = error.to_string();
+    assert!(detail.contains("openai/probe"), "{detail}");
+    assert!(detail.contains("cache_write_per_mtok"), "{detail}");
+    assert!(detail.contains("Anthropic Messages dialect"), "{detail}");
+
+    // The same rates on a plane that CAN carry a breakpoint load fine — so the
+    // refusal is about the plane and not about the numbers.
+    load_catalog_rates(
+        "cache-write-right-plane",
+        "anthropic",
+        "input_per_mtok = 3.00\noutput_per_mtok = 6.00\ncache_write_per_mtok = 3.75",
+        "input_per_mtok = 3.00\noutput_per_mtok = 6.00\ncache_write_per_mtok = 3.75",
+    )
+    .await
+    .expect("the anthropic plane carries cache_control, so it may sell cache writes");
+
+    // And an OpenAI lane that declares NO write rate is untouched: it simply
+    // does not sell caching, which is the state every non-Claude lane is in.
+    load_catalog_rates(
+        "cache-write-silent-openai",
+        "openai",
+        "input_per_mtok = 3.00\noutput_per_mtok = 6.00",
+        "input_per_mtok = 3.00\noutput_per_mtok = 6.00",
+    )
+    .await
+    .expect("a lane that does not price cache writes is not making any claim to check");
+}
+
 /// adapter would have let a real-money upstream be priced at zero and marked
 /// free by `is_free`, the key stage 3's metering skip is specified to read.
 /// The declaration, not the wire, is what enters the free lane.
@@ -753,6 +873,7 @@ fn router(pool: PgPool, fakes: Vec<Arc<FakeModelProvider>>) -> RouterState {
 
 fn served_usage() -> zerorouter::provider::TokenUsage {
     zerorouter::provider::TokenUsage {
+        cache_write_input_tokens: None,
         input_tokens: Some(1_000),
         output_tokens: Some(20),
         cached_input_tokens: None,

@@ -157,6 +157,7 @@ fn usage_record(cost_usd: Decimal) -> UsageRecord {
             candidate_id: None,
             basis_rates: None,
             sell_rates: ModelRates {
+                cache_write_per_mtok: None,
                 input_per_mtok: Some(2.0),
                 output_per_mtok: Some(10.0),
                 cached_input_per_mtok: Some(0.2),
@@ -1168,6 +1169,7 @@ async fn velocity_counts_uncached_tokens_only() {
             completion_tokens: 25,
             total_tokens: 2_025,
             prompt_tokens_details: Some(PromptTokenDetails {
+                cache_write_tokens: 0,
                 cached_tokens: 1_950,
             }),
         },

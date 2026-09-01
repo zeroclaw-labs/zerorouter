@@ -406,6 +406,14 @@ impl RequestTelemetry {
 pub struct AttemptTokens {
     pub input: Option<u64>,
     pub cached_input: Option<u64>,
+    /// Prompt tokens this attempt WROTE into the upstream's cache.
+    ///
+    /// Carried for the same reason `cached_input` is: attempt COGS is priced
+    /// by `usage_cost` from these numbers, and a cache write costs 1.25x a
+    /// fresh read on the lanes that price it. An attempt that lost the
+    /// distinction would report a COGS 25% under what the invoice says on
+    /// exactly the requests this dimension exists for.
+    pub cache_write_input: Option<u64>,
     pub output: Option<u64>,
 }
 
@@ -416,6 +424,7 @@ impl AttemptTokens {
         Self {
             input: Some(usage.prompt_tokens),
             cached_input: Some(usage.cached_input_tokens()),
+            cache_write_input: Some(usage.cache_write_tokens()),
             output: Some(usage.completion_tokens),
         }
     }
@@ -445,16 +454,21 @@ impl AttemptTokens {
     /// request's `attempts_cost_basis_complete` FALSE.
     #[must_use]
     pub fn priceable(self) -> Option<OpenAiUsage> {
-        self.input.or(self.cached_input).or(self.output)?;
+        self.input
+            .or(self.cached_input)
+            .or(self.cache_write_input)
+            .or(self.output)?;
         let input = self.input.unwrap_or(0);
         let cached = self.cached_input.unwrap_or(0).min(input);
+        let written = self.cache_write_input.unwrap_or(0).min(input - cached);
         let output = self.output.unwrap_or(0);
         Some(OpenAiUsage {
             prompt_tokens: input,
             completion_tokens: output,
             total_tokens: input.saturating_add(output),
-            prompt_tokens_details: (cached > 0).then_some(PromptTokenDetails {
+            prompt_tokens_details: (cached > 0 || written > 0).then_some(PromptTokenDetails {
                 cached_tokens: cached,
+                cache_write_tokens: written,
             }),
         })
     }
@@ -463,7 +477,10 @@ impl AttemptTokens {
     /// contribute to a COGS sum that claims to be a total.
     #[must_use]
     pub fn is_complete(self) -> bool {
-        self.input.is_some() && self.cached_input.is_some() && self.output.is_some()
+        self.input.is_some()
+            && self.cached_input.is_some()
+            && self.cache_write_input.is_some()
+            && self.output.is_some()
     }
 }
 
@@ -558,6 +575,13 @@ fn rates_snapshot(rates: &ModelRates) -> String {
     json!({
         "input_per_mtok": rates.input_per_mtok,
         "cached_input_per_mtok": rates.cached_input_per_mtok,
+        // Serialized as `null` on every lane that does not price the dimension,
+        // which is what the other three optional-looking keys already do. A
+        // snapshot is the ledger's record of the rate table a row was billed
+        // at, so a dimension the biller reads has to appear in it even when it
+        // is absent — a key that is silently missing on some rows and present
+        // on others cannot be told from a schema change later.
+        "cache_write_per_mtok": rates.cache_write_per_mtok,
         "output_per_mtok": rates.output_per_mtok,
     })
     .to_string()
@@ -1130,6 +1154,13 @@ pub async fn migrate(pool: &PgPool) -> Result<()> {
                 Cow::Borrowed("byok fallback opt in"),
                 MigrationType::Simple,
                 Cow::Borrowed(include_str!("../migrations/0028_byok_fallback_opt_in.sql")),
+                false,
+            ),
+            Migration::new(
+                29,
+                Cow::Borrowed("cache write tokens"),
+                MigrationType::Simple,
+                Cow::Borrowed(include_str!("../migrations/0029_cache_write_tokens.sql")),
                 false,
             ),
         ]),
@@ -2347,11 +2378,21 @@ impl UsageSession {
                  that should have reserved and settled"
             );
         }
-        let (Ok(input_tokens), Ok(cached_input_tokens), Ok(output_tokens)) = (
+        let (
+            Ok(input_tokens),
+            Ok(cached_input_tokens),
+            Ok(cache_write_input_tokens),
+            Ok(output_tokens),
+        ) = (
             checked_token_count(record.usage.prompt_tokens, "prompt_tokens"),
             checked_token_count(record.usage.cached_input_tokens(), "cached_input_tokens"),
+            checked_token_count(
+                record.usage.cache_write_tokens(),
+                "cache_write_input_tokens",
+            ),
             checked_token_count(record.usage.completion_tokens, "completion_tokens"),
-        ) else {
+        )
+        else {
             tracing::warn!(
                 request_id = %self.request_id,
                 "free-lane usage counts exceed the database integer range; no observability row written"
@@ -2435,12 +2476,13 @@ impl UsageSession {
                     shape_ok,
                     priority,
                     usage_gap,
-                    byok
+                    byok,
+                    cache_write_input_tokens
                 )
                 VALUES (
                     $1, $2, $3, $4, $5, $6, $7, $8, 0, $9, $10,
                     $11, $12, $13::JSONB, $14::JSONB, $15, $16, $17, $18, $19,
-                    $20, $21, $22, $23, $24, $25, $26
+                    $20, $21, $22, $23, $24, $25, $26, $27
                 )
                 "#,
                 )
@@ -2475,6 +2517,12 @@ impl UsageSession {
                 // dashboard counting BYOK traffic must not silently omit the
                 // lane that skips metering.
                 .bind(telemetry.byok)
+                // Clamped into the room the cached count leaves, so the row
+                // can never assert three buckets that overflow the prompt.
+                .bind(
+                    cache_write_input_tokens
+                        .min(input_tokens.saturating_sub(cached_input_tokens.min(input_tokens))),
+                )
                 .execute(&mut *transaction)
                 .await?;
                 transaction.commit().await
@@ -2687,6 +2735,10 @@ async fn settle_once(
     let input_tokens = checked_token_count(record.usage.prompt_tokens, "prompt_tokens")?;
     let cached_input_tokens =
         checked_token_count(record.usage.cached_input_tokens(), "cached_input_tokens")?;
+    let cache_write_input_tokens = checked_token_count(
+        record.usage.cache_write_tokens(),
+        "cache_write_input_tokens",
+    )?;
     let output_tokens = checked_token_count(record.usage.completion_tokens, "completion_tokens")?;
 
     let mut transaction = pool.begin().await?;
@@ -2883,13 +2935,14 @@ async fn settle_once(
                 priority,
                 usage_gap,
                 byok,
-                byok_catalog_usd
+                byok_catalog_usd,
+                cache_write_input_tokens
             )
             VALUES (
                 $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
                 $12, $13, $14, $15::JSONB, $16::JSONB, $17, $18, $19, $20, $21,
                 $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34,
-                $35, $36
+                $35, $36, $37
             )
             "#,
     )
@@ -2940,6 +2993,14 @@ async fn settle_once(
     // lands. Writing it is what makes the next request's allowance read
     // correct, so it is not telemetry — it is the other half of the charge.
     .bind(byok_catalog_usd)
+    // Clamped into what the cached count leaves, matching the same clamp on
+    // `cached_input_tokens` above: the three prompt buckets are disjoint and
+    // must sum to at most `input_tokens`, or the row cannot be read back as an
+    // explanation of its own `cost_usd`.
+    .bind(
+        cache_write_input_tokens
+            .min(input_tokens.saturating_sub(cached_input_tokens.min(input_tokens))),
+    )
     .execute(&mut *transaction)
     .await;
     if let Err(error) = settled {
@@ -2975,6 +3036,20 @@ async fn settle_once(
             .map(|tokens| checked_token_count(tokens, "attempt_cached_input_tokens"))
             .transpose()?
             .map(|cached| cached.min(attempt_input.unwrap_or(cached)));
+        // Clamped into the room the cached count leaves, mirroring the clamp
+        // on `attempt_cached` above and the one the settled row applies.
+        let attempt_cache_write = attempt
+            .tokens
+            .cache_write_input
+            .map(|tokens| checked_token_count(tokens, "attempt_cache_write_input_tokens"))
+            .transpose()?
+            .map(|written| {
+                written.min(
+                    attempt_input
+                        .unwrap_or(written)
+                        .saturating_sub(attempt_cached.unwrap_or(0)),
+                )
+            });
         let attempt_output = attempt
             .tokens
             .output
@@ -3000,9 +3075,10 @@ async fn settle_once(
                     tokens_estimated,
                     cost_basis_usd,
                     finish_reason,
-                    validator_kind
+                    validator_kind,
+                    cache_write_input_tokens
                 )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
                 "#,
         )
         .bind(reservation_id)
@@ -3023,6 +3099,7 @@ async fn settle_once(
         .bind(attempt.cost_basis_usd)
         .bind(attempt.finish_reason.as_deref())
         .bind(attempt.validator_kind.as_deref())
+        .bind(attempt_cache_write)
         .execute(&mut *transaction)
         .await?;
     }
@@ -3790,6 +3867,13 @@ struct SettlementIntent {
 struct UsagePayload {
     prompt_tokens: u64,
     cached_input_tokens: u64,
+    /// `#[serde(default)]` for the reason every other late field here carries
+    /// one: an intent written before this dimension existed has no such key,
+    /// and a settle that cannot replay is a settle that never completes. It
+    /// defaults to 0 — "no writes" — which is precisely what such an intent was
+    /// priced at when it was written.
+    #[serde(default)]
+    cache_write_input_tokens: u64,
     completion_tokens: u64,
     total_tokens: u64,
 }
@@ -3798,6 +3882,13 @@ struct UsagePayload {
 struct RatesPayload {
     input_per_mtok: Option<f64>,
     cached_input_per_mtok: Option<f64>,
+    /// `#[serde(default)]` for the same reason `finish_reason_source` carries
+    /// one: an intent written by a binary that predates the cache-write
+    /// dimension has no such key, and replaying it must not fail. Such an
+    /// intent settles with the dimension absent — which is exactly what it was
+    /// priced at, since the biller falls an absent write rate back to input.
+    #[serde(default)]
+    cache_write_per_mtok: Option<f64>,
     output_per_mtok: Option<f64>,
 }
 
@@ -3871,6 +3962,12 @@ struct AttemptPayload {
 struct AttemptTokensPayload {
     input: Option<u64>,
     cached_input: Option<u64>,
+    /// `#[serde(default)]` on the same replay grounds as the rest of this
+    /// payload: a pre-dimension intent has no key, and `None` is the honest
+    /// reading — that attempt's writes were never measured, so its COGS is a
+    /// floor and `attempts_cost_basis_complete` says so.
+    #[serde(default)]
+    cache_write_input: Option<u64>,
     output: Option<u64>,
 }
 
@@ -3932,6 +4029,7 @@ impl SettlementIntent {
                     tokens: AttemptTokensPayload {
                         input: attempt.tokens.input,
                         cached_input: attempt.tokens.cached_input,
+                        cache_write_input: attempt.tokens.cache_write_input,
                         output: attempt.tokens.output,
                     },
                     tokens_estimated: attempt.tokens_estimated,
@@ -3962,6 +4060,7 @@ impl SettlementIntent {
                 tokens: AttemptTokens {
                     input: attempt.tokens.input,
                     cached_input: attempt.tokens.cached_input,
+                    cache_write_input: attempt.tokens.cache_write_input,
                     output: attempt.tokens.output,
                 },
                 tokens_estimated: attempt.tokens_estimated,
@@ -4048,6 +4147,7 @@ impl UsagePayload {
         Self {
             prompt_tokens: usage.prompt_tokens,
             cached_input_tokens: usage.cached_input_tokens(),
+            cache_write_input_tokens: usage.cache_write_tokens(),
             completion_tokens: usage.completion_tokens,
             total_tokens: usage.total_tokens,
         }
@@ -4058,9 +4158,12 @@ impl UsagePayload {
             prompt_tokens: self.prompt_tokens,
             completion_tokens: self.completion_tokens,
             total_tokens: self.total_tokens,
-            prompt_tokens_details: (self.cached_input_tokens > 0).then_some(PromptTokenDetails {
-                cached_tokens: self.cached_input_tokens,
-            }),
+            prompt_tokens_details: (self.cached_input_tokens > 0
+                || self.cache_write_input_tokens > 0)
+                .then_some(PromptTokenDetails {
+                    cached_tokens: self.cached_input_tokens,
+                    cache_write_tokens: self.cache_write_input_tokens,
+                }),
         }
     }
 }
@@ -4070,6 +4173,7 @@ impl RatesPayload {
         Self {
             input_per_mtok: rates.input_per_mtok,
             cached_input_per_mtok: rates.cached_input_per_mtok,
+            cache_write_per_mtok: rates.cache_write_per_mtok,
             output_per_mtok: rates.output_per_mtok,
         }
     }
@@ -4078,6 +4182,7 @@ impl RatesPayload {
         ModelRates {
             input_per_mtok: self.input_per_mtok,
             cached_input_per_mtok: self.cached_input_per_mtok,
+            cache_write_per_mtok: self.cache_write_per_mtok,
             output_per_mtok: self.output_per_mtok,
         }
     }

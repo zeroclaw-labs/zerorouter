@@ -180,6 +180,38 @@ Streaming producers stop writing after client backpressure/disconnect but keep
 draining the upstream usage frame. On SIGTERM, the router cancels and meters
 all tracked background work before exiting.
 
-## Deployment gate
+## Prompt caching
 
-The pinned ZeroClaw provider API normalizes messages into `ChatMessage { role, content }`. It cannot carry arbitrary client `cache_control` blocks or every OpenAI request extension unchanged. Its Anthropic adapter adds its own cache breakpoints, but that is not strict client cache transparency. The router therefore rejects detected `cache_control` input instead of silently dropping it. Do not describe B0 as cache-transparent or enable customer traffic that depends on client-specified cache boundaries until the pinned provider interface is extended and this router preserves those fields end to end.
+This gate is **lifted**, and the paragraph it replaces is worth keeping in mind
+because it explains the shape of what shipped. It read: the pinned ZeroClaw
+provider API normalizes messages into `ChatMessage { role, content }`, cannot
+carry arbitrary client `cache_control` blocks, and its Anthropic adapter adds
+its own cache breakpoints — which is not client cache transparency. So the
+router rejected every detected `cache_control` rather than dropping it
+silently, and nobody was to describe the service as cache-transparent until the
+provider interface could preserve those fields end to end.
+
+The pin is gone and the router owns its wires, so it can. What that took, and
+what is still true of it:
+
+- **Client breakpoints are forwarded where the client placed them.** A
+  `cache_control: {"type": "ephemeral"}` on a chat-completions message or tool
+  reaches the Messages API at the corresponding position. A request that places
+  any takes the client's placement and NONE of the wire's three defaults —
+  Anthropic caps a request at four breakpoints, and merging would both risk the
+  cap and charge a write premium at boundaries the customer did not choose.
+- **Transparency required a price first.** The wire's own breakpoints mean
+  essentially every Claude request writes to the upstream cache, and Anthropic
+  bills a write at 1.25x input while ZeroRouter billed it at 1x. Accepting
+  client `cache_control` without transcribing that rate would have widened a
+  loss rather than shipped a feature, so `cache_write_per_mtok` landed with it.
+- **Absence of that rate is the capability signal.** A lane that does not price
+  cache writes refuses `cache_control` with `prompt_caching_unsupported`, the
+  way an undeclared modality refuses an image. Only the Claude lanes declare
+  it; catalog validation additionally refuses a cache-write price on any plane
+  that could not carry a breakpoint upstream.
+- **Still refused, deliberately:** `cache_control` inside a message content
+  part or at the top level (no honest placement — see `ApiError::CacheControl
+  Unsupported`), a `ttl` (the 1-hour cache is priced differently and is not
+  transcribed), more than four breakpoints, and the whole feature on
+  `/v1/responses`, which is the chat surface only.

@@ -1411,6 +1411,39 @@ pub fn provider_has_surface(provider: &str, surface: &str) -> bool {
     })
 }
 
+/// Whether the plane this candidate would dispatch on can CARRY a client
+/// `cache_control` breakpoint to the upstream.
+///
+/// Only the two adapters that speak the Anthropic Messages dialect can:
+/// `cache_control` is a property of a Messages content block, and the other
+/// two adapters have nowhere to put one. A chat-completions or Responses
+/// upstream handed a breakpoint would either 400 or — far worse — accept the
+/// request and silently drop it, which is a customer paying a cache-write
+/// premium for a cache that was never written.
+///
+/// Read from the inventory rather than from a list in `config.rs`, for the
+/// reason [`provider_has_surface`] gives. `surface` is the candidate's own
+/// `surface = "..."`, so the answer is about the plane that will actually be
+/// dialled: `bedrock` reaches the Messages dialect through its
+/// `classic_runtime` surface and nothing else.
+#[must_use]
+pub fn provider_carries_cache_control(provider: &str, surface: Option<&str>) -> bool {
+    ProviderInventory::load().is_ok_and(|inventory| {
+        inventory
+            .provider(provider)
+            .and_then(|metadata| match surface {
+                None => Some(metadata.adapter),
+                Some(name) => metadata.surfaces.get(name).map(|surface| surface.adapter),
+            })
+            .is_some_and(|adapter| {
+                matches!(
+                    adapter,
+                    ProviderAdapter::Anthropic | ProviderAdapter::AnthropicBedrockRuntime
+                )
+            })
+    })
+}
+
 /// Returns whether `provider` has a constructor in this module.
 ///
 /// Configuration validation should use this function instead of maintaining a
@@ -2564,6 +2597,7 @@ mod tests {
             model: format!("upstream/{id}"),
             surface: surface.map(str::to_owned),
             rates: crate::provider::RateSchedule::flat(ModelRates {
+                cache_write_per_mtok: None,
                 input_per_mtok: Some(1.0),
                 output_per_mtok: Some(2.0),
                 cached_input_per_mtok: None,

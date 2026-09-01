@@ -229,6 +229,7 @@ mod tests {
             model: model.to_owned(),
             surface: None,
             rates: crate::provider::RateSchedule::flat(ModelRates {
+                cache_write_per_mtok: None,
                 input_per_mtok: Some(1.0),
                 output_per_mtok: Some(2.0),
                 cached_input_per_mtok: None,

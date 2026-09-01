@@ -1246,12 +1246,18 @@ async fn catalog_drift(args: CatalogDriftArgs) -> Result<()> {
         "{:<22} {:<32} {:<18} {:>26} {:>26} {:>13} {:>10}",
         "TIER", "CANDIDATE", "VERDICT", "RECORDED BASIS", "UPSTREAM COST", "UPSTREAM CTX", "MARKUP"
     );
+    // input / cached / WRITE / output. The write slot renders `-` on every
+    // lane that does not price the dimension, which is most of them, and it
+    // has to be shown rather than folded away: without it a cache-write
+    // disagreement prints as `BASIS DRIFT` beside two rate triples that look
+    // identical, and an operator reading the row cannot see what drifted.
     let rate = |r: crate::provider::ModelRates| {
         let show = |v: Option<f64>| v.map_or_else(|| "-".to_owned(), |v| format!("{v}"));
         format!(
-            "{}/{}/{}",
+            "{}/{}/{}/{}",
             show(r.input_per_mtok),
             show(r.cached_input_per_mtok),
+            show(r.cache_write_per_mtok),
             show(r.output_per_mtok)
         )
     };
@@ -1397,6 +1403,32 @@ async fn catalog_drift(args: CatalogDriftArgs) -> Result<()> {
                     drift.upstream,
                 );
             }
+        }
+    }
+
+    // Lanes the source prices cache writes for while the file declares none.
+    //
+    // NOT drift, and the section says so in as many words. An absent
+    // `cache_write_per_mtok` is a capability decision — it is how a lane
+    // states that it does not sell client prompt caching — so the file and the
+    // source are not disagreeing about a number here, they are answering
+    // different questions. Treating it as drift would redden CI over every
+    // lane ZeroRouter has deliberately not turned the feature on for.
+    //
+    // It is printed anyway, because the alternative is a reconciliation that
+    // quietly knows something the operator does not: these are exactly the
+    // lanes that COULD sell prompt caching, with the vendor's own number
+    // already in hand, and the only thing between them and the feature is
+    // somebody transcribing it.
+    let undeclared = crate::drift::cache_write_undeclared(&findings);
+    if !undeclared.is_empty() {
+        println!(
+            "\nCache-write pricing published upstream but not declared here \
+             (INFORMATIONAL — an absent cache_write_per_mtok means the lane does not sell \
+             client prompt caching, which is a decision, not drift):"
+        );
+        for (candidate, rate) in undeclared {
+            println!("  {candidate:<32} source cache_write {rate}");
         }
     }
 

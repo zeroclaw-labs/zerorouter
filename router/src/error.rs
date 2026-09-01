@@ -15,7 +15,53 @@ pub enum ApiError {
     /// rather than resolved by precedence (design doc: "Precedence and
     /// conflicts").
     PriorityConflict,
-    CacheControlUnsupported,
+    /// The request put a `cache_control` somewhere this surface cannot place
+    /// it — at the top level, or inside a message content part.
+    ///
+    /// The variant predates prompt-caching support, where it refused EVERY
+    /// `cache_control` on the grounds that the pinned provider interface could
+    /// not carry one. That interface is gone and the breakpoints are now
+    /// forwarded, so the blanket refusal went with it — but the variant is
+    /// kept rather than retired, because two placements are still genuinely
+    /// unplaceable and they deserve the specific answer this code already
+    /// gives. What changed is the message: it now names where a breakpoint
+    /// DOES go, so a client that guessed wrong is one edit from working
+    /// instead of concluding the feature does not exist.
+    ///
+    /// `placement` is a fixed label chosen by
+    /// [`crate::openai::ChatCompletionRequest::unplaceable_cache_control`],
+    /// never request content.
+    CacheControlUnsupported {
+        placement: &'static str,
+    },
+    /// A `cache_control` this router could place but not honour as written:
+    /// the wrong shape, a `ttl` it has no price for, or more breakpoints than
+    /// the upstream accepts.
+    ///
+    /// Its own code rather than a reuse of [`Self::CacheControlUnsupported`],
+    /// on the rule the rest of this enum follows: the remedy differs and a
+    /// caller acts on the code. That one means "move it"; this one means "fix
+    /// it" — and the message says which of the three it was, because a
+    /// breakpoint is a billing instruction and a client that got one wrong is
+    /// entitled to know which.
+    CacheControlInvalid {
+        detail: Cow<'static, str>,
+    },
+    /// The request asked for prompt caching on a tier where no candidate
+    /// prices cache writes.
+    ///
+    /// Its own code rather than a reuse of [`Self::CacheControlUnsupported`],
+    /// and the reason is exactly the one [`Self::ModalityUnsupported`] gives
+    /// for not reusing `unsupported_request_fields`: the shape is fine and the
+    /// router can carry it — this MODEL does not sell it. So the fix is to
+    /// pick a different model, and the message names ones that work.
+    ///
+    /// Refused before any reservation is taken or any upstream dialled, on the
+    /// same principle as [`Self::ModalityUnsupported`]: a request that cannot
+    /// be served must not move money first.
+    PromptCachingUnsupported {
+        model: String,
+    },
     PayloadTooLarge,
     /// The router is already buffering as many request bodies as it will
     /// hold. Shedding here is deliberate: the alternative is queueing
@@ -192,14 +238,46 @@ impl ApiError {
                 Some("zerorouter.priority"),
                 "priority_conflict",
             ),
-            Self::CacheControlUnsupported => (
+            Self::CacheControlUnsupported { placement } => (
                 StatusCode::BAD_REQUEST,
-                Cow::Borrowed(
-                    "Client cache_control passthrough is not supported by the pinned provider interface.",
-                ),
+                Cow::Owned(format!(
+                    "ZeroRouter cannot place a cache_control found in {placement}. Put the \
+                     breakpoint on a message object or on a tool object instead — \
+                     {{\"role\": \"user\", \"content\": \"…\", \"cache_control\": {{\"type\": \
+                     \"ephemeral\"}}}} — which caches everything up to and including that item. \
+                     Nothing was reserved and no upstream was contacted."
+                )),
                 "invalid_request_error",
                 Some("messages"),
                 "cache_control_unsupported",
+            ),
+            Self::CacheControlInvalid { detail } => (
+                StatusCode::BAD_REQUEST,
+                Cow::Owned(format!(
+                    "This request's cache_control cannot be honoured: {detail}. Nothing was \
+                     reserved and no upstream was contacted."
+                )),
+                "invalid_request_error",
+                Some("messages"),
+                "cache_control_invalid",
+            ),
+            // 400 and `invalid_request_error`, for the reason
+            // `modality_unsupported` is: nothing here is ZeroRouter's
+            // misconfiguration — the caller asked a model for something it does
+            // not sell, and can fix it by asking a different one.
+            Self::PromptCachingUnsupported { model } => (
+                StatusCode::BAD_REQUEST,
+                Cow::Owned(format!(
+                    "The model {model} does not offer client-controlled prompt caching, so a \
+                     cache_control breakpoint cannot be honoured on it. Prompt caching is \
+                     available on the Claude lanes — anthropic/* and bedrock/* — where the \
+                     cache-write price is published; GET /v1/models lists what each model \
+                     supports. Remove cache_control, or send this request to one of those \
+                     models. Nothing was reserved and no upstream was contacted."
+                )),
+                "invalid_request_error",
+                Some("messages"),
+                "prompt_caching_unsupported",
             ),
             Self::PayloadTooLarge => (
                 StatusCode::PAYLOAD_TOO_LARGE,

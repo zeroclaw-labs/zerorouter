@@ -76,6 +76,52 @@ schema_version = 1
 #   Under-reserving would let a customer spend past their balance; over-
 #   reserving costs them nothing.
 #
+# CACHE-WRITE RATES (2026-09-01): a `rates` table may carry
+# `cache_write_per_mtok`, the price of a prompt token the upstream both read
+# and STORED under a `cache_control` breakpoint. It is the fourth billed
+# dimension, beside input, cached input and output.
+#
+# EVERY VALUE IN THIS FILE IS EXACTLY 1.25 x THAT LANE'S INPUT RATE — Anthropic's
+# published multiplier for the 5-minute-TTL cache write, which is the only TTL
+# this router requests. Verified against models.dev on 2026-09-01, the same
+# source `admin catalog-drift` reconciles against: it publishes `cost.cache_write`
+# of 1.25 / 2.50 / 6.25 / 12.50 for haiku-4.5 / sonnet-5 / opus-5 / fable-5,
+# matching the four first-party lanes below number for number. The four Bedrock
+# lanes are 1.25x their own in-region input rate, which is ALSO 1.10x the
+# first-party figure (6.875 = 1.25 x 5.50 = 1.10 x 6.25; 4.125 = 1.25 x 3.30 =
+# 1.10 x 3.75; 1.375 = 1.25 x 1.10 = 1.10 x 1.25) — the same one-ratio check the
+# Bedrock block header describes for the other three dimensions, arriving at the
+# same numbers from two directions.
+#
+# Anthropic also sells a 1-hour TTL at 2x input. It is NOT transcribed here and
+# the request surface refuses `cache_control` carrying a `ttl` by name, because
+# a price nobody wrote down is a price this catalog will not charge.
+#
+# THE KEY'S ABSENCE IS A CAPABILITY DECISION, not an oversight, and it is the
+# reason only these eight lanes carry it. A lane that declares no
+# `cache_write_per_mtok` REFUSES a client `cache_control` outright
+# (`prompt_caching_unsupported`), because selling a dimension at a rate nobody
+# transcribed is the one thing this file never does. Adding the key to a lane
+# is therefore a product decision as much as a price: it turns prompt caching on
+# for that model. Note that the source publishes a cache-write rate for several
+# lanes here that deliberately do not declare one — `admin catalog-drift` lists
+# them under "cache-write pricing published upstream" as information, never as
+# drift.
+#
+# What has NOT changed is what an omitted key costs: `usage_cost` falls an
+# absent cache-write rate back to the INPUT rate, exactly as it does for an
+# absent cached rate. So a lane without the key prices bit-for-bit as it did
+# before the dimension existed. Adding it to these eight is the change, and it
+# raises what those lanes charge for cache-writing tokens by 25% — which is what
+# ZeroRouter has been paying for them all along.
+#
+# Admission reserves at the DEAREST rate any prompt token could carry
+# (`RateSchedule::reservation_rates`), so a lane declaring this key holds 25%
+# more against the prompt bound and settlement releases the difference. That is
+# required rather than cautious: settlement is clamped to the reservation, and a
+# hold sized at the input rate could not cover a request that wrote its whole
+# prompt into the cache.
+#
 # `/v1/models` PUBLISHES THE BANDS, as OpenRouter's `pricing.overrides[]`
 # keyed on the same `min_prompt_tokens` field name. A price a customer cannot
 # see is a price they cannot check, and quoting only the base rate understated
@@ -1033,6 +1079,7 @@ output_per_mtok = 1.80
 [tiers."anthropic/claude-haiku-4-5".rates]
 input_per_mtok = 1.00
 cached_input_per_mtok = 0.10
+cache_write_per_mtok = 1.25
 output_per_mtok = 5.00
 
 [[tiers."anthropic/claude-haiku-4-5".candidates]]
@@ -1051,6 +1098,7 @@ tool_call = true
 [tiers."anthropic/claude-haiku-4-5".candidates.rates]
 input_per_mtok = 1.00
 cached_input_per_mtok = 0.10
+cache_write_per_mtok = 1.25
 output_per_mtok = 5.00
 
 # terra sits between luna and sol on the OpenAI 5.6 ladder. Added 2026-08-12,
@@ -1117,6 +1165,7 @@ output_per_mtok = 18.00
 [tiers."anthropic/claude-sonnet-5".rates]
 input_per_mtok = 2.00
 cached_input_per_mtok = 0.20
+cache_write_per_mtok = 2.50
 output_per_mtok = 10.00
 
 [[tiers."anthropic/claude-sonnet-5".candidates]]
@@ -1133,6 +1182,7 @@ tool_call = true
 [tiers."anthropic/claude-sonnet-5".candidates.rates]
 input_per_mtok = 2.00
 cached_input_per_mtok = 0.20
+cache_write_per_mtok = 2.50
 output_per_mtok = 10.00
 
 [tiers."anthropic/claude-opus-5"]
@@ -1140,6 +1190,7 @@ output_per_mtok = 10.00
 [tiers."anthropic/claude-opus-5".rates]
 input_per_mtok = 5.00
 cached_input_per_mtok = 0.50
+cache_write_per_mtok = 6.25
 output_per_mtok = 25.00
 
 [[tiers."anthropic/claude-opus-5".candidates]]
@@ -1156,6 +1207,7 @@ tool_call = true
 [tiers."anthropic/claude-opus-5".candidates.rates]
 input_per_mtok = 5.00
 cached_input_per_mtok = 0.50
+cache_write_per_mtok = 6.25
 output_per_mtok = 25.00
 
 [tiers."openai/gpt-5.6-sol"]
@@ -1204,6 +1256,7 @@ output_per_mtok = 30.00
 [tiers."anthropic/claude-fable-5".rates]
 input_per_mtok = 10.00
 cached_input_per_mtok = 1.00
+cache_write_per_mtok = 12.50
 output_per_mtok = 50.00
 
 [[tiers."anthropic/claude-fable-5".candidates]]
@@ -1220,6 +1273,7 @@ tool_call = true
 [tiers."anthropic/claude-fable-5".candidates.rates]
 input_per_mtok = 10.00
 cached_input_per_mtok = 1.00
+cache_write_per_mtok = 12.50
 output_per_mtok = 50.00
 
 # GOOGLE (added 2026-08-18). Gemini is reached over Google's OpenAI-compatible
@@ -1636,6 +1690,7 @@ output_per_mtok = 18.00
 [tiers."bedrock/claude-opus-4-6".rates]
 input_per_mtok = 5.50
 cached_input_per_mtok = 0.55
+cache_write_per_mtok = 6.875
 output_per_mtok = 27.50
 
 [[tiers."bedrock/claude-opus-4-6".candidates]]
@@ -1668,6 +1723,7 @@ tool_call = true
 [tiers."bedrock/claude-opus-4-6".candidates.rates]
 input_per_mtok = 5.50
 cached_input_per_mtok = 0.55
+cache_write_per_mtok = 6.875
 output_per_mtok = 27.50
 
 [tiers."bedrock/claude-opus-4-5"]
@@ -1675,6 +1731,7 @@ output_per_mtok = 27.50
 [tiers."bedrock/claude-opus-4-5".rates]
 input_per_mtok = 5.50
 cached_input_per_mtok = 0.55
+cache_write_per_mtok = 6.875
 output_per_mtok = 27.50
 
 [[tiers."bedrock/claude-opus-4-5".candidates]]
@@ -1703,6 +1760,7 @@ tool_call = true
 [tiers."bedrock/claude-opus-4-5".candidates.rates]
 input_per_mtok = 5.50
 cached_input_per_mtok = 0.55
+cache_write_per_mtok = 6.875
 output_per_mtok = 27.50
 
 [tiers."bedrock/claude-sonnet-4-5"]
@@ -1710,6 +1768,7 @@ output_per_mtok = 27.50
 [tiers."bedrock/claude-sonnet-4-5".rates]
 input_per_mtok = 3.30
 cached_input_per_mtok = 0.33
+cache_write_per_mtok = 4.125
 output_per_mtok = 16.50
 
 [[tiers."bedrock/claude-sonnet-4-5".candidates]]
@@ -1748,6 +1807,7 @@ tool_call = true
 [tiers."bedrock/claude-sonnet-4-5".candidates.rates]
 input_per_mtok = 3.30
 cached_input_per_mtok = 0.33
+cache_write_per_mtok = 4.125
 output_per_mtok = 16.50
 
 [tiers."bedrock/claude-haiku-4-5"]
@@ -1755,6 +1815,7 @@ output_per_mtok = 16.50
 [tiers."bedrock/claude-haiku-4-5".rates]
 input_per_mtok = 1.10
 cached_input_per_mtok = 0.11
+cache_write_per_mtok = 1.375
 output_per_mtok = 5.50
 
 [[tiers."bedrock/claude-haiku-4-5".candidates]]
@@ -1778,6 +1839,7 @@ tool_call = true
 [tiers."bedrock/claude-haiku-4-5".candidates.rates]
 input_per_mtok = 1.10
 cached_input_per_mtok = 0.11
+cache_write_per_mtok = 1.375
 output_per_mtok = 5.50
 
 # ---------------------------------------------------------------------------

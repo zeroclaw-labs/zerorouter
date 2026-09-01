@@ -63,6 +63,12 @@ struct SourceCost {
     input: Option<f64>,
     output: Option<f64>,
     cache_read: Option<f64>,
+    /// What the source says a cache WRITE costs. Read because the source does
+    /// publish it — for every Claude lane, and for the OpenAI family too — and
+    /// a dimension ZeroRouter now bills on is a dimension CI should be able to
+    /// check. See [`rates_agree`] for why silence on EITHER side ends the
+    /// comparison rather than producing a finding.
+    cache_write: Option<f64>,
     /// Conditional rates that REPLACE the flat ones above some measured
     /// threshold. Read from the structured array and from nowhere else.
     ///
@@ -87,6 +93,7 @@ struct SourceCostTier {
     input: Option<f64>,
     output: Option<f64>,
     cache_read: Option<f64>,
+    cache_write: Option<f64>,
     tier: SourceCostTierBound,
 }
 
@@ -372,12 +379,16 @@ fn upstream_tier_note(entry: &SourceModel) -> Option<String> {
     let mut notes: Vec<String> = Vec::new();
     for tier in &cost.tiers {
         let show = |rate: Option<f64>| rate.map_or_else(|| "-".to_owned(), |r| format!("{r}"));
+        // input / cached / write / output, the same four slots and the same
+        // order the report's main rate column uses, so a band note and a base
+        // row can be read against each other without counting positions.
         notes.push(format!(
-            "≥{} {}: {}/{}/{}",
+            "≥{} {}: {}/{}/{}/{}",
             tier.tier.size,
             tier.tier.kind,
             show(tier.input),
             show(tier.cache_read),
+            show(tier.cache_write),
             show(tier.output)
         ));
     }
@@ -579,6 +590,7 @@ fn conditional_agrees(recorded: &RateSchedule, upstream: &[SourceCostTier]) -> b
                         input_per_mtok: upstream.input,
                         output_per_mtok: upstream.output,
                         cached_input_per_mtok: upstream.cache_read,
+                        cache_write_per_mtok: upstream.cache_write,
                     },
                 )
         })
@@ -592,12 +604,57 @@ fn rates_agree(recorded: ModelRates, upstream: ModelRates) -> bool {
         (_, None) => true,
         (None, Some(_)) => false,
     };
+    // The cache-write dimension is compared ONLY when both sides state it, so
+    // its own comparator is deliberately weaker than `close` in one direction.
+    //
+    // For the other three, a file that declares nothing where the source
+    // publishes a rate is drift: the dimension exists on every lane, so silence
+    // is an omission. Cache write is not like that. An absent
+    // `cache_write_per_mtok` is a CAPABILITY decision — it is how a lane says
+    // it does not sell client prompt caching (see `ModelRates`) — and the
+    // source publishes a cache-write rate for lanes ZeroRouter deliberately
+    // does not sell it on. Reusing `close` here would turn every one of those
+    // deliberate omissions into a red CI run demanding a price for a feature
+    // the lane refuses.
+    //
+    // What survives is the check that matters: once a lane DOES transcribe the
+    // rate, it is reconciled against the source like any other number, so a
+    // vendor moving the multiplier is caught. Lanes that declare nothing are
+    // reported informationally instead — `cache_write_undeclared`.
+    let close_if_both = |a: Option<f64>, b: Option<f64>| match (a, b) {
+        (Some(a), Some(b)) => (a - b).abs() < EPSILON,
+        _ => true,
+    };
     close(recorded.input_per_mtok, upstream.input_per_mtok)
         && close(recorded.output_per_mtok, upstream.output_per_mtok)
         && close(
             recorded.cached_input_per_mtok,
             upstream.cached_input_per_mtok,
         )
+        && close_if_both(recorded.cache_write_per_mtok, upstream.cache_write_per_mtok)
+}
+
+/// Lanes the source prices cache writes for while `tiers.toml` declares none.
+///
+/// Not a finding and never actionable — see [`rates_agree`] for why silence is
+/// a decision here rather than an omission. It is printed anyway, because the
+/// alternative is that the reconciliation quietly knows something the operator
+/// does not: these are exactly the lanes that COULD sell prompt caching, with
+/// the vendor's own number already in hand, and the only thing standing between
+/// them and the feature is somebody transcribing it.
+#[must_use]
+pub fn cache_write_undeclared(findings: &[CandidateDrift]) -> Vec<(&str, f64)> {
+    findings
+        .iter()
+        .filter(|found| found.unreconcilable_reason.is_none())
+        .filter(|found| !found.recorded_basis.prices_cache_writes())
+        .filter_map(|found| {
+            found
+                .upstream_cost
+                .cache_write_per_mtok
+                .map(|rate| (found.candidate_id.as_str(), rate))
+        })
+        .collect()
 }
 
 /// Compare the metadata a candidate records against what the source publishes.
@@ -807,6 +864,7 @@ pub(crate) fn reconcile_with(
                     input_per_mtok: c.input,
                     output_per_mtok: c.output,
                     cached_input_per_mtok: c.cache_read,
+                    cache_write_per_mtok: c.cache_write,
                 })
                 .unwrap_or_default();
 
@@ -898,6 +956,7 @@ pub(crate) fn reconcile_with(
                                 input_per_mtok: tier.input,
                                 output_per_mtok: tier.output,
                                 cached_input_per_mtok: tier.cache_read,
+                                cache_write_per_mtok: tier.cache_write,
                             },
                         )
                     })
@@ -947,6 +1006,7 @@ mod tests {
 
     fn rates(input: f64, cached: f64, output: f64) -> ModelRates {
         ModelRates {
+            cache_write_per_mtok: None,
             input_per_mtok: Some(input),
             cached_input_per_mtok: Some(cached),
             output_per_mtok: Some(output),
@@ -1759,6 +1819,7 @@ mod tests {
 
     fn free() -> ModelRates {
         ModelRates {
+            cache_write_per_mtok: None,
             input_per_mtok: Some(0.0),
             cached_input_per_mtok: None,
             output_per_mtok: Some(0.0),

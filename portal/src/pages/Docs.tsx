@@ -166,6 +166,26 @@ const MODELS_ROW = `{
   }
 }`
 
+const CACHING = `{
+  "model": "${EXAMPLE_MODEL}",
+  "messages": [
+    {
+      "role": "system",
+      "content": "<a long, stable system prompt>",
+      "cache_control": { "type": "ephemeral" }
+    },
+    { "role": "user", "content": "and today's question" }
+  ]
+}`
+
+const CACHING_USAGE = `"usage": {
+  "prompt_tokens": 12400,
+  "completion_tokens": 180,
+  "total_tokens": 12580,
+  "prompt_tokens_details": { "cached_tokens": 11900 },
+  "zerorouter": { "cache_write_tokens": 0 }
+}`
+
 const CLI = `zerorouter user login     # RFC 8628 device flow; stores the credential
 zerorouter user whoami    # which router this machine is logged in to
 zerorouter user models    # the catalog, with rates and retention postures
@@ -250,6 +270,24 @@ const ERROR_ROWS: ReadonlyArray<ErrorRow> = [
     status: '400 · invalid_request_error',
     meaning:
       'The content is a shape ZeroRouter carries, but this model does not take it — an image sent to a text-only lane. Distinct from unsupported_request_fields because the fix is a different model, not a different body: the message names what this one accepts, and GET /v1/models lists what every lane takes. Nothing was reserved and no upstream was contacted.',
+  },
+  {
+    code: 'prompt_caching_unsupported',
+    status: '400 · invalid_request_error',
+    meaning:
+      'A cache_control breakpoint was sent to a model that does not sell client prompt caching. Same shape of answer as modality_unsupported and for the same reason — the fix is a different model, not a different body. The message names the model and points at the lanes that do accept it. Nothing was reserved and no upstream was contacted.',
+  },
+  {
+    code: 'cache_control_invalid',
+    status: '400 · invalid_request_error',
+    meaning:
+      'The breakpoint itself cannot be honoured: it is not exactly {"type": "ephemeral"}, it named a ttl this router does not sell, or the request carried more than four. The message says which. Refused here rather than upstream, so nothing is reserved and no dispatch is spent on a request the provider would reject.',
+  },
+  {
+    code: 'cache_control_unsupported',
+    status: '400 · invalid_request_error',
+    meaning:
+      'A cache_control was placed somewhere ZeroRouter cannot map onto an upstream content block — at the top level, or inside a message content part. Distinct from cache_control_invalid because the fix is to move it rather than to correct it: put it on the message object or the tool object, and the message says so.',
   },
   {
     code: 'request_too_large',
@@ -399,9 +437,10 @@ export function Docs() {
           is a 400. If your client sets one of these by default, unset it.
         </li>
         <li>
-          <span className="mono">cache_control</span> passthrough has its own code,{' '}
-          <span className="mono">400 cache_control_unsupported</span>, so a prompt-caching client
-          learns that specifically rather than reading a generic refusal.
+          <span className="mono">cache_control</span> is <strong>accepted</strong> on the Claude
+          lanes — see <a href="#caching">prompt caching</a> below. Everywhere else it is a{' '}
+          <span className="mono">400 prompt_caching_unsupported</span> naming the model, so a
+          prompt-caching client learns that specifically rather than reading a generic refusal.
         </li>
         <li>
           Bodies are capped at <strong>8 MiB</strong> and must arrive within 30 seconds.
@@ -491,6 +530,57 @@ export function Docs() {
         every size has no <span className="mono">overrides</span> key at all. The published band is
         the band settlement actually charges; the <Link to="/models">models page</Link> shows the
         numbers.
+      </p>
+
+      {/* ── Prompt caching ──────────────────────────────────────────────── */}
+
+      <h2 id="caching">Prompt caching</h2>
+      <p>
+        The Claude lanes — <span className="mono">anthropic/*</span> and{' '}
+        <span className="mono">bedrock/*</span> — accept Anthropic-style cache breakpoints. Mark a
+        stable prefix and the next request that repeats it is billed at the cached rate instead of
+        the input rate. For an agent loop that re-sends its whole history every turn, that is where
+        most of the bill goes.
+      </p>
+      <CodeBlock label="A cached system prompt">{CACHING}</CodeBlock>
+      <p>
+        Put <span className="mono">cache_control</span> on a <strong>message</strong> object or on a{' '}
+        <strong>tool</strong> object. It caches everything up to and including that item. The only
+        accepted value is <span className="mono">{'{"type": "ephemeral"}'}</span>, exactly — a{' '}
+        <span className="mono">ttl</span> field is refused by name, because the 1-hour cache is
+        priced differently upstream and this router does not sell it.
+      </p>
+      <p>
+        <strong>Four breakpoints per request, maximum.</strong> That is the upstream&apos;s limit,
+        and ZeroRouter enforces it at the edge — a fifth is a{' '}
+        <span className="mono">400 cache_control_invalid</span> before anything is reserved, rather
+        than an upstream failure after the request has been dispatched. Mark prefixes that actually
+        repeat: a system prompt, a tool list, the end of a long shared history.
+      </p>
+
+      <h3>What it costs</h3>
+      <p>
+        Three prices, not one. A <strong>cache read</strong> costs about a tenth of the input rate.
+        A <strong>cache write</strong> — the first request through a new breakpoint — costs{' '}
+        <strong>1.25×</strong> the input rate, which is Anthropic&apos;s published multiplier for
+        the 5-minute cache and exactly what these lanes are sold at. Everything else is fresh input.
+        So a breakpoint pays for itself on its second hit and is a small loss if it is never reused.
+      </p>
+      <p>
+        The response tells you which happened. The{' '}
+        <span className="mono">usage</span> object carries{' '}
+        <span className="mono">prompt_tokens_details.cached_tokens</span> for reads and{' '}
+        <span className="mono">zerorouter.cache_write_tokens</span> for writes — the write count is
+        namespaced because it is not part of the OpenAI schema.{' '}
+        <span className="mono">prompt_tokens</span> is the whole prompt and includes both.
+      </p>
+      <CodeBlock label="A second turn, hitting the cache">{CACHING_USAGE}</CodeBlock>
+      <p>
+        Sending <span className="mono">cache_control</span> to a lane that does not sell caching is a{' '}
+        <span className="mono">400 prompt_caching_unsupported</span> naming the model, rather than a
+        request served with your breakpoints silently discarded. Nothing is reserved and no upstream
+        is contacted. Lanes that do not accept it may still cache on their own — that is the
+        provider&apos;s automatic caching, which you neither control nor pay a write premium for.
       </p>
 
       {/* ── Streaming ───────────────────────────────────────────────────── */}
