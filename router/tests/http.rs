@@ -469,6 +469,12 @@ async fn model_pricing_matches_zeroclaws_model_pricing_wire_contract() {
     // backwards-compatibility claim for this field, asserted as a whole-row
     // snapshot: a flat tier's JSON is byte-identical to what it published
     // before conditional rates existed.
+    //
+    // It DOES carry `input_cache_write`, at 1.25x the prompt rate, because
+    // this is a lane that sells client prompt caching. The field's presence is
+    // the machine-readable form of that claim — a lane that refuses
+    // `cache_control` omits it entirely — which is what makes the rate
+    // something a customer can check rather than a number in a docs page.
     let candidate = data
         .iter()
         .find(|model| model["id"] == "anthropic/claude-haiku-4-5")
@@ -484,6 +490,7 @@ async fn model_pricing_matches_zeroclaws_model_pricing_wire_contract() {
                 "prompt": "0.000001",
                 "completion": "0.000005",
                 "input_cache_read": "0.0000001",
+                "input_cache_write": "0.00000125",
             },
             "context_length": 200_000,
             "max_output_tokens": 64_000,

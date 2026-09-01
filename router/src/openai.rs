@@ -947,15 +947,31 @@ pub struct ModelRetention {
 /// *per single token* — a numeric JSON value fails that struct's serde, so
 /// these must stay strings. Only the fields ZeroClaw's pricing normalizer
 /// (`zeroclaw-providers/src/pricing.rs::normalize_pricing`) actually reads
-/// are emitted: `prompt`, `completion`, and `input_cache_read`.
-/// `input_cache_write` is part of ZeroClaw's contract but that normalizer
-/// never reads it, so ZR never populates it.
+/// are emitted: `prompt`, `completion`, `input_cache_read`, and — since
+/// ZeroRouter began charging for cache writes — `input_cache_write`.
+///
+/// That last one was deliberately left unpopulated while it named a rate this
+/// router did not charge: `input_cache_write` is part of ZeroClaw's contract
+/// but its normalizer never reads it, so publishing it would have been noise.
+/// It stops being noise the moment a customer can be billed at it. The rule
+/// this catalog states about conditional bands applies unchanged — **a price a
+/// customer cannot see is a price they cannot check** — and a lane selling
+/// writes at 1.25x input while quoting only the input rate understates the
+/// bill on precisely the agent traffic the feature is for.
 #[derive(Debug, Serialize)]
 pub struct ModelPricing {
     pub prompt: String,
     pub completion: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub input_cache_read: Option<String>,
+    /// What a cache WRITE costs, when this lane sells them.
+    ///
+    /// Absent — and omitted from the wire entirely — on every lane that does
+    /// not, which is also every lane that refuses a client `cache_control`. So
+    /// its presence is the machine-readable answer to "can I cache against
+    /// this model", and its value is what doing so costs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_cache_write: Option<String>,
     /// What this model costs past a prompt-size threshold, when it reprices.
     ///
     /// **A price a customer cannot see is a price they cannot check**, and
@@ -993,6 +1009,8 @@ pub struct PricingOverride {
     pub completion: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub input_cache_read: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_cache_write: Option<String>,
 }
 
 impl ModelPricing {
@@ -1013,6 +1031,7 @@ impl ModelPricing {
             prompt: per_token_price(base.input_per_mtok.unwrap_or(0.0)),
             completion: per_token_price(base.output_per_mtok.unwrap_or(0.0)),
             input_cache_read: base.cached_input_per_mtok.map(per_token_price),
+            input_cache_write: base.cache_write_per_mtok.map(per_token_price),
             overrides: schedule
                 .conditional()
                 .iter()
@@ -1021,6 +1040,7 @@ impl ModelPricing {
                     prompt: per_token_price(conditional.rates.input_per_mtok.unwrap_or(0.0)),
                     completion: per_token_price(conditional.rates.output_per_mtok.unwrap_or(0.0)),
                     input_cache_read: conditional.rates.cached_input_per_mtok.map(per_token_price),
+                    input_cache_write: conditional.rates.cache_write_per_mtok.map(per_token_price),
                 })
                 .collect(),
         }
