@@ -1400,6 +1400,32 @@ async fn catalog_drift(args: CatalogDriftArgs) -> Result<()> {
         }
     }
 
+    // Lanes the source prices cache writes for while the file declares none.
+    //
+    // NOT drift, and the section says so in as many words. An absent
+    // `cache_write_per_mtok` is a capability decision — it is how a lane
+    // states that it does not sell client prompt caching — so the file and the
+    // source are not disagreeing about a number here, they are answering
+    // different questions. Treating it as drift would redden CI over every
+    // lane ZeroRouter has deliberately not turned the feature on for.
+    //
+    // It is printed anyway, because the alternative is a reconciliation that
+    // quietly knows something the operator does not: these are exactly the
+    // lanes that COULD sell prompt caching, with the vendor's own number
+    // already in hand, and the only thing between them and the feature is
+    // somebody transcribing it.
+    let undeclared = crate::drift::cache_write_undeclared(&findings);
+    if !undeclared.is_empty() {
+        println!(
+            "\nCache-write pricing published upstream but not declared here \
+             (INFORMATIONAL — an absent cache_write_per_mtok means the lane does not sell \
+             client prompt caching, which is a decision, not drift):"
+        );
+        for (candidate, rate) in undeclared {
+            println!("  {candidate:<32} source cache_write {rate}");
+        }
+    }
+
     // The SECOND source, if asked for. Printed before the summary below so
     // the exit-deciding lines stay last in the log, and separated from it so
     // nothing here reads as a finding: this section corroborates, it does not

@@ -6897,3 +6897,400 @@ async fn a_file_part_is_refused_because_no_lane_can_carry_one() {
     assert_eq!(vision.call_count(), 0);
     assert_eq!(open_reservations(&pool, api_key_id).await, 0);
 }
+
+// ---------------------------------------------------------------------------
+// Prompt caching: what a client `cache_control` costs, and where it is refused.
+//
+// The wire-level question — does the breakpoint reach the upstream at the
+// position the client named — is pinned by unit tests in `wire::anthropic`,
+// because a fake provider builds no Messages body. What these tests own is the
+// MONEY: that a reported cache split settles at three rates rather than one,
+// that a lane which cannot sell caching refuses before it takes any, and that
+// a mixed tier does not fall through to a rung that would drop the request's
+// breakpoints on the floor.
+// ---------------------------------------------------------------------------
+
+/// A `cache_control` breakpoint on the request's single user turn.
+fn caching_body(model: &str) -> Value {
+    let mut body = completion_body(model, false);
+    body["messages"] = json!([{
+        "role": "user",
+        "content": "hello",
+        "cache_control": {"type": "ephemeral"},
+    }]);
+    body
+}
+
+/// What a caching upstream reports: 1,000 prompt tokens of which 600 were read
+/// back from its cache and 300 were written into it, leaving 100 fresh.
+fn cache_split_usage() -> TokenUsage {
+    TokenUsage {
+        input_tokens: Some(1_000),
+        output_tokens: Some(20),
+        cached_input_tokens: Some(600),
+        cache_write_input_tokens: Some(300),
+    }
+}
+
+/// `(input_tokens, cached_input_tokens, cache_write_input_tokens)` off the
+/// settled row — the three buckets that have to explain its `cost_usd`.
+async fn settled_cache_split(pool: &PgPool, api_key_id: Uuid) -> (i32, i32, Option<i32>) {
+    query_as(
+        r#"
+        SELECT input_tokens, cached_input_tokens, cache_write_input_tokens
+        FROM usage_events
+        WHERE api_key_id = $1
+        "#,
+    )
+    .bind(api_key_id)
+    .fetch_one(pool)
+    .await
+    .expect("settled cache split must query")
+}
+
+/// The reservation this key is currently holding, in dollars.
+async fn reserved_cost(pool: &PgPool, api_key_id: Uuid) -> Option<Decimal> {
+    query_scalar::<_, Decimal>(
+        "SELECT reserved_cost_usd FROM usage_reservations WHERE api_key_id = $1",
+    )
+    .bind(api_key_id)
+    .fetch_optional(pool)
+    .await
+    .expect("reservation cost must query")
+}
+
+#[tokio::test]
+async fn a_cache_bearing_request_settles_its_three_buckets_at_three_rates() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let (api_key_id, key) = create_funded_key(&pool, "cache-split").await;
+    let cacher = FakeModelProvider::new(
+        "cacher",
+        vec![FakeOutcome::chat("cached hello", cache_split_usage())],
+    );
+    let state = router(pool.clone(), vec![cacher.clone()]);
+
+    let response = app(state.clone())
+        .oneshot(completion_request(&key, &caching_body("zero/test-caching")))
+        .await
+        .expect("completion request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    state.wait_for_background_tasks().await;
+
+    // The customer-visible usage object: OpenAI's half is exactly OpenAI's,
+    // and the written bucket rides ZeroRouter's own namespaced key rather than
+    // being smuggled into `prompt_tokens_details`.
+    assert_eq!(body["usage"]["prompt_tokens"], 1_000);
+    assert_eq!(body["usage"]["prompt_tokens_details"]["cached_tokens"], 600);
+    assert_eq!(body["usage"]["zerorouter"]["cache_write_tokens"], 300);
+
+    // THE MONEY. 100 fresh at $4.00 + 600 cached at $0.40 + 300 written at
+    // $5.00 + 20 output at $8.00, per million:
+    //   400 + 240 + 1500 + 160 = 2300 / 1e6 = 0.00230
+    let (_, _, input_tokens, output_tokens, cost_usd, status) =
+        settled_event(&pool, api_key_id).await;
+    assert_eq!(
+        input_tokens, 1_000,
+        "the prompt is the sum of all three buckets"
+    );
+    assert_eq!(output_tokens, 20);
+    assert_eq!(status, 200);
+    assert_eq!(
+        cost_usd,
+        decimal("0.00230"),
+        "the written bucket bills at 1.25x input, not at input"
+    );
+    // Had the write bucket been billed as fresh input, the same request would
+    // have cost 0.00200 — the 0.00030 difference IS the premium ZeroRouter
+    // pays and, until this dimension existed, did not collect.
+    assert_ne!(cost_usd, decimal("0.00200"));
+
+    // COGS at the candidate's own basis, which is half the sell rate on every
+    // dimension: 100*2.00 + 600*0.20 + 300*2.50 + 20*4.00 = 1150 / 1e6.
+    let (candidate_id, cost_basis_usd, _, _) = settled_provenance(&pool, api_key_id).await;
+    assert_eq!(candidate_id.as_deref(), Some("anthropic/cacher"));
+    assert_eq!(cost_basis_usd, Some(decimal("0.00115")));
+
+    // The row explains its own price: three buckets, recorded separately, so
+    // `cost_usd` is reproducible from the row and its rate snapshot.
+    assert_eq!(
+        settled_cache_split(&pool, api_key_id).await,
+        (1_000, 600, Some(300))
+    );
+
+    assert_eq!(
+        balance(&pool, user_of(&pool, api_key_id).await)
+            .await
+            .expect("balance must query"),
+        Decimal::from(50) - decimal("0.00230")
+    );
+    assert_eq!(open_reservations(&pool, api_key_id).await, 0);
+}
+
+#[tokio::test]
+async fn a_request_reporting_no_cache_activity_prices_as_it_always_did() {
+    // The control for the test above, and the guarantee that matters most
+    // broadly: adding a fourth dimension must not move the price of a request
+    // that never touches it. Same lane, same rates, an upstream that reports
+    // no cache split.
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let (api_key_id, key) = create_funded_key(&pool, "cache-none").await;
+    let cacher = FakeModelProvider::new(
+        "cacher",
+        vec![FakeOutcome::chat("plain hello", served_usage())],
+    );
+    let state = router(pool.clone(), vec![cacher.clone()]);
+
+    let response = app(state.clone())
+        .oneshot(completion_request(
+            &key,
+            &completion_body("zero/test-caching", false),
+        ))
+        .await
+        .expect("completion request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    state.wait_for_background_tasks().await;
+
+    // No extension key at all, so a client parsing this against OpenAI's
+    // schema meets nothing new.
+    assert!(body["usage"].get("zerorouter").is_none());
+    assert!(body["usage"].get("prompt_tokens_details").is_none());
+
+    // 1000 fresh at $4.00 + 20 output at $8.00 = 4160 / 1e6.
+    let (_, _, _, _, cost_usd, _) = settled_event(&pool, api_key_id).await;
+    assert_eq!(cost_usd, decimal("0.00416"));
+    assert_eq!(
+        settled_cache_split(&pool, api_key_id).await,
+        (1_000, 0, Some(0)),
+        "a measured absence of cache activity is zero, and is recorded as zero"
+    );
+}
+
+#[tokio::test]
+async fn a_lane_that_does_not_sell_caching_refuses_before_it_reserves_anything() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let (api_key_id, key) = create_funded_key(&pool, "cache-refused").await;
+    // `zero/test-pair` prices no cache writes on either rung, so no candidate
+    // can honour a breakpoint and the request is refused outright.
+    let primary = FakeModelProvider::new("primary", vec![]);
+    let secondary = FakeModelProvider::new("secondary", vec![]);
+    let state = router(pool.clone(), vec![primary.clone(), secondary.clone()]);
+
+    let response = app(state.clone())
+        .oneshot(completion_request(&key, &caching_body("zero/test-pair")))
+        .await
+        .expect("completion request should complete");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = json_body(response).await;
+    assert_eq!(body["error"]["code"], "prompt_caching_unsupported");
+    assert_eq!(body["error"]["param"], "messages");
+    // The message names the model that was asked for and points at ones that
+    // do work — the information needed to fix the request, which a bare code
+    // does not carry.
+    let message = body["error"]["message"].as_str().unwrap_or_default();
+    assert!(message.contains("zero/test-pair"), "{message}");
+    assert!(message.contains("anthropic/"), "{message}");
+
+    // Nothing moved: no dispatch, no reservation, no settled row. This is the
+    // property the gate's PLACEMENT buys — it sits after resolution so the
+    // answer can name the model, and before `sized_reservation`, the provider
+    // route and `admit_usage`.
+    assert_eq!(primary.call_count(), 0);
+    assert_eq!(secondary.call_count(), 0);
+    assert_eq!(open_reservations(&pool, api_key_id).await, 0);
+    assert_eq!(settled_count(&pool, api_key_id).await, 0);
+}
+
+#[tokio::test]
+async fn a_mixed_tier_skips_the_rung_that_cannot_carry_a_breakpoint() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let (api_key_id, key) = create_funded_key(&pool, "cache-mixed").await;
+    // `openai/uncached` is FIRST in the fixture's candidate order, so it is
+    // what an unmarked request is served by — and what a cache-bearing request
+    // must not fall through to, because it would drop the breakpoints.
+    let uncached = FakeModelProvider::new("uncached", vec![]);
+    let cacher = FakeModelProvider::new(
+        "mixed-cacher",
+        vec![FakeOutcome::chat("cached hello", cache_split_usage())],
+    );
+    let state = router_matching_aliases(pool.clone(), vec![uncached.clone(), cacher.clone()]);
+
+    let response = app(state.clone())
+        .oneshot(completion_request(
+            &key,
+            &caching_body("zero/test-mixed-caching"),
+        ))
+        .await
+        .expect("completion request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    state.wait_for_background_tasks().await;
+
+    assert_eq!(
+        uncached.call_count(),
+        0,
+        "the incapable rung is SKIPPED, not merely deprioritised: a fall-through to it \
+         would serve the request with its breakpoints silently discarded"
+    );
+    assert_eq!(cacher.call_count(), 1);
+    let (candidate_id, _, _, _) = settled_provenance(&pool, api_key_id).await;
+    assert_eq!(candidate_id.as_deref(), Some("anthropic/mixed-cacher"));
+
+    // And the same tier still serves its first rung when nothing is marked,
+    // so the narrowing is scoped to the request that asked for it.
+    let (api_key_id, key) = create_funded_key(&pool, "cache-mixed-plain").await;
+    let uncached = FakeModelProvider::new(
+        "uncached",
+        vec![FakeOutcome::chat("plain hello", served_usage())],
+    );
+    let cacher = FakeModelProvider::new("mixed-cacher", vec![]);
+    let state = router_matching_aliases(pool.clone(), vec![uncached.clone(), cacher.clone()]);
+    let response = app(state.clone())
+        .oneshot(completion_request(
+            &key,
+            &completion_body("zero/test-mixed-caching", false),
+        ))
+        .await
+        .expect("completion request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    state.wait_for_background_tasks().await;
+    assert_eq!(uncached.call_count(), 1);
+    assert_eq!(cacher.call_count(), 0);
+    let (candidate_id, _, _, _) = settled_provenance(&pool, api_key_id).await;
+    assert_eq!(candidate_id.as_deref(), Some("openai/uncached"));
+}
+
+#[tokio::test]
+async fn a_malformed_breakpoint_is_refused_by_name_before_admission() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let (api_key_id, key) = create_funded_key(&pool, "cache-malformed").await;
+
+    // Each of the four refusals a breakpoint can earn, with the code a client
+    // branches on. All four are decided before the catalog is even consulted,
+    // which is why they are asserted against a lane that DOES sell caching:
+    // the answer must not depend on the model.
+    let cases: Vec<(Value, &str)> = vec![
+        // Wrong shape.
+        (
+            json!([{"role": "user", "content": "hi",
+                    "cache_control": {"type": "persistent"}}]),
+            "cache_control_invalid",
+        ),
+        // A ttl this catalog has no price for.
+        (
+            json!([{"role": "user", "content": "hi",
+                    "cache_control": {"type": "ephemeral", "ttl": "1h"}}]),
+            "cache_control_invalid",
+        ),
+        // A fifth breakpoint, which the upstream would 400 anyway.
+        (
+            json!([
+                {"role": "user", "content": "a", "cache_control": {"type": "ephemeral"}},
+                {"role": "user", "content": "b", "cache_control": {"type": "ephemeral"}},
+                {"role": "user", "content": "c", "cache_control": {"type": "ephemeral"}},
+                {"role": "user", "content": "d", "cache_control": {"type": "ephemeral"}},
+                {"role": "user", "content": "e", "cache_control": {"type": "ephemeral"}},
+            ]),
+            "cache_control_invalid",
+        ),
+        // A placement the router cannot map onto a Messages content block.
+        (
+            json!([{"role": "user", "content": [
+                {"type": "text", "text": "hi", "cache_control": {"type": "ephemeral"}}
+            ]}]),
+            "cache_control_unsupported",
+        ),
+    ];
+
+    for (messages, code) in cases {
+        let cacher = FakeModelProvider::new("cacher", vec![]);
+        let state = router(pool.clone(), vec![cacher.clone()]);
+        let mut body = completion_body("zero/test-caching", false);
+        body["messages"] = messages.clone();
+        let response = app(state.clone())
+            .oneshot(completion_request(&key, &body))
+            .await
+            .expect("completion request should complete");
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "should have been refused: {messages}"
+        );
+        let refused = json_body(response).await;
+        assert_eq!(refused["error"]["code"], code, "for {messages}");
+        assert_eq!(cacher.call_count(), 0);
+    }
+
+    assert_eq!(open_reservations(&pool, api_key_id).await, 0);
+    assert_eq!(settled_count(&pool, api_key_id).await, 0);
+}
+
+#[tokio::test]
+async fn a_caching_lane_reserves_at_the_cache_write_rate_it_could_settle_at() {
+    // The reservation-sufficiency property, observed on a live hold rather
+    // than argued about. Settlement is clamped to the reservation, so if the
+    // hold were sized at the input rate a request that wrote its whole prompt
+    // into the cache would settle above it and ZeroRouter would silently fail
+    // to collect the 25% premium it had just paid.
+    //
+    // The lane's rates differ only in that it sells cache writes at 1.25x, so
+    // the two holds below are the same arithmetic on the same prompt bound and
+    // their RATIO is the multiplier.
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let hold_for = |tier: &'static str, label: &'static str| {
+        let pool = pool.clone();
+        async move {
+            let (api_key_id, key) = create_funded_key(&pool, label).await;
+            // The fake holds the request open — and with it the reservation —
+            // for long enough to read the row. Five seconds against a 20ms
+            // poll is ~250 chances to catch it, and the stall is the whole
+            // cost of the test, so it is kept as short as that margin allows.
+            let stall =
+                FakeModelProvider::new("held", vec![FakeOutcome::Stall(Duration::from_secs(5))]);
+            let fakes = if tier == "zero/test-pair" {
+                vec![stall.clone(), FakeModelProvider::new("held2", vec![])]
+            } else {
+                vec![stall.clone()]
+            };
+            let state = router(pool.clone(), fakes);
+            let request =
+                app(state.clone()).oneshot(completion_request(&key, &completion_body(tier, false)));
+            let reader = async {
+                // Poll until admission has written the row.
+                for _ in 0..250 {
+                    if let Some(cost) = reserved_cost(&pool, api_key_id).await {
+                        return cost;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                panic!("no reservation appeared for {tier}");
+            };
+            let (_, cost) = tokio::join!(request, reader);
+            cost
+        }
+    };
+
+    // `zero/test-caching` sells 4.00 input and 5.00 written; `zero/test-pair`
+    // sells 3.00 input and prices no writes at all. Both hold the same
+    // byte-derived prompt bound and the same output bound, so the caching
+    // lane's hold is strictly larger.
+    let caching = hold_for("zero/test-caching", "hold-caching").await;
+    let plain = hold_for("zero/test-pair", "hold-plain").await;
+    assert!(
+        caching > plain,
+        "a lane that can settle a prompt token at 1.25x must hold more than one that cannot: \
+         caching {caching}, plain {plain}"
+    );
+}

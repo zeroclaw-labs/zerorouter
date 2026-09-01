@@ -1190,6 +1190,178 @@ mod tests {
         assert!(!luna().any_required_rates_are_zero());
     }
 
+    // -----------------------------------------------------------------------
+    // Cache writes: the fourth dimension, and the two different jobs its
+    // absence does.
+    // -----------------------------------------------------------------------
+
+    /// A rate table with a cache-write price, at Anthropic's 1.25x multiplier.
+    fn writing(input: f64, cached: f64, output: f64) -> ModelRates {
+        ModelRates {
+            cache_write_per_mtok: Some(input * 1.25),
+            ..rates(input, Some(cached), output)
+        }
+    }
+
+    #[test]
+    fn a_lane_that_does_not_price_cache_writes_is_incapable_of_them() {
+        // The capability question is asked on the DECLARED field and nowhere
+        // else. This is what the admission gate reads, so an absent rate has
+        // to answer "no" here even though the biller will happily charge such
+        // a lane's writes at its input rate.
+        assert!(!rates(2.0, Some(0.2), 10.0).prices_cache_writes());
+        assert!(writing(2.0, 0.2, 10.0).prices_cache_writes());
+        // ...and the same question at schedule level, where it must hold in
+        // EVERY band. A schedule that declares the price at the base and drops
+        // it above a threshold would sell long cache-writing requests at a
+        // rate nobody chose, so it does not count as capable.
+        let base_only = RateSchedule::new(
+            writing(2.0, 0.2, 10.0),
+            vec![ConditionalRate {
+                min_prompt_tokens: 200_000,
+                rates: rates(4.0, Some(0.4), 18.0),
+            }],
+        );
+        assert!(
+            !base_only.prices_cache_writes(),
+            "a band that omits the dimension makes the whole schedule incapable"
+        );
+        assert!(RateSchedule::flat(writing(2.0, 0.2, 10.0)).prices_cache_writes());
+    }
+
+    #[test]
+    fn an_absent_cache_write_rate_still_bills_at_the_input_rate() {
+        // The other half of the same absence, and the half that keeps this
+        // change from costing anybody money. `usage_cost` reads the EFFECTIVE
+        // value, so a lane that declares nothing charges input for a write —
+        // which is exactly what it charged before the dimension existed. The
+        // alternative reading, "absent means free", would give the Anthropic
+        // wire's own three breakpoints away on every lane that has not
+        // transcribed a price.
+        let silent = rates(2.0, Some(0.2), 10.0);
+        assert_eq!(silent.cache_write_per_mtok, None);
+        assert_eq!(silent.effective_cache_write_per_mtok(), Some(2.0));
+        // A table with no input rate has nothing to fall back to, and says so
+        // rather than inventing a zero.
+        assert_eq!(ModelRates::default().effective_cache_write_per_mtok(), None);
+    }
+
+    #[test]
+    fn a_conditional_band_carries_its_own_cache_write_rate() {
+        // A band REPLACES the base table wholesale, on this dimension like the
+        // other three, and the band that applies is selected by prompt size in
+        // the usual way.
+        let schedule = RateSchedule::new(
+            writing(2.0, 0.2, 10.0),
+            vec![ConditionalRate {
+                min_prompt_tokens: 200_000,
+                rates: writing(4.0, 0.4, 18.0),
+            }],
+        );
+        assert_eq!(
+            schedule.at_prompt_tokens(199_999).cache_write_per_mtok,
+            Some(2.5)
+        );
+        assert_eq!(
+            schedule.at_prompt_tokens(200_000).cache_write_per_mtok,
+            Some(5.0)
+        );
+        // And the worst case is the dearest of them, per dimension.
+        assert_eq!(schedule.worst_case().cache_write_per_mtok, Some(5.0));
+    }
+
+    #[test]
+    fn a_reservation_is_sized_at_the_dearest_rate_a_prompt_token_could_carry() {
+        // THE reservation-sufficiency property, stated as arithmetic.
+        //
+        // Every prompt token in a reservation is priced at `input_per_mtok`,
+        // because the reservation's usage carries no cache detail. Settlement
+        // splits the real prompt and can charge a write rate ABOVE the input
+        // rate — the first prompt-side rate that has ever been allowed above
+        // it — and the debit is clamped to the reservation. So the reserved
+        // input rate has to be the maximum over all three prompt-side rates,
+        // or a fully cache-writing request settles above its own hold and
+        // ZeroRouter eats the difference.
+        let schedule = RateSchedule::flat(writing(2.0, 0.2, 10.0));
+        assert_eq!(schedule.worst_case().input_per_mtok, Some(2.0));
+        assert_eq!(
+            schedule.reservation_rates().input_per_mtok,
+            Some(2.5),
+            "the hold prices the prompt bound at the cache-write rate, not the input rate"
+        );
+        // Output is untouched: an output token has exactly one rate.
+        assert_eq!(schedule.reservation_rates().output_per_mtok, Some(10.0));
+
+        // The dominance property the clamp depends on, checked against every
+        // band a request could land in and every way its prompt could split.
+        for schedule in [
+            RateSchedule::flat(writing(2.0, 0.2, 10.0)),
+            RateSchedule::new(
+                writing(2.0, 0.2, 10.0),
+                vec![ConditionalRate {
+                    min_prompt_tokens: 200_000,
+                    rates: writing(4.0, 0.4, 18.0),
+                }],
+            ),
+        ] {
+            let reserved = schedule.reservation_rates().input_per_mtok;
+            for prompt_tokens in [0, 199_999, 200_000, u64::MAX] {
+                let applied = schedule.at_prompt_tokens(prompt_tokens);
+                for settled in [
+                    applied.input_per_mtok,
+                    applied.effective_cached_input_per_mtok(),
+                    applied.effective_cache_write_per_mtok(),
+                ] {
+                    assert!(
+                        settled <= reserved,
+                        "a prompt token at {prompt_tokens} can settle at {settled:?}, above the \
+                         {reserved:?} the reservation held for it"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_catalog_without_cache_write_rates_reserves_exactly_what_it_always_did() {
+        // The backwards-compatibility guarantee for the reservation change,
+        // stated as a test rather than left to inspection: on every schedule
+        // that declares no cache-write rate, `reservation_rates` must equal
+        // `worst_case` — the same `Option` shape included, not merely a table
+        // that happens to hold the same amount.
+        for schedule in [
+            RateSchedule::flat(rates(2.0, None, 10.0)),
+            RateSchedule::flat(rates(2.0, Some(0.2), 10.0)),
+            luna(),
+        ] {
+            assert_eq!(
+                schedule.reservation_rates(),
+                schedule.worst_case(),
+                "a lane that does not sell cache writes must not hold a cent more"
+            );
+        }
+    }
+
+    #[test]
+    fn a_declared_cache_write_rate_stops_a_schedule_being_free() {
+        // Same rule as the cached dimension: a DECLARED nonzero rate is money,
+        // and the free lane writes no reservation and no ledger row, so a
+        // schedule that bills for writes must never reach it.
+        let free_except_writes = ModelRates {
+            cache_write_per_mtok: Some(1.0),
+            ..rates(0.0, Some(0.0), 0.0)
+        };
+        assert!(!free_except_writes.are_zero());
+        assert!(
+            free_except_writes.required_rates_are_zero(),
+            "which is exactly why the weaker question is not the one that refuses it"
+        );
+        // An OMITTED write rate over a zero input rate is still free, so the
+        // commonest honest local config does not have to write `= 0` for a
+        // dimension its server has never heard of.
+        assert!(rates(0.0, None, 0.0).are_zero());
+    }
+
     #[test]
     fn the_usage_contract_is_cached_as_a_subset_of_input() {
         // The one invariant every wire must normalize to, restated here
@@ -1205,6 +1377,31 @@ mod tests {
         assert_eq!(
             fresh, 100,
             "the billable fresh portion is input minus cached"
+        );
+    }
+
+    #[test]
+    fn cached_and_written_tokens_are_disjoint_subsets_of_the_prompt() {
+        // The contract the Anthropic wire normalizes into, restated where the
+        // type lives. Three buckets, and `input_tokens` is their SUM — not the
+        // fresh portion, which is what Anthropic itself reports and what the
+        // wire deliberately converts away from.
+        let usage = TokenUsage {
+            input_tokens: Some(1_000),
+            output_tokens: Some(50),
+            cached_input_tokens: Some(600),
+            cache_write_input_tokens: Some(300),
+        };
+        let cached = usage.cached_input_tokens.unwrap();
+        let written = usage.cache_write_input_tokens.unwrap();
+        assert!(
+            cached + written <= usage.input_tokens.unwrap(),
+            "the two cache buckets are disjoint and both sit inside the prompt"
+        );
+        assert_eq!(
+            usage.input_tokens.unwrap() - cached - written,
+            100,
+            "the fresh portion is what neither bucket claimed"
         );
     }
 

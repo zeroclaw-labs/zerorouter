@@ -2287,6 +2287,318 @@ mod tests {
         assert!(request.contains_cache_control());
     }
 
+    // -----------------------------------------------------------------------
+    // Cache breakpoints: what the request surface accepts, and what it refuses
+    // before anything is reserved.
+    // -----------------------------------------------------------------------
+
+    fn parse(body: serde_json::Value) -> ChatCompletionRequest {
+        serde_json::from_value(body).expect("request should parse")
+    }
+
+    #[test]
+    fn a_breakpoint_on_a_message_or_a_tool_is_accepted_and_counted() {
+        let request = parse(json!({
+            "model": "anthropic/claude-sonnet-5",
+            "messages": [
+                {"role": "system", "content": "be terse",
+                 "cache_control": {"type": "ephemeral"}},
+                {"role": "user", "content": "hi"}
+            ],
+            "tools": [{
+                "type": "function",
+                "function": {"name": "shell", "description": "run", "parameters": {}},
+                "cache_control": {"type": "ephemeral"}
+            }]
+        }));
+        assert_eq!(request.cache_breakpoints(), Ok(2));
+        assert_eq!(request.unplaceable_cache_control(), None);
+        // And they survive into the provider view the wires read — this is the
+        // seam a stripped-breakpoint bug would show up at first.
+        let messages = request.provider_messages();
+        assert!(messages[0].cache_control, "the system turn keeps its mark");
+        assert!(
+            !messages[1].cache_control,
+            "an unmarked turn stays unmarked"
+        );
+        assert!(request.provider_tools()[0].cache_control);
+    }
+
+    #[test]
+    fn a_request_that_asks_for_nothing_reports_no_breakpoints() {
+        // The overwhelmingly common answer, and the one that has to keep the
+        // wires on their own default placement.
+        let request = parse(json!({
+            "model": "anthropic/claude-sonnet-5",
+            "messages": [{"role": "user", "content": "hi"}]
+        }));
+        assert_eq!(request.cache_breakpoints(), Ok(0));
+        assert!(!request.provider_messages()[0].cache_control);
+    }
+
+    #[test]
+    fn only_the_ephemeral_shape_is_accepted() {
+        // A breakpoint is a billing instruction — it decides which tokens are
+        // charged at 1.25x — so an unrecognized key is a client believing
+        // something about this request that ZeroRouter is not going to do.
+        for value in [
+            json!({}),
+            json!({"type": "persistent"}),
+            json!({"type": "ephemeral", "scope": "global"}),
+            json!("ephemeral"),
+            json!(true),
+            json!(null),
+        ] {
+            let request = parse(json!({
+                "model": "anthropic/claude-sonnet-5",
+                "messages": [{"role": "user", "content": "hi", "cache_control": value}]
+            }));
+            assert_eq!(
+                request.cache_breakpoints(),
+                Err(CacheControlFault::Shape),
+                "accepted a cache_control this router does not implement: {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_ttl_is_refused_by_name_rather_than_quietly_downgraded() {
+        // Anthropic's 1-hour TTL is priced at 2x input; this catalog has
+        // transcribed only the 1.25x five-minute figure. Forwarding it would
+        // bill the customer 1.25x for a write ZeroRouter pays 2x on, and
+        // dropping it would sell an hour of cache that was never written —
+        // so it is named, and the client is told which.
+        for ttl in [json!("1h"), json!("5m"), json!(3600)] {
+            let request = parse(json!({
+                "model": "anthropic/claude-sonnet-5",
+                "messages": [{
+                    "role": "user", "content": "hi",
+                    "cache_control": {"type": "ephemeral", "ttl": ttl}
+                }]
+            }));
+            assert_eq!(
+                request.cache_breakpoints(),
+                Err(CacheControlFault::Ttl),
+                "a ttl of {ttl} must be refused by name, even the one we do serve"
+            );
+        }
+    }
+
+    #[test]
+    fn a_fifth_breakpoint_is_refused_here_rather_than_upstream() {
+        // Anthropic 400s the fifth. Counting at the edge turns that into a
+        // ZeroRouter 400 with a number in it, before any reservation is taken
+        // — rather than an upstream refusal after the walk has burned a
+        // dispatch and spent the customer's latency budget.
+        let message = |text: &str| json!({"role": "user", "content": text, "cache_control": {"type": "ephemeral"}});
+        let four = parse(json!({
+            "model": "anthropic/claude-sonnet-5",
+            "messages": [message("a"), message("b"), message("c"), message("d")]
+        }));
+        assert_eq!(four.cache_breakpoints(), Ok(MAX_CACHE_BREAKPOINTS));
+
+        let five = parse(json!({
+            "model": "anthropic/claude-sonnet-5",
+            "messages": [message("a"), message("b"), message("c"), message("d")],
+            "tools": [{
+                "type": "function",
+                "function": {"name": "shell", "description": "run", "parameters": {}},
+                "cache_control": {"type": "ephemeral"}
+            }]
+        }));
+        assert_eq!(
+            five.cache_breakpoints(),
+            Err(CacheControlFault::TooMany { count: 5 }),
+            "tools count toward the same budget as messages, because upstream they do"
+        );
+    }
+
+    #[test]
+    fn a_breakpoint_the_router_cannot_place_is_named_rather_than_ignored() {
+        // Two placements survive the old blanket refusal, and both are refused
+        // because there is nowhere honest to put them rather than because
+        // caching is unsupported. The content-part spelling is the one
+        // OpenRouter documents, so it is the one a migrating client is most
+        // likely to send — which is exactly why the answer names where a
+        // breakpoint DOES go instead of just saying no.
+        let in_a_part = parse(json!({
+            "model": "anthropic/claude-sonnet-5",
+            "messages": [{
+                "role": "user",
+                "content": [{"type": "text", "text": "hi",
+                             "cache_control": {"type": "ephemeral"}}]
+            }]
+        }));
+        assert_eq!(
+            in_a_part.unplaceable_cache_control(),
+            Some("a message content part")
+        );
+
+        let at_the_top = parse(json!({
+            "model": "anthropic/claude-sonnet-5",
+            "cache_control": {"type": "ephemeral"},
+            "messages": [{"role": "user", "content": "hi"}]
+        }));
+        assert_eq!(
+            at_the_top.unplaceable_cache_control(),
+            Some("the top level of the request")
+        );
+
+        // Neither counts as a breakpoint: the request is refused before the
+        // count is ever consulted, and reporting one would let a caller that
+        // ignored the refusal think a boundary had been placed.
+        assert_eq!(in_a_part.cache_breakpoints(), Ok(0));
+        assert_eq!(at_the_top.cache_breakpoints(), Ok(0));
+    }
+
+    // -----------------------------------------------------------------------
+    // Pricing a three-way prompt split.
+    // -----------------------------------------------------------------------
+
+    /// `anthropic/claude-sonnet-5` as the catalog sells it: 2.00 input, 0.20
+    /// cached, 2.50 written (1.25x input), 10.00 output.
+    fn sonnet() -> ModelRates {
+        ModelRates {
+            input_per_mtok: Some(2.00),
+            cached_input_per_mtok: Some(0.20),
+            cache_write_per_mtok: Some(2.50),
+            output_per_mtok: Some(10.00),
+        }
+    }
+
+    fn split(prompt: u64, cached: u64, written: u64, output: u64) -> OpenAiUsage {
+        OpenAiUsage {
+            prompt_tokens: prompt,
+            completion_tokens: output,
+            total_tokens: prompt + output,
+            prompt_tokens_details: Some(PromptTokenDetails {
+                cached_tokens: cached,
+                cache_write_tokens: written,
+            }),
+        }
+    }
+
+    #[test]
+    fn a_prompt_is_priced_in_three_buckets_at_three_rates() {
+        // The money, exactly. 10,000 prompt tokens of which 6,000 were read
+        // from cache and 3,000 written into it, leaving 1,000 fresh, plus 500
+        // output.
+        let usage = split(10_000, 6_000, 3_000, 500);
+        let expected = (Decimal::from(1_000) * Decimal::from_f64(2.00).unwrap()
+            + Decimal::from(6_000) * Decimal::from_f64(0.20).unwrap()
+            + Decimal::from(3_000) * Decimal::from_f64(2.50).unwrap()
+            + Decimal::from(500) * Decimal::from_f64(10.00).unwrap())
+            / Decimal::from(1_000_000);
+        assert_eq!(usage_cost(sonnet(), usage), Some(expected));
+
+        // And it is strictly more than the same request would have cost when
+        // writes were billed as fresh reads — which is the whole point, and the
+        // amount is the 25% premium on the written bucket.
+        let as_fresh = ModelRates {
+            cache_write_per_mtok: None,
+            ..sonnet()
+        };
+        let premium =
+            Decimal::from(3_000) * Decimal::from_f64(0.50).unwrap() / Decimal::from(1_000_000);
+        assert_eq!(
+            usage_cost(sonnet(), usage).unwrap() - usage_cost(as_fresh, usage).unwrap(),
+            premium
+        );
+    }
+
+    #[test]
+    fn a_lane_that_does_not_price_writes_bills_them_as_fresh_input() {
+        // Absence is not free. A lane with no transcribed write price charges
+        // input for a written token — precisely what it charged before the
+        // dimension existed — so the Anthropic wire's own breakpoints cannot
+        // give inference away on a lane nobody has priced yet.
+        let silent = ModelRates {
+            cache_write_per_mtok: None,
+            ..sonnet()
+        };
+        let written = split(10_000, 0, 4_000, 0);
+        let all_fresh = split(10_000, 0, 0, 0);
+        assert_eq!(
+            usage_cost(silent, written),
+            usage_cost(silent, all_fresh),
+            "with no write rate the three buckets collapse to one"
+        );
+    }
+
+    #[test]
+    fn a_usage_with_no_cache_detail_prices_exactly_as_it_always_did() {
+        // The backwards-compatibility guarantee for every reservation and for
+        // every wire that reports no cache numbers.
+        let plain = OpenAiUsage {
+            prompt_tokens: 10_000,
+            completion_tokens: 500,
+            total_tokens: 10_500,
+            prompt_tokens_details: None,
+        };
+        let expected = (Decimal::from(10_000) * Decimal::from_f64(2.00).unwrap()
+            + Decimal::from(500) * Decimal::from_f64(10.00).unwrap())
+            / Decimal::from(1_000_000);
+        assert_eq!(usage_cost(sonnet(), plain), Some(expected));
+    }
+
+    #[test]
+    fn buckets_that_do_not_add_up_are_clamped_rather_than_believed() {
+        // An upstream whose three numbers overflow the prompt must not be able
+        // to inflate a bill. Cached is taken first and written out of what is
+        // left, so the excess is lost from the DEARER bucket and the fresh
+        // remainder can never go negative.
+        let overclaimed = split(1_000, 800, 800, 0);
+        let honest = split(1_000, 800, 200, 0);
+        assert_eq!(
+            usage_cost(sonnet(), overclaimed),
+            usage_cost(sonnet(), honest)
+        );
+        assert_eq!(
+            usage_cost(sonnet(), split(1_000, 2_000, 2_000, 0)),
+            usage_cost(sonnet(), split(1_000, 1_000, 0, 0)),
+            "a prompt that is entirely cache reads is the ceiling, not a negative remainder"
+        );
+    }
+
+    #[test]
+    fn the_wire_reports_writes_under_zerorouters_own_key_and_never_openais() {
+        // A client parsing `prompt_tokens_details` against OpenAI's schema must
+        // not meet a key the vendor never defined, and a response from a lane
+        // with no cache activity must be byte-identical to what it always was.
+        let none = serde_json::to_value(OpenAiUsage {
+            prompt_tokens: 10,
+            completion_tokens: 2,
+            total_tokens: 12,
+            prompt_tokens_details: None,
+        })
+        .unwrap();
+        assert_eq!(
+            none,
+            json!({"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12})
+        );
+
+        // A first turn writes cache and reads none, and that must NOT
+        // manufacture a `prompt_tokens_details` object out of a zero.
+        let written_only = serde_json::to_value(split(10, 0, 8, 2)).unwrap();
+        assert_eq!(
+            written_only,
+            json!({
+                "prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12,
+                "zerorouter": {"cache_write_tokens": 8}
+            })
+        );
+
+        let both = serde_json::to_value(split(10, 6, 3, 2)).unwrap();
+        assert_eq!(
+            both,
+            json!({
+                "prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12,
+                "prompt_tokens_details": {"cached_tokens": 6},
+                "zerorouter": {"cache_write_tokens": 3}
+            })
+        );
+    }
+
     #[test]
     fn detects_unsupported_openai_controls() {
         let request: ChatCompletionRequest = serde_json::from_value(json!({

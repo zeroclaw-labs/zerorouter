@@ -1425,6 +1425,172 @@ mod anthropic_review_fix_tests {
     }
 
     #[test]
+    fn a_client_that_places_breakpoints_gets_its_own_placement_and_not_the_wires() {
+        // The transparency rule, and the whole point of accepting
+        // `cache_control` at all: the boundaries the customer named are the
+        // boundaries sent upstream, at the exact positions they named them.
+        let wire = AnthropicWire::new("anthropic", "k", None, 512, 900);
+        let messages = vec![
+            ChatMessage::system("be terse").with_cache_breakpoint(),
+            ChatMessage::user("first question").with_cache_breakpoint(),
+            ChatMessage::assistant("first answer"),
+            ChatMessage::user("second question"),
+        ];
+        let spec = |name: &str, marked: bool| crate::provider::ToolSpec {
+            cache_control: marked,
+            name: name.into(),
+            description: "d".into(),
+            parameters: (json!({"type": "object"})),
+        };
+        // The client marks the FIRST of two tools. The wire's own default
+        // marks the last, so this placement is only reachable by honouring the
+        // client — and it is the one that matters, because a breakpoint caches
+        // everything above it and moving one changes both the hit rate and
+        // the bill.
+        let tools = vec![spec("a", true), spec("b", false)];
+        let body = wire.request_body("claude-sonnet-5", &messages, Some(&tools), None, false);
+
+        assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(body["tools"][0]["cache_control"]["type"], "ephemeral");
+        assert!(
+            body["tools"][1].get("cache_control").is_none(),
+            "the wire's default last-tool marker must not be added alongside the client's"
+        );
+
+        let turns = body["messages"].as_array().unwrap();
+        assert_eq!(
+            turns[0]["content"][0]["cache_control"]["type"], "ephemeral",
+            "the marked user turn keeps its breakpoint"
+        );
+        assert!(
+            turns.last().unwrap()["content"][0]
+                .get("cache_control")
+                .is_none(),
+            "and the wire's default final-turn marker is NOT added: three defaults on top of a \
+             client's breakpoints would exceed the API's limit of four"
+        );
+        assert_eq!(
+            body.to_string().matches("cache_control").count(),
+            3,
+            "exactly the three the client asked for"
+        );
+    }
+
+    #[test]
+    fn one_client_breakpoint_replaces_all_three_defaults() {
+        // The rule is "the client's placement or the wire's, never both", and
+        // a single client breakpoint is enough to switch. Merging instead
+        // would charge a write premium at boundaries the customer did not
+        // choose — and on a four-breakpoint client would 400 the request.
+        let wire = AnthropicWire::new("anthropic", "k", None, 512, 900);
+        let messages = vec![
+            ChatMessage::system("be terse"),
+            ChatMessage::user("q").with_cache_breakpoint(),
+        ];
+        let spec = crate::provider::ToolSpec {
+            cache_control: false,
+            name: "a".into(),
+            description: "d".into(),
+            parameters: (json!({"type": "object"})),
+        };
+        let body = wire.request_body("claude-sonnet-5", &messages, Some(&[spec]), None, false);
+        assert_eq!(
+            body.to_string().matches("cache_control").count(),
+            1,
+            "one client breakpoint, and none of the wire's three"
+        );
+        assert!(
+            body["system"][0].get("cache_control").is_none(),
+            "the system default is dropped too — the client did not mark it"
+        );
+        assert_eq!(
+            body["messages"][0]["content"][0]["cache_control"]["type"],
+            "ephemeral"
+        );
+    }
+
+    #[test]
+    fn a_breakpoint_lands_on_the_block_its_own_message_produced() {
+        // A message that contributes NO block — empty or whitespace-only
+        // content, which this builder deliberately drops — must not push its
+        // breakpoint onto the previous message's block. That would cache a
+        // boundary the client never named, at a price the client did not
+        // expect.
+        let messages = vec![
+            ChatMessage::user("real content"),
+            ChatMessage::user("   ").with_cache_breakpoint(),
+        ];
+        let (_, turns) = build_anthropic_messages(&messages);
+        assert_eq!(
+            turns.len(),
+            1,
+            "the blank turn contributes nothing, as it always has"
+        );
+        assert!(
+            turns[0]["content"][0].get("cache_control").is_none(),
+            "a breakpoint on a message that produced no block must not migrate to another's"
+        );
+    }
+
+    #[test]
+    fn a_breakpoint_marks_the_last_block_of_a_multi_block_turn() {
+        // The Messages API caches everything up to and including the marked
+        // block, so a turn's breakpoint belongs on its LAST block — an
+        // assistant turn that emits text and then two tool calls is one
+        // boundary at the end, not three.
+        let messages = vec![
+            ChatMessage::user("go"),
+            ChatMessage::assistant(
+                r#"{"content":"running","tool_calls":[{"id":"t1","name":"shell","arguments":"{}"},{"id":"t2","name":"shell","arguments":"{}"}],"reasoning_content":null}"#,
+            )
+            .with_cache_breakpoint(),
+        ];
+        let (_, turns) = build_anthropic_messages(&messages);
+        let blocks = turns[1]["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 3, "text plus two tool_use blocks");
+        assert!(blocks[0].get("cache_control").is_none());
+        assert!(blocks[1].get("cache_control").is_none());
+        assert_eq!(blocks[2]["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn anthropic_cache_creation_tokens_are_carried_out_rather_than_folded_away() {
+        // The billing correction, at the wire. `input_tokens` stays the SUM of
+        // all three buckets — it is what the customer sees and what selects a
+        // conditional band — while the creation bucket now travels beside it
+        // instead of disappearing into the total where it billed as a fresh
+        // read.
+        let usage = AnthropicUsage {
+            input_tokens: Some(100),
+            output_tokens: Some(20),
+            cache_read_input_tokens: Some(600),
+            cache_creation_input_tokens: Some(300),
+        }
+        .into_token_usage()
+        .expect("a believable usage report");
+        assert_eq!(
+            usage.input_tokens,
+            Some(1_000),
+            "the OpenAI-convention total is fresh + read + written"
+        );
+        assert_eq!(usage.cached_input_tokens, Some(600));
+        assert_eq!(usage.cache_write_input_tokens, Some(300));
+
+        // Absent stays absent: a response with no cache activity must not
+        // assert that zero tokens were written, which is a measurement.
+        let plain = AnthropicUsage {
+            input_tokens: Some(100),
+            output_tokens: Some(20),
+            cache_read_input_tokens: None,
+            cache_creation_input_tokens: None,
+        }
+        .into_token_usage()
+        .expect("a believable usage report");
+        assert_eq!(plain.input_tokens, Some(100));
+        assert_eq!(plain.cache_write_input_tokens, None);
+    }
+
+    #[test]
     fn an_interrupted_parallel_tool_history_is_backfilled() {
         // Calls a and b went out, only a's result came back before the user
         // typed again. The wire must synthesize b's result or the API 400s.

@@ -165,6 +165,72 @@ cached_input_per_mtok = 0.20
 output_per_mtok = 2.00
 
 # ---------------------------------------------------------------------------
+# PROMPT-CACHING LANES. Two tiers whose only interesting property is which of
+# their candidates declares `cache_write_per_mtok` — the field that decides
+# whether a lane may accept a client `cache_control` breakpoint at all.
+#
+# Rates are round so the three-way settle split is an exact decimal a test can
+# name: 4.00 input, 0.40 cached (a tenth), 5.00 written (1.25x input, which is
+# Anthropic's published multiplier and the ratio every shipped Claude lane
+# uses), 8.00 output.
+# ---------------------------------------------------------------------------
+
+[tiers."zero/test-caching"]
+
+[tiers."zero/test-caching".rates]
+input_per_mtok = 4.00
+cached_input_per_mtok = 0.40
+cache_write_per_mtok = 5.00
+output_per_mtok = 8.00
+
+[[tiers."zero/test-caching".candidates]]
+id = "anthropic/cacher"
+provider = "anthropic"
+model = "upstream/cacher"
+
+# Basis is exactly half the sell rate on every dimension, so a settled row's
+# cost_usd and cost_basis_usd are told apart by a factor of two and neither can
+# be mistaken for the other.
+[tiers."zero/test-caching".candidates.rates]
+input_per_mtok = 2.00
+cached_input_per_mtok = 0.20
+cache_write_per_mtok = 2.50
+output_per_mtok = 4.00
+
+# A MIXED tier: the first rung cannot carry a breakpoint (no cache-write price,
+# and an OpenAI plane besides), the second can. A cache-bearing request must
+# skip the first rather than fall through to it and have its breakpoints
+# silently dropped.
+[tiers."zero/test-mixed-caching"]
+
+[tiers."zero/test-mixed-caching".rates]
+input_per_mtok = 4.00
+cached_input_per_mtok = 0.40
+cache_write_per_mtok = 5.00
+output_per_mtok = 8.00
+
+[[tiers."zero/test-mixed-caching".candidates]]
+id = "openai/uncached"
+provider = "openai"
+model = "upstream/uncached"
+
+[tiers."zero/test-mixed-caching".candidates.rates]
+input_per_mtok = 1.00
+cached_input_per_mtok = 0.20
+output_per_mtok = 2.00
+
+[[tiers."zero/test-mixed-caching".candidates]]
+id = "anthropic/mixed-cacher"
+provider = "anthropic"
+model = "upstream/mixed-cacher"
+
+[tiers."zero/test-mixed-caching".candidates.rates]
+input_per_mtok = 2.00
+cached_input_per_mtok = 0.20
+cache_write_per_mtok = 2.50
+output_per_mtok = 4.00
+
+# ---------------------------------------------------------------------------
 # RETENTION POSTURE — required: `validate_tier_catalog` refuses a catalog in
 # which any candidate's provider has no resolvable posture, so a fixture must
 # label its lanes exactly as the shipped catalog does. Fixture values: the URLs

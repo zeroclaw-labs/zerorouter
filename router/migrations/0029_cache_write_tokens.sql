@@ -45,11 +45,35 @@
 -- dimension exists for, and `attempts_cost_basis_usd` would silently disagree
 -- with the served row beside it.
 
+-- INTEGER, matching `input_tokens` and `cached_input_tokens` rather than
+-- widening: `wire::believable` already refuses any count above i32::MAX before
+-- it can reach a row, so a wider column would only make the two token columns
+-- on one row disagree about what a token count is.
+--
+-- The disjointness CHECK is the schema's own statement of the invariant the
+-- settle path clamps to. Both exist for the reason
+-- `usage_events_cached_tokens_do_not_exceed_input` already gives: the clamp
+-- keeps this constraint from ever firing, and the constraint keeps a future
+-- edit that loses the clamp from writing a row whose `cost_usd` cannot be
+-- derived from its own buckets.
 ALTER TABLE usage_events
-    ADD COLUMN cache_write_input_tokens BIGINT;
+    ADD COLUMN cache_write_input_tokens INTEGER,
+    ADD CONSTRAINT usage_events_cache_write_tokens_are_nonnegative
+        CHECK (cache_write_input_tokens IS NULL OR cache_write_input_tokens >= 0),
+    ADD CONSTRAINT usage_events_cache_buckets_fit_the_prompt
+        CHECK (
+            cache_write_input_tokens IS NULL
+            OR cache_write_input_tokens + cached_input_tokens <= input_tokens
+        );
 
+-- Non-negativity only, matching `request_attempts_tokens_are_nonnegative`: an
+-- attempt's dimensions are independently nullable, so "written is known while
+-- the prompt is not" is a legitimate row here in a way it never is on a
+-- settled event.
 ALTER TABLE request_attempts
-    ADD COLUMN cache_write_input_tokens BIGINT;
+    ADD COLUMN cache_write_input_tokens INTEGER,
+    ADD CONSTRAINT request_attempts_cache_write_tokens_are_nonnegative
+        CHECK (cache_write_input_tokens IS NULL OR cache_write_input_tokens >= 0);
 
 COMMENT ON COLUMN usage_events.cache_write_input_tokens IS
     'Prompt tokens written into the upstream cache under a cache_control breakpoint, billed at cache_write_per_mtok. A subset of input_tokens, disjoint from cached_input_tokens; fresh = input - cached - cache_write. NULL = not captured (predates migration 0029, or the wire reports no such dimension), never "no writes"';
