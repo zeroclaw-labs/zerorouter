@@ -7308,3 +7308,318 @@ async fn a_caching_lane_reserves_at_the_cache_write_rate_it_could_settle_at() {
         "the cache-write uplift applies to the prompt bound only, never to the output bound"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Hybrid provider routing, phase 1: unified (routed) ids + the retention
+// switch, driven end to end over the real admission → walk → settle path.
+//
+// The fixture catalog is `tests/unified_tiers.toml`, which synthesizes two
+// unified ids: `test-flash` = [ vertex (zero) → google (standard) ] and
+// `test-standard-only` = [ google (standard), openai (standard) ]. The routed
+// layer is dark by default, so every test opts it in with
+// `.with_unified_ids(true)` via `unified_router_by_provider`.
+// ---------------------------------------------------------------------------
+
+fn unified_tier_config_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/unified_tiers.toml")
+}
+
+/// A funded key whose `retention_policy` column is set to `policy` — the switch
+/// in a non-default position, which `create_funded_key` (defaulting to
+/// `zdr_only`) cannot express.
+async fn create_funded_key_with_policy(pool: &PgPool, label: &str, policy: &str) -> (Uuid, String) {
+    let (api_key_id, key) = create_funded_key(pool, label).await;
+    query("UPDATE api_keys SET retention_policy = $1 WHERE id = $2")
+        .bind(policy)
+        .bind(api_key_id)
+        .execute(pool)
+        .await
+        .expect("retention policy update must apply");
+    (api_key_id, key)
+}
+
+/// A router over the unified fixture with the routed layer ON, matching each
+/// scripted fake to a candidate by its PROVIDER (the candidate id suffixes
+/// collide across a unified id, so the alias matcher cannot be used, and this
+/// tolerates any subset of the route the switch leaves rather than asserting a
+/// candidate count).
+fn unified_router_by_provider(
+    pool: PgPool,
+    fakes: Vec<(&'static str, Arc<FakeModelProvider>)>,
+) -> RouterState {
+    let fakes: Vec<(String, Arc<FakeModelProvider>)> = fakes
+        .into_iter()
+        .map(|(provider, fake)| (provider.to_owned(), fake))
+        .collect();
+    let route: InjectedRoute = Arc::new(move |resolved: &ResolvedRoute, _max_output_tokens| {
+        ProviderRoute::from_candidates(
+            resolved
+                .candidates
+                .iter()
+                .cloned()
+                .map(|definition| {
+                    let fake = fakes
+                        .iter()
+                        .find(|(provider, _)| *provider == definition.provider)
+                        .unwrap_or_else(|| {
+                            panic!("no scripted fake for provider {}", definition.provider)
+                        })
+                        .1
+                        .clone();
+                    ProviderCandidate::with_provider(definition, fake)
+                })
+                .collect(),
+        )
+    });
+    RouterState::with_injected_route(unified_tier_config_path(), pool, true, route)
+        .with_unified_ids(true)
+}
+
+#[tokio::test]
+async fn a_unified_id_routes_to_the_zero_candidate_and_settles() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    // A default key: `retention_policy` backfills to `zdr_only`, so the eligible
+    // set for `test-flash` is the zero (vertex) lane alone and the standard
+    // (google) lane never enters the walk.
+    let (api_key_id, key) = create_funded_key(&pool, "unified-zero").await;
+    let zero = FakeModelProvider::new(
+        "test-flash",
+        vec![FakeOutcome::chat(
+            "hello from the zero lane",
+            served_usage(),
+        )],
+    );
+    let standard = FakeModelProvider::new("test-flash-standard", Vec::new());
+    let state = unified_router_by_provider(
+        pool.clone(),
+        vec![("vertex", zero.clone()), ("google", standard.clone())],
+    );
+
+    let response = app(state.clone())
+        .oneshot(completion_request(
+            &key,
+            &completion_body("test-flash", false),
+        ))
+        .await
+        .expect("completion request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        header(&response, "x-zerorouter-provider"),
+        "vertex",
+        "a zdr_only key must route the unified id to its zero-retention lane"
+    );
+    assert_eq!(header(&response, "x-zerorouter-model"), "google/test-flash");
+    let body = json_body(response).await;
+    state.wait_for_background_tasks().await;
+
+    assert_eq!(body["model"], "test-flash");
+    assert_eq!(
+        body["choices"][0]["message"]["content"],
+        "hello from the zero lane"
+    );
+    assert_eq!(zero.call_count(), 1);
+    assert_eq!(
+        standard.call_count(),
+        0,
+        "the standard lane was never eligible"
+    );
+
+    // Same admission → walk → settle path a pin takes: one metered row, billed
+    // at the shared tier rate against the zero provider.
+    let (provider, model, input, output, cost, status) = settled_event(&pool, api_key_id).await;
+    assert_eq!(provider, "vertex");
+    assert_eq!(model, "google/test-flash");
+    assert_eq!((input, output, status), (1_000, 20, 200));
+    assert_eq!(cost, served_sell_cost());
+    assert_eq!(open_reservations(&pool, api_key_id).await, 0);
+    assert_eq!(
+        balance(&pool, user_of(&pool, api_key_id).await)
+            .await
+            .expect("balance must query"),
+        Decimal::from(50) - served_sell_cost()
+    );
+}
+
+#[tokio::test]
+async fn a_zdr_only_key_with_only_standard_route_fails_closed_and_reserves_nothing() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    // `test-standard-only` unifies two STANDARD providers, so its zero partition
+    // is empty. A zdr_only key must be refused before any reservation rather
+    // than routed to a retaining provider.
+    let (api_key_id, key) = create_funded_key(&pool, "unified-failclosed").await;
+    let google = FakeModelProvider::new("std-google", Vec::new());
+    let openai = FakeModelProvider::new("std-openai", Vec::new());
+    let state = unified_router_by_provider(
+        pool.clone(),
+        vec![("google", google.clone()), ("openai", openai.clone())],
+    );
+
+    let refused = app(state.clone())
+        .oneshot(completion_request(
+            &key,
+            &completion_body("test-standard-only", false),
+        ))
+        .await
+        .expect("completion request should complete");
+    assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = json_body(refused).await;
+    assert_eq!(
+        body["error"]["code"], "no_zero_retention_route",
+        "the fail-closed refusal has its own code, distinct from an outage: {body}"
+    );
+
+    // Refused before the walk and before admission: no upstream call, no
+    // reservation, no settled row, balance untouched. This is the money/trust
+    // guarantee.
+    assert_eq!(google.call_count(), 0);
+    assert_eq!(openai.call_count(), 0);
+    assert_eq!(
+        open_reservations(&pool, api_key_id).await,
+        0,
+        "fail-closed must reserve nothing"
+    );
+    assert_eq!(settled_count(&pool, api_key_id).await, 0);
+    assert_eq!(
+        balance(&pool, user_of(&pool, api_key_id).await)
+            .await
+            .expect("balance must query"),
+        Decimal::from(50)
+    );
+}
+
+#[tokio::test]
+async fn allow_non_zdr_reaches_the_standard_route_and_settles() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    // The same `test-standard-only` id that a zdr_only key fails closed on is
+    // served for an `allow_non_zdr` key: the switch has made the standard
+    // partition eligible. Serves the first standard lane (google, by catalog
+    // order) and settles it.
+    let (api_key_id, key) =
+        create_funded_key_with_policy(&pool, "unified-allow", "allow_non_zdr").await;
+    let google = FakeModelProvider::new(
+        "std-google",
+        vec![FakeOutcome::chat(
+            "hello from a standard lane",
+            served_usage(),
+        )],
+    );
+    let openai = FakeModelProvider::new("std-openai", Vec::new());
+    let state = unified_router_by_provider(
+        pool.clone(),
+        vec![("google", google.clone()), ("openai", openai.clone())],
+    );
+
+    let response = app(state.clone())
+        .oneshot(completion_request(
+            &key,
+            &completion_body("test-standard-only", false),
+        ))
+        .await
+        .expect("completion request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(header(&response, "x-zerorouter-provider"), "google");
+    let body = json_body(response).await;
+    state.wait_for_background_tasks().await;
+    assert_eq!(
+        body["choices"][0]["message"]["content"],
+        "hello from a standard lane"
+    );
+    assert_eq!(google.call_count(), 1);
+
+    let (provider, _model, _input, _output, cost, status) = settled_event(&pool, api_key_id).await;
+    assert_eq!((provider.as_str(), status), ("google", 200));
+    assert_eq!(cost, served_sell_cost());
+    assert_eq!(open_reservations(&pool, api_key_id).await, 0);
+}
+
+#[tokio::test]
+async fn allow_non_zdr_still_serves_the_zero_lane_first() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    // Widening the switch does NOT demote zero: for `test-flash` an
+    // allow_non_zdr key still serves the zero (vertex) lane, because the
+    // standard lane is only eligible BELOW it. `allow_non_zdr` is a floor for
+    // what may be reached, never a reordering.
+    let (api_key_id, key) =
+        create_funded_key_with_policy(&pool, "unified-allow-flash", "allow_non_zdr").await;
+    let zero = FakeModelProvider::new(
+        "test-flash",
+        vec![FakeOutcome::chat("still the zero lane", served_usage())],
+    );
+    let standard = FakeModelProvider::new("test-flash-standard", Vec::new());
+    let state = unified_router_by_provider(
+        pool.clone(),
+        vec![("vertex", zero.clone()), ("google", standard.clone())],
+    );
+
+    let response = app(state.clone())
+        .oneshot(completion_request(
+            &key,
+            &completion_body("test-flash", false),
+        ))
+        .await
+        .expect("completion request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(header(&response, "x-zerorouter-provider"), "vertex");
+    state.wait_for_background_tasks().await;
+    assert_eq!(zero.call_count(), 1);
+    assert_eq!(standard.call_count(), 0, "the zero lane still leads");
+    let (provider, _model, _input, _output, _cost, status) = settled_event(&pool, api_key_id).await;
+    assert_eq!((provider.as_str(), status), ("vertex", 200));
+}
+
+#[tokio::test]
+async fn the_unified_and_pinned_paths_refuse_an_unfunded_key_identically() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    // One admission/money path: a unified id runs the SAME admission a pin does.
+    // An unfunded zdr_only key hits `test-flash` (unified → the zero lane) and
+    // `vertex/test-flash` (the pin of that same lane) and is refused with the
+    // identical insufficient-credits error, before the walk and reserving
+    // nothing, either way.
+    let (api_key_id, key) = create_unfunded_key(&pool, "unified-parity").await;
+    let zero = FakeModelProvider::new("test-flash", Vec::new());
+    let standard = FakeModelProvider::new("test-flash-standard", Vec::new());
+    let state = unified_router_by_provider(
+        pool.clone(),
+        vec![("vertex", zero.clone()), ("google", standard.clone())],
+    );
+
+    let unified = app(state.clone())
+        .oneshot(completion_request(
+            &key,
+            &completion_body("test-flash", false),
+        ))
+        .await
+        .expect("unified request should complete");
+    assert_eq!(unified.status(), StatusCode::PAYMENT_REQUIRED);
+    let unified_body = json_body(unified).await;
+
+    let pinned = app(state.clone())
+        .oneshot(completion_request(
+            &key,
+            &completion_body("vertex/test-flash", false),
+        ))
+        .await
+        .expect("pinned request should complete");
+    assert_eq!(pinned.status(), StatusCode::PAYMENT_REQUIRED);
+    let pinned_body = json_body(pinned).await;
+
+    assert_eq!(unified_body["error"]["code"], "insufficient_credits");
+    assert_eq!(
+        unified_body, pinned_body,
+        "the unified id and the pin of its zero lane share one admission path, so they \
+         share its refusal byte for byte"
+    );
+    assert_eq!(zero.call_count(), 0, "admission runs before the walk");
+    assert_eq!(open_reservations(&pool, api_key_id).await, 0);
+    assert_eq!(settled_count(&pool, api_key_id).await, 0);
+}

@@ -1,0 +1,104 @@
+schema_version = 1
+
+# Fixture catalog for the hybrid-provider-routing (phase 1) request-path tests.
+# Kept separate from request_path_tiers.toml so the unified-id assertions pin
+# their own catalog and nothing else has to grow a unifiable pair.
+#
+# Two synthesized unified ids fall out of the four pins below:
+#
+#   test-flash          = [ vertex (zero) , google (standard) ]   (mixed)
+#   test-standard-only  = [ google (standard) , openai (standard) ] (no zero lane)
+#
+# `test-flash` is the mixed case: a zdr_only key routes to the zero lane, an
+# allow_non_zdr key may reach the standard one below it. `test-standard-only`
+# is the fail-closed case: it unifies (two providers, one rate) but has NO zero
+# partition, so a zdr_only key must be refused before any reservation.
+#
+# Every pin sells at 3.00 / 6.00 (input / output) so the settled cost matches
+# `served_sell_cost()` (0.00312 on the shared 1000-in / 20-out fixture usage),
+# and each candidate's basis is half its tier's sell rate so a served row's
+# cost and cost-basis are told apart by a factor of two.
+
+# --- test-flash: mixed zero + standard, identical rate → unifies ---
+
+[tiers."vertex/test-flash"]
+[tiers."vertex/test-flash".rates]
+input_per_mtok = 3.00
+cached_input_per_mtok = 0.60
+output_per_mtok = 6.00
+[[tiers."vertex/test-flash".candidates]]
+id = "vertex/test-flash"
+provider = "vertex"
+model = "google/test-flash"
+[tiers."vertex/test-flash".candidates.rates]
+input_per_mtok = 1.50
+cached_input_per_mtok = 0.30
+output_per_mtok = 3.00
+
+[tiers."google/test-flash"]
+[tiers."google/test-flash".rates]
+input_per_mtok = 3.00
+cached_input_per_mtok = 0.60
+output_per_mtok = 6.00
+[[tiers."google/test-flash".candidates]]
+id = "google/test-flash"
+provider = "google"
+model = "test-flash"
+[tiers."google/test-flash".candidates.rates]
+input_per_mtok = 1.50
+cached_input_per_mtok = 0.30
+output_per_mtok = 3.00
+
+# --- test-standard-only: two standard providers, identical rate → unifies,
+#     but has no zero partition, so zdr_only fails closed ---
+
+[tiers."google/test-standard-only"]
+[tiers."google/test-standard-only".rates]
+input_per_mtok = 3.00
+cached_input_per_mtok = 0.60
+output_per_mtok = 6.00
+[[tiers."google/test-standard-only".candidates]]
+id = "google/test-standard-only"
+provider = "google"
+model = "std-a"
+[tiers."google/test-standard-only".candidates.rates]
+input_per_mtok = 1.50
+cached_input_per_mtok = 0.30
+output_per_mtok = 3.00
+
+[tiers."openai/test-standard-only"]
+[tiers."openai/test-standard-only".rates]
+input_per_mtok = 3.00
+cached_input_per_mtok = 0.60
+output_per_mtok = 6.00
+[[tiers."openai/test-standard-only".candidates]]
+id = "openai/test-standard-only"
+provider = "openai"
+model = "std-b"
+[tiers."openai/test-standard-only".candidates.rates]
+input_per_mtok = 1.50
+cached_input_per_mtok = 0.30
+output_per_mtok = 3.00
+
+# --- retention postures (required; URLs/digests are fixture filler) ---
+
+[retention.vertex]
+posture = "zero"
+description = "Fixture lane: vertex zero retention."
+source_url = "https://example.test/vertex/retention"
+verified = "2026-08-20"
+source_sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
+
+[retention.google]
+posture = "standard"
+description = "Fixture lane: google standard retention."
+source_url = "https://example.test/google/retention"
+verified = "2026-08-20"
+source_sha256 = "2222222222222222222222222222222222222222222222222222222222222222"
+
+[retention.openai]
+posture = "standard"
+description = "Fixture lane: openai standard retention."
+source_url = "https://example.test/openai/retention"
+verified = "2026-08-20"
+source_sha256 = "3333333333333333333333333333333333333333333333333333333333333333"
