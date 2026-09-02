@@ -333,18 +333,25 @@ the flagship zero lane.
      drift checks do not read. So the storefront and every pinned route are
      byte-for-byte unchanged; the operator can drive routed traffic in prod and
      watch it with zero customer-visible change.
-   - **Equivalence is doubly conservative.** Two pins unify only when their bare
-     ids match EXACTLY (no cross-version merge) AND they sell at the IDENTICAL
-     rate. The rate rule is stricter than the doc's same-model rule and exists
-     to keep "one admission/money path" literally true: a unified route carries
-     one sell schedule and settlement bills at it, so pins that price
-     differently would make the charge depend on which provider served — a
-     billing decision this layer must not make. Consequence in today's catalog:
-     the three Google/Vertex Gemini twins unify (identical price); the
-     Bedrock/Anthropic Claude **haiku** twin does NOT (the zero lane costs more).
-     Unifying the haiku twin needs a deliberate rate-reconciliation policy
-     (which rate the unified id bills, and the resulting margin), which is a
-     pricing decision for the owner, not a silent config effect — deferred.
+   - **Equivalence: same-model, and reconciled to the DEARER rate.** Two pins
+     unify only when their bare ids match EXACTLY (no cross-version merge). A
+     unified route carries one sell schedule and settlement bills at it, so when
+     the pins price differently the route's rate has to be CHOSEN deliberately.
+     **Option ii (owner decision, 2026-09-02):** the unified id sells at the
+     per-dimension DEARER rate across its members (`RateSchedule::dearest_across`)
+     so no candidate is ever undercharged — whichever provider serves, the
+     customer pays at least that provider's own pinned price, and each
+     candidate's basis (≤ its own sell ≤ the dearer unified sell) keeps every
+     margin positive. Consequence in today's catalog: the three Google/Vertex
+     Gemini twins price identically and unify unchanged; the Bedrock/Anthropic
+     Claude **haiku** twin now ALSO unifies, selling at Bedrock's dearer schedule
+     (bedrock 1.10/0.11/1.375/5.50 vs anthropic 1.00/0.10/1.25/5.00 — a uniform
+     1.10x). Under `zdr_only` it routes to Bedrock (zero) at cost; only an
+     `allow_non_zdr` key served by Anthropic pays the ~10% house margin, which
+     the owner accepts. Reconciliation is per band, so a twin whose members
+     REPRICE at different sizes (a differing band structure) has no common band
+     to take a maximum within: `dearest_across` returns `None` and the pair stays
+     pin-only. The switch and the dark gate below are unchanged by this.
    - **The switch vs a pin.** The `retention_policy` switch governs a routed
      (unified) id only. An explicitly provider-pinned id is served as itself
      whatever the switch says — including a `zdr_only` key pinning a standard

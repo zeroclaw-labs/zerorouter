@@ -910,6 +910,131 @@ impl RateSchedule {
             .iter()
             .map(|conditional| conditional.min_prompt_tokens)
     }
+
+    /// The per-dimension DEAREST schedule across `schedules` — the single
+    /// schedule that undercharges none of them — or `None` when they do not
+    /// share a band STRUCTURE.
+    ///
+    /// # Why a unified route needs this ("option ii")
+    ///
+    /// A bare model id backed by the same model on several providers bills at
+    /// ONE sell schedule regardless of which provider serves (settlement reads
+    /// the route's rate, not the served candidate's — see
+    /// [`crate::config::TierCatalog::synthesize_unified`]). So that one schedule
+    /// has to be at least as dear as every member in every dimension, or serving
+    /// one provider would charge the customer LESS than that provider's own
+    /// pinned price does — a silent undercharge that depends on which backend
+    /// happened to answer. The reconciled schedule is therefore the per-dimension
+    /// MAXIMUM: dearest wins, so no member is ever undercut.
+    ///
+    /// # The maximum is taken over BILLED (effective) rates, not declared ones
+    ///
+    /// This matters only for the two optional dimensions, and getting it wrong
+    /// is a money bug:
+    ///
+    /// - **input, output** are required and have no fallback, so effective ==
+    ///   declared and the maximum is the plain per-dimension max.
+    /// - **cached_input, cache_write** fall back to the INPUT rate when a member
+    ///   omits them — [`crate::openai::usage_cost`] prices an omitted dimension
+    ///   at input, not at nothing. So a member that omits cache_write does not
+    ///   price writes at zero; it prices them at its own input rate. The dearest
+    ///   across the group is the max of those EFFECTIVE values
+    ///   ([`ModelRates::effective_cache_write_per_mtok`]). Taking the max of the
+    ///   DECLARED values instead — "a present rate always beats an absent one" —
+    ///   is wrong exactly when a member that OMITS the dimension has a higher
+    ///   input rate than another member's declared premium: that omitting member
+    ///   would then bill the dimension ABOVE the unified rate, i.e. the unified
+    ///   id would undercharge it. The effective max cannot be undercut that way.
+    ///
+    /// An optional dimension is DECLARED on the result only when at least one
+    /// member declared it. When none did, the effective max is exactly the
+    /// unified input rate — which an absent dimension already yields by the same
+    /// fallback — so leaving it absent is both correct and preserves the "this
+    /// lane does not price cache writes" capability signal for a group where no
+    /// member prices them.
+    ///
+    /// # The structure guard, and why it returns `None`
+    ///
+    /// Reconciliation is per band, so it is only meaningful when every schedule
+    /// has the SAME bands: the same count of conditional tables at identical
+    /// `min_prompt_tokens` thresholds, in the same order. Two schedules that
+    /// reprice at different sizes share no common band to take a maximum within —
+    /// a per-dimension max of two structurally different schedules could be
+    /// CHEAPER than one of them inside some prompt-size band, breaking the very
+    /// invariant this exists to keep — so this returns `None` and the caller
+    /// stays conservative (it does not unify). Every same-model twin the catalog
+    /// carries today is flat, so `None` is the rare path; the guard is what keeps
+    /// a future conditional twin from being reconciled unsafely.
+    ///
+    /// Returns `None` for an empty slice (nothing to reconcile). A single
+    /// schedule reconciles to itself.
+    #[must_use]
+    pub fn dearest_across(schedules: &[&RateSchedule]) -> Option<RateSchedule> {
+        let (first, _rest) = schedules.split_first()?;
+        // Same band structure across every schedule, or there is no common band
+        // to reconcile within.
+        let thresholds: Vec<u64> = first.thresholds().collect();
+        if schedules
+            .iter()
+            .any(|schedule| schedule.thresholds().ne(thresholds.iter().copied()))
+        {
+            return None;
+        }
+
+        // The dearest EFFECTIVE rate for one dimension across every schedule's
+        // copy of one band. `effective` reads the billed value (input fallback
+        // applied); `declared` decides only whether the result names an OPTIONAL
+        // dimension at all — a group in which no member declares it leaves it
+        // absent, so the input fallback still yields the same billed rate.
+        let dearest = |tables: &[ModelRates],
+                       declared: fn(&ModelRates) -> Option<f64>,
+                       effective: fn(&ModelRates) -> Option<f64>,
+                       optional: bool|
+         -> Option<f64> {
+            if optional && !tables.iter().any(|rates| declared(rates).is_some()) {
+                return None;
+            }
+            tables
+                .iter()
+                .filter_map(effective)
+                .fold(None, |dearest: Option<f64>, rate| {
+                    Some(dearest.map_or(rate, |dearest| dearest.max(rate)))
+                })
+        };
+        let reconcile = |tables: &[ModelRates]| ModelRates {
+            input_per_mtok: dearest(tables, |r| r.input_per_mtok, |r| r.input_per_mtok, false),
+            output_per_mtok: dearest(tables, |r| r.output_per_mtok, |r| r.output_per_mtok, false),
+            cached_input_per_mtok: dearest(
+                tables,
+                |r| r.cached_input_per_mtok,
+                ModelRates::effective_cached_input_per_mtok,
+                true,
+            ),
+            cache_write_per_mtok: dearest(
+                tables,
+                |r| r.cache_write_per_mtok,
+                ModelRates::effective_cache_write_per_mtok,
+                true,
+            ),
+        };
+
+        let base_tables: Vec<ModelRates> =
+            schedules.iter().map(|schedule| schedule.base()).collect();
+        let base = reconcile(&base_tables);
+        let conditional = (0..thresholds.len())
+            .map(|band| {
+                let tables: Vec<ModelRates> = schedules
+                    .iter()
+                    .map(|schedule| schedule.conditional()[band].rates)
+                    .collect();
+                ConditionalRate {
+                    min_prompt_tokens: thresholds[band],
+                    rates: reconcile(&tables),
+                }
+            })
+            .collect();
+        Some(RateSchedule::new(base, conditional))
+    }
 }
 
 /// Output ceiling assumed when a request names none.
@@ -1415,5 +1540,169 @@ mod tests {
         ] {
             assert_eq!(message.role, role);
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Dearer-rate reconciliation across same-model twins (`dearest_across`),
+    // the arithmetic under a unified id's one sell schedule (option ii).
+    // -----------------------------------------------------------------------
+
+    /// A full four-dimension table, so the optional cache dimensions can be set
+    /// or omitted independently — which `rates` (cache_write always `None`)
+    /// cannot express.
+    fn full(input: f64, cached: Option<f64>, cache_write: Option<f64>, output: f64) -> ModelRates {
+        ModelRates {
+            input_per_mtok: Some(input),
+            cached_input_per_mtok: cached,
+            cache_write_per_mtok: cache_write,
+            output_per_mtok: Some(output),
+        }
+    }
+
+    #[test]
+    fn dearest_across_takes_the_per_dimension_max_on_matching_structure() {
+        // The `claude-haiku-4-5` twin: bedrock (dearer, a uniform 1.10x) and
+        // anthropic. The reconciled schedule is bedrock's, dimension by
+        // dimension — the DEARER rate everywhere, so neither lane is undercut.
+        let bedrock = RateSchedule::flat(full(1.10, Some(0.11), Some(1.375), 5.50));
+        let anthropic = RateSchedule::flat(full(1.00, Some(0.10), Some(1.25), 5.00));
+        let reconciled = RateSchedule::dearest_across(&[&bedrock, &anthropic])
+            .expect("two flat schedules share the empty band structure");
+        assert_eq!(
+            reconciled, bedrock,
+            "dearest per dimension is bedrock's whole table"
+        );
+        // Symmetric in argument order — the max does not depend on which pin the
+        // catalog happened to list first.
+        assert_eq!(
+            RateSchedule::dearest_across(&[&anthropic, &bedrock]),
+            Some(bedrock.clone())
+        );
+        // A crossed schedule (each dearer in a DIFFERENT dimension) takes the
+        // max of each dimension, never either input table wholesale.
+        let a = RateSchedule::flat(full(2.00, Some(0.20), Some(2.50), 4.00));
+        let b = RateSchedule::flat(full(1.00, Some(0.50), Some(1.25), 9.00));
+        let crossed = RateSchedule::dearest_across(&[&a, &b]).expect("flat pair reconciles");
+        assert_eq!(crossed.base(), full(2.00, Some(0.50), Some(2.50), 9.00));
+    }
+
+    #[test]
+    fn dearest_across_is_none_on_a_mismatched_band_structure() {
+        // Flat vs banded: different band COUNT, no common band to reconcile.
+        let flat = RateSchedule::flat(full(1.00, Some(0.10), None, 5.00));
+        assert!(
+            RateSchedule::dearest_across(&[&flat, &luna()]).is_none(),
+            "a flat schedule and a banded one share no common band structure"
+        );
+        // Same band count but a DIFFERENT threshold: still no shared structure.
+        let banded_a = RateSchedule::new(
+            rates(1.0, Some(0.1), 5.0),
+            vec![ConditionalRate {
+                min_prompt_tokens: 200_000,
+                rates: rates(2.0, Some(0.2), 10.0),
+            }],
+        );
+        let banded_b = RateSchedule::new(
+            rates(1.0, Some(0.1), 5.0),
+            vec![ConditionalRate {
+                min_prompt_tokens: 300_000,
+                rates: rates(2.0, Some(0.2), 10.0),
+            }],
+        );
+        assert!(
+            RateSchedule::dearest_across(&[&banded_a, &banded_b]).is_none(),
+            "same band count, different thresholds — not a shared structure"
+        );
+        // IDENTICAL thresholds DO reconcile, per band, taking each band's
+        // per-dimension max.
+        let banded_c = RateSchedule::new(
+            rates(1.5, Some(0.3), 4.0),
+            vec![ConditionalRate {
+                min_prompt_tokens: 200_000,
+                rates: rates(3.0, Some(0.5), 8.0),
+            }],
+        );
+        let reconciled = RateSchedule::dearest_across(&[&banded_a, &banded_c])
+            .expect("identical thresholds share a structure");
+        assert_eq!(reconciled.thresholds().collect::<Vec<_>>(), vec![200_000]);
+        assert_eq!(reconciled.base(), rates(1.5, Some(0.3), 5.0));
+        assert_eq!(
+            reconciled.at_prompt_tokens(200_000),
+            rates(3.0, Some(0.5), 10.0)
+        );
+    }
+
+    #[test]
+    fn dearest_across_prices_an_omitted_optional_at_its_effective_rate() {
+        // A member that OMITS cache_write does not price writes at nothing — it
+        // prices them at its own input rate (`usage_cost`'s fallback). When that
+        // input rate is dearer than the OTHER member's declared premium, the
+        // reconciled rate must be the omitting member's input, or the unified id
+        // would undercharge the omitting lane. Max-of-declared ("present wins")
+        // would pick the lower declared 1.25 and undercut the omitting lane's
+        // effective 2.00.
+        let omits = RateSchedule::flat(full(2.00, None, None, 5.00));
+        let declares = RateSchedule::flat(full(1.00, Some(0.10), Some(1.25), 5.00));
+        let reconciled =
+            RateSchedule::dearest_across(&[&omits, &declares]).expect("flat pair reconciles");
+        // cache_write is DECLARED on the result (one member declares it) and is
+        // the dearer EFFECTIVE value across both: max(2.00 fallback, 1.25) = 2.00.
+        assert_eq!(reconciled.base().cache_write_per_mtok, Some(2.00));
+        // cached_input likewise: `omits` bills cached at its 2.00 input,
+        // `declares` at 0.10; the dearer effective is 2.00.
+        assert_eq!(reconciled.base().cached_input_per_mtok, Some(2.00));
+
+        // When NEITHER member declares an optional, it stays ABSENT: the input
+        // fallback already yields the same billed rate, and leaving it absent
+        // preserves the "this lane does not price cache writes" capability.
+        let neither_a = RateSchedule::flat(full(2.00, None, None, 4.00));
+        let neither_b = RateSchedule::flat(full(1.00, None, None, 9.00));
+        let none_declared =
+            RateSchedule::dearest_across(&[&neither_a, &neither_b]).expect("flat pair reconciles");
+        assert_eq!(none_declared.base().cache_write_per_mtok, None);
+        assert_eq!(none_declared.base().cached_input_per_mtok, None);
+        assert!(!none_declared.prices_cache_writes());
+    }
+
+    #[test]
+    fn dearest_across_never_undercharges_any_member_in_any_dimension() {
+        // The invariant option ii rests on, asserted DIRECTLY over the effective
+        // (billed) rate of every dimension: the reconciled schedule is >= every
+        // member in every dimension `usage_cost` prices, so whichever provider
+        // serves under the one unified sell rate, the customer is never charged
+        // less than that provider's own pin would charge.
+        let members = [
+            RateSchedule::flat(full(1.10, Some(0.11), Some(1.375), 5.50)),
+            RateSchedule::flat(full(1.00, Some(0.10), Some(1.25), 5.00)),
+            RateSchedule::flat(full(0.90, None, None, 6.00)),
+        ];
+        let refs: Vec<&RateSchedule> = members.iter().collect();
+        let unified = RateSchedule::dearest_across(&refs)
+            .expect("flat members share the empty band structure");
+        let u = unified.base();
+        for member in &members {
+            let m = member.base();
+            assert!(u.input_per_mtok.unwrap() >= m.input_per_mtok.unwrap());
+            assert!(u.output_per_mtok.unwrap() >= m.output_per_mtok.unwrap());
+            assert!(
+                u.effective_cached_input_per_mtok().unwrap()
+                    >= m.effective_cached_input_per_mtok().unwrap(),
+                "cached undercharged: {u:?} vs member {m:?}"
+            );
+            assert!(
+                u.effective_cache_write_per_mtok().unwrap()
+                    >= m.effective_cache_write_per_mtok().unwrap(),
+                "cache_write undercharged: {u:?} vs member {m:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn dearest_across_of_a_single_schedule_is_that_schedule() {
+        // Degenerate but well-defined: the max over one member is that member.
+        let one = luna();
+        assert_eq!(RateSchedule::dearest_across(&[&one]), Some(one));
+        // And an empty slice reconciles to nothing.
+        assert!(RateSchedule::dearest_across(&[]).is_none());
     }
 }

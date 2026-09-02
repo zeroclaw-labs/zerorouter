@@ -7313,10 +7313,12 @@ async fn a_caching_lane_reserves_at_the_cache_write_rate_it_could_settle_at() {
 // Hybrid provider routing, phase 1: unified (routed) ids + the retention
 // switch, driven end to end over the real admission → walk → settle path.
 //
-// The fixture catalog is `tests/unified_tiers.toml`, which synthesizes two
-// unified ids: `test-flash` = [ vertex (zero) → google (standard) ] and
-// `test-standard-only` = [ google (standard), openai (standard) ]. The routed
-// layer is dark by default, so every test opts it in with
+// The fixture catalog is `tests/unified_tiers.toml`, which synthesizes three
+// unified ids: `test-flash` = [ vertex (zero) → google (standard) ],
+// `test-standard-only` = [ google (standard), openai (standard) ], and
+// `test-haiku` = [ bedrock (zero, dearer) → anthropic (standard, cheaper) ] —
+// a differently-priced twin that unifies at the DEARER rate (option ii). The
+// routed layer is dark by default, so every test opts it in with
 // `.with_unified_ids(true)` via `unified_router_by_provider`.
 // ---------------------------------------------------------------------------
 
@@ -7622,4 +7624,78 @@ async fn the_unified_and_pinned_paths_refuse_an_unfunded_key_identically() {
     assert_eq!(zero.call_count(), 0, "admission runs before the walk");
     assert_eq!(open_reservations(&pool, api_key_id).await, 0);
     assert_eq!(settled_count(&pool, api_key_id).await, 0);
+}
+
+#[tokio::test]
+async fn allow_non_zdr_on_a_priced_twin_settles_the_dearer_unified_rate() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    // Option ii, end to end: `test-haiku` unifies a dearer zero lane (bedrock)
+    // and a cheaper standard lane (anthropic) at the DEARER (bedrock) sell
+    // schedule. An allow_non_zdr key reaches the standard lane only BELOW the
+    // zero one, so bedrock is scripted to a non-retryable 4xx and the walk fails
+    // over to anthropic. Whichever lane serves, the customer is billed at the
+    // ONE dearer unified rate — here anthropic serves, realizing the house
+    // margin the owner accepted.
+    let (api_key_id, key) =
+        create_funded_key_with_policy(&pool, "unified-haiku-allow", "allow_non_zdr").await;
+    let bedrock = FakeModelProvider::new(
+        "test-haiku-zero",
+        vec![FakeOutcome::Failure("401 Unauthorized")],
+    );
+    let anthropic = FakeModelProvider::new(
+        "test-haiku-standard",
+        vec![FakeOutcome::chat(
+            "hello from the dearer twin",
+            served_usage(),
+        )],
+    );
+    let state = unified_router_by_provider(
+        pool.clone(),
+        vec![
+            ("bedrock", bedrock.clone()),
+            ("anthropic", anthropic.clone()),
+        ],
+    );
+
+    let response = app(state.clone())
+        .oneshot(completion_request(
+            &key,
+            &completion_body("test-haiku", false),
+        ))
+        .await
+        .expect("completion request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    // The zero lead failed over (401, non-retryable); the standard lane served.
+    assert_eq!(header(&response, "x-zerorouter-provider"), "anthropic");
+    state.wait_for_background_tasks().await;
+    assert_eq!(bedrock.call_count(), 1, "the zero lead is tried first");
+    assert_eq!(
+        anthropic.call_count(),
+        1,
+        "and the walk fails over to the standard lane below it"
+    );
+
+    // Settlement bills the customer at the DEARER unified (bedrock) rate even
+    // though the cheaper anthropic lane served: 1000 input @ $1.10/Mtok + 20
+    // output @ $5.50/Mtok = $0.00121.
+    let (provider, _model, input, output, cost, status) = settled_event(&pool, api_key_id).await;
+    assert_eq!(provider, "anthropic");
+    assert_eq!((input, output, status), (1_000, 20, 200));
+    assert_eq!(
+        cost,
+        decimal("0.00121"),
+        "the unified id bills the dearer schedule even when the cheaper lane serves"
+    );
+    // Strictly dearer than the standard lane's OWN sell would have been —
+    // 1000 @ $1.00 + 20 @ $5.00 = $0.00110 — which is the accepted house margin.
+    assert!(cost > decimal("0.00110"));
+    // COGS basis is the served (anthropic) candidate's own basis, untouched by
+    // the dearer sell: 1000 @ $0.50 + 20 @ $2.50 = $0.00055, so the realized
+    // margin is real and positive.
+    let (candidate_id, cost_basis, _, _) = settled_provenance(&pool, api_key_id).await;
+    assert_eq!(candidate_id.as_deref(), Some("anthropic/test-haiku"));
+    assert_eq!(cost_basis, Some(decimal("0.00055")));
+    assert_eq!(open_reservations(&pool, api_key_id).await, 0);
 }

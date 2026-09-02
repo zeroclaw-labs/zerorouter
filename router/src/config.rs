@@ -1299,16 +1299,24 @@ impl TierCatalog {
     /// 2. **Different providers.** A group needs at least two distinct
     ///    `provider`s; a single provider serving a model is just that pin, with
     ///    no routing to do.
-    /// 3. **Same sell rate.** Every unifying pin must sell at the IDENTICAL
-    ///    [`RateSchedule`]. A unified route carries ONE sell schedule and bills
-    ///    every candidate at it (settlement reads the route's sell rate, not the
-    ///    served candidate's), so unifying pins that priced differently would
-    ///    change what a customer is charged depending on which provider happened
-    ///    to serve — a billing decision this layer must not make silently. The
-    ///    catalog's Bedrock/Anthropic Claude twins price the zero lane higher,
-    ///    so they are (correctly) left un-unified here; the Google/Vertex Gemini
-    ///    twins price identically, so they unify. This rule is STRICTER than the
-    ///    same-model rule and is what keeps "one admission/money path" true.
+    /// 3. **Reconcilable sell rates → the DEARER rate.** A unified route carries
+    ///    ONE sell schedule and bills every candidate at it (settlement reads the
+    ///    route's sell rate, not the served candidate's), so the route's rate has
+    ///    to be chosen deliberately when the pins price differently. Option ii
+    ///    (owner decision): the unified id sells at the per-dimension DEARER rate
+    ///    across its members ([`RateSchedule::dearest_across`]), so no candidate
+    ///    is ever undercharged — whichever provider serves, the customer pays at
+    ///    least that provider's own pinned price, and each candidate's cost basis
+    ///    (≤ its own sell ≤ the dearer unified sell) keeps every margin positive.
+    ///    Consequence in today's catalog: the Google/Vertex Gemini twins price
+    ///    identically and unify unchanged; the Bedrock/Anthropic Claude **haiku**
+    ///    twin (Bedrock a uniform 1.10x dearer) now ALSO unifies, selling at
+    ///    Bedrock's dearer schedule — under `zdr_only` it routes to Bedrock (zero)
+    ///    at cost, and only an `allow_non_zdr` key served by Anthropic pays the
+    ///    house margin the owner accepted. Reconciliation is per band, so it is
+    ///    skipped (pin-only) ONLY when the members reprice at different sizes: a
+    ///    differing band structure has no common band to take a maximum within,
+    ///    and `dearest_across` returns `None`.
     ///
     /// A bare id that would collide with an existing tier id, or that is not a
     /// simple name (it still contains a `/`), is skipped rather than allowed to
@@ -1359,13 +1367,20 @@ impl TierCatalog {
             if providers.len() < 2 {
                 continue;
             }
-            // One shared sell schedule, or unifying would change the bill by
-            // provider. Compared against the first member's schedule; all must
-            // match exactly.
-            let sell_rates = members[0].sell_rates.clone();
-            if members.iter().any(|member| member.sell_rates != sell_rates) {
+            // One sell schedule for the whole route — settlement bills at it,
+            // not at the served candidate's own rate. Option ii (owner decision):
+            // reconcile differently-priced twins to the DEARER rate per dimension
+            // (`RateSchedule::dearest_across`) so no candidate is ever
+            // undercharged whichever one serves. Reconciliation is per band, so
+            // it skips ONLY when the members reprice at different sizes — a band
+            // structure with no common band to take a maximum within, where
+            // `dearest_across` returns `None` and this stays conservative
+            // (pin-only, no unification).
+            let schedules: Vec<&RateSchedule> =
+                members.iter().map(|member| &member.sell_rates).collect();
+            let Some(sell_rates) = RateSchedule::dearest_across(&schedules) else {
                 continue;
-            }
+            };
             // Retention is the PRIMARY key: zero candidates before standard
             // ones. A stable sort keeps the catalog's own order within a
             // partition, so the result is deterministic run to run.
@@ -4687,8 +4702,12 @@ output_per_mtok = 2.00
     ///
     /// - `shared-flash` — one zero (`vertex`) and one standard (`google`) pin at
     ///   the SAME bare id and the SAME rate → unifies.
-    /// - `dear-model` — the same shape but the two pins price DIFFERENTLY →
-    ///   refused, because a unified route bills at one rate.
+    /// - `dear-model` — the same shape but the two pins price DIFFERENTLY (the
+    ///   `claude-haiku-4-5` case: the zero `bedrock` lane is a uniform 1.10x
+    ///   dearer than the standard `anthropic` one, and both carry `cache_control`
+    ///   so the cache-write dimension is expressible). Under option ii it STILL
+    ///   unifies, selling at the per-dimension DEARER (bedrock) rate so neither
+    ///   lane is undercharged.
     /// - `model-4-5` / `model-5` — two DIFFERENT bare ids (a version apart), one
     ///   provider each → never merged, and each single-provider → never unified.
     const UNIFY_FIXTURE: &str = r#"
@@ -4742,29 +4761,42 @@ model = "shared-flash"
 input_per_mtok = 1.00
 output_per_mtok = 2.00
 
-[tiers."vertex/dear-model"]
-[tiers."vertex/dear-model".rates]
-input_per_mtok = 2.00
-output_per_mtok = 4.00
-[[tiers."vertex/dear-model".candidates]]
-id = "vertex/dear-model"
-provider = "vertex"
-model = "google/dear-model"
-[tiers."vertex/dear-model".candidates.rates]
-input_per_mtok = 2.00
-output_per_mtok = 4.00
+# The dearer, zero lane (bedrock, a uniform 1.10x): the claude-haiku-4-5 shape.
+# Cache-write pricing is allowed only on the Anthropic-Messages wire, which is
+# why this twin is bedrock/anthropic (both carry `cache_control`) rather than
+# the vertex/google pair the same-rate `shared-flash` twin uses.
+[tiers."bedrock/dear-model"]
+[tiers."bedrock/dear-model".rates]
+input_per_mtok = 1.10
+cached_input_per_mtok = 0.11
+cache_write_per_mtok = 1.375
+output_per_mtok = 5.50
+[[tiers."bedrock/dear-model".candidates]]
+id = "bedrock/dear-model"
+provider = "bedrock"
+model = "anthropic.dear-model"
+[tiers."bedrock/dear-model".candidates.rates]
+input_per_mtok = 1.10
+cached_input_per_mtok = 0.11
+cache_write_per_mtok = 1.375
+output_per_mtok = 5.50
 
-[tiers."google/dear-model"]
-[tiers."google/dear-model".rates]
+# The cheaper, standard lane (anthropic): the anthropic-side haiku rates.
+[tiers."anthropic/dear-model"]
+[tiers."anthropic/dear-model".rates]
 input_per_mtok = 1.00
-output_per_mtok = 2.00
-[[tiers."google/dear-model".candidates]]
-id = "google/dear-model"
-provider = "google"
+cached_input_per_mtok = 0.10
+cache_write_per_mtok = 1.25
+output_per_mtok = 5.00
+[[tiers."anthropic/dear-model".candidates]]
+id = "anthropic/dear-model"
+provider = "anthropic"
 model = "dear-model"
-[tiers."google/dear-model".candidates.rates]
+[tiers."anthropic/dear-model".candidates.rates]
 input_per_mtok = 1.00
-output_per_mtok = 2.00
+cached_input_per_mtok = 0.10
+cache_write_per_mtok = 1.25
+output_per_mtok = 5.00
 
 [tiers."bedrock/model-4-5"]
 [tiers."bedrock/model-4-5".rates]
@@ -4847,28 +4879,83 @@ output_per_mtok = 2.00
     }
 
     #[test]
-    fn pins_priced_differently_do_not_unify() {
+    fn pins_priced_differently_unify_at_the_dearer_rate() {
         let catalog = loaded(UNIFY_FIXTURE);
-        // Same bare id, two providers, but different sell rates: unifying would
-        // make the customer's charge depend on which provider served, which the
-        // money path forbids. So it stays two pins and no unified id appears.
-        assert!(
-            catalog.resolve_unified("dear-model").is_none(),
-            "pins that price differently must not unify — a unified route bills one rate"
+        // Option ii (owner decision): same bare id, two providers, DIFFERENT
+        // sell rates — the `claude-haiku-4-5` case. It NOW unifies, and the
+        // unified route sells at the per-dimension DEARER (vertex) schedule, so
+        // no candidate is ever undercharged whichever one serves.
+        let route = catalog
+            .resolve_unified("dear-model")
+            .expect("a differently-priced twin unifies at the dearer rate");
+        let dearer = catalog.tiers["bedrock/dear-model"].rates.clone();
+        assert_eq!(
+            route.sell_rates, dearer,
+            "the unified id sells at the dearer (bedrock) schedule, whole"
         );
-        // The pins themselves still resolve, untouched.
-        assert!(catalog.resolve("vertex/dear-model").is_some());
-        assert!(catalog.resolve("google/dear-model").is_some());
+        // Dimension by dimension, including cache_write — the dearer of the two.
+        let unified = route.sell_rates.base();
+        assert_eq!(unified.input_per_mtok, Some(1.10));
+        assert_eq!(unified.cached_input_per_mtok, Some(0.11));
+        assert_eq!(unified.cache_write_per_mtok, Some(1.375));
+        assert_eq!(unified.output_per_mtok, Some(5.50));
+        // Zero (bedrock) still leads the candidate order — retention is the
+        // primary key, unchanged by the price reconciliation.
+        let ordered: Vec<&str> = route
+            .candidates
+            .iter()
+            .map(|candidate| candidate.id.as_str())
+            .collect();
+        assert_eq!(ordered, ["bedrock/dear-model", "anthropic/dear-model"]);
+        assert_eq!(
+            route.retention_posture("bedrock/dear-model"),
+            Some(RetentionPosture::Zero)
+        );
+        // The pins themselves still resolve as themselves, each at its own rate.
+        assert!(catalog.resolve("bedrock/dear-model").is_some());
+        assert!(catalog.resolve("anthropic/dear-model").is_some());
     }
 
     #[test]
-    fn only_the_same_model_same_rate_pair_is_synthesized() {
+    fn the_unified_sell_never_undercharges_either_member() {
+        // The no-undercharge invariant asserted directly on the routed catalog:
+        // the unified `dear-model` sell is >= each backing pin's own sell in
+        // every dimension `usage_cost` prices, so a customer is never charged
+        // less than the pin that served would have charged.
+        let catalog = loaded(UNIFY_FIXTURE);
+        let unified = catalog
+            .resolve_unified("dear-model")
+            .expect("the twin unifies")
+            .sell_rates
+            .base();
+        for pin in ["bedrock/dear-model", "anthropic/dear-model"] {
+            let member = catalog.tiers[pin].rates.base();
+            assert!(unified.input_per_mtok.unwrap() >= member.input_per_mtok.unwrap());
+            assert!(unified.output_per_mtok.unwrap() >= member.output_per_mtok.unwrap());
+            assert!(
+                unified.effective_cached_input_per_mtok().unwrap()
+                    >= member.effective_cached_input_per_mtok().unwrap(),
+                "cached undercharged against {pin}"
+            );
+            assert!(
+                unified.effective_cache_write_per_mtok().unwrap()
+                    >= member.effective_cache_write_per_mtok().unwrap(),
+                "cache_write undercharged against {pin}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_reconcilable_multi_provider_pair_is_synthesized() {
         let catalog = loaded(UNIFY_FIXTURE);
         let unified: Vec<&str> = catalog.unified.keys().map(String::as_str).collect();
+        // Both same-model, multi-provider bare ids unify now: the same-rate
+        // `shared-flash` AND the differently-priced `dear-model` (option ii).
+        // The version-apart `model-4-5`/`model-5` still never merge.
         assert_eq!(
             unified,
-            ["shared-flash"],
-            "exactly the same-model, same-rate, multi-provider bare id unifies"
+            ["dear-model", "shared-flash"],
+            "every same-model, multi-provider bare id with a shared band structure unifies"
         );
     }
 

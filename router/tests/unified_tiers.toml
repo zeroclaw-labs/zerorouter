@@ -80,7 +80,60 @@ input_per_mtok = 1.50
 cached_input_per_mtok = 0.30
 output_per_mtok = 3.00
 
+# --- test-haiku: differently-priced twins → unify at the DEARER rate
+#     (option ii). The `claude-haiku-4-5` case: bedrock (zero) is a uniform
+#     1.10x dearer than anthropic (standard). The unified id sells at bedrock's
+#     dearer schedule, so an allow_non_zdr request served by anthropic settles
+#     the DEARER rate (the house margin the owner accepted). Each candidate's
+#     basis is half its own tier sell. ---
+
+[tiers."bedrock/test-haiku"]
+[tiers."bedrock/test-haiku".rates]
+input_per_mtok = 1.10
+cached_input_per_mtok = 0.11
+cache_write_per_mtok = 1.375
+output_per_mtok = 5.50
+[[tiers."bedrock/test-haiku".candidates]]
+id = "bedrock/test-haiku"
+provider = "bedrock"
+model = "anthropic.claude-haiku"
+[tiers."bedrock/test-haiku".candidates.rates]
+input_per_mtok = 0.55
+cached_input_per_mtok = 0.055
+cache_write_per_mtok = 0.6875
+output_per_mtok = 2.75
+
+[tiers."anthropic/test-haiku"]
+[tiers."anthropic/test-haiku".rates]
+input_per_mtok = 1.00
+cached_input_per_mtok = 0.10
+cache_write_per_mtok = 1.25
+output_per_mtok = 5.00
+[[tiers."anthropic/test-haiku".candidates]]
+id = "anthropic/test-haiku"
+provider = "anthropic"
+model = "claude-haiku"
+[tiers."anthropic/test-haiku".candidates.rates]
+input_per_mtok = 0.50
+cached_input_per_mtok = 0.05
+cache_write_per_mtok = 0.625
+output_per_mtok = 2.50
+
 # --- retention postures (required; URLs/digests are fixture filler) ---
+
+[retention.bedrock]
+posture = "zero"
+description = "Fixture lane: bedrock enforced zero retention."
+source_url = "https://example.test/bedrock/retention"
+verified = "2026-08-20"
+source_sha256 = "4444444444444444444444444444444444444444444444444444444444444444"
+
+[retention.anthropic]
+posture = "standard"
+description = "Fixture lane: anthropic standard retention."
+source_url = "https://example.test/anthropic/retention"
+verified = "2026-08-20"
+source_sha256 = "5555555555555555555555555555555555555555555555555555555555555555"
 
 [retention.vertex]
 posture = "zero"
