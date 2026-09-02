@@ -697,6 +697,7 @@ mod tests {
             tiers,
             retention: BTreeMap::new(),
             unavailable: BTreeMap::new(),
+            unified: BTreeMap::new(),
         }
     }
 
@@ -1170,6 +1171,7 @@ mod tests {
             tiers,
             retention: BTreeMap::new(),
             unavailable: BTreeMap::new(),
+            unified: BTreeMap::new(),
         };
         let found = crate::drift::reconcile_with(&edge, PRIMARY, &|_| true, &|_| None, &|_| None);
         assert_eq!(found[0].verdict, Verdict::Unreconcilable);
@@ -1234,6 +1236,7 @@ mod tests {
             tiers,
             retention: BTreeMap::new(),
             unavailable: BTreeMap::new(),
+            unified: BTreeMap::new(),
         };
         let primary = PRIMARY.replace(
             "\"openai\": {",

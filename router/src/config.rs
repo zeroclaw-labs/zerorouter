@@ -58,6 +58,52 @@ pub struct TierCatalog {
     /// field in it.
     #[serde(skip)]
     pub unavailable: BTreeMap<String, UnavailableTier>,
+    /// UNIFIED (routed) model ids synthesized from the pins (hybrid provider
+    /// routing, phase 1), keyed by the bare model id (`gemini-3.7-flash`).
+    ///
+    /// A VIEW over the existing servable tiers, not new catalog data: each
+    /// entry's candidates and rates are copied from the pins it unifies, so
+    /// there is nothing here to keep in sync with `tiers` beyond re-deriving it
+    /// at load. Never deserialized from the file — it is computed by
+    /// [`TierCatalog::synthesize_unified`] after validation and withholding,
+    /// from `tiers` alone.
+    ///
+    /// Kept in ITS OWN map, deliberately apart from `tiers`, so the unified
+    /// layer is dark by construction: [`TierCatalog::resolve`],
+    /// [`TierCatalog::model_listing`], and the drift checks all read `tiers`
+    /// and never this, so a synthesized id cannot leak into `/v1/models` or
+    /// change any pinned route. It is reached only through
+    /// [`TierCatalog::resolve_unified`], and only when the deployment has turned
+    /// the routed layer on.
+    #[serde(skip)]
+    pub unified: BTreeMap<String, UnifiedModel>,
+}
+
+/// A synthesized unified model: the routed view over the pins that serve the
+/// same model across providers (hybrid provider routing, phase 1).
+///
+/// It is a [`TierDefinition`] shaped exactly like a manually-authored alias
+/// tier — a multi-candidate tier whose candidates span providers — paired with
+/// the posture each candidate serves under, resolved once at synthesis by the
+/// SAME [`TierCatalog::candidate_retention`] the catalog publishes from. The
+/// candidates are stored already RETENTION-PARTITIONED: every zero-posture
+/// candidate precedes every standard one, which is the design's primary key
+/// ("retention is not a tiebreaker, it is the primary key"). Runtime health and
+/// cost ordering runs within the eligible set the switch leaves; it never
+/// promotes a standard candidate above a zero one.
+#[derive(Clone, Debug)]
+pub struct UnifiedModel {
+    /// The synthesized tier: candidates (zero-first) and the shared sell
+    /// schedule every candidate is billed at. All unified candidates share one
+    /// sell schedule by construction (see [`TierCatalog::synthesize_unified`]),
+    /// so this route bills exactly as the pin it resolved to would — the money
+    /// path is unchanged, whichever provider serves.
+    pub definition: TierDefinition,
+    /// Each candidate's posture by id, precomputed so
+    /// [`TierCatalog::resolve_unified`] hands admission the same posture map a
+    /// pin route carries, honoring any tier-level retention override the
+    /// underlying pin declared.
+    pub retention: BTreeMap<String, RetentionPosture>,
 }
 
 /// A tier that parses and is structurally valid but must not be served,
@@ -449,6 +495,76 @@ impl RetentionPosture {
     }
 }
 
+/// The per-key retention SWITCH (hybrid provider routing, phase 1;
+/// `api_keys.retention_policy`, migration 0030).
+///
+/// This is the standing default a key's ROUTED (unified-id) requests run under.
+/// It is a policy the customer sets once and relies on, distinct from
+/// [`RetentionPosture`], which is a fact about what one upstream does with a
+/// request. The switch decides which postures are *eligible* for a routed id;
+/// the posture is what an eligible candidate actually is.
+///
+/// It governs only unified ids. An explicitly provider-pinned id
+/// (`anthropic/…`, `bedrock/…`) is a deliberate, auditable choice to address
+/// one lane by name and is served as itself whatever the switch says — see the
+/// design doc, "Unified id vs explicit alias" and "The switch". The switch is
+/// the default for the routed layer, never a filter over direct addressing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RetentionPolicy {
+    /// The safe default: a routed request is eligible only for the zero
+    /// partition and FAILS CLOSED (`no_zero_retention_route`, a 503 refused
+    /// before any reservation) when no zero-retention route is available,
+    /// rather than crossing to a retaining provider. Every key that predates
+    /// the switch is backfilled to this.
+    ZdrOnly,
+    /// A deliberate loosening: the standard partition becomes eligible too,
+    /// always ordered strictly below the zero partition. Flipping to this is an
+    /// auditable act on the key.
+    AllowNonZdr,
+}
+
+impl RetentionPolicy {
+    /// Parse the keyword the database column carries. The words are exactly the
+    /// `api_keys_retention_policy_is_known` CHECK's set (migration 0030), so a
+    /// policy read here and the constraint that guards the column cannot
+    /// disagree.
+    #[must_use]
+    pub fn from_keyword(keyword: &str) -> Option<Self> {
+        match keyword {
+            "zdr_only" => Some(Self::ZdrOnly),
+            "allow_non_zdr" => Some(Self::AllowNonZdr),
+            _ => None,
+        }
+    }
+
+    /// The keyword this policy is stored under. Its own default position is the
+    /// strict end, matching the column default.
+    #[must_use]
+    pub const fn as_keyword(self) -> &'static str {
+        match self {
+            Self::ZdrOnly => "zdr_only",
+            Self::AllowNonZdr => "allow_non_zdr",
+        }
+    }
+
+    /// Whether a candidate serving under `posture` is eligible for a routed
+    /// request under this switch.
+    ///
+    /// The zero partition is always eligible. The standard partition is
+    /// eligible only under [`Self::AllowNonZdr`]. This is the ONE place the
+    /// switch decides eligibility, so the fail-closed guarantee and the
+    /// standard-below-zero rule both read from it rather than from a second
+    /// copy of the rule at the serve site.
+    #[must_use]
+    pub const fn permits(self, posture: RetentionPosture) -> bool {
+        match (self, posture) {
+            (_, RetentionPosture::Zero) => true,
+            (Self::AllowNonZdr, RetentionPosture::Standard) => true,
+            (Self::ZdrOnly, RetentionPosture::Standard) => false,
+        }
+    }
+}
+
 /// A pinned retention claim: what the posture is, and the evidence it was read
 /// from.
 ///
@@ -550,6 +666,19 @@ pub struct ResolvedRoute {
     /// ([`TierCatalog::tier_retention`]) is the right claim for a catalog
     /// listing, where no rung has been chosen yet, and the wrong one here.
     pub retention: BTreeMap<String, RetentionPosture>,
+    /// Whether this route came from a UNIFIED (bare) model id rather than a pin
+    /// (hybrid provider routing, phase 1).
+    ///
+    /// It is the one bit the admission path reads to decide whether the key's
+    /// retention SWITCH ([`RetentionPolicy`]) applies. A routed request is
+    /// subject to the switch — its standard-posture candidates are dropped
+    /// under `zdr_only`, and an empty eligible set fails closed. A PIN is not:
+    /// naming `anthropic/…` or `bedrock/…` is a deliberate, auditable choice to
+    /// address one lane, served as itself whatever the switch says (design doc,
+    /// "Unified id vs explicit alias"). Every route [`TierCatalog::resolve`]
+    /// produces is a pin or a manually-authored alias tier and carries `false`;
+    /// only [`TierCatalog::resolve_unified`] sets it `true`.
+    pub routed: bool,
 }
 
 impl ResolvedRoute {
@@ -863,6 +992,9 @@ impl TierCatalog {
                 retention: self.route_retention(tier, &tier.candidates),
                 candidates: tier.candidates.clone(),
                 sell_rates: tier.rates.clone(),
+                // A tier id names a pin or a manually-authored alias tier, never
+                // a synthesized unified id — the switch does not govern it.
+                routed: false,
             });
         }
 
@@ -885,6 +1017,9 @@ impl TierCatalog {
                     // rung directly lands on exactly that lane.
                     retention: self.route_retention(tier, std::slice::from_ref(&candidate)),
                     candidates: vec![candidate],
+                    // A concrete pinned candidate is a pin: the switch never
+                    // filters a lane the caller addressed by name.
+                    routed: false,
                 })
         })
     }
@@ -1111,6 +1246,151 @@ impl TierCatalog {
             })
             .flatten()
     }
+
+    /// Route a bare UNIFIED model id (hybrid provider routing, phase 1).
+    ///
+    /// Deliberately SEPARATE from [`TierCatalog::resolve`], which stays exactly
+    /// as it was: pins and manually-authored alias tiers resolve there and
+    /// unchanged, so every existing route and every catalog test is untouched.
+    /// A unified id is reached only here, and the request path consults this
+    /// only when the deployment has enabled the routed layer — which is what
+    /// keeps phase 1 dark.
+    ///
+    /// The candidates come back already retention-partitioned (zero-first) and
+    /// the route is stamped [`ResolvedRoute::routed`] `= true`, so admission
+    /// knows to apply the key's retention switch to it. The sell schedule is
+    /// the one every unified candidate shares by construction, so the money
+    /// path is identical to the pin this id resolves to.
+    #[must_use]
+    pub fn resolve_unified(&self, requested_model: &str) -> Option<ResolvedRoute> {
+        let unified = self.unified.get(requested_model)?;
+        Some(ResolvedRoute {
+            requested_model: requested_model.to_owned(),
+            candidates: unified.definition.candidates.clone(),
+            sell_rates: unified.definition.rates.clone(),
+            retention: unified.retention.clone(),
+            routed: true,
+        })
+    }
+
+    /// Build the unified (routed) view from the servable pins, into
+    /// [`TierCatalog::unified`].
+    ///
+    /// Runs once at load, after validation and withholding, over `tiers` alone:
+    /// a withheld tier is already gone from `tiers`, so a model a request for it
+    /// would refuse never becomes a unified candidate. It writes only
+    /// `self.unified` and reads only `self.tiers` + `self.retention`, so it
+    /// cannot perturb any pinned route.
+    ///
+    /// # The equivalence rule, and why it is this conservative
+    ///
+    /// Two pins unify into one bare id iff they are, provably, the SAME model
+    /// on DIFFERENT providers billed at the SAME sell rate. Concretely:
+    ///
+    /// 1. **Same model — by exact bare-id match.** The bare id is the candidate
+    ///    id with its `provider/` prefix stripped (`bedrock/claude-haiku-4-5` →
+    ///    `claude-haiku-4-5`). Only an EXACT string match unifies, so
+    ///    `bedrock/claude-sonnet-4-5` and `anthropic/claude-sonnet-5` — two
+    ///    different model VERSIONS — never merge: a request must never be
+    ///    answered by a different model than it named. A curated equivalence map
+    ///    (to unify deliberately-aliased names) is a later refinement; until it
+    ///    exists, string identity is the only claim the catalog can make
+    ///    honestly.
+    /// 2. **Different providers.** A group needs at least two distinct
+    ///    `provider`s; a single provider serving a model is just that pin, with
+    ///    no routing to do.
+    /// 3. **Same sell rate.** Every unifying pin must sell at the IDENTICAL
+    ///    [`RateSchedule`]. A unified route carries ONE sell schedule and bills
+    ///    every candidate at it (settlement reads the route's sell rate, not the
+    ///    served candidate's), so unifying pins that priced differently would
+    ///    change what a customer is charged depending on which provider happened
+    ///    to serve — a billing decision this layer must not make silently. The
+    ///    catalog's Bedrock/Anthropic Claude twins price the zero lane higher,
+    ///    so they are (correctly) left un-unified here; the Google/Vertex Gemini
+    ///    twins price identically, so they unify. This rule is STRICTER than the
+    ///    same-model rule and is what keeps "one admission/money path" true.
+    ///
+    /// A bare id that would collide with an existing tier id, or that is not a
+    /// simple name (it still contains a `/`), is skipped rather than allowed to
+    /// shadow an addressable id.
+    fn synthesize_unified(&mut self) {
+        /// One servable pin's contribution to a candidate bare-id group, owned
+        /// so the grouping can outlive the borrow of `self.tiers`.
+        struct Member {
+            candidate: TierCandidate,
+            sell_rates: RateSchedule,
+            posture: RetentionPosture,
+        }
+
+        let mut groups: BTreeMap<String, Vec<Member>> = BTreeMap::new();
+        for definition in self.tiers.values() {
+            for candidate in &definition.candidates {
+                let Some((_provider, bare)) = candidate.id.split_once('/') else {
+                    continue;
+                };
+                // A bare id must be a simple, currently-unaddressable name: not
+                // empty, no further `/`, and not already a tier id. Any of these
+                // means unifying it could shadow something a caller can already
+                // address, which the routed layer must never do.
+                if bare.is_empty() || bare.contains('/') || self.tiers.contains_key(bare) {
+                    continue;
+                }
+                // The posture the pin actually serves under, honoring a
+                // tier-level override — the same resolution `/v1/models`
+                // publishes from. A pin the catalog loaded always resolves one.
+                let Some(pin) = self.candidate_retention(definition, candidate) else {
+                    continue;
+                };
+                groups.entry(bare.to_owned()).or_default().push(Member {
+                    candidate: candidate.clone(),
+                    sell_rates: definition.rates.clone(),
+                    posture: pin.posture,
+                });
+            }
+        }
+
+        let mut unified = BTreeMap::new();
+        for (bare, mut members) in groups {
+            // Different providers, or there is nothing to route between.
+            let providers: BTreeSet<&str> = members
+                .iter()
+                .map(|member| member.candidate.provider.as_str())
+                .collect();
+            if providers.len() < 2 {
+                continue;
+            }
+            // One shared sell schedule, or unifying would change the bill by
+            // provider. Compared against the first member's schedule; all must
+            // match exactly.
+            let sell_rates = members[0].sell_rates.clone();
+            if members.iter().any(|member| member.sell_rates != sell_rates) {
+                continue;
+            }
+            // Retention is the PRIMARY key: zero candidates before standard
+            // ones. A stable sort keeps the catalog's own order within a
+            // partition, so the result is deterministic run to run.
+            members.sort_by_key(|member| member.posture.ordering_rank());
+            let retention = members
+                .iter()
+                .map(|member| (member.candidate.id.clone(), member.posture))
+                .collect();
+            let candidates = members.into_iter().map(|member| member.candidate).collect();
+            unified.insert(
+                bare,
+                UnifiedModel {
+                    definition: TierDefinition {
+                        candidates,
+                        rates: sell_rates,
+                        // No single tier override: each candidate's posture is
+                        // carried per-id in `retention` above, computed already.
+                        retention: None,
+                    },
+                    retention,
+                },
+            );
+        }
+        self.unified = unified;
+    }
 }
 
 /// One row of the public catalog: the provider that serves this id, the sell
@@ -1162,6 +1442,11 @@ pub async fn load_tier_catalog(path: &Path) -> Result<TierCatalog, TierConfigErr
     let withheld = validate_tier_catalog(&catalog)?;
     report_withheld_tiers(&withheld);
     catalog.withhold(withheld);
+    // Derived AFTER withholding, over the servable pins only: a model a request
+    // would be refused must not become a unified candidate. Writes only the
+    // separate `unified` map, so nothing a pinned route or `/v1/models` reads is
+    // touched.
+    catalog.synthesize_unified();
     Ok(catalog)
 }
 
@@ -4381,5 +4666,316 @@ output_per_mtok = 2.00
             pinned.retention_posture("anthropic/negotiated"),
             Some(RetentionPosture::Zero)
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Hybrid provider routing, phase 1: unified (routed) ids + the switch.
+    // -----------------------------------------------------------------------
+
+    /// Parse, validate, withhold, and synthesize — the same pipeline
+    /// `load_tier_catalog` runs, from a string, so a unit test can inspect
+    /// `catalog.unified` without touching the filesystem.
+    fn loaded(toml: &str) -> TierCatalog {
+        let mut catalog: TierCatalog = toml::from_str(toml).expect("fixture catalog parses");
+        let withheld = validate_tier_catalog(&catalog).expect("fixture catalog validates");
+        catalog.withhold(withheld);
+        catalog.synthesize_unified();
+        catalog
+    }
+
+    /// A catalog exercising every branch of the unification rule at once:
+    ///
+    /// - `shared-flash` — one zero (`vertex`) and one standard (`google`) pin at
+    ///   the SAME bare id and the SAME rate → unifies.
+    /// - `dear-model` — the same shape but the two pins price DIFFERENTLY →
+    ///   refused, because a unified route bills at one rate.
+    /// - `model-4-5` / `model-5` — two DIFFERENT bare ids (a version apart), one
+    ///   provider each → never merged, and each single-provider → never unified.
+    const UNIFY_FIXTURE: &str = r#"
+schema_version = 1
+[retention.vertex]
+posture = "zero"
+description = "vertex retains nothing"
+source_url = "https://example.test/vertex"
+verified = "2026-08-20"
+source_sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
+[retention.google]
+posture = "standard"
+description = "google retains for a period"
+source_url = "https://example.test/google"
+verified = "2026-08-20"
+source_sha256 = "2222222222222222222222222222222222222222222222222222222222222222"
+[retention.bedrock]
+posture = "zero"
+description = "bedrock enforced none"
+source_url = "https://example.test/bedrock"
+verified = "2026-08-20"
+source_sha256 = "3333333333333333333333333333333333333333333333333333333333333333"
+[retention.anthropic]
+posture = "standard"
+description = "anthropic retains for 30 days"
+source_url = "https://example.test/anthropic"
+verified = "2026-08-20"
+source_sha256 = "4444444444444444444444444444444444444444444444444444444444444444"
+
+[tiers."vertex/shared-flash"]
+[tiers."vertex/shared-flash".rates]
+input_per_mtok = 1.00
+output_per_mtok = 2.00
+[[tiers."vertex/shared-flash".candidates]]
+id = "vertex/shared-flash"
+provider = "vertex"
+model = "google/shared-flash"
+[tiers."vertex/shared-flash".candidates.rates]
+input_per_mtok = 1.00
+output_per_mtok = 2.00
+
+[tiers."google/shared-flash"]
+[tiers."google/shared-flash".rates]
+input_per_mtok = 1.00
+output_per_mtok = 2.00
+[[tiers."google/shared-flash".candidates]]
+id = "google/shared-flash"
+provider = "google"
+model = "shared-flash"
+[tiers."google/shared-flash".candidates.rates]
+input_per_mtok = 1.00
+output_per_mtok = 2.00
+
+[tiers."vertex/dear-model"]
+[tiers."vertex/dear-model".rates]
+input_per_mtok = 2.00
+output_per_mtok = 4.00
+[[tiers."vertex/dear-model".candidates]]
+id = "vertex/dear-model"
+provider = "vertex"
+model = "google/dear-model"
+[tiers."vertex/dear-model".candidates.rates]
+input_per_mtok = 2.00
+output_per_mtok = 4.00
+
+[tiers."google/dear-model"]
+[tiers."google/dear-model".rates]
+input_per_mtok = 1.00
+output_per_mtok = 2.00
+[[tiers."google/dear-model".candidates]]
+id = "google/dear-model"
+provider = "google"
+model = "dear-model"
+[tiers."google/dear-model".candidates.rates]
+input_per_mtok = 1.00
+output_per_mtok = 2.00
+
+[tiers."bedrock/model-4-5"]
+[tiers."bedrock/model-4-5".rates]
+input_per_mtok = 1.00
+output_per_mtok = 2.00
+[[tiers."bedrock/model-4-5".candidates]]
+id = "bedrock/model-4-5"
+provider = "bedrock"
+model = "anthropic.model-4-5"
+[tiers."bedrock/model-4-5".candidates.rates]
+input_per_mtok = 1.00
+output_per_mtok = 2.00
+
+[tiers."anthropic/model-5"]
+[tiers."anthropic/model-5".rates]
+input_per_mtok = 1.00
+output_per_mtok = 2.00
+[[tiers."anthropic/model-5".candidates]]
+id = "anthropic/model-5"
+provider = "anthropic"
+model = "model-5"
+[tiers."anthropic/model-5".candidates.rates]
+input_per_mtok = 1.00
+output_per_mtok = 2.00
+"#;
+
+    #[test]
+    fn a_unified_id_partitions_zero_before_standard() {
+        let catalog = loaded(UNIFY_FIXTURE);
+        let route = catalog
+            .resolve_unified("shared-flash")
+            .expect("the same-model, same-rate pair unifies");
+        assert!(route.routed, "a unified route is subject to the switch");
+        let ordered: Vec<&str> = route
+            .candidates
+            .iter()
+            .map(|candidate| candidate.id.as_str())
+            .collect();
+        assert_eq!(
+            ordered,
+            ["vertex/shared-flash", "google/shared-flash"],
+            "the zero-retention candidate must lead the standard one — retention is the \
+             primary key, not a tiebreaker"
+        );
+        assert_eq!(
+            route.retention_posture("vertex/shared-flash"),
+            Some(RetentionPosture::Zero)
+        );
+        assert_eq!(
+            route.retention_posture("google/shared-flash"),
+            Some(RetentionPosture::Standard)
+        );
+        // The unified route bills at the one shared schedule, which is the pin's
+        // schedule — the money path is unchanged whichever provider serves.
+        assert_eq!(
+            route.sell_rates, catalog.tiers["vertex/shared-flash"].rates,
+            "a unified route sells at the shared pin rate"
+        );
+    }
+
+    #[test]
+    fn same_model_string_across_versions_is_never_merged() {
+        let catalog = loaded(UNIFY_FIXTURE);
+        // `model-4-5` and `model-5` are one model version apart; each is served
+        // by a single provider under a different bare id. Neither unifies, and
+        // nothing merges them into one id.
+        assert!(
+            catalog.resolve_unified("model-4-5").is_none(),
+            "a single-provider bare id has no route to unify"
+        );
+        assert!(catalog.resolve_unified("model-5").is_none());
+        // And no synthesized id spans the two versions — the exact-string rule.
+        assert!(
+            catalog
+                .unified
+                .keys()
+                .all(|bare| bare != "model-4-5" && bare != "model-5"),
+            "conservatism: only an exact bare-id match unifies, never across versions"
+        );
+    }
+
+    #[test]
+    fn pins_priced_differently_do_not_unify() {
+        let catalog = loaded(UNIFY_FIXTURE);
+        // Same bare id, two providers, but different sell rates: unifying would
+        // make the customer's charge depend on which provider served, which the
+        // money path forbids. So it stays two pins and no unified id appears.
+        assert!(
+            catalog.resolve_unified("dear-model").is_none(),
+            "pins that price differently must not unify — a unified route bills one rate"
+        );
+        // The pins themselves still resolve, untouched.
+        assert!(catalog.resolve("vertex/dear-model").is_some());
+        assert!(catalog.resolve("google/dear-model").is_some());
+    }
+
+    #[test]
+    fn only_the_same_model_same_rate_pair_is_synthesized() {
+        let catalog = loaded(UNIFY_FIXTURE);
+        let unified: Vec<&str> = catalog.unified.keys().map(String::as_str).collect();
+        assert_eq!(
+            unified,
+            ["shared-flash"],
+            "exactly the same-model, same-rate, multi-provider bare id unifies"
+        );
+    }
+
+    #[test]
+    fn a_unified_id_is_absent_from_the_default_models_listing() {
+        // Dark gating: a synthesized id lives in `unified`, never in `tiers`, so
+        // `model_listing` (which reads `tiers` alone) cannot publish it. The pin
+        // rows that back it stay, unchanged.
+        let catalog = loaded(UNIFY_FIXTURE);
+        let listing = catalog.model_listing(&|_| true);
+        assert!(
+            !listing.contains_key("shared-flash"),
+            "a unified id must not appear on /v1/models in phase 1"
+        );
+        assert!(
+            listing.contains_key("vertex/shared-flash")
+                && listing.contains_key("google/shared-flash"),
+            "the pins that back a unified id are published as themselves, unchanged"
+        );
+    }
+
+    #[test]
+    fn a_pinned_id_is_never_a_routed_route() {
+        // The switch runs only on a routed route. A pin — including a pin of a
+        // STANDARD lane — resolves to a non-routed route, so the switch never
+        // filters or refuses it. This is the unit expression of the design's
+        // precedence rule: a `zdr_only` key that PINS `google/shared-flash` is
+        // served that lane, because pinning is a deliberate single-lane address,
+        // not the routed default the switch governs (design doc, "The switch").
+        let catalog = loaded(UNIFY_FIXTURE);
+        let pinned_zero = catalog
+            .resolve("vertex/shared-flash")
+            .expect("the zero pin resolves");
+        assert!(!pinned_zero.routed, "a pin is never switch-governed");
+        let pinned_standard = catalog
+            .resolve("google/shared-flash")
+            .expect("the standard pin resolves");
+        assert!(
+            !pinned_standard.routed,
+            "pinning a standard lane by name is honored, not filtered by the switch"
+        );
+    }
+
+    #[test]
+    fn the_switch_permits_the_partition_it_should() {
+        // zdr_only: only the zero partition is eligible; the standard partition
+        // is not a fallback, it is never eligible.
+        assert!(RetentionPolicy::ZdrOnly.permits(RetentionPosture::Zero));
+        assert!(!RetentionPolicy::ZdrOnly.permits(RetentionPosture::Standard));
+        // allow_non_zdr: both are eligible (the route order keeps standard below
+        // zero; eligibility does not reorder).
+        assert!(RetentionPolicy::AllowNonZdr.permits(RetentionPosture::Zero));
+        assert!(RetentionPolicy::AllowNonZdr.permits(RetentionPosture::Standard));
+    }
+
+    #[test]
+    fn the_switch_eligible_set_is_zero_only_under_zdr_and_both_otherwise() {
+        // The exact computation the admission path runs, over a real unified
+        // route: under zdr_only the eligible ids are the zero partition alone;
+        // under allow_non_zdr they are everything, zero still first.
+        let catalog = loaded(UNIFY_FIXTURE);
+        let route = catalog
+            .resolve_unified("shared-flash")
+            .expect("the pair unifies");
+        let eligible = |policy: RetentionPolicy| -> Vec<&str> {
+            route
+                .candidates
+                .iter()
+                .filter(|candidate| {
+                    route
+                        .retention_posture(&candidate.id)
+                        .is_some_and(|posture| policy.permits(posture))
+                })
+                .map(|candidate| candidate.id.as_str())
+                .collect()
+        };
+        assert_eq!(
+            eligible(RetentionPolicy::ZdrOnly),
+            ["vertex/shared-flash"],
+            "zdr_only serves the zero lane only and fails closed if it is gone"
+        );
+        assert_eq!(
+            eligible(RetentionPolicy::AllowNonZdr),
+            ["vertex/shared-flash", "google/shared-flash"],
+            "allow_non_zdr adds the standard lane, still ordered below the zero one"
+        );
+    }
+
+    #[test]
+    fn retention_policy_keywords_round_trip() {
+        for policy in [RetentionPolicy::ZdrOnly, RetentionPolicy::AllowNonZdr] {
+            assert_eq!(
+                RetentionPolicy::from_keyword(policy.as_keyword()),
+                Some(policy)
+            );
+        }
+        // The migration-0030 CHECK spells exactly these; an unknown value is
+        // refused rather than defaulted here (the caller chooses the safe
+        // fallback).
+        assert_eq!(
+            RetentionPolicy::from_keyword("zdr_only"),
+            Some(RetentionPolicy::ZdrOnly)
+        );
+        assert_eq!(
+            RetentionPolicy::from_keyword("allow_non_zdr"),
+            Some(RetentionPolicy::AllowNonZdr)
+        );
+        assert_eq!(RetentionPolicy::from_keyword("off"), None);
     }
 }

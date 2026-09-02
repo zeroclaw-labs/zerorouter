@@ -113,6 +113,7 @@ async fn create_key(
         id: key_id,
         user_id,
         default_priority: None,
+        retention_policy: zerorouter::config::RetentionPolicy::ZdrOnly,
     }
 }
 
@@ -1006,6 +1007,7 @@ async fn admission_does_not_know_the_playground_key_is_a_playground_key() {
             id: key_id,
             user_id,
             default_priority: None,
+            retention_policy: zerorouter::config::RetentionPolicy::ZdrOnly,
         }
     };
 
@@ -1619,6 +1621,7 @@ async fn create_limited_key(
         id: key_id,
         user_id,
         default_priority: None,
+        retention_policy: zerorouter::config::RetentionPolicy::ZdrOnly,
     }
 }
 
@@ -1993,6 +1996,7 @@ async fn the_two_spend_ceilings_are_reported_separately() {
             id: key_id,
             user_id,
             default_priority: None,
+            retention_policy: zerorouter::config::RetentionPolicy::ZdrOnly,
         }
     };
     assert!(
@@ -2932,6 +2936,7 @@ async fn the_playground_key_carries_a_default_budget_admission_enforces() {
         id: body["id"].as_str().expect("id").parse().expect("uuid"),
         user_id,
         default_priority: None,
+        retention_policy: zerorouter::config::RetentionPolicy::ZdrOnly,
     };
     // $6 is under the operator's $20 default month-to-date ceiling and over the
     // customer's $5 budget, so the code it refuses with says which one bound.

@@ -1289,17 +1289,17 @@ async fn migration_chain_applies_on_a_fresh_database() {
          a key attached under #103's no-fallback promise must not have it \
          revoked by a migration"
     );
-    // 29, not 25: 0013 (dispute resolution), 0014 (dispatched reservations),
+    // 30, not 25: 0013 (dispute resolution), 0014 (dispatched reservations),
     // 0015 (released reservations), 0016 (deposit fee), 0017 (stripe observed
     // reversals), 0018 (autopay withheld state), 0019 (monthly spend rollup),
     // 0020 (usage gap and real finish reason), 0021 (autopay tax), 0022
     // (checkout intent cleanup), 0023 (key expiry and credit limits), 0024
     // (autopay tax lifecycle), 0025 (redemption tax), 0026 (byok provider
-    // keys), 0027 (byok monthly allowance), 0028 (byok fallback opt in) and
-    // 0029 (cache write tokens) are numbered with a gap so 0010-0012 stay
-    // available to branches in flight.
+    // keys), 0027 (byok monthly allowance), 0028 (byok fallback opt in), 0029
+    // (cache write tokens) and 0030 (key retention policy) are numbered with a
+    // gap so 0010-0012 stay available to branches in flight.
     // The chain's head is the highest version applied, not a count of files.
-    assert_eq!(outcome.22, 29, "the chain reaches migration version 29");
+    assert_eq!(outcome.22, 30, "the chain reaches migration version 30");
 }
 
 /// Rewrite the database name in a Postgres URL, keeping any query string

@@ -191,6 +191,26 @@ pub enum ApiError {
     /// guarantee than the one they bought, which is a materially different
     /// event from an upstream being down.
     RetentionAttestationFailed,
+    /// A ROUTED (unified-id) request on a `zdr_only` key found no
+    /// zero-retention route to serve it, so it was refused rather than sent to
+    /// a provider that retains the prompt (hybrid provider routing, phase 1;
+    /// the crux decision, `docs/design/hybrid-provider-routing.md`).
+    ///
+    /// This is the FAIL-CLOSED default made observable. It is raised BEFORE any
+    /// reservation — no money moves and no `usage_reservations` row is written —
+    /// so a caller that hits it has been charged nothing and has not silently
+    /// had a prompt kept. Its own code rather than a reuse of
+    /// [`Self::NoProviderAvailable`] for the reason
+    /// [`Self::RetentionAttestationFailed`] gives: the remedy differs and a
+    /// caller acts on the code. "No provider available" reads as a transient
+    /// outage inviting a retry; this is a POLICY refusal — the key is
+    /// zero-retention-only and the model's zero lanes are (all) unavailable —
+    /// and the caller's real options are to retry (a zero lane may return), to
+    /// pin a specific provider they trust, or, if they own the key, to flip its
+    /// `retention_policy` to `allow_non_zdr`. Silently downgrading to a
+    /// retaining provider is the one thing that must not happen, and this code
+    /// is where that guarantee is spent honestly instead of hidden.
+    NoZeroRetentionRoute,
     UpstreamTimeout,
     ServerShuttingDown,
     MeteringUnavailable,
@@ -516,6 +536,32 @@ impl ApiError {
                 "server_error",
                 None,
                 "retention_attestation_failed",
+            ),
+            // 503 and in the `server_error` family: nothing about the caller's
+            // request is malformed, so this is not a 4xx. It is a policy
+            // refusal the caller can act on, and the message says exactly that —
+            // that the key is zero-retention-only, that no zero lane was
+            // available, that NOTHING was sent to a retaining provider and
+            // nothing was billed, and the three ways forward. It deliberately
+            // does NOT name the providers behind the model: a customer is told
+            // their guarantee held and why the request stopped, not which
+            // vendors sit in the pool. Distinct `code` from the transient
+            // `no_provider_available` so a caller's retry logic can tell a ZDR
+            // policy stop from an outage.
+            Self::NoZeroRetentionRoute => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Cow::Borrowed(
+                    "This key is zero-data-retention only and no zero-retention provider is \
+                     currently available for the requested model, so ZeroRouter refused the \
+                     request rather than route it to a provider that would retain your prompt. \
+                     Nothing was sent to a retaining provider and nothing was billed. Retry (a \
+                     zero-retention lane may return), pin a specific provider by its \
+                     `vendor/model` id, or — if you own this key — set its retention policy to \
+                     allow non-zero-retention providers.",
+                ),
+                "server_error",
+                Some("model"),
+                "no_zero_retention_route",
             ),
             Self::UpstreamTimeout => (
                 StatusCode::GATEWAY_TIMEOUT,

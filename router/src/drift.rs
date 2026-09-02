@@ -1058,6 +1058,7 @@ mod tests {
             tiers,
             retention: BTreeMap::new(),
             unavailable: BTreeMap::new(),
+            unified: BTreeMap::new(),
         }
     }
 
@@ -1814,6 +1815,7 @@ mod tests {
             tiers,
             retention: BTreeMap::new(),
             unavailable: BTreeMap::new(),
+            unified: BTreeMap::new(),
         }
     }
 
@@ -1904,6 +1906,7 @@ mod tests {
             tiers,
             retention: BTreeMap::new(),
             unavailable: BTreeMap::new(),
+            unified: BTreeMap::new(),
         };
 
         // WITHOUT the declaration the source disagrees, and it disagrees in the
@@ -1974,6 +1977,7 @@ mod tests {
             tiers,
             retention: BTreeMap::new(),
             unavailable: BTreeMap::new(),
+            unified: BTreeMap::new(),
         };
 
         // WITHOUT the declaration: the row exists, at a key one character off,
@@ -2028,6 +2032,7 @@ mod tests {
             tiers,
             retention: BTreeMap::new(),
             unavailable: BTreeMap::new(),
+            unified: BTreeMap::new(),
         };
 
         let found = reconcile_with(

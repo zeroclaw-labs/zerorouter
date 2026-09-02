@@ -843,10 +843,41 @@ pub struct RouterState {
     /// [`RouterState::with_database`]).
     dispatchable: Option<DispatchableProviders>,
     services: Option<Arc<RouterServices>>,
+    /// Whether the UNIFIED (routed) model-id layer is live for this deployment
+    /// (hybrid provider routing, phase 1). `false` — the default and the
+    /// production default until the operator sets `ZEROROUTER_UNIFIED_IDS` —
+    /// means a bare unified id resolves to nothing (a 404, exactly as today)
+    /// and the routing/switch code is never reached, so the phase ships dark.
+    ///
+    /// It gates RESOLUTION only, never listing: a unified id is never published
+    /// on `/v1/models` in phase 1 whatever this says, because the catalog's
+    /// `unified` map is not read by `model_listing`. Turning this on lets the
+    /// operator drive routed requests in prod and watch their behavior with the
+    /// customer-facing catalog unchanged.
+    unified_ids_enabled: bool,
 }
 
 /// "Can this deployment dispatch to this provider?", as a value.
 type DispatchableProviders = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+
+/// The environment flag that lights up the routed (unified-id) layer. Off in
+/// every deployment that does not set it, which is what keeps phase 1 dark.
+const UNIFIED_IDS_ENV: &str = "ZEROROUTER_UNIFIED_IDS";
+
+/// Read [`UNIFIED_IDS_ENV`] as a boolean. Present and truthy (`1`, `true`,
+/// `yes`, `on`, case-insensitive) turns the layer on; absent, empty, or any
+/// other value leaves it off — an unrecognized value is treated as "off"
+/// rather than guessed at, because the safe reading of an ambiguous flag on a
+/// money path is the one that changes nothing.
+#[must_use]
+fn unified_ids_enabled_from_env() -> bool {
+    std::env::var(UNIFIED_IDS_ENV).ok().is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
 
 struct RouterServices {
     pool: PgPool,
@@ -904,6 +935,10 @@ impl RouterState {
             tier_config_path: Arc::new(tier_config_path.into()),
             dispatchable: None,
             services: None,
+            // A public-surface-only state never routes a request, so the flag
+            // is inert here; false is the honest default for a state with no
+            // dispatch path.
+            unified_ids_enabled: false,
         }
     }
 
@@ -979,6 +1014,12 @@ impl RouterState {
         Self {
             tier_config_path: Arc::new(tier_config_path.into()),
             dispatchable: None,
+            // Production reads the environment: the routed layer is on only
+            // where the operator set the flag. Read once at construction — the
+            // catalog is re-parsed per request, but whether the deployment
+            // offers the routed layer at all is a deployment property, not a
+            // per-request one.
+            unified_ids_enabled: unified_ids_enabled_from_env(),
             services: Some(Arc::new(RouterServices {
                 pool,
                 authenticator: KeyAuthenticator::new(),
@@ -1007,6 +1048,11 @@ impl RouterState {
         Self {
             tier_config_path: Arc::new(tier_config_path.into()),
             dispatchable: None,
+            // Dark by default even in the harness: a request_path test opts the
+            // routed layer in explicitly with [`RouterState::with_unified_ids`],
+            // so a test that does not mention it exercises exactly today's
+            // pinned behavior.
+            unified_ids_enabled: false,
             services: Some(Arc::new(RouterServices {
                 pool,
                 authenticator: KeyAuthenticator::new(),
@@ -1018,6 +1064,24 @@ impl RouterState {
                 injected_route: Some(route),
             })),
         }
+    }
+
+    /// Turn the routed (unified-id) layer on for this state, for tests that
+    /// drive a unified id without setting a process-global environment variable
+    /// (which would race across the parallel test binary). Production reaches
+    /// the same switch through [`UNIFIED_IDS_ENV`]; this is the deterministic
+    /// per-state equivalent.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn with_unified_ids(mut self, enabled: bool) -> Self {
+        self.unified_ids_enabled = enabled;
+        self
+    }
+
+    /// Whether this state serves the routed (unified-id) layer.
+    #[must_use]
+    fn unified_ids_enabled(&self) -> bool {
+        self.unified_ids_enabled
     }
 
     #[must_use]
@@ -1625,10 +1689,26 @@ async fn inference(
     // anything else falls through to the same not-found answer as before.
     // Everything downstream — `usage_events.tier`, the response `model`
     // field, stream metadata — reads the resolved (stripped) name.
-    let (resolved, suffix_priority) = match catalog.resolve(&request.model) {
+    //
+    // A bare UNIFIED id (hybrid provider routing, phase 1) is consulted only
+    // AFTER a pin miss and only where the deployment has turned the routed layer
+    // on (`ZEROROUTER_UNIFIED_IDS`). With the layer off — every deployment that
+    // has not set the flag — `resolve_model` is exactly `catalog.resolve`, so
+    // this resolution is byte-for-byte the previous one and a bare id 404s as an
+    // unknown model. Pins are always tried first, so a unified id can never
+    // shadow a pinned route.
+    let unified_ids_enabled = state.unified_ids_enabled();
+    let resolve_model = |model: &str| -> Option<ResolvedRoute> {
+        catalog.resolve(model).or_else(|| {
+            unified_ids_enabled
+                .then(|| catalog.resolve_unified(model))
+                .flatten()
+        })
+    };
+    let (resolved, suffix_priority) = match resolve_model(&request.model) {
         Some(resolved) => (resolved, None),
         None => match split_priority_suffix(&request.model) {
-            Some((base, priority)) => match catalog.resolve(base) {
+            Some((base, priority)) => match resolve_model(base) {
                 Some(resolved) => (resolved, Some(priority)),
                 None => return Err(model_unresolvable(&catalog, base)),
             },
@@ -1678,6 +1758,42 @@ async fn inference(
         resolved
             .candidates
             .retain(|candidate| candidate.rates.prices_cache_writes());
+    }
+    // The retention SWITCH (hybrid provider routing, phase 1). It governs a
+    // ROUTED (unified) id ONLY — a pin is a deliberate single-lane address and
+    // is never filtered by the switch, so a `zdr_only` key that pins a standard
+    // lane by name is served that lane (design doc, "Unified id vs explicit
+    // alias" and "The switch"; `resolved.routed` is the bit that tells them
+    // apart). Applied HERE, before any sizing, reservation, or credential mint,
+    // so the fail-closed refusal lands before money moves and writes no
+    // reservation row — the money/trust guarantee, enforced where it cannot be
+    // bypassed.
+    if resolved.routed {
+        let policy = authenticated.retention_policy;
+        // The eligible ids under this switch, read from the ONE definition of
+        // eligibility ([`RetentionPolicy::permits`]): the zero partition always,
+        // the standard partition only under `allow_non_zdr`. Collected first so
+        // the candidate retain does not borrow the posture map it filters on.
+        let eligible: BTreeSet<String> = resolved
+            .retention
+            .iter()
+            .filter(|(_, posture)| policy.permits(**posture))
+            .map(|(id, _)| id.clone())
+            .collect();
+        resolved
+            .candidates
+            .retain(|candidate| eligible.contains(&candidate.id));
+        // FAIL CLOSED. An empty eligible set means a `zdr_only` key found no
+        // zero-retention route for this model — the standard partition was not
+        // a fallback, it was never eligible — so the request is refused rather
+        // than routed to a provider that would retain the prompt. (Under
+        // `allow_non_zdr` every posture is eligible and a prior gate has already
+        // guaranteed at least one candidate survives, so this branch is the
+        // `zdr_only` fail-closed and nothing else.) Its own 503, before any
+        // reservation.
+        if resolved.candidates.is_empty() {
+            return Err(ApiError::NoZeroRetentionRoute);
+        }
     }
     let resolved = resolved;
     let max_output_tokens = *request.max_tokens.get_or_insert(BASELINE_MAX_TOKENS);
@@ -1795,6 +1911,18 @@ async fn inference(
         // and admission do, so every one of them describes the same request.
         &request.needs(reservation_usage.prompt_tokens),
     );
+    // Retention is the PRIMARY ordering key for a routed request. Health and
+    // cost ordering above may interleave providers; this re-establishes the
+    // partition so a standard-retention rung can never rank above a
+    // zero-retention one (design doc, "Candidate ordering" — retention is not a
+    // tiebreaker, it is the primary key). A STABLE sort, so the health/cost
+    // order is preserved WITHIN each partition. Under `zdr_only` only zero rungs
+    // remain and this is a no-op; it earns its keep under `allow_non_zdr`, the
+    // only switch position that leaves a standard rung eligible. A pin route is
+    // never touched.
+    if resolved.routed {
+        partition_route_by_retention(provider_route.candidates_mut(), &resolved.retention);
+    }
     // The metering seam (edge mode, stage 3). Decided AFTER ordering, over the
     // route the walk will actually take, and read from server-side
     // configuration only — see [`free_lane_admissible`].
@@ -2189,6 +2317,34 @@ fn unservable_prompt_caching(resolved: &ResolvedRoute) -> Option<ApiError> {
 /// reason. An all-ineligible route partitions to itself, so a single-candidate
 /// tier still dispatches and still gets whatever answer the upstream gives,
 /// exactly as it does today. Nothing here can empty a route.
+/// Stable-partition a ROUTED request's candidates so every zero-retention rung
+/// precedes every standard one (hybrid provider routing, phase 1).
+///
+/// The retention partition is the PRIMARY key of a unified route's ordering —
+/// prior to health and cost, which [`order_candidates`] applies and which may
+/// interleave providers. This is the one place the partition is re-established
+/// after that runtime ordering, so a standard-retention rung can never be
+/// promoted above a zero-retention one, whatever the health or price signals
+/// say. A stable sort keeps the health/cost order intact WITHIN each partition.
+///
+/// The posture of each rung is read from the route's own `retention` map — the
+/// same map admission and the response header read — so this ordering and the
+/// posture a served response reports cannot disagree. A rung absent from the
+/// map (which cannot happen for a synthesized unified route) sorts as the
+/// weaker `standard`, never silently ahead of a zero rung.
+fn partition_route_by_retention(
+    candidates: &mut [ProviderCandidate],
+    retention: &BTreeMap<String, RetentionPosture>,
+) {
+    candidates.sort_by_key(|candidate| {
+        retention
+            .get(&candidate.definition().id)
+            .copied()
+            .unwrap_or(RetentionPosture::Standard)
+            .ordering_rank()
+    });
+}
+
 fn order_candidates(
     priority: Priority,
     candidates: &mut Vec<ProviderCandidate>,
@@ -5063,6 +5219,7 @@ mod tests {
             retention: BTreeMap::new(),
             candidates: definitions,
             sell_rates,
+            routed: false,
         };
         // Same stand-in as `ordered`, and for the same reason: the real
         // `is_free` needs an installed operator inventory, which this binary
@@ -5268,6 +5425,46 @@ mod tests {
                 &ProviderHealth::default(),
             ),
             ["openai/cloud", "local/qwen"]
+        );
+    }
+
+    #[test]
+    fn a_routed_partition_pulls_every_zero_rung_above_every_standard_one() {
+        // The runtime retention guard (hybrid provider routing, phase 1).
+        // Health and cost ordering may interleave providers, so after
+        // `order_candidates` a standard-retention rung can sit above a
+        // zero-retention one. This is the one place that is undone. Build a
+        // route in the WRONG order — standard first — and confirm the partition
+        // restores zero-first while keeping each partition's internal order
+        // stable (a standard rung is never promoted above a zero one, whatever
+        // health or price said).
+        let mut candidates: Vec<ProviderCandidate> = ["std/a", "zero/x", "std/b", "zero/y"]
+            .into_iter()
+            .map(|id| {
+                ProviderCandidate::against_local_upstream(
+                    cloud_rung(id),
+                    "http://127.0.0.1:1/unused",
+                )
+            })
+            .collect();
+        let retention: BTreeMap<String, RetentionPosture> = [
+            ("std/a", RetentionPosture::Standard),
+            ("zero/x", RetentionPosture::Zero),
+            ("std/b", RetentionPosture::Standard),
+            ("zero/y", RetentionPosture::Zero),
+        ]
+        .into_iter()
+        .map(|(id, posture)| (id.to_owned(), posture))
+        .collect();
+        partition_route_by_retention(&mut candidates, &retention);
+        let order: Vec<String> = candidates
+            .iter()
+            .map(|candidate| candidate.definition().id.clone())
+            .collect();
+        assert_eq!(
+            order,
+            ["zero/x", "zero/y", "std/a", "std/b"],
+            "every zero rung must precede every standard one, stable within each partition"
         );
     }
 
@@ -5583,6 +5780,7 @@ mod tests {
             id: Uuid::new_v4(),
             user_id,
             default_priority: None,
+            retention_policy: crate::config::RetentionPolicy::ZdrOnly,
         };
         query("INSERT INTO users (id, email) VALUES ($1, $2)")
             .bind(user_id)
@@ -6165,6 +6363,7 @@ mod tests {
             requested_model: "zero/test".to_owned(),
             candidates,
             sell_rates,
+            routed: false,
         }
     }
 
