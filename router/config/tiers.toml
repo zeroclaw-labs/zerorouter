@@ -443,12 +443,27 @@ openrouter_slug = "google-ai-studio"
 # coincidence rather than corroboration — it describes OPENROUTER's Bedrock
 # account, which has its own retention configuration and knows nothing about
 # ours. The evidence for this pin is the GET above, not a third party.
+# RE-PINNED 2026-09-02: AWS restructured this page into an ordered mode model
+# (none < default < aws_review < provider_data_share, with a legacy note), and
+# introduced a NEW requirement that Claude FABLE 5 / 5.1 need `aws_review` and
+# do NOT permit `none`. That does not touch this pin: the page states plainly
+# "There is no data retention change to Claude models released before Claude
+# Fable 5", and every lane this account serves — claude-haiku-4-5,
+# claude-opus-4-5, claude-opus-4-6, claude-sonnet-4-5 — is pre-Fable-5, so
+# `none` still resolves to zero for them (a pre-Fable-5 model's allowed_modes
+# includes `none`; e.g. the page's own Opus 4.8 example). The `none` guarantee
+# is re-read verbatim: "No request or response data is written to durable
+# storage by AWS or shared with the model provider ... Chat Completions and
+# Messages requests are never retained." Digest re-pinned; posture unchanged;
+# the live `--bedrock-live` GET remains the load-bearing evidence, this hash a
+# secondary check. Do NOT add a Fable-5 Bedrock lane without re-checking its
+# allowed_modes — such a lane would require aws_review and could NOT be zero.
 [retention.bedrock]
 posture = "zero"
-description = "AWS Bedrock under account data_retention_mode: none — no request or response data is written to durable storage by AWS or shared with the model provider, enforced across the Messages, Chat Completions, and Responses APIs."
+description = "AWS Bedrock under account data_retention_mode: none — no request or response data is written to durable storage by AWS or shared with the model provider, enforced across the Messages, Chat Completions, and Responses APIs. The four Claude lanes served here are all pre-Fable-5 and so retain none's zero guarantee under AWS's 2026 mode model."
 source_url = "https://docs.aws.amazon.com/bedrock/latest/userguide/data-retention.html"
-verified = "2026-08-20"
-source_sha256 = "7cb04795622b5f7cac43a5d7a216e699f045da24dfbb84de7998cc5204d0cedf"
+verified = "2026-09-02"
+source_sha256 = "b92689b0640dad752c327b367a5b3d1b2cb774c4a99c948d2de9a12ad2e7e7b4"
 openrouter_slug = "amazon-bedrock"
 
 # THE THIRD BASIS FOR A `zero` PIN (2026-08-20): the vendor's PUBLISHED DEFAULT.
