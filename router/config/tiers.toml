@@ -2073,12 +2073,30 @@ output_per_mtok = 3.96
 # snapshot, and the 0731 page says it supersedes the preview. models.dev carries
 # the dated and undated ids at identical rates, so this join is exact either way
 # and the dated id is the one with an argument behind it.
+# REPRICED 2026-09-02 (interim, conservative). models.dev raised this lane to
+# 0.22 / 0.007 / 0.66 (input / cache-read / output) from the 0.14 / 0.028 / 0.28
+# pinned here since July — a reprice UP on input and output that, left alone,
+# would have sold the catalog's cheapest and most-used lane BELOW cost on every
+# request. Fireworks does not publish serverless inference rates in any form a
+# machine can read (the /models API carries none, billing endpoints 404 for our
+# key, a completion's usage has no cost field, and both the pricing and model
+# pages are JS-rendered), so models.dev is the only current signal and is taken
+# as the interim cost basis. This lane is sold at cost, so sell tracks basis.
+#
+# THE 0.007 CACHE-READ RATE IS THE NUMBER TO DISTRUST: it is 3% of the input
+# rate where every other lane's cache is ~20%, so it may be a models.dev glitch.
+# It is taken anyway for drift coherence and because cache-read tokens are a
+# small share; if it is wrong the exposure is bounded to that dimension. The
+# WHOLE triple is provisional and reconciles against the first real Fireworks
+# invoice (Jordan's decision 2026-09-02: stop the input/output bleed now, true
+# up on the invoice). When the invoice lands, re-pin all three to the billed
+# rate and refresh `verified`.
 [tiers."fireworks/deepseek-v4-flash"]
 
 [tiers."fireworks/deepseek-v4-flash".rates]
-input_per_mtok = 0.14
-cached_input_per_mtok = 0.028
-output_per_mtok = 0.28
+input_per_mtok = 0.22
+cached_input_per_mtok = 0.007
+output_per_mtok = 0.66
 
 [[tiers."fireworks/deepseek-v4-flash".candidates]]
 id = "fireworks/deepseek-v4-flash"
@@ -2096,9 +2114,9 @@ input_modalities = ["text"]
 tool_call = true
 
 [tiers."fireworks/deepseek-v4-flash".candidates.rates]
-input_per_mtok = 0.14
-cached_input_per_mtok = 0.028
-output_per_mtok = 0.28
+input_per_mtok = 0.22
+cached_input_per_mtok = 0.007
+output_per_mtok = 0.66
 
 # THE CHEAPEST LANE IN THE WHOLE CATALOG, and the one whose metadata Fireworks
 # most plainly contradicts itself about — two fields are omitted below.
