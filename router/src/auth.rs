@@ -6,6 +6,7 @@ use tokio::{sync::RwLock, time::Instant};
 use uuid::Uuid;
 
 use crate::{
+    config::RetentionPolicy,
     priority::Priority,
     sqlx::{self, PgPool},
 };
@@ -27,6 +28,20 @@ pub struct AuthenticatedKey {
     /// itself: a changed default has exactly the staleness contract of a
     /// disablement. `None` means balanced.
     pub default_priority: Option<Priority>,
+    /// The key's retention SWITCH (migration 0030), carried here for the same
+    /// reason as `default_priority`: the switch filters a routed id's candidate
+    /// set BEFORE admission — the fail-closed refusal must land before any
+    /// reservation — so it has to be known ahead of the admission SELECT, which
+    /// runs after candidate ordering. Rides the same 30-second cache and so has
+    /// the same staleness contract a disablement or a changed default does: a
+    /// flip is honored within one cache TTL. For phase 1 the routed layer is
+    /// dark (off unless `ZEROROUTER_UNIFIED_IDS` is set), so this reaches a
+    /// decision only where the operator has enabled it.
+    ///
+    /// The column is `NOT NULL DEFAULT 'zdr_only'` with a CHECK, so a row can
+    /// only ever carry a keyword this parses; an unparseable value is read as
+    /// the safe default rather than silently widening the switch.
+    pub retention_policy: RetentionPolicy,
 }
 
 #[derive(Clone, Debug)]
@@ -84,10 +99,11 @@ impl KeyAuthenticator {
                 bool,
                 Option<String>,
                 Option<DateTime<Utc>>,
+                String,
             ),
         >(
             r#"
-            SELECT id, user_id, key_hash, disabled, default_priority, expires_at
+            SELECT id, user_id, key_hash, disabled, default_priority, expires_at, retention_policy
             FROM api_keys
             WHERE key_hash = $1
             "#,
@@ -108,7 +124,7 @@ impl KeyAuthenticator {
         let expired = |expires_at: Option<DateTime<Utc>>| {
             expires_at.is_some_and(|deadline| deadline <= Utc::now())
         };
-        let Some((id, user_id, _, _, default_priority, expires_at)) =
+        let Some((id, user_id, _, _, default_priority, expires_at, retention_policy)) =
             row.filter(|row| syntactically_valid && hashes_match && !row.3 && !expired(row.5))
         else {
             return Err(AuthenticationError::Invalid);
@@ -120,6 +136,13 @@ impl KeyAuthenticator {
             // The column is CHECK-constrained to the three keywords, so a
             // `None` here is a genuine NULL — balanced — not a parse loss.
             default_priority: default_priority.as_deref().and_then(Priority::from_keyword),
+            // The column is NOT NULL with a CHECK to the two keywords, so this
+            // always parses; an out-of-set value (which the CHECK makes
+            // unreachable) falls back to the SAFE default rather than widening
+            // the switch, because a parse loss must never read as "allow
+            // standard retention".
+            retention_policy: RetentionPolicy::from_keyword(&retention_policy)
+                .unwrap_or(RetentionPolicy::ZdrOnly),
         };
         // A cached entry may not outlive the key it caches. Without this clamp
         // a key that expires one second from now would still be served from

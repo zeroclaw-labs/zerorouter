@@ -89,6 +89,7 @@ async fn create_key(pool: &PgPool, user_id: Uuid) -> AuthenticatedKey {
         id: key_id,
         user_id,
         default_priority: None,
+        retention_policy: zerorouter::config::RetentionPolicy::ZdrOnly,
     }
 }
 

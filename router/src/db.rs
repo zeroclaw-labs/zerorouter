@@ -1163,6 +1163,13 @@ pub async fn migrate(pool: &PgPool) -> Result<()> {
                 Cow::Borrowed(include_str!("../migrations/0029_cache_write_tokens.sql")),
                 false,
             ),
+            Migration::new(
+                30,
+                Cow::Borrowed("key retention policy"),
+                MigrationType::Simple,
+                Cow::Borrowed(include_str!("../migrations/0030_key_retention_policy.sql")),
+                false,
+            ),
         ]),
         ignore_missing: false,
         locking: true,
