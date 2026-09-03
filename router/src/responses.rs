@@ -744,12 +744,28 @@ pub fn items_from_completion(
 /// capability fields, and for the same reason: a plausible default is
 /// indistinguishable from a measurement.
 fn usage_to_wire(usage: OpenAiUsage) -> Value {
-    json!({
+    let mut wire = json!({
         "input_tokens": usage.prompt_tokens,
         "input_tokens_details": { "cached_tokens": usage.cached_input_tokens() },
         "output_tokens": usage.completion_tokens,
         "total_tokens": usage.total_tokens,
-    })
+    });
+    // The cache-WRITE bucket, in the same `zerorouter.cache_write_tokens`
+    // spelling the chat-completions surface uses (see `openai::OpenAiUsage`'s
+    // hand-written Serialize). Emitted only when non-zero, for the same reason:
+    // a request that wrote no cache carries no new object. Without this a
+    // caller on a Claude lane is BILLED for cache writes (settle prices them at
+    // 1.25x) but cannot see the token count that produced the charge — the
+    // reported usage would not reconcile with the invoice, the exact
+    // report-vs-bill gap the published `/v1/models` write rate exists to close.
+    // The Responses dialect has no native field for it, so it rides the same
+    // `zerorouter` extension rather than being renamed into an OpenAI key it is
+    // not.
+    let written = usage.cache_write_tokens();
+    if written > 0 {
+        wire["zerorouter"] = json!({ "cache_write_tokens": written });
+    }
+    wire
 }
 
 #[must_use]
@@ -1423,6 +1439,33 @@ mod serialization_tests {
             arguments: r#"{"command":"pwd"}"#.to_owned(),
             extra_content: None,
         }
+    }
+
+    /// A cache-writing request bills the write bucket (settle prices it at
+    /// 1.25x), so the Responses usage object must report the token count that
+    /// produced the charge — under the same `zerorouter.cache_write_tokens`
+    /// spelling the chat surface uses — or the caller cannot reconcile the
+    /// invoice. Absent when nothing was written, so a plain request's usage is
+    /// byte-for-byte what it was before this dimension existed.
+    #[test]
+    fn the_responses_usage_reports_the_cache_write_bucket_it_bills() {
+        use crate::openai::PromptTokenDetails;
+        let plain = usage_to_wire(usage());
+        assert!(
+            plain.get("zerorouter").is_none(),
+            "a request that wrote no cache carries no zerorouter usage extension"
+        );
+
+        let mut wrote = usage();
+        wrote.prompt_tokens_details = Some(PromptTokenDetails {
+            cached_tokens: 0,
+            cache_write_tokens: 300,
+        });
+        let wire = usage_to_wire(wrote);
+        assert_eq!(wire["zerorouter"]["cache_write_tokens"], 300);
+        // The OpenAI-shaped fields are untouched by the extension.
+        assert_eq!(wire["input_tokens"], 40);
+        assert_eq!(wire["output_tokens"], 9);
     }
 
     #[test]
