@@ -1706,10 +1706,10 @@ mod chat_completions_tests {
     #[test]
     fn image_parts_become_openai_image_parts_byte_for_byte() {
         let messages = vec![ChatMessage::user_parts(vec![
-            ContentPart::Text("what is this? ".to_owned()),
-            ContentPart::Image("data:image/png;base64,AAAA".to_owned()),
-            ContentPart::Text(" and this? ".to_owned()),
-            ContentPart::Image("https://example.com/x.jpg".to_owned()),
+            ContentPart::text("what is this? ".to_owned()),
+            ContentPart::image("data:image/png;base64,AAAA".to_owned()),
+            ContentPart::text(" and this? ".to_owned()),
+            ContentPart::image("https://example.com/x.jpg".to_owned()),
         ])];
         let built = build_chat_completions_messages(&messages);
         assert_eq!(

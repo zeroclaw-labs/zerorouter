@@ -150,7 +150,7 @@ pub(super) fn messages_request_body(
     // Neither is a merge worth having, and "the client owns the cache
     // boundaries when it states any" is the rule a caching-aware agent
     // expects.
-    let client_placed = messages.iter().any(|message| message.cache_control)
+    let client_placed = messages.iter().any(ChatMessage::has_client_breakpoint)
         || tools.is_some_and(|tools| tools.iter().any(|tool| tool.cache_control));
     let (system, mut turns) = build_anthropic_messages(messages);
     // Cache breakpoints, matching what the pinned adapter set: the
@@ -255,7 +255,7 @@ fn push_anthropic_block(turns: &mut Vec<Value>, role: &str, block: Value) {
 /// "Vision", read 2026-08-21): `source.type` is one of `base64` (with
 /// `media_type` + `data`), `url`, or `file`.
 fn push_user_content(turns: &mut Vec<Value>, message: &ChatMessage) {
-    for part in super::user_parts(message) {
+    for (part, cache_control) in super::user_parts_cached(message) {
         let block = match part {
             super::UserPart::Text(text) => json!({ "type": "text", "text": text }),
             super::UserPart::Base64Image { media_type, data } => json!({
@@ -272,6 +272,15 @@ fn push_user_content(turns: &mut Vec<Value>, message: &ChatMessage) {
             }),
         };
         push_anthropic_block(turns, "user", block);
+        // A client breakpoint on THIS part marks the block it just produced —
+        // the Messages API caches everything up to and including a marked
+        // block, so a mark on part 2 of 4 caches parts 1 and 2 and leaves the
+        // rest fresh, which is the boundary the client named. The block was
+        // just appended, so it is the last one; `mark_last_block` marks it.
+        // This is the per-part twin of the message-level marking below.
+        if cache_control {
+            mark_last_block(turns);
+        }
     }
 }
 
@@ -1661,12 +1670,117 @@ mod anthropic_review_fix_tests {
     }
 
     #[test]
+    fn a_content_part_breakpoint_lands_on_its_own_block_and_not_a_later_one() {
+        // The heart of the content-part feature: a breakpoint on part 2 of a
+        // text array caches parts 1 and 2 and leaves the rest fresh, so the
+        // mark must sit on the SECOND block and no later one. Placing it at the
+        // message end instead (the boundary the old comment warned about) would
+        // cache the whole turn — a different, dearer boundary the client did
+        // not ask for.
+        let messages = vec![ChatMessage::user_parts(vec![
+            ContentPart::text("stable prefix"),
+            ContentPart::Text {
+                text: "cached up to here".to_owned(),
+                cache_control: true,
+            },
+            ContentPart::text("fresh tail"),
+        ])];
+        let (_, turns) = build_anthropic_messages(&messages);
+        let blocks = turns[0]["content"].as_array().expect("blocks");
+        assert_eq!(blocks.len(), 3, "each content part is its own block");
+        assert!(
+            blocks[0].get("cache_control").is_none(),
+            "the block before the marked one is not cached"
+        );
+        assert_eq!(
+            blocks[1]["cache_control"]["type"], "ephemeral",
+            "the marked part carries the boundary"
+        );
+        assert!(
+            blocks[2].get("cache_control").is_none(),
+            "a LATER block must stay fresh — the boundary is not hoisted to the turn's end"
+        );
+        // Exactly one breakpoint on the wire: the one the client placed, with
+        // none of the wire's three defaults added alongside it.
+        assert_eq!(
+            body_of(&messages)
+                .to_string()
+                .matches("cache_control")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_content_part_breakpoint_switches_off_the_wires_default_breakpoints() {
+        // A content-part breakpoint makes the client the owner of this
+        // request's cache boundaries, exactly as a message-level one does: the
+        // wire sets NONE of its three defaults, because three defaults plus the
+        // client's marks could exceed Anthropic's limit of four and would cache
+        // boundaries the customer did not choose.
+        let messages = vec![
+            ChatMessage::system("be terse"),
+            ChatMessage::user_parts(vec![ContentPart::Text {
+                text: "cache me".to_owned(),
+                cache_control: true,
+            }]),
+        ];
+        let body = body_of(&messages);
+        assert!(
+            body["system"][0].get("cache_control").is_none(),
+            "the wire's default system-prompt marker is dropped — the client did not mark it"
+        );
+        assert_eq!(
+            body.to_string().matches("cache_control").count(),
+            1,
+            "one client breakpoint, and none of the wire's three"
+        );
+    }
+
+    #[test]
+    fn a_breakpoint_on_an_image_content_part_marks_its_image_block() {
+        // The image half: a `cache_control` on an image part marks the native
+        // image block the wire builds for it, so a client can cache a prefix
+        // that ends on an image.
+        let messages = vec![ChatMessage::user_parts(vec![
+            ContentPart::text("describe both"),
+            ContentPart::Image {
+                url: "data:image/png;base64,AAAA".to_owned(),
+                cache_control: true,
+            },
+            ContentPart::text("and then continue"),
+        ])];
+        let (_, turns) = build_anthropic_messages(&messages);
+        let blocks = turns[0]["content"].as_array().expect("blocks");
+        assert_eq!(blocks[1]["type"], "image");
+        assert_eq!(
+            blocks[1]["cache_control"]["type"], "ephemeral",
+            "the marked image block carries the boundary"
+        );
+        assert!(blocks[0].get("cache_control").is_none());
+        assert!(blocks[2].get("cache_control").is_none());
+    }
+
+    /// Build a Messages body the way the wire does, for the cache-marker count
+    /// assertions — a thin helper so the tests read the body a request path
+    /// would send.
+    fn body_of(messages: &[ChatMessage]) -> Value {
+        AnthropicWire::new("anthropic", "k", None, 512, 900).request_body(
+            "claude-sonnet-5",
+            messages,
+            None,
+            None,
+            false,
+        )
+    }
+
+    #[test]
     fn image_parts_become_native_image_blocks() {
         let messages = vec![ChatMessage::user_parts(vec![
-            ContentPart::Text("what is this? ".to_owned()),
-            ContentPart::Image("data:image/png;base64,AAAA".to_owned()),
-            ContentPart::Text(" and this? ".to_owned()),
-            ContentPart::Image("https://example.com/x.jpg".to_owned()),
+            ContentPart::text("what is this? ".to_owned()),
+            ContentPart::image("data:image/png;base64,AAAA".to_owned()),
+            ContentPart::text(" and this? ".to_owned()),
+            ContentPart::image("https://example.com/x.jpg".to_owned()),
         ])];
         let (_, turns) = build_anthropic_messages(&messages);
         let blocks = turns[0]["content"].as_array().unwrap();
@@ -1707,10 +1821,10 @@ mod anthropic_review_fix_tests {
     #[test]
     fn image_blocks_are_byte_stable() {
         let messages = vec![ChatMessage::user_parts(vec![
-            ContentPart::Text("look ".to_owned()),
-            ContentPart::Image("data:image/png;base64,AAAA".to_owned()),
-            ContentPart::Text(" and ".to_owned()),
-            ContentPart::Image("https://example.com/x.jpg".to_owned()),
+            ContentPart::text("look ".to_owned()),
+            ContentPart::image("data:image/png;base64,AAAA".to_owned()),
+            ContentPart::text(" and ".to_owned()),
+            ContentPart::image("https://example.com/x.jpg".to_owned()),
         ])];
         let (_, turns) = build_anthropic_messages(&messages);
         assert_eq!(

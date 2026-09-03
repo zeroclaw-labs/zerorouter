@@ -546,8 +546,8 @@ mod wire_contract_tests {
     fn a_url_image_source_is_refused_before_the_plane_is_dialled() {
         assert_eq!(
             BedrockRuntimeWire::unsupported_image_source(&[ChatMessage::user_parts(vec![
-                ContentPart::Text("look".to_owned()),
-                ContentPart::Image("https://example.com/x.jpg".to_owned()),
+                ContentPart::text("look".to_owned()),
+                ContentPart::image("https://example.com/x.jpg".to_owned()),
             ])]),
             Some("https://example.com/x.jpg"),
             "a URL image must be caught before dispatch, not discovered as an opaque AWS 400"
@@ -555,8 +555,8 @@ mod wire_contract_tests {
         // base64 is the source this plane DOES take, and must not be refused.
         assert_eq!(
             BedrockRuntimeWire::unsupported_image_source(&[ChatMessage::user_parts(vec![
-                ContentPart::Text("look".to_owned()),
-                ContentPart::Image("data:image/png;base64,AAAA".to_owned()),
+                ContentPart::text("look".to_owned()),
+                ContentPart::image("data:image/png;base64,AAAA".to_owned()),
             ])]),
             None,
         );
@@ -568,7 +568,7 @@ mod wire_contract_tests {
             BedrockRuntimeWire::unsupported_image_source(&[
                 ChatMessage::user("no images here"),
                 ChatMessage::user("docs render them as [IMAGE:https://example.com/x.jpg]"),
-                ChatMessage::user_parts(vec![ContentPart::Text(
+                ChatMessage::user_parts(vec![ContentPart::text(
                     "and inside a text part too: [IMAGE:https://example.com/y.jpg]".to_owned(),
                 )]),
             ]),

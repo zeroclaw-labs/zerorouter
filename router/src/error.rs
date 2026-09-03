@@ -16,17 +16,20 @@ pub enum ApiError {
     /// conflicts").
     PriorityConflict,
     /// The request put a `cache_control` somewhere this surface cannot place
-    /// it — at the top level, or inside a message content part.
+    /// it — at the TOP LEVEL, which names no content block at all.
     ///
     /// The variant predates prompt-caching support, where it refused EVERY
     /// `cache_control` on the grounds that the pinned provider interface could
     /// not carry one. That interface is gone and the breakpoints are now
     /// forwarded, so the blanket refusal went with it — but the variant is
-    /// kept rather than retired, because two placements are still genuinely
-    /// unplaceable and they deserve the specific answer this code already
-    /// gives. What changed is the message: it now names where a breakpoint
-    /// DOES go, so a client that guessed wrong is one edit from working
-    /// instead of concluding the feature does not exist.
+    /// kept rather than retired, because the top-level placement is still
+    /// genuinely unplaceable and it deserves the specific answer this code
+    /// already gives. The content-PART placement (the OpenRouter spelling) used
+    /// to land here too; it is now placeable — a part carries its own
+    /// breakpoint onto the block it produces — so only the top level remains.
+    /// What also changed is the message: it names where a breakpoint DOES go,
+    /// so a client that guessed wrong is one edit from working instead of
+    /// concluding the feature does not exist.
     ///
     /// `placement` is a fixed label chosen by
     /// [`crate::openai::ChatCompletionRequest::unplaceable_cache_control`],
