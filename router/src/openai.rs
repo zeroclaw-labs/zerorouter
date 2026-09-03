@@ -327,12 +327,7 @@ impl ChatCompletionRequest {
         self.extra.contains_key("cache_control")
             || self.messages.iter().any(|message| {
                 message.extra.contains_key("cache_control")
-                    || message.content.as_array().is_some_and(|parts| {
-                        parts.iter().any(|part| {
-                            part.as_object()
-                                .is_some_and(|part| part.contains_key("cache_control"))
-                        })
-                    })
+                    || content_part_cache_controls(message).next().is_some()
             })
             || self
                 .tools
@@ -342,38 +337,32 @@ impl ChatCompletionRequest {
 
     /// A `cache_control` this surface cannot place, if the request carries one.
     ///
-    /// Two spellings are refused, and both are refused because the router has
-    /// nowhere honest to put them rather than because caching is unsupported:
+    /// ONE spelling is refused now, and it is refused because the router has
+    /// nowhere honest to put it rather than because caching is unsupported:
     ///
     /// - **Top level.** `cache_control` beside `model` and `messages` names no
     ///   boundary at all. There is no content block it corresponds to.
-    /// - **Inside a content part.** This is the spelling OpenRouter documents,
-    ///   so it is the one a migrating client is most likely to send — but
-    ///   `ChatMessage` carries structured parts only for IMAGES (see
-    ///   `provider::ContentPart`), and a text-only content array is flattened
-    ///   back to one string before any wire sees it. A breakpoint on part 2 of
-    ///   4 would have to be hoisted to the message and would land at the end of
-    ///   the whole turn — a different boundary from the one the client asked
-    ///   for, at a different price. Refusing is the honest answer until parts
-    ///   can carry a breakpoint of their own.
+    ///
+    /// The content-PART spelling used to be refused here too — the one
+    /// OpenRouter documents, and so the one a migrating client is most likely
+    /// to send. It no longer is: [`ContentPart`] carries a per-part breakpoint,
+    /// and the Anthropic Messages wires place the mark on the exact block the
+    /// part produced (`wire::anthropic::push_user_content`), so the boundary
+    /// the client named is the boundary sent upstream. A content-part
+    /// breakpoint against a lane that cannot carry an explicit one is still
+    /// refused, but by the pre-reserve CAPABILITY gate that also governs the
+    /// message-level spelling (`api::unservable_prompt_caching`) — the honest
+    /// answer there is "this model does not sell it", not "this shape cannot be
+    /// placed".
     ///
     /// Returning the offending PLACEMENT rather than a bool so the refusal can
     /// name it; the string is a fixed label from this function, never request
     /// content.
     #[must_use]
     pub fn unplaceable_cache_control(&self) -> Option<&'static str> {
-        if self.extra.contains_key("cache_control") {
-            return Some("the top level of the request");
-        }
-        let in_a_part = self.messages.iter().any(|message| {
-            message.content.as_array().is_some_and(|parts| {
-                parts.iter().any(|part| {
-                    part.as_object()
-                        .is_some_and(|part| part.contains_key("cache_control"))
-                })
-            })
-        });
-        in_a_part.then_some("a message content part")
+        self.extra
+            .contains_key("cache_control")
+            .then_some("the top level of the request")
     }
 
     /// Every client-placed cache breakpoint, validated, or the reason the
@@ -402,6 +391,12 @@ impl ChatCompletionRequest {
     /// `upstream_rejected_parameters` and costs a debugging session.
     pub fn cache_breakpoints(&self) -> Result<usize, CacheControlFault> {
         let mut count = 0_usize;
+        // Message-level and tool-level breakpoints, then the content-PART ones.
+        // All three fold into the SAME validation and the SAME cap, because
+        // upstream they share one budget: Anthropic 400s the fifth breakpoint
+        // whatever mix of placements produced it, so a request placing three on
+        // messages and two inside content parts is a five-breakpoint request
+        // and is refused here with the count, before any reservation.
         for value in self
             .messages
             .iter()
@@ -411,6 +406,7 @@ impl ChatCompletionRequest {
                     .iter()
                     .filter_map(|tool| tool.extra.get("cache_control")),
             )
+            .chain(self.messages.iter().flat_map(content_part_cache_controls))
         {
             validate_cache_control(value)?;
             count += 1;
@@ -686,14 +682,16 @@ fn part_is_supported(role: &str, part: &Value) -> bool {
         return false;
     };
     match part.get("type").and_then(Value::as_str) {
-        // A text part carries `type` and `text` and nothing else this surface
-        // can preserve — `prompt_cache_breakpoint` is handled by the
-        // cache-control predicate, which runs first and answers separately.
+        // A text part carries `type` and `text`, and MAY carry a
+        // `cache_control` breakpoint (the OpenRouter spelling) — whose value is
+        // validated separately by the cache-control predicate, which runs
+        // first and answers with a named 400 of its own. No other key is a
+        // shape this surface can preserve.
         Some("text") => {
             part.get("text").is_some_and(Value::is_string)
                 && part
                     .keys()
-                    .all(|key| matches!(key.as_str(), "type" | "text"))
+                    .all(|key| matches!(key.as_str(), "type" | "text" | "cache_control"))
         }
         Some("image_url") if role == "user" => {
             part.get("image_url")
@@ -707,7 +705,7 @@ fn part_is_supported(role: &str, part: &Value) -> bool {
                 })
                 && part
                     .keys()
-                    .all(|key| matches!(key.as_str(), "type" | "image_url"))
+                    .all(|key| matches!(key.as_str(), "type" | "image_url" | "cache_control"))
         }
         _ => false,
     }
@@ -728,6 +726,24 @@ fn image_urls(messages: &[OpenAiMessage]) -> impl Iterator<Item = &str> {
                 .and_then(|image| image.get("url"))
                 .and_then(Value::as_str)
         })
+}
+
+/// Every content-part `cache_control` on one message, as the RAW value the
+/// client placed, in document order.
+///
+/// The OpenRouter spelling: a `{"type":"text","text":"…","cache_control":{…}}`
+/// or `image_url` part carries its own breakpoint. Returning the raw value —
+/// not a bool — lets the one validator [`validate_cache_control`] judge it
+/// exactly as it judges a message-level or tool-level breakpoint: one budget,
+/// one shape rule, one place a `ttl` is refused by name.
+fn content_part_cache_controls(message: &OpenAiMessage) -> impl Iterator<Item = &Value> {
+    message
+        .content
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_object)
+        .filter_map(|part| part.get("cache_control"))
 }
 
 fn byte_len(value: &str) -> u64 {
@@ -797,22 +813,39 @@ fn to_provider_message(message: &OpenAiMessage) -> ChatMessage {
 /// text and the `content` string says everything.
 ///
 /// `None` is returned for a text-only array too, not just for a string: a
-/// text-only array IS the joined string (`needs` says so, and every
-/// byte-stability pin in the wires was written against the string), so
-/// promoting it to structured parts would change bytes on the wire for a
-/// request whose meaning did not change. Only an actual image earns the
-/// structured path.
+/// text-only array with NO breakpoint IS the joined string (`needs` says so,
+/// and every byte-stability pin in the wires was written against the string),
+/// so promoting it to structured parts would change bytes on the wire for a
+/// request whose meaning did not change. Two things earn the structured path:
+/// an actual image (which cannot be spelled into a text string at all), and a
+/// content-PART cache breakpoint (which needs its own block to land on — the
+/// joined string has one boundary, at the end, and a breakpoint on part 2 of 4
+/// belongs in the middle). A text-only array carrying neither still collapses,
+/// so the no-breakpoint body stays byte-identical to today's.
+///
+/// Each part carries its own `cache_control`, read from the OpenRouter spelling
+/// `{"type":"text","text":"…","cache_control":{"type":"ephemeral"}}`. The VALUE
+/// was already validated at the edge by `cache_breakpoints` (ephemeral-only,
+/// ttl refused by name), which runs before this, so a present key here is a
+/// confirmed breakpoint and nothing else.
 fn content_to_parts(content: &Value) -> Option<Vec<ContentPart>> {
     let Value::Array(raw) = content else {
         return None;
     };
     let mut parts = Vec::with_capacity(raw.len());
-    let mut carries_image = false;
+    let mut earns_structure = false;
     for part in raw {
+        let cache_control = part
+            .as_object()
+            .is_some_and(|part| part.contains_key("cache_control"));
+        earns_structure |= cache_control;
         match part.get("type").and_then(Value::as_str) {
             Some("text") => {
                 if let Some(text) = part.get("text").and_then(Value::as_str) {
-                    parts.push(ContentPart::Text(text.to_owned()));
+                    parts.push(ContentPart::Text {
+                        text: text.to_owned(),
+                        cache_control,
+                    });
                 }
             }
             Some("image_url") => {
@@ -821,14 +854,20 @@ fn content_to_parts(content: &Value) -> Option<Vec<ContentPart>> {
                     .and_then(|image| image.get("url"))
                     .and_then(Value::as_str)
                 {
-                    carries_image = true;
-                    parts.push(ContentPart::Image(url.to_owned()));
+                    // An image cannot be spelled into the joined text string,
+                    // so it always earns the structured path regardless of a
+                    // breakpoint.
+                    earns_structure = true;
+                    parts.push(ContentPart::Image {
+                        url: url.to_owned(),
+                        cache_control,
+                    });
                 }
             }
             _ => {}
         }
     }
-    carries_image.then_some(parts)
+    earns_structure.then_some(parts)
 }
 
 /// Flatten a content value to TEXT. Image parts contribute nothing — they are
@@ -2434,26 +2473,13 @@ mod tests {
     }
 
     #[test]
-    fn a_breakpoint_the_router_cannot_place_is_named_rather_than_ignored() {
-        // Two placements survive the old blanket refusal, and both are refused
-        // because there is nowhere honest to put them rather than because
-        // caching is unsupported. The content-part spelling is the one
-        // OpenRouter documents, so it is the one a migrating client is most
-        // likely to send — which is exactly why the answer names where a
-        // breakpoint DOES go instead of just saying no.
-        let in_a_part = parse(json!({
-            "model": "anthropic/claude-sonnet-5",
-            "messages": [{
-                "role": "user",
-                "content": [{"type": "text", "text": "hi",
-                             "cache_control": {"type": "ephemeral"}}]
-            }]
-        }));
-        assert_eq!(
-            in_a_part.unplaceable_cache_control(),
-            Some("a message content part")
-        );
-
+    fn only_the_top_level_placement_is_named_as_unplaceable() {
+        // ONE placement survives the old blanket refusal, and it is refused
+        // because there is nowhere honest to put it rather than because caching
+        // is unsupported: a top-level `cache_control` names no content block at
+        // all. The content-PART spelling — the one OpenRouter documents, and so
+        // the one a migrating client is most likely to send — is no longer
+        // here: it is placeable, and lands on the block the part produces.
         let at_the_top = parse(json!({
             "model": "anthropic/claude-sonnet-5",
             "cache_control": {"type": "ephemeral"},
@@ -2463,12 +2489,170 @@ mod tests {
             at_the_top.unplaceable_cache_control(),
             Some("the top level of the request")
         );
-
-        // Neither counts as a breakpoint: the request is refused before the
+        // It does not count as a breakpoint: the request is refused before the
         // count is ever consulted, and reporting one would let a caller that
         // ignored the refusal think a boundary had been placed.
-        assert_eq!(in_a_part.cache_breakpoints(), Ok(0));
         assert_eq!(at_the_top.cache_breakpoints(), Ok(0));
+    }
+
+    #[test]
+    fn a_content_part_breakpoint_is_placeable_and_counts() {
+        // The feature: the OpenRouter spelling
+        // `{"type":"text","text":"…","cache_control":{"type":"ephemeral"}}` is
+        // no longer bounced. It is placeable (nothing to name as unplaceable),
+        // it counts toward the four-breakpoint budget, and the mark reaches the
+        // structured part the wires read — on a text block and on an image
+        // block alike.
+        let request = parse(json!({
+            "model": "anthropic/claude-sonnet-5",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "stable prefix",
+                     "cache_control": {"type": "ephemeral"}},
+                    {"type": "text", "text": "fresh tail"}
+                ]
+            }]
+        }));
+        assert_eq!(request.unplaceable_cache_control(), None);
+        assert_eq!(request.cache_breakpoints(), Ok(1));
+        // The provider view the wires read: the array was promoted to
+        // structured parts (a breakpoint needs its own block to land on), the
+        // MARKED part carries the flag, and the later one does not.
+        let messages = request.provider_messages();
+        assert_eq!(
+            messages[0].parts,
+            vec![
+                ContentPart::Text {
+                    text: "stable prefix".to_owned(),
+                    cache_control: true,
+                },
+                ContentPart::Text {
+                    text: "fresh tail".to_owned(),
+                    cache_control: false,
+                },
+            ]
+        );
+
+        // An image part may carry it too.
+        let with_image = parse(json!({
+            "model": "anthropic/claude-sonnet-5",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "look at this"},
+                    {"type": "image_url",
+                     "image_url": {"url": "data:image/png;base64,AAAA"},
+                     "cache_control": {"type": "ephemeral"}}
+                ]
+            }]
+        }));
+        assert_eq!(with_image.unplaceable_cache_control(), None);
+        assert_eq!(with_image.cache_breakpoints(), Ok(1));
+        assert_eq!(
+            with_image.provider_messages()[0].parts[1],
+            ContentPart::Image {
+                url: "data:image/png;base64,AAAA".to_owned(),
+                cache_control: true,
+            }
+        );
+    }
+
+    #[test]
+    fn a_text_only_array_without_a_breakpoint_still_collapses_to_a_string() {
+        // The byte-stability half: a text-only content array that carries NO
+        // breakpoint is NOT promoted to structured parts — it is the joined
+        // string it always was, so the emitted upstream body is byte-identical
+        // to today's. Only an image or a content-part breakpoint earns the
+        // structured path.
+        let request = parse(json!({
+            "model": "anthropic/claude-sonnet-5",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "one"},
+                    {"type": "text", "text": "two"}
+                ]
+            }]
+        }));
+        assert_eq!(request.cache_breakpoints(), Ok(0));
+        let message = &request.provider_messages()[0];
+        assert!(
+            message.parts.is_empty(),
+            "a text-only, breakpoint-free array stays a plain string, not structured parts"
+        );
+        assert_eq!(message.content, "one\ntwo");
+    }
+
+    #[test]
+    fn content_part_breakpoints_count_against_the_same_four_breakpoint_budget() {
+        // Mixed placements — message-level and content-part — share ONE budget,
+        // because Anthropic 400s the fifth whatever produced it. Three on
+        // messages plus two inside content parts is a five-breakpoint request,
+        // refused here with the count before any reservation.
+        let marked_message = |text: &str| json!({"role": "user", "content": text, "cache_control": {"type": "ephemeral"}});
+        let two_marked_parts = json!({
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "p1", "cache_control": {"type": "ephemeral"}},
+                {"type": "text", "text": "p2", "cache_control": {"type": "ephemeral"}}
+            ]
+        });
+        let four = parse(json!({
+            "model": "anthropic/claude-sonnet-5",
+            "messages": [marked_message("a"), marked_message("b"), two_marked_parts.clone()]
+        }));
+        assert_eq!(
+            four.cache_breakpoints(),
+            Ok(MAX_CACHE_BREAKPOINTS),
+            "two message-level plus two content-part breakpoints is exactly four"
+        );
+
+        let five = parse(json!({
+            "model": "anthropic/claude-sonnet-5",
+            "messages": [
+                marked_message("a"),
+                marked_message("b"),
+                marked_message("c"),
+                two_marked_parts
+            ]
+        }));
+        assert_eq!(
+            five.cache_breakpoints(),
+            Err(CacheControlFault::TooMany { count: 5 }),
+            "content-part breakpoints count alongside message-level ones"
+        );
+    }
+
+    #[test]
+    fn a_ttl_inside_a_content_part_is_refused_by_name() {
+        // The content-part spelling folds into the SAME validation: a ttl named
+        // inside a part is refused by name exactly as it is at the message
+        // level, because the 1-hour TTL is a different upstream price this
+        // catalog has not transcribed.
+        let request = parse(json!({
+            "model": "anthropic/claude-sonnet-5",
+            "messages": [{
+                "role": "user",
+                "content": [{"type": "text", "text": "hi",
+                             "cache_control": {"type": "ephemeral", "ttl": "1h"}}]
+            }]
+        }));
+        assert_eq!(request.cache_breakpoints(), Err(CacheControlFault::Ttl));
+
+        // And a wrong shape inside a part is a Shape fault, same as elsewhere.
+        let wrong_shape = parse(json!({
+            "model": "anthropic/claude-sonnet-5",
+            "messages": [{
+                "role": "user",
+                "content": [{"type": "text", "text": "hi",
+                             "cache_control": {"type": "persistent"}}]
+            }]
+        }));
+        assert_eq!(
+            wrong_shape.cache_breakpoints(),
+            Err(CacheControlFault::Shape)
+        );
     }
 
     // -----------------------------------------------------------------------

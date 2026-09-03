@@ -88,21 +88,48 @@ pub(crate) enum UserPart<'a> {
 /// Text runs that are empty or whitespace-only are dropped: Anthropic rejects
 /// empty text blocks outright, and a blank part carries nothing on any dialect.
 pub(crate) fn user_parts(message: &ChatMessage) -> Vec<UserPart<'_>> {
+    user_parts_cached(message)
+        .into_iter()
+        .map(|(part, _cache_control)| part)
+        .collect()
+}
+
+/// [`user_parts`], but pairing each part with whether the CLIENT placed a cache
+/// breakpoint on it.
+///
+/// One classification, two views: `user_parts` is this with the flag dropped,
+/// so the split can never drift between the wires that ignore breakpoints (the
+/// two OpenAI dialects, which cannot carry an explicit one) and the two
+/// Anthropic Messages wires that place them. Only the latter read the bool; a
+/// content-part breakpoint reaches no other lane, because the pre-reserve
+/// capability gate refuses it there before dispatch (`api::unservable_prompt_caching`).
+///
+/// A dropped part carries no breakpoint out with it: an empty or
+/// whitespace-only text run produces no block (Anthropic rejects empty text
+/// blocks), so a mark on one has nowhere to land — the same tolerance the
+/// message-level path already has for a breakpoint on a turn that produces no
+/// block.
+pub(crate) fn user_parts_cached(message: &ChatMessage) -> Vec<(UserPart<'_>, bool)> {
     if message.parts.is_empty() {
-        // A plain-text turn. All of it is text, whatever it spells.
+        // A plain-text turn. All of it is text, whatever it spells, and it
+        // carries no per-part breakpoint (the message-level `cache_control` is
+        // placed separately, at the end of the turn).
         return if message.content.trim().is_empty() {
             Vec::new()
         } else {
-            vec![UserPart::Text(&message.content)]
+            vec![(UserPart::Text(&message.content), false)]
         };
     }
     message
         .parts
         .iter()
         .filter_map(|part| match part {
-            ContentPart::Text(text) if text.trim().is_empty() => None,
-            ContentPart::Text(text) => Some(UserPart::Text(text)),
-            ContentPart::Image(url) => Some(image_part(url)),
+            ContentPart::Text { text, .. } if text.trim().is_empty() => None,
+            ContentPart::Text {
+                text,
+                cache_control,
+            } => Some((UserPart::Text(text), *cache_control)),
+            ContentPart::Image { url, cache_control } => Some((image_part(url), *cache_control)),
         })
         .collect()
 }
@@ -572,8 +599,8 @@ mod structured_content_tests {
         // gets the same guarantee: `parts` says which pieces are images, and a
         // Text part is never re-examined for a grammar.
         let messages = vec![ChatMessage::user_parts(vec![
-            ContentPart::Text(PROSE.to_owned()),
-            ContentPart::Image("https://example.com/real.jpg".to_owned()),
+            ContentPart::text(PROSE.to_owned()),
+            ContentPart::image("https://example.com/real.jpg".to_owned()),
         ])];
 
         let (_, turns) = anthropic::build_anthropic_messages(&messages);
@@ -610,9 +637,9 @@ mod structured_content_tests {
         // line, a future caller — sees the customer's words and never a
         // grammar that could be mistaken for one.
         let message = ChatMessage::user_parts(vec![
-            ContentPart::Text("before".to_owned()),
-            ContentPart::Image("data:image/png;base64,AAAA".to_owned()),
-            ContentPart::Text("after".to_owned()),
+            ContentPart::text("before".to_owned()),
+            ContentPart::image("data:image/png;base64,AAAA".to_owned()),
+            ContentPart::text("after".to_owned()),
         ]);
         assert_eq!(message.content, "before\nafter");
         assert!(!message.content.contains("[IMAGE:"));

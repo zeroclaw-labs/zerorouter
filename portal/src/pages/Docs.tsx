@@ -287,7 +287,7 @@ const ERROR_ROWS: ReadonlyArray<ErrorRow> = [
     code: 'cache_control_unsupported',
     status: '400 · invalid_request_error',
     meaning:
-      'A cache_control was placed somewhere ZeroRouter cannot map onto an upstream content block — at the top level, or inside a message content part. Distinct from cache_control_invalid because the fix is to move it rather than to correct it: put it on the message object or the tool object, and the message says so.',
+      'A cache_control was placed at the top level of the request, which names no content block ZeroRouter can map onto an upstream boundary. Distinct from cache_control_invalid because the fix is to move it rather than to correct it: put it on a message object, a tool object, or a content part, and the message says so. (A content-part breakpoint is now placeable — this code is the top-level placement only.)',
   },
   {
     code: 'request_too_large',
@@ -544,14 +544,20 @@ export function Docs() {
       </p>
       <CodeBlock label="A cached system prompt">{CACHING}</CodeBlock>
       <p>
-        Put <span className="mono">cache_control</span> on a <strong>message</strong> object or on a{' '}
-        <strong>tool</strong> object. It caches everything up to and including that item. The only
-        accepted value is <span className="mono">{'{"type": "ephemeral"}'}</span>, exactly — a{' '}
-        <span className="mono">ttl</span> field is refused by name, because the 1-hour cache is
-        priced differently upstream and this router does not sell it.
+        Put <span className="mono">cache_control</span> on a <strong>message</strong> object, on a{' '}
+        <strong>tool</strong> object, or on an individual <strong>content part</strong> — the
+        OpenRouter-compatible spelling,{' '}
+        <span className="mono">
+          {'{"type": "text", "text": "…", "cache_control": {"type": "ephemeral"}}'}
+        </span>
+        , which marks that specific block. All three caches everything up to and including the marked
+        item. The only accepted value is <span className="mono">{'{"type": "ephemeral"}'}</span>,
+        exactly — a <span className="mono">ttl</span> field is refused by name, because the 1-hour
+        cache is priced differently upstream and this router does not sell it.
       </p>
       <p>
-        <strong>Four breakpoints per request, maximum.</strong> That is the upstream&apos;s limit,
+        <strong>Four breakpoints per request, maximum</strong> — counted across every placement
+        together, whether on messages, tools, or content parts. That is the upstream&apos;s limit,
         and ZeroRouter enforces it at the edge — a fifth is a{' '}
         <span className="mono">400 cache_control_invalid</span> before anything is reserved, rather
         than an upstream failure after the request has been dispatched. Mark prefixes that actually

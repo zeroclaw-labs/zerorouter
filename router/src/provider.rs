@@ -44,14 +44,72 @@ use futures_util::stream::BoxStream;
 /// Only `user` turns ever carry parts: `image_url` content parts are user-only
 /// in the OpenAI schema, and `openai::content_is_supported` refuses them
 /// anywhere else before a `ChatMessage` is ever built.
+///
+/// # Per-part cache breakpoints
+///
+/// Each part carries its own `cache_control` bool, distinct from the
+/// MESSAGE-level [`ChatMessage::cache_control`]. This is the placeable form of
+/// the spelling OpenRouter documents — `{"type":"text","text":"…",
+/// "cache_control":{"type":"ephemeral"}}` — which the router used to refuse
+/// because a text content array was flattened to one string before any wire
+/// saw it, leaving a breakpoint on part 2 of 4 with nowhere honest to land. A
+/// part now carries the mark on the block IT produces, so the boundary the
+/// client named is the boundary sent upstream. A bool rather than a value for
+/// the same reason [`ChatMessage::cache_control`] is: `{"type":"ephemeral"}`
+/// is the only thing a breakpoint may say, validated at the edge by
+/// `openai::validate_cache_control`, so by the time a part exists there is
+/// exactly one thing the mark can mean.
+///
+/// The two levels coexist. Only the Anthropic Messages wires
+/// (`wire::anthropic`, `wire::bedrock_runtime`) read the mark; the other lanes
+/// cannot carry an explicit breakpoint at all, and a request that places one
+/// against them is refused before dispatch by the same pre-reserve capability
+/// gate the message-level feature uses (`api::unservable_prompt_caching`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ContentPart {
     /// A run of the customer's text, verbatim. Never re-scanned for a grammar.
-    Text(String),
+    Text {
+        text: String,
+        /// Whether the CLIENT placed a cache breakpoint on this text block.
+        cache_control: bool,
+    },
     /// An image, as the `url` string the customer supplied — either an
     /// `https://…` URL or a `data:<media-type>;base64,…` URI. Kept in the form
     /// it arrived in; each wire decides how its own dialect carries it.
-    Image(String),
+    Image {
+        url: String,
+        /// Whether the CLIENT placed a cache breakpoint on this image block.
+        cache_control: bool,
+    },
+}
+
+impl ContentPart {
+    /// A text part with no breakpoint — the overwhelmingly common shape, and
+    /// the one every caller built before per-part breakpoints existed.
+    #[must_use]
+    pub fn text(text: impl Into<String>) -> Self {
+        Self::Text {
+            text: text.into(),
+            cache_control: false,
+        }
+    }
+
+    /// An image part with no breakpoint.
+    #[must_use]
+    pub fn image(url: impl Into<String>) -> Self {
+        Self::Image {
+            url: url.into(),
+            cache_control: false,
+        }
+    }
+
+    /// Whether the client placed a cache breakpoint on this part.
+    #[must_use]
+    pub fn cache_control(&self) -> bool {
+        match self {
+            Self::Text { cache_control, .. } | Self::Image { cache_control, .. } => *cache_control,
+        }
+    }
 }
 
 /// One turn of conversation, as the router hands it to an upstream.
@@ -126,8 +184,8 @@ impl ChatMessage {
         let content = parts
             .iter()
             .filter_map(|part| match part {
-                ContentPart::Text(text) => Some(text.as_str()),
-                ContentPart::Image(_) => None,
+                ContentPart::Text { text, .. } => Some(text.as_str()),
+                ContentPart::Image { .. } => None,
             })
             .collect::<Vec<_>>()
             .join("\n");
@@ -144,6 +202,16 @@ impl ChatMessage {
     pub fn with_cache_breakpoint(mut self) -> Self {
         self.cache_control = true;
         self
+    }
+
+    /// Whether the CLIENT placed any cache breakpoint on this turn — at the
+    /// message level (`cache_control`, at the end of the turn) OR on one of its
+    /// content parts. The two spellings coexist, and either one means the
+    /// client owns this request's cache boundaries (see `wire::anthropic` for
+    /// why it is the client's placement or the wire's defaults, never both).
+    #[must_use]
+    pub fn has_client_breakpoint(&self) -> bool {
+        self.cache_control || self.parts.iter().any(ContentPart::cache_control)
     }
 
     pub fn assistant(content: impl Into<String>) -> Self {

@@ -6921,6 +6921,23 @@ fn caching_body(model: &str) -> Value {
     body
 }
 
+/// The same breakpoint, placed INSIDE a content part — the OpenRouter spelling.
+/// Byte for byte a different placement from [`caching_body`], settling
+/// identically: the wire reports the same cache split whichever block carried
+/// the breakpoint.
+fn content_part_caching_body(model: &str) -> Value {
+    let mut body = completion_body(model, false);
+    body["messages"] = json!([{
+        "role": "user",
+        "content": [{
+            "type": "text",
+            "text": "hello",
+            "cache_control": {"type": "ephemeral"},
+        }],
+    }]);
+    body
+}
+
 /// What a caching upstream reports: 1,000 prompt tokens of which 600 were read
 /// back from its cache and 300 were written into it, leaving 100 fresh.
 fn cache_split_usage() -> TokenUsage {
@@ -7027,6 +7044,106 @@ async fn a_cache_bearing_request_settles_its_three_buckets_at_three_rates() {
         Decimal::from(50) - decimal("0.00230")
     );
     assert_eq!(open_reservations(&pool, api_key_id).await, 0);
+}
+
+#[tokio::test]
+async fn a_content_part_cache_bearing_request_settles_its_three_buckets_at_three_rates() {
+    // The content-PART spelling reaches settlement exactly as the message-level
+    // one does: the breakpoint is placed inside a text content part, the
+    // anthropic-wire lane reports the same cache split, and the row settles the
+    // three buckets at three rates. Mirrors
+    // `a_cache_bearing_request_settles_its_three_buckets_at_three_rates`, and
+    // asserts the SAME Decimal — the point being that WHICH block carried the
+    // breakpoint changes nothing downstream of the wire.
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let (api_key_id, key) = create_funded_key(&pool, "cache-split-part").await;
+    let cacher = FakeModelProvider::new(
+        "cacher",
+        vec![FakeOutcome::chat("cached hello", cache_split_usage())],
+    );
+    let state = router(pool.clone(), vec![cacher.clone()]);
+
+    let response = app(state.clone())
+        .oneshot(completion_request(
+            &key,
+            &content_part_caching_body("zero/test-caching"),
+        ))
+        .await
+        .expect("completion request should complete");
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "a content-part breakpoint on a caching lane is served, not refused"
+    );
+    let body = json_body(response).await;
+    state.wait_for_background_tasks().await;
+
+    assert_eq!(body["usage"]["prompt_tokens"], 1_000);
+    assert_eq!(body["usage"]["prompt_tokens_details"]["cached_tokens"], 600);
+    assert_eq!(body["usage"]["zerorouter"]["cache_write_tokens"], 300);
+
+    // THE MONEY, identical to the message-level test: 100 fresh at $4.00 + 600
+    // cached at $0.40 + 300 written at $5.00 + 20 output at $8.00 per million
+    //   = 400 + 240 + 1500 + 160 = 2300 / 1e6 = 0.00230.
+    let (_, _, input_tokens, output_tokens, cost_usd, status) =
+        settled_event(&pool, api_key_id).await;
+    assert_eq!(input_tokens, 1_000);
+    assert_eq!(output_tokens, 20);
+    assert_eq!(status, 200);
+    assert_eq!(
+        cost_usd,
+        decimal("0.00230"),
+        "the written bucket bills at 1.25x input, whichever block placed the breakpoint"
+    );
+    assert_ne!(cost_usd, decimal("0.00200"));
+
+    let (candidate_id, cost_basis_usd, _, _) = settled_provenance(&pool, api_key_id).await;
+    assert_eq!(candidate_id.as_deref(), Some("anthropic/cacher"));
+    assert_eq!(cost_basis_usd, Some(decimal("0.00115")));
+    assert_eq!(
+        settled_cache_split(&pool, api_key_id).await,
+        (1_000, 600, Some(300))
+    );
+    assert_eq!(open_reservations(&pool, api_key_id).await, 0);
+}
+
+#[tokio::test]
+async fn a_content_part_breakpoint_on_a_non_caching_lane_refuses_before_it_reserves() {
+    // The pre-reserve capability gate governs the content-part spelling exactly
+    // as it governs the message-level one — because content-part breakpoints
+    // now COUNT, so a lane that sells no cache writes is refused before any
+    // reservation, dispatch, or settled row. Without that gate the request
+    // would reserve and then eat an upstream 400 (or worse, serve with the
+    // breakpoints silently dropped); this pins the clean pre-reserve refusal.
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let (api_key_id, key) = create_funded_key(&pool, "cache-part-refused").await;
+    let primary = FakeModelProvider::new("primary", vec![]);
+    let secondary = FakeModelProvider::new("secondary", vec![]);
+    let state = router(pool.clone(), vec![primary.clone(), secondary.clone()]);
+
+    let response = app(state.clone())
+        .oneshot(completion_request(
+            &key,
+            &content_part_caching_body("zero/test-pair"),
+        ))
+        .await
+        .expect("completion request should complete");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = json_body(response).await;
+    assert_eq!(
+        body["error"]["code"], "prompt_caching_unsupported",
+        "a content-part breakpoint hits the same capability gate as a message-level one"
+    );
+
+    // Nothing moved: the refusal is pre-reserve, the property the gate buys.
+    assert_eq!(primary.call_count(), 0);
+    assert_eq!(secondary.call_count(), 0);
+    assert_eq!(open_reservations(&pool, api_key_id).await, 0);
+    assert_eq!(settled_count(&pool, api_key_id).await, 0);
 }
 
 #[tokio::test]
@@ -7203,12 +7320,15 @@ async fn a_malformed_breakpoint_is_refused_by_name_before_admission() {
             ]),
             "cache_control_invalid",
         ),
-        // A placement the router cannot map onto a Messages content block.
+        // A ttl INSIDE a content part folds into the same validation as a
+        // message-level one — the content-part spelling is now placeable, but a
+        // malformed breakpoint on it is still refused by name.
         (
             json!([{"role": "user", "content": [
-                {"type": "text", "text": "hi", "cache_control": {"type": "ephemeral"}}
+                {"type": "text", "text": "hi",
+                 "cache_control": {"type": "ephemeral", "ttl": "1h"}}
             ]}]),
-            "cache_control_unsupported",
+            "cache_control_invalid",
         ),
     ];
 

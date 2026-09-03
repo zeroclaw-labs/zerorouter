@@ -891,10 +891,10 @@ mod review_fix_tests {
     #[test]
     fn image_parts_become_responses_input_image_parts_byte_for_byte() {
         let messages = vec![ChatMessage::user_parts(vec![
-            ContentPart::Text("what is this? ".to_owned()),
-            ContentPart::Image("data:image/png;base64,AAAA".to_owned()),
-            ContentPart::Text(" and this? ".to_owned()),
-            ContentPart::Image("https://example.com/x.jpg".to_owned()),
+            ContentPart::text("what is this? ".to_owned()),
+            ContentPart::image("data:image/png;base64,AAAA".to_owned()),
+            ContentPart::text(" and this? ".to_owned()),
+            ContentPart::image("https://example.com/x.jpg".to_owned()),
         ])];
         let (_, input) = build_responses_input(&messages);
         assert_eq!(
