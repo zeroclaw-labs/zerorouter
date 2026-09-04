@@ -272,6 +272,13 @@ pub struct DraftPinArgs {
     /// The facts dossier JSON to draft from. Required — the whole input.
     #[arg(long)]
     pub facts: std::path::PathBuf,
+    /// The live tier file, read to learn the candidate provider's
+    /// `[retention.<provider>]` posture — the fact that stops a `standard` lane
+    /// silently inheriting a provider's `zero` pin. Defaults to the same path
+    /// the server serves, resolved exactly as `discover`/`catalog-drift` do:
+    /// `--tiers`, else `ZEROROUTER_TIERS_PATH`, else the standard config path.
+    #[arg(long)]
+    pub tiers: Option<std::path::PathBuf>,
     /// The `verified` date to stamp on every emitted retention pin, as
     /// `YYYY-MM-DD`. Required unless the dossier carries its own `verified`
     /// field; `--verified` wins when both are present. NEVER the system clock —
@@ -1729,7 +1736,28 @@ async fn draft_pin(args: DraftPinArgs) -> Result<()> {
     let verified = resolve_verified(args.verified.as_deref(), facts.verified.as_deref())
         .map_err(|error| anyhow::anyhow!("{error}"))?;
 
-    let outcome = draft_and_validate(&facts, &verified)
+    // Load the live tier file — resolved exactly as `discover` does — to learn
+    // the candidate provider's retention pin. That live posture is what stops a
+    // `standard` lane silently inheriting a provider's `zero` (FIX 3).
+    let tiers_path = args.tiers.unwrap_or_else(|| {
+        std::env::var(crate::config::TIER_CONFIG_PATH_ENV)
+            .unwrap_or_else(|_| crate::config::DEFAULT_TIER_CONFIG_PATH.to_owned())
+            .into()
+    });
+    let live_catalog = crate::config::load_tier_catalog(&tiers_path)
+        .await
+        .with_context(|| {
+            format!(
+                "loading the live tier catalog from {}",
+                tiers_path.display()
+            )
+        })?;
+    let provider_posture = live_catalog
+        .retention
+        .get(&facts.candidate.provider)
+        .map(|pin| pin.posture);
+
+    let outcome = draft_and_validate(&facts, &verified, provider_posture)
         .await
         .context("writing the temp fragment for load-validation")?;
 

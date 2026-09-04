@@ -57,12 +57,21 @@ use crate::config::{RetentionPosture, TierCatalog, TierConfigError};
 /// (`input_per_mtok`, `source_url`) so a transcriber reads the same spelling on
 /// both sides; only [`BasisKind`] carries a kebab-case value (`published-default`)
 /// and the `category` string echoes [`crate::discover::Category`]'s kebab
-/// spelling. `deny_unknown_fields` is on every struct so a misspelled key is a
-/// loud parse error rather than a silently-dropped field — the same reasoning
-/// [`crate::config`]'s `RawConditionalRate` gives: a rejected dossier is a
-/// better answer than one that quietly drafted at the wrong price or posture.
+/// spelling.
+///
+/// **Unknown fields are TOLERATED, not rejected.** The dossier is produced by an
+/// LLM research agent (see `docs/research-skill.md`) that decorates it with
+/// descriptive fields a strict schema never anticipated — a `label`/`note` on a
+/// price band, a per-field `note`, other running commentary. `deny_unknown_fields`
+/// would let a single stray key kill the whole draft, which for an unattended
+/// weekly bot means silent no-output. Lenient parsing is SAFE here precisely
+/// because every downstream invariant already fails toward a conservative
+/// outcome: a mistyped REQUIRED price deserialises as absent and REFUSES
+/// (invariants 2/3), and a mistyped `covers_this_model`/`human_attested`
+/// deserialises as `false` and yields `standard` (invariant 4). Lenience can
+/// only ever cause an over-refuse or a `standard` — never a false `zero` or a
+/// wrong price.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct FactsDossier {
     /// The phase-1 [`crate::discover::Candidate`] this dossier expands, by
     /// value. Modelled locally rather than importing that type so the phase-1
@@ -77,6 +86,18 @@ pub struct FactsDossier {
     pub display_id: String,
     pub prices: Prices,
     pub retention: RetentionFacts,
+    /// The researcher's STANDARD retention receipt: the evidence that the honest
+    /// posture is `standard` (not that it is `zero`). Consumed two ways — it is
+    /// shown in the dossier as the retention receipt, and when the lane resolves
+    /// `standard` it is the evidence used to pin `standard` EXPLICITLY on a
+    /// provider whose live pin is `zero` (see [`resolve_posture`] / FIX 3),
+    /// rather than letting the lane silently inherit that `zero`.
+    #[serde(default)]
+    pub standard_evidence: Option<StandardEvidence>,
+    /// Free-text caveats the research agent flagged for a human — surfaced
+    /// verbatim in the dossier so nothing the researcher was unsure about is lost.
+    #[serde(default)]
+    pub gaps: Vec<String>,
     /// Whether a LIVE invoke actually succeeded. `true` (the boolean) is the
     /// only value that clears [`refuse_if_not_invokable`]; `false` or the string
     /// `"unknown"` refuse. This is the Bedrock GPT-5.6 / Grok trap: an account
@@ -93,12 +114,38 @@ pub struct FactsDossier {
     pub verified: Option<String>,
 }
 
+/// A retention receipt for a `standard` posture: the same four evidence fields a
+/// [`Basis`] carries, but asserting the honest default rather than a `zero`
+/// claim. It never on its own produces a `zero` label.
+#[derive(Debug, Clone, Deserialize)]
+pub struct StandardEvidence {
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub source_url: String,
+    #[serde(default)]
+    pub source_sha256: String,
+    #[serde(default)]
+    pub source_extract: String,
+}
+
+impl StandardEvidence {
+    /// Whether this receipt can be built into a real retention pin: all four
+    /// fields present, and the URL/digest well-formed enough that the loader
+    /// will accept them.
+    fn is_usable(&self) -> bool {
+        !self.description.trim().is_empty()
+            && !self.source_extract.trim().is_empty()
+            && looks_http(&self.source_url)
+            && looks_sha256(&self.source_sha256)
+    }
+}
+
 /// The phase-1 candidate fields, in the shape [`crate::discover::Candidate`]
 /// serialises to. `category` is a free string here rather than a typed enum: it
 /// is echoed into the dossier for a human and never drives a money or retention
 /// decision, so validating it would add a refusal path for no safety.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct CandidateFacts {
     pub category: String,
     pub provider: String,
@@ -138,7 +185,6 @@ impl Invokable {
 /// in the type only so a missing one becomes a clean refusal
 /// ([`refuse_if_prices_incomplete`]) rather than a serde error.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Prices {
     pub input_per_mtok: Option<f64>,
     pub output_per_mtok: Option<f64>,
@@ -148,8 +194,11 @@ pub struct Prices {
     pub cache_write_per_mtok: Option<f64>,
     #[serde(default)]
     pub context_window: Option<u64>,
-    /// Conditional rate bands (the OpenAI 272k repricing shape). Optional and
-    /// commonly empty.
+    /// Conditional rate bands. Only a band keyed on `min_prompt_tokens` — the
+    /// OpenAI 272k repricing shape — is a lane rate this drafter models. Research
+    /// agents overload this list with cache-TTL, batch, region, and time
+    /// variants that carry no `min_prompt_tokens`; those are NOT lane rates and
+    /// are ignored (see [`context_bands`]). Optional and commonly empty.
     #[serde(default)]
     pub conditional: Vec<ConditionalPrice>,
     #[serde(default)]
@@ -160,12 +209,18 @@ pub struct Prices {
     pub source_extract: String,
 }
 
+/// One `conditional` entry. Every field is optional because the research agent
+/// emits entries of many shapes here; only an entry with `min_prompt_tokens`
+/// present is a context-tier lane rate (see [`context_bands`]), and such an
+/// entry still needs `input`/`output` to load, which the loader enforces.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ConditionalPrice {
-    pub min_prompt_tokens: u64,
-    pub input_per_mtok: f64,
-    pub output_per_mtok: f64,
+    #[serde(default)]
+    pub min_prompt_tokens: Option<u64>,
+    #[serde(default)]
+    pub input_per_mtok: Option<f64>,
+    #[serde(default)]
+    pub output_per_mtok: Option<f64>,
     #[serde(default)]
     pub cached_input_per_mtok: Option<f64>,
     #[serde(default)]
@@ -175,7 +230,6 @@ pub struct ConditionalPrice {
 /// The retention facts: whether the model is open-weight, and the ONE basis (if
 /// any) the dossier offers for a `zero` claim.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct RetentionFacts {
     /// Whether the model is open-weight. Load-bearing for basis 3: a closed-
     /// weight model may not ride a published-default `zero` pin, because the
@@ -188,7 +242,6 @@ pub struct RetentionFacts {
 
 /// A single retention basis, exactly as `docs/DEPLOY.md` frames the three.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Basis {
     pub kind: BasisKind,
     /// What the basis asserts the posture is. `standard` here never yields a
@@ -212,6 +265,23 @@ pub struct Basis {
     pub source_sha256: String,
     #[serde(default)]
     pub source_extract: String,
+}
+
+impl Basis {
+    /// Whether the basis carries the three evidence fields a claim needs to be
+    /// checkable. Non-emptiness only — well-formedness is [`Self::is_pin_usable`].
+    fn has_provenance(&self) -> bool {
+        !self.source_url.trim().is_empty()
+            && !self.source_sha256.trim().is_empty()
+            && !self.source_extract.trim().is_empty()
+    }
+
+    /// Whether this basis can be built into a real retention pin the loader will
+    /// accept: a well-formed URL and digest. The description is synthesised when
+    /// blank ([`pin_from_basis`]), so it is not required here.
+    fn is_pin_usable(&self) -> bool {
+        looks_http(&self.source_url) && looks_sha256(&self.source_sha256)
+    }
 }
 
 /// Which of `docs/DEPLOY.md`'s three bases a [`Basis`] claims.
@@ -311,13 +381,20 @@ impl Draft {
 // ---------------------------------------------------------------------------
 
 /// Draft a lane from a dossier, applying every fail-safe gate. Pure: no IO, no
-/// clock. `verified` is the already-resolved, already-validated ISO date.
+/// clock. `verified` is the already-resolved, already-validated ISO date;
+/// `provider_posture` is the candidate provider's LIVE `[retention.<provider>]`
+/// posture read from the operator's `tiers.toml` (`None` if the provider has no
+/// pin there yet) — the fact that closes the false-zero fail-open (FIX 3).
 ///
 /// The load-validation gate (invariant 5) is NOT here — it needs the loader,
 /// which is async and file-backed — so a bare `draft` result is "would draft,
 /// pending the load check". [`draft_and_validate`] is the whole story.
 #[must_use]
-pub fn draft(facts: &FactsDossier, verified: &str) -> Decision {
+pub fn draft(
+    facts: &FactsDossier,
+    verified: &str,
+    provider_posture: Option<RetentionPosture>,
+) -> Decision {
     // 1. Not proven invokable ⇒ refuse. A draft asserts "ready to serve".
     if let Some(reason) = refuse_if_not_invokable(facts) {
         return Decision::Refused { reason };
@@ -335,12 +412,27 @@ pub fn draft(facts: &FactsDossier, verified: &str) -> Decision {
         .output_per_mtok
         .expect("output price presence was just checked");
 
-    // 4. Posture, fail-safe to standard.
-    let resolution = resolve_posture(&facts.retention, verified);
+    // 4 + FIX 3. Posture, fail-safe to standard, reconciled against the live
+    // provider pin. This is the only gate that can REFUSE on retention grounds:
+    // a `standard` lane on a `zero` provider with no receipt to pin standard.
+    let resolution = match resolve_posture(
+        &facts.candidate.provider,
+        &facts.retention,
+        facts.standard_evidence.as_ref(),
+        provider_posture,
+        verified,
+    ) {
+        Ok(resolution) => resolution,
+        Err(reason) => return Decision::Refused { reason },
+    };
 
     // 6. Sanity FLAGS (warn, never refuse).
     let mut flags = price_sanity_flags(&facts.prices, input, output);
     flags.extend(resolution.flags.clone());
+
+    let posture = resolution.posture;
+    let reasoning = resolution.reasoning;
+    let inherit_note = resolution.inherit_note;
 
     // Emit the stanza. Consume the placement once: an override goes INTO the
     // stanza; a scaffold is kept aside for load-validation only.
@@ -362,9 +454,10 @@ pub fn draft(facts: &FactsDossier, verified: &str) -> Decision {
         facts,
         input,
         output,
-        resolution.posture,
-        &resolution.reasoning,
-        &resolution.inherit_note,
+        posture,
+        provider_posture,
+        &reasoning,
+        &inherit_note,
         &stanza_toml,
         &flags,
     );
@@ -372,12 +465,12 @@ pub fn draft(facts: &FactsDossier, verified: &str) -> Decision {
     Decision::Drafted(Box::new(Draft {
         display_id: facts.display_id.clone(),
         provider: facts.candidate.provider.clone(),
-        posture: resolution.posture,
+        posture,
         override_emitted,
         stanza_toml,
         dossier_markdown,
         flags,
-        inherit_note: resolution.inherit_note,
+        inherit_note,
         scaffold_pin,
     }))
 }
@@ -442,12 +535,15 @@ fn refuse_if_prices_incomplete(display_id: &str, prices: &Prices) -> Option<Stri
 
 /// Where a resolved posture's evidence goes.
 enum PinPlacement {
-    /// Emit an explicit `[tiers."<id>".retention]` override in the stanza. Used
-    /// only when the lane resolves `standard` on a provider whose basis says
-    /// `zero`, so relying on the provider pin would silently inherit `zero`.
+    /// Emit an explicit `[tiers."<id>".retention]` override in the stanza —
+    /// whenever the resolved lane posture DIFFERS from the live provider pin, so
+    /// the lane publishes what it earned rather than inheriting the provider's
+    /// (the `fireworks/qwen3.8-max` shape, and its mirror when a lane earns
+    /// `zero` on a provider whose pin is not `zero`).
     TierOverride(PinFields),
-    /// Rely on the provider pin. The carried [`PinFields`] is scaffolding for
-    /// load-validation only and is never emitted.
+    /// Rely on the provider pin (the resolved posture equals it, or the provider
+    /// is not `zero` so there is no unearned `zero` to inherit). The carried
+    /// [`PinFields`] is scaffolding for load-validation only and is never emitted.
     ProviderScaffold(PinFields),
 }
 
@@ -459,69 +555,51 @@ struct PostureResolution {
     inherit_note: String,
 }
 
-/// Invariant 4 — the core, and the fail-safe.
+/// Invariant 4 (the posture core) reconciled with the live provider pin (FIX 3).
 ///
-/// A lane is labelled `zero` only when EVERY condition holds:
+/// A lane earns `zero` only when EVERY condition holds:
 ///
-/// - a basis is present, and its `source_url` + `source_sha256` +
-///   `source_extract` are all non-empty (a `zero` claim with no evidence is not
-///   a claim);
-/// - `basis.posture == zero`;
-/// - `basis.covers_this_model == true`;
+/// - a basis is present with all three of `source_url`/`source_sha256`/
+///   `source_extract` non-empty (a `zero` claim with no evidence is not a claim);
+/// - `basis.posture == zero` and `basis.covers_this_model == true`;
 /// - the kind is `published-default` (publicly verifiable, basis 3), OR it is
 ///   `signed`/`enforced` (bases 1/2, private to the account) AND
 ///   `human_attested == true`;
-/// - the weight guard: the model is open-weight, OR the basis is
-///   `signed`/`enforced`. A **published default never zeros a closed-weight
-///   model** — the common published default is scoped to open models, and a
-///   research agent cannot establish closed-weight coverage from a public
-///   default. Only an account-private, human-attested basis can cover a
-///   closed-weight lane.
+/// - the weight guard: open-weight, OR an account-private basis. A **published
+///   default never zeros a closed-weight model**.
 ///
-/// Every other case is `standard`. When the basis nonetheless claimed the
-/// provider is `zero` (so the provider pin would read `zero`), an explicit
-/// `standard` override is emitted to stop the lane silently inheriting it — the
-/// `fireworks/qwen3.8-max` shape.
-fn resolve_posture(retention: &RetentionFacts, verified: &str) -> PostureResolution {
-    let Some(basis) = &retention.basis else {
-        // No basis at all: standard, and say so loudly. We cannot force
-        // standard via an override (an override needs evidence we do not have),
-        // so the lane will inherit whatever the provider pin is.
-        return PostureResolution {
-            posture: RetentionPosture::Standard,
-            placement: PinPlacement::ProviderScaffold(placeholder_pin(
-                RetentionPosture::Standard,
-                verified,
-            )),
-            reasoning: "No retention basis supplied; defaulting to standard (fail-safe)."
-                .to_owned(),
-            flags: vec![NEEDS_RETENTION_EVIDENCE.to_owned()],
-            inherit_note: "inherits the provider's [retention.<provider>] pin — confirm it is \
-                           `standard` before merge"
-                .to_owned(),
-        };
-    };
+/// Every other case is `standard`. Then the resolved posture is reconciled with
+/// the LIVE provider pin (`provider_posture`), which is what closes the
+/// false-zero fail-open:
+///
+/// - resolved posture == provider pin → a plain lane inherits the pin;
+/// - resolved `zero`, provider pin not `zero` → explicit `zero` override (also
+///   the only way a lane can be labelled when the provider has no pin yet);
+/// - resolved `standard`, provider pin `zero` → explicit `standard` override
+///   built from a receipt (`standard_evidence`, or the basis), and if no receipt
+///   exists, **REFUSE** rather than let the lane inherit an unearned `zero`.
+fn resolve_posture(
+    provider: &str,
+    retention: &RetentionFacts,
+    standard_evidence: Option<&StandardEvidence>,
+    provider_posture: Option<RetentionPosture>,
+    verified: &str,
+) -> Result<PostureResolution, String> {
+    let provider_is_zero = provider_posture == Some(RetentionPosture::Zero);
+    let provider_note = describe_provider_pin(provider_posture);
 
-    let has_provenance = !basis.source_url.trim().is_empty()
-        && !basis.source_sha256.trim().is_empty()
-        && !basis.source_extract.trim().is_empty();
-    let kind_ok = !basis.kind.is_account_private() || basis.human_attested;
-    let weight_ok = retention.weight_open || basis.kind.is_account_private();
-    let zero_ok = has_provenance
-        && basis.posture == RetentionPosture::Zero
-        && basis.covers_this_model
-        && kind_ok
-        && weight_ok;
+    // Does the basis earn a `zero` label?
+    if let Some(basis) = &retention.basis {
+        let kind_ok = !basis.kind.is_account_private() || basis.human_attested;
+        let weight_ok = retention.weight_open || basis.kind.is_account_private();
+        let zero_ok = basis.has_provenance()
+            && basis.posture == RetentionPosture::Zero
+            && basis.covers_this_model
+            && kind_ok
+            && weight_ok;
 
-    if zero_ok {
-        return PostureResolution {
-            posture: RetentionPosture::Zero,
-            placement: PinPlacement::ProviderScaffold(pin_from_basis(
-                basis,
-                RetentionPosture::Zero,
-                verified,
-            )),
-            reasoning: format!(
+        if zero_ok {
+            let base = format!(
                 "zero: basis kind={kind}, posture=zero, covers_this_model=true, provenance present{attest}.",
                 kind = basis.kind.label(),
                 attest = if basis.kind.is_account_private() {
@@ -529,54 +607,190 @@ fn resolve_posture(retention: &RetentionFacts, verified: &str) -> PostureResolut
                 } else {
                     " (published default — publicly verifiable)"
                 },
-            ),
-            flags: Vec::new(),
-            inherit_note: "inherits the provider's [retention.<provider>] pin = zero".to_owned(),
-        };
+            );
+            if provider_is_zero {
+                // The lane and the provider agree: a plain lane inherits the pin.
+                return Ok(PostureResolution {
+                    posture: RetentionPosture::Zero,
+                    placement: PinPlacement::ProviderScaffold(pin_from_basis(
+                        basis,
+                        RetentionPosture::Zero,
+                        verified,
+                    )),
+                    reasoning: base,
+                    flags: Vec::new(),
+                    inherit_note: format!(
+                        "inherits [retention.{provider}] = zero ({provider_note})"
+                    ),
+                });
+            }
+            // The lane earned zero but the provider pin is standard/absent:
+            // publish zero EXPLICITLY (and this is the only way the lane is
+            // labelled at all when the provider has no pin).
+            return Ok(PostureResolution {
+                posture: RetentionPosture::Zero,
+                placement: PinPlacement::TierOverride(pin_from_basis(
+                    basis,
+                    RetentionPosture::Zero,
+                    verified,
+                )),
+                reasoning: format!(
+                    "{base} Provider pin is {provider_note}, so zero is pinned explicitly."
+                ),
+                flags: vec![AUTO_DESCRIPTION.to_owned(), ZERO_OVERRIDE_NOTE.to_owned()],
+                inherit_note: "explicit [tiers.\"<id>\".retention] override → zero".to_owned(),
+            });
+        }
     }
 
-    // Downgraded to standard. Explain why, in the order the conditions are
-    // checked, so the dominant reason leads.
-    let reason = downgrade_reason(
-        basis,
-        retention.weight_open,
-        has_provenance,
-        kind_ok,
-        weight_ok,
-    );
+    // Standard — the fail-safe. Say why (for the dossier).
+    let reason = standard_reason(retention);
 
-    // An override is needed only when the basis asserted the PROVIDER is zero
-    // (so the provider pin would read zero) AND we have provenance to build a
-    // valid override from. Without provenance we cannot emit a valid pin, so we
-    // fall back to a flagged plain lane.
-    if basis.posture == RetentionPosture::Zero && has_provenance {
-        let mut pin = pin_from_basis(basis, RetentionPosture::Standard, verified);
-        pin.description = override_description(basis, retention.weight_open, kind_ok);
-        return PostureResolution {
+    // Provider pin is NOT zero: a plain standard lane cannot inherit an unearned
+    // zero, so it is safe. Flag thin evidence unless a receipt is available.
+    if !provider_is_zero {
+        let (scaffold, needs_evidence) =
+            standard_scaffold_any(retention.basis.as_ref(), standard_evidence, verified);
+        let mut flags = Vec::new();
+        if needs_evidence {
+            flags.push(NEEDS_RETENTION_EVIDENCE.to_owned());
+        }
+        return Ok(PostureResolution {
+            posture: RetentionPosture::Standard,
+            placement: PinPlacement::ProviderScaffold(scaffold),
+            reasoning: format!("standard: {reason}"),
+            flags,
+            inherit_note: format!("inherits [retention.{provider}] ({provider_note})"),
+        });
+    }
+
+    // Provider pin IS zero and the lane is standard: pin standard EXPLICITLY, or
+    // refuse. Never let the lane inherit an unearned zero — a false claim.
+    if let Some(pin) = build_standard_override(
+        retention.basis.as_ref(),
+        standard_evidence,
+        retention.weight_open,
+        verified,
+    ) {
+        return Ok(PostureResolution {
             posture: RetentionPosture::Standard,
             placement: PinPlacement::TierOverride(pin),
-            reasoning: format!("standard (override): {reason}"),
+            reasoning: format!(
+                "standard (explicit override — live provider pin is zero): {reason}"
+            ),
             flags: vec![AUTO_DESCRIPTION.to_owned()],
             inherit_note: "explicit [tiers.\"<id>\".retention] override → standard (does NOT \
-                           inherit the provider pin)"
+                           inherit the provider's zero pin)"
                 .to_owned(),
-        };
+        });
     }
+    Err(format!(
+        "REFUSED: drafting `standard` on provider `{provider}`, whose live [retention.{provider}] \
+         pin is `zero`, would make the lane inherit an unearned zero — a false zero-retention claim \
+         to a customer, the one thing this drafter must never emit. Supply `standard_evidence` \
+         (description + source_url + source_sha256 + source_extract) to pin standard explicitly, or \
+         a valid zero basis to earn the zero. ({reason})"
+    ))
+}
 
-    // Plain standard lane. Use the basis evidence for the scaffold when it is
-    // usable; otherwise a placeholder, and flag that evidence is thin.
-    let (scaffold, needs_evidence) = standard_scaffold(basis, verified);
-    let mut flags = Vec::new();
-    if needs_evidence {
-        flags.push(NEEDS_RETENTION_EVIDENCE.to_owned());
+/// A one-line description of the live provider pin, for reasoning/inherit notes.
+fn describe_provider_pin(posture: Option<RetentionPosture>) -> String {
+    match posture {
+        Some(RetentionPosture::Zero) => "live provider pin = zero".to_owned(),
+        Some(RetentionPosture::Standard) => "live provider pin = standard".to_owned(),
+        None => "no live provider pin found — add [retention.<provider>] before merge".to_owned(),
     }
-    PostureResolution {
-        posture: RetentionPosture::Standard,
-        placement: PinPlacement::ProviderScaffold(scaffold),
-        reasoning: format!("standard: {reason}"),
-        flags,
-        inherit_note: "inherits the provider's [retention.<provider>] pin (standard)".to_owned(),
+}
+
+/// Why the lane fell to `standard`, for the dossier. `None` basis is its own
+/// reason; otherwise the dominant unmet `zero` condition.
+fn standard_reason(retention: &RetentionFacts) -> String {
+    match &retention.basis {
+        None => "no retention basis supplied.".to_owned(),
+        Some(basis) => {
+            let kind_ok = !basis.kind.is_account_private() || basis.human_attested;
+            let weight_ok = retention.weight_open || basis.kind.is_account_private();
+            downgrade_reason(
+                basis,
+                retention.weight_open,
+                basis.has_provenance(),
+                kind_ok,
+                weight_ok,
+            )
+        }
     }
+}
+
+/// Build the `standard` override pin from the best available receipt, or `None`
+/// when neither a usable `standard_evidence` nor a usable basis exists (→ the
+/// caller REFUSES). `standard_evidence` is preferred: it is the dedicated
+/// positive receipt for the standard posture; a downgraded-`zero` basis is the
+/// fallback (its description explains why zero does not reach this lane).
+fn build_standard_override(
+    basis: Option<&Basis>,
+    standard_evidence: Option<&StandardEvidence>,
+    weight_open: bool,
+    verified: &str,
+) -> Option<PinFields> {
+    if let Some(evidence) = standard_evidence.filter(|evidence| evidence.is_usable()) {
+        return Some(PinFields {
+            posture: RetentionPosture::Standard,
+            description: evidence.description.clone(),
+            source_url: evidence.source_url.clone(),
+            verified: verified.to_owned(),
+            source_sha256: evidence.source_sha256.clone(),
+        });
+    }
+    if let Some(basis) = basis.filter(|basis| basis.is_pin_usable()) {
+        let kind_ok = !basis.kind.is_account_private() || basis.human_attested;
+        let description = if basis.posture == RetentionPosture::Zero {
+            override_description(basis, weight_open, kind_ok)
+        } else {
+            nonblank(
+                &basis.description,
+                "retention basis (see source); description not supplied in the dossier",
+            )
+        };
+        return Some(PinFields {
+            posture: RetentionPosture::Standard,
+            description,
+            source_url: basis.source_url.clone(),
+            verified: verified.to_owned(),
+            source_sha256: basis.source_sha256.clone(),
+        });
+    }
+    None
+}
+
+/// The scaffold for a plain `standard` lane, plus whether the evidence was too
+/// thin to count as a receipt (which flags NEEDS RETENTION EVIDENCE). Prefers a
+/// usable `standard_evidence`, then a usable basis, then a placeholder; a
+/// placeholder means no receipt exists and the flag fires. Never refuses —
+/// invariant 4 emits-and-flags a thin `standard` lane rather than refusing it.
+fn standard_scaffold_any(
+    basis: Option<&Basis>,
+    standard_evidence: Option<&StandardEvidence>,
+    verified: &str,
+) -> (PinFields, bool) {
+    if let Some(evidence) = standard_evidence.filter(|evidence| evidence.is_usable()) {
+        return (
+            PinFields {
+                posture: RetentionPosture::Standard,
+                description: evidence.description.clone(),
+                source_url: evidence.source_url.clone(),
+                verified: verified.to_owned(),
+                source_sha256: evidence.source_sha256.clone(),
+            },
+            false,
+        );
+    }
+    if let Some(basis) = basis.filter(|basis| basis.is_pin_usable()) {
+        return (
+            pin_from_basis(basis, RetentionPosture::Standard, verified),
+            false,
+        );
+    }
+    (placeholder_pin(RetentionPosture::Standard, verified), true)
 }
 
 const NEEDS_RETENTION_EVIDENCE: &str = "NEEDS RETENTION EVIDENCE: the dossier does not supply a \
@@ -585,6 +799,10 @@ const NEEDS_RETENTION_EVIDENCE: &str = "NEEDS RETENTION EVIDENCE: the dossier do
 
 const AUTO_DESCRIPTION: &str = "AUTO-GENERATED override description — a human must read the cited \
      page and rewrite this description before merge; the drafter only templated it.";
+
+const ZERO_OVERRIDE_NOTE: &str = "ZERO PINNED EXPLICITLY on a provider whose live pin is not `zero` \
+     — the lane earned zero from its basis, but confirm the basis truly reaches this model before \
+     merge; a zero label is a claim to a customer about their data.";
 
 /// Spell out why a `zero`-claiming basis was downgraded, dominant reason first.
 fn downgrade_reason(
@@ -694,24 +912,6 @@ fn placeholder_pin(posture: RetentionPosture, verified: &str) -> PinFields {
     }
 }
 
-/// The scaffold for a plain `standard` lane, plus whether the basis evidence was
-/// too thin to use (which flags NEEDS RETENTION EVIDENCE). We fall back to a
-/// placeholder rather than refuse, because invariant 4 says a `standard` lane
-/// with thin evidence is emitted-and-flagged, never refused.
-fn standard_scaffold(basis: &Basis, verified: &str) -> (PinFields, bool) {
-    if !basis.description.trim().is_empty()
-        && looks_http(&basis.source_url)
-        && looks_sha256(&basis.source_sha256)
-    {
-        (
-            pin_from_basis(basis, RetentionPosture::Standard, verified),
-            false,
-        )
-    } else {
-        (placeholder_pin(RetentionPosture::Standard, verified), true)
-    }
-}
-
 fn looks_http(url: &str) -> bool {
     let url = url.trim();
     url.starts_with("https://") || url.starts_with("http://")
@@ -731,11 +931,43 @@ fn nonblank(value: &str, fallback: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Conditional bands: only `min_prompt_tokens` context tiers are lane rates.
+// ---------------------------------------------------------------------------
+
+/// The conditional entries that are genuine lane rates: those keyed on
+/// `min_prompt_tokens`. Research agents overload the `conditional` list with
+/// cache-TTL, batch, region, and time variants that carry no `min_prompt_tokens`
+/// — those are not lane rates this drafter models, so they are dropped here
+/// rather than emitted as (invalid) conditional rates.
+fn context_bands(prices: &Prices) -> Vec<&ConditionalPrice> {
+    prices
+        .conditional
+        .iter()
+        .filter(|band| band.min_prompt_tokens.is_some())
+        .collect()
+}
+
+/// How many `conditional` entries were dropped for carrying no
+/// `min_prompt_tokens`.
+fn ignored_conditional_count(prices: &Prices) -> usize {
+    prices.conditional.len() - context_bands(prices).len()
+}
+
+// ---------------------------------------------------------------------------
 // Invariant 6 — price sanity flags (warn, never refuse).
 // ---------------------------------------------------------------------------
 
 fn price_sanity_flags(prices: &Prices, input: f64, output: f64) -> Vec<String> {
     let mut flags = Vec::new();
+    let ignored = ignored_conditional_count(prices);
+    if ignored > 0 {
+        flags.push(format!(
+            "{ignored} conditional pricing variant(s) were IGNORED for carrying no \
+             min_prompt_tokens (cache-TTL / batch / region / time tiers are not lane rates); only \
+             a min_prompt_tokens context tier becomes a conditional lane rate. Review them by hand \
+             if any should shape the lane."
+        ));
+    }
     if let Some(cached) = prices.cached_input_per_mtok
         && input > 0.0
         && cached < input / 50.0
@@ -846,18 +1078,29 @@ fn render_rates_block(base_header: &str, prices: &Prices, input: f64, output: f6
     }
     let _ = writeln!(out, "output_per_mtok = {}", fmt_price(output));
 
-    for band in &prices.conditional {
+    // Only genuine `min_prompt_tokens` context tiers become conditional lane
+    // rates. A context tier missing input/output emits a table the loader then
+    // refuses (invariant 5) — the fail-safe: a real repricing tier with a hole
+    // in it must refuse, never silently under-price.
+    for band in context_bands(prices) {
+        let Some(min_prompt_tokens) = band.min_prompt_tokens else {
+            continue;
+        };
         out.push('\n');
         let _ = writeln!(out, "[[{base_header}.conditional]]");
-        let _ = writeln!(out, "min_prompt_tokens = {}", band.min_prompt_tokens);
-        let _ = writeln!(out, "input_per_mtok = {}", fmt_price(band.input_per_mtok));
+        let _ = writeln!(out, "min_prompt_tokens = {min_prompt_tokens}");
+        if let Some(band_input) = band.input_per_mtok {
+            let _ = writeln!(out, "input_per_mtok = {}", fmt_price(band_input));
+        }
         if let Some(cached) = band.cached_input_per_mtok {
             let _ = writeln!(out, "cached_input_per_mtok = {}", fmt_price(cached));
         }
         if let Some(write_rate) = band.cache_write_per_mtok {
             let _ = writeln!(out, "cache_write_per_mtok = {}", fmt_price(write_rate));
         }
-        let _ = writeln!(out, "output_per_mtok = {}", fmt_price(band.output_per_mtok));
+        if let Some(band_output) = band.output_per_mtok {
+            let _ = writeln!(out, "output_per_mtok = {}", fmt_price(band_output));
+        }
     }
     out
 }
@@ -937,6 +1180,7 @@ fn render_dossier(
     input: f64,
     output: f64,
     posture: RetentionPosture,
+    provider_posture: Option<RetentionPosture>,
     reasoning: &str,
     inherit_note: &str,
     stanza_toml: &str,
@@ -959,7 +1203,12 @@ fn render_dossier(
     out.push_str("## Posture decision\n\n");
     let _ = writeln!(out, "- Resolved posture: **{}**", posture.wire_token());
     let _ = writeln!(out, "- Reasoning: {reasoning}");
-    let _ = writeln!(out, "- Provider pin: {inherit_note}");
+    let _ = writeln!(
+        out,
+        "- Live provider pin: {}",
+        describe_provider_pin(provider_posture)
+    );
+    let _ = writeln!(out, "- Pin placement: {inherit_note}");
     match &facts.retention.basis {
         None => out.push_str("- Basis: none supplied.\n"),
         Some(basis) => {
@@ -986,6 +1235,32 @@ fn render_dossier(
             );
         }
     }
+    match &facts.standard_evidence {
+        None => out.push_str("- Standard evidence (retention receipt): none supplied.\n"),
+        Some(evidence) => {
+            out.push_str("- Standard evidence (retention receipt):\n");
+            let _ = writeln!(
+                out,
+                "  - description: {}",
+                quote_or_none(&evidence.description)
+            );
+            let _ = writeln!(
+                out,
+                "  - source_url: {}",
+                quote_or_none(&evidence.source_url)
+            );
+            let _ = writeln!(
+                out,
+                "  - source_sha256: {}",
+                quote_or_none(&evidence.source_sha256)
+            );
+            let _ = writeln!(
+                out,
+                "  - source_extract: {}",
+                quote_or_none(&evidence.source_extract)
+            );
+        }
+    }
     out.push('\n');
 
     out.push_str("## Prices (each traceable)\n\n");
@@ -1003,13 +1278,22 @@ fn render_dossier(
         }
         None => out.push_str("- context_window = (absent)\n"),
     }
-    for band in &facts.prices.conditional {
+    for band in context_bands(&facts.prices) {
+        let min = band.min_prompt_tokens.unwrap_or_default();
         let _ = writeln!(
             out,
-            "- conditional above {} tokens: input {}, output {}",
-            band.min_prompt_tokens,
-            fmt_price(band.input_per_mtok),
-            fmt_price(band.output_per_mtok),
+            "- conditional above {min} tokens: input {}, output {}",
+            band.input_per_mtok
+                .map_or("(missing)".to_owned(), fmt_price),
+            band.output_per_mtok
+                .map_or("(missing)".to_owned(), fmt_price),
+        );
+    }
+    let ignored = ignored_conditional_count(&facts.prices);
+    if ignored > 0 {
+        let _ = writeln!(
+            out,
+            "- ({ignored} non-min_prompt_tokens pricing variant(s) ignored — see Flags)"
         );
     }
     let _ = writeln!(
@@ -1035,6 +1319,14 @@ fn render_dossier(
         facts.invokable.describe(),
         quote_or_none(&facts.invoke_evidence),
     );
+
+    if !facts.gaps.is_empty() {
+        out.push_str("## Researcher-flagged gaps\n\n");
+        for gap in &facts.gaps {
+            let _ = writeln!(out, "- {gap}");
+        }
+        out.push('\n');
+    }
 
     out.push_str("## Flags\n\n");
     if flags.is_empty() {
@@ -1168,10 +1460,11 @@ pub struct OutcomeJson {
     pub flags: Vec<String>,
 }
 
-/// Draft, then prove the draft loads. `Ok(Outcome)` covers both a draft and a
-/// refusal (including a load-validation refusal); `Err` is reserved for an
-/// environment failure writing the temp fragment, which is not the dossier's
-/// fault.
+/// Draft, then prove the draft loads. `provider_posture` is the candidate
+/// provider's live `[retention.<provider>]` posture (see [`draft`]). `Ok(Outcome)`
+/// covers both a draft and a refusal (including a load-validation refusal and the
+/// FIX-3 false-zero refusal); `Err` is reserved for an environment failure
+/// writing the temp fragment, which is not the dossier's fault.
 ///
 /// # Errors
 ///
@@ -1180,8 +1473,9 @@ pub struct OutcomeJson {
 pub async fn draft_and_validate(
     facts: &FactsDossier,
     verified: &str,
+    provider_posture: Option<RetentionPosture>,
 ) -> Result<Outcome, std::io::Error> {
-    let draft = match draft(facts, verified) {
+    let draft = match draft(facts, verified, provider_posture) {
         Decision::Refused { reason } => {
             return Ok(Outcome::refused(&facts.display_id, reason, Vec::new()));
         }
@@ -1321,6 +1615,8 @@ mod tests {
                     source_extract: "deletes API inputs and outputs within 30 days".to_owned(),
                 }),
             },
+            standard_evidence: None,
+            gaps: Vec::new(),
             invokable: Invokable::Proven(true),
             invoke_evidence: "200 OK from messages.create".to_owned(),
             verified: None,
@@ -1329,17 +1625,61 @@ mod tests {
 
     const VERIFIED: &str = "2026-09-04";
 
+    /// The live `[retention.<provider>]` posture a test's fixture provider would
+    /// carry, mirroring the shipped `config/tiers.toml`: the zero-retention
+    /// providers pin `zero`, the ordinary API accounts pin `standard`, and an
+    /// unknown provider has no pin. Deriving it from the provider means the
+    /// arity-1 helpers below need no per-call posture.
+    fn test_provider_pin(provider: &str) -> Option<RetentionPosture> {
+        match provider {
+            "fireworks" | "vertex" | "bedrock" | "xai" | "groq" | "together" => {
+                Some(RetentionPosture::Zero)
+            }
+            "anthropic" | "openai" | "google" | "azure" => Some(RetentionPosture::Standard),
+            _ => None,
+        }
+    }
+
     fn drafted(facts: &FactsDossier) -> Draft {
-        match draft(facts, VERIFIED) {
+        match draft(
+            facts,
+            VERIFIED,
+            test_provider_pin(&facts.candidate.provider),
+        ) {
             Decision::Drafted(draft) => *draft,
             Decision::Refused { reason } => panic!("expected a draft, got refusal: {reason}"),
         }
     }
 
     fn refusal(facts: &FactsDossier) -> String {
-        match draft(facts, VERIFIED) {
+        match draft(
+            facts,
+            VERIFIED,
+            test_provider_pin(&facts.candidate.provider),
+        ) {
             Decision::Refused { reason } => reason,
             Decision::Drafted(_) => panic!("expected a refusal, got a draft"),
+        }
+    }
+
+    async fn validate(facts: &FactsDossier) -> Outcome {
+        draft_and_validate(
+            facts,
+            VERIFIED,
+            test_provider_pin(&facts.candidate.provider),
+        )
+        .await
+        .expect("no io error")
+    }
+
+    /// A usable standard retention receipt for FIX-2 / FIX-3 tests.
+    fn standard_evidence() -> StandardEvidence {
+        StandardEvidence {
+            description: "Provider retains API inputs and outputs up to 30 days; not zero."
+                .to_owned(),
+            source_url: "https://example.com/data-retention".to_owned(),
+            source_sha256: "d".repeat(64),
+            source_extract: "we retain inputs and outputs for up to 30 days".to_owned(),
         }
     }
 
@@ -1349,7 +1689,10 @@ mod tests {
     fn invokable_true_is_accepted() {
         // MUTATION: if `is_proven` returned true for non-`true` values, the
         // `false`/`unknown` tests below would stop refusing.
-        assert!(matches!(draft(&baseline(), VERIFIED), Decision::Drafted(_)));
+        assert!(matches!(
+            draft(&baseline(), VERIFIED, test_provider_pin("anthropic")),
+            Decision::Drafted(_)
+        ));
     }
 
     #[test]
@@ -1589,9 +1932,9 @@ mod tests {
         // brief's output template omitted them, but every real lane has them.
         let mut facts = baseline();
         facts.prices.conditional = vec![ConditionalPrice {
-            min_prompt_tokens: 272_000,
-            input_per_mtok: 10.0,
-            output_per_mtok: 50.0,
+            min_prompt_tokens: Some(272_000),
+            input_per_mtok: Some(10.0),
+            output_per_mtok: Some(50.0),
             cached_input_per_mtok: Some(1.0),
             cache_write_per_mtok: None,
         }];
@@ -1615,9 +1958,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_valid_draft_loads_through_the_real_loader() {
-        let outcome = draft_and_validate(&zero_published_default_open(), VERIFIED)
-            .await
-            .expect("no io error");
+        let outcome = validate(&zero_published_default_open()).await;
         assert_eq!(
             outcome.status,
             Status::Draft,
@@ -1629,9 +1970,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_anthropic_golden_lane_validates_as_standard() {
-        let outcome = draft_and_validate(&baseline(), VERIFIED)
-            .await
-            .expect("no io error");
+        let outcome = validate(&baseline()).await;
         assert_eq!(
             outcome.status,
             Status::Draft,
@@ -1641,19 +1980,81 @@ mod tests {
         assert_eq!(outcome.posture, Some(RetentionPosture::Standard));
     }
 
-    #[tokio::test]
-    async fn the_gemini_vertex_zero_golden_lane_validates_as_zero() {
-        let mut facts = zero_published_default_open();
+    /// A vertex/gemini-3.8-flash fixture in the REAL dossier's shape: `basis:
+    /// null` (Vertex zero retention is an enforced project setting a research
+    /// agent cannot verify), closed-weight, no Anthropic-dialect cache write.
+    fn gemini_basis_null() -> FactsDossier {
+        let mut facts = baseline();
+        facts.candidate.category = "version-bump".to_owned();
         facts.candidate.provider = "vertex".to_owned();
         facts.candidate.model = "gemini-3.8-flash".to_owned();
         facts.display_id = "vertex/gemini-3.8-flash".to_owned();
-        facts.retention.weight_open = false;
-        let basis = facts.retention.basis.as_mut().unwrap();
-        basis.kind = BasisKind::Enforced;
-        basis.human_attested = true;
-        let outcome = draft_and_validate(&facts, VERIFIED)
-            .await
-            .expect("no io error");
+        facts.prices.cache_write_per_mtok = None;
+        facts.retention = RetentionFacts {
+            weight_open: false,
+            basis: None,
+        };
+        facts.standard_evidence = None;
+        facts
+    }
+
+    #[tokio::test]
+    async fn the_gemini_vertex_golden_lane_validates_as_a_standard_override() {
+        // FIX 3: the REAL gemini dossier has basis:null on vertex, whose LIVE
+        // pin is `zero`. A plain standard lane would inherit that zero — a false
+        // claim. WITH a standard_evidence receipt, the drafter pins `standard`
+        // EXPLICITLY, and that override must load.
+        let mut facts = gemini_basis_null();
+        facts.standard_evidence = Some(standard_evidence());
+        let outcome = validate(&facts).await;
+        assert_eq!(
+            outcome.status,
+            Status::Draft,
+            "reason: {:?}",
+            outcome.refuse_reason
+        );
+        assert_eq!(outcome.posture, Some(RetentionPosture::Standard));
+        let stanza = outcome.stanza_toml.unwrap();
+        assert!(
+            stanza.contains(".retention]"),
+            "an explicit standard override must be emitted, not inherited"
+        );
+        assert!(stanza.contains("posture = \"standard\""));
+    }
+
+    #[tokio::test]
+    async fn the_gemini_vertex_golden_without_standard_evidence_refuses() {
+        // FIX 3: the REAL gemini dossier as delivered — basis:null AND no
+        // standard_evidence — on a zero provider. There is no receipt to pin
+        // standard, so the drafter REFUSES rather than emit a false zero.
+        // MUTATION: if the standard-on-zero-provider branch fell through to a
+        // plain lane instead of refusing, this lane would inherit vertex's zero.
+        let outcome = validate(&gemini_basis_null()).await;
+        assert_eq!(outcome.status, Status::Refused);
+        assert!(
+            outcome
+                .refuse_reason
+                .unwrap()
+                .contains("inherit an unearned zero")
+        );
+    }
+
+    #[tokio::test]
+    async fn an_enforced_attested_zero_lane_validates_as_zero() {
+        // The zero path still validates end-to-end: a closed-weight model on an
+        // enforced account setting a human attested to, on a zero provider.
+        let mut facts = gemini_basis_null();
+        facts.retention.basis = Some(Basis {
+            kind: BasisKind::Enforced,
+            posture: RetentionPosture::Zero,
+            covers_this_model: true,
+            human_attested: true,
+            description: "Vertex project configured for zero data retention.".to_owned(),
+            source_url: "https://cloud.google.com/vertex-ai/zdr".to_owned(),
+            source_sha256: "e".repeat(64),
+            source_extract: "no request or response data is retained".to_owned(),
+        });
+        let outcome = validate(&facts).await;
         assert_eq!(
             outcome.status,
             Status::Draft,
@@ -1669,9 +2070,7 @@ mod tests {
         // explicit standard override is emitted AND must load.
         let mut facts = zero_published_default_open();
         facts.retention.weight_open = false;
-        let outcome = draft_and_validate(&facts, VERIFIED)
-            .await
-            .expect("no io error");
+        let outcome = validate(&facts).await;
         assert_eq!(
             outcome.status,
             Status::Draft,
@@ -1742,9 +2141,7 @@ mod tests {
         let mut facts = baseline();
         facts.candidate.provider = "not-a-real-provider".to_owned();
         facts.display_id = "not-a-real-provider/model".to_owned();
-        let outcome = draft_and_validate(&facts, VERIFIED)
-            .await
-            .expect("no io error");
+        let outcome = validate(&facts).await;
         assert_eq!(outcome.status, Status::Refused);
         assert!(
             outcome
@@ -1761,9 +2158,7 @@ mod tests {
         let mut facts = zero_published_default_open();
         facts.prices.cached_input_per_mtok = Some(1.0);
         facts.prices.cache_write_per_mtok = Some(2.5);
-        let outcome = draft_and_validate(&facts, VERIFIED)
-            .await
-            .expect("no io error");
+        let outcome = validate(&facts).await;
         assert_eq!(outcome.status, Status::Refused);
     }
 
@@ -1771,11 +2166,214 @@ mod tests {
     async fn the_golden_refusal_unknown_invokable() {
         let mut facts = baseline();
         facts.invokable = Invokable::Unknown("unknown".to_owned());
-        let outcome = draft_and_validate(&facts, VERIFIED)
-            .await
-            .expect("no io error");
+        let outcome = validate(&facts).await;
         assert_eq!(outcome.status, Status::Refused);
         assert!(outcome.stanza_toml.is_none());
+    }
+
+    // ---- FIX 1: tolerate research-agent input -----------------------------
+
+    #[test]
+    fn stray_descriptive_fields_are_tolerated() {
+        // A real research agent decorates the dossier with fields a strict schema
+        // never anticipated: a top-level extra, a per-field `note`, and
+        // `label`/`note` on price bands. None may kill the draft.
+        // MUTATION: restoring `deny_unknown_fields` makes this fail to parse.
+        let json = r#"{
+          "candidate": { "category": "new", "provider": "fireworks",
+            "model": "accounts/fireworks/models/qwen3p7-plus", "note": "hi" },
+          "display_id": "fireworks/qwen3.7-plus",
+          "researcher_confidence": "high",
+          "prices": {
+            "input_per_mtok": 0.40, "output_per_mtok": 1.60,
+            "cached_input_per_mtok": 0.08,
+            "context_window": 262144,
+            "conditional": [
+              { "label": "1h cache write", "cache_write_per_mtok": 10.0,
+                "note": "not a min_prompt_tokens tier" }
+            ],
+            "source_url": "https://docs.fireworks.ai/serverless/pricing",
+            "source_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "source_extract": "Qwen 3.7 Plus: $0.40 / $1.60"
+          },
+          "retention": {
+            "weight_open": true,
+            "basis": {
+              "kind": "published-default", "posture": "zero",
+              "covers_this_model": true, "note": "open models only",
+              "description": "ZDR by default for open models.",
+              "source_url": "https://docs.fireworks.ai/data",
+              "source_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "source_extract": "data exists only in volatile memory"
+            }
+          },
+          "invokable": true,
+          "invoke_evidence": "200 OK"
+        }"#;
+        let facts: FactsDossier =
+            serde_json::from_str(json).expect("stray fields must be tolerated, not rejected");
+        // Still drafts correctly: open-weight published-default zero on a zero
+        // provider → a plain zero lane.
+        let draft = drafted(&facts);
+        assert_eq!(draft.posture, RetentionPosture::Zero);
+        // The label/note-only conditional entry carried no min_prompt_tokens and
+        // is ignored, not emitted.
+        assert!(!draft.stanza_toml.contains(".rates.conditional]]"));
+        assert!(draft.flags.iter().any(|f| f.contains("IGNORED")));
+    }
+
+    #[test]
+    fn a_mistyped_required_price_still_refuses() {
+        // With lenient parsing, a misspelled REQUIRED key is dropped, so the
+        // field reads as absent — and absent required prices REFUSE (never a
+        // silently-wrong lane). This is the safety the coordinator required.
+        let json = r#"{
+          "candidate": { "category": "new", "provider": "anthropic", "model": "m" },
+          "display_id": "anthropic/m",
+          "prices": {
+            "input_per_mtokk": 5.0, "output_per_mtok": 25.0,
+            "source_url": "https://x/", "source_sha256": "aa", "source_extract": "x"
+          },
+          "retention": { "weight_open": false },
+          "invokable": true
+        }"#;
+        let facts: FactsDossier = serde_json::from_str(json).expect("parses (lenient)");
+        assert_eq!(
+            facts.prices.input_per_mtok, None,
+            "the typo'd key is dropped"
+        );
+        assert!(refusal(&facts).contains("input_per_mtok"));
+    }
+
+    #[test]
+    fn conditional_without_min_prompt_tokens_is_ignored_not_emitted() {
+        let mut facts = baseline();
+        facts.prices.conditional = vec![
+            ConditionalPrice {
+                min_prompt_tokens: None,
+                input_per_mtok: Some(2.5),
+                output_per_mtok: Some(12.5),
+                cached_input_per_mtok: None,
+                cache_write_per_mtok: None,
+            },
+            ConditionalPrice {
+                min_prompt_tokens: None,
+                input_per_mtok: Some(10.0),
+                output_per_mtok: Some(50.0),
+                cached_input_per_mtok: None,
+                cache_write_per_mtok: None,
+            },
+        ];
+        let draft = drafted(&facts);
+        assert!(
+            !draft.stanza_toml.contains(".rates.conditional]]"),
+            "no min_prompt_tokens band means no emitted conditional rate"
+        );
+        assert!(draft.flags.iter().any(|f| f.contains("2 conditional")));
+    }
+
+    // ---- FIX 2: consume standard_evidence and gaps -------------------------
+
+    #[test]
+    fn standard_evidence_suppresses_the_needs_evidence_flag_and_is_surfaced() {
+        // basis:null on a STANDARD provider would normally flag NEEDS RETENTION
+        // EVIDENCE; a standard_evidence receipt is the evidence, so the flag is
+        // suppressed and the receipt is shown in the dossier.
+        let mut facts = baseline();
+        facts.retention = RetentionFacts {
+            weight_open: false,
+            basis: None,
+        };
+        facts.standard_evidence = Some(standard_evidence());
+        let draft = drafted(&facts);
+        assert_eq!(draft.posture, RetentionPosture::Standard);
+        assert!(
+            !draft
+                .flags
+                .iter()
+                .any(|f| f.contains("NEEDS RETENTION EVIDENCE")),
+            "a present standard receipt suppresses the gap flag"
+        );
+        assert!(
+            draft
+                .dossier_markdown
+                .contains("Standard evidence (retention receipt)")
+        );
+        assert!(draft.dossier_markdown.contains("up to 30 days"));
+    }
+
+    #[test]
+    fn gaps_are_surfaced_in_the_dossier() {
+        let mut facts = baseline();
+        facts.gaps = vec!["Retention: no bot-establishable zero basis.".to_owned()];
+        let draft = drafted(&facts);
+        assert!(draft.dossier_markdown.contains("Researcher-flagged gaps"));
+        assert!(
+            draft
+                .dossier_markdown
+                .contains("no bot-establishable zero basis")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_real_shaped_anthropic_dossier_drafts_a_standard_plain_lane() {
+        // The shape the real research agent emits for claude-opus-4-8: basis
+        // null, a standard_evidence receipt, gaps, and conditional variants with
+        // no min_prompt_tokens (1h-cache / batch / fast-mode). Anthropic's live
+        // pin is standard, so a plain standard lane is correct and validates.
+        let json = r#"{
+          "candidate": { "category": "new", "provider": "anthropic",
+            "model": "claude-opus-4-8", "note": "legacy-but-available GA" },
+          "display_id": "anthropic/claude-opus-4-8",
+          "prices": {
+            "input_per_mtok": 5.0, "output_per_mtok": 25.0,
+            "cached_input_per_mtok": 0.5, "cache_write_per_mtok": 6.25,
+            "context_window": 1000000,
+            "conditional": [
+              { "label": "1h cache write", "cache_write_per_mtok": 10.0, "note": "TTL variant" },
+              { "label": "Batch API", "input_per_mtok": 2.5, "output_per_mtok": 12.5 }
+            ],
+            "source_url": "https://platform.claude.com/docs/en/about-claude/pricing",
+            "source_sha256": "a5e896b765ff04ca5c0431d94c3eb83fd237af881bdae539a256205fecaa66a4",
+            "source_extract": "Claude Opus 4.8 $5 / MTok ... $25 / MTok"
+          },
+          "retention": { "weight_open": false, "basis": null },
+          "standard_evidence": {
+            "description": "Anthropic deletes API inputs and outputs within 30 days; zero only by signed agreement.",
+            "source_url": "https://privacy.claude.com/en/articles/7996866",
+            "source_sha256": "8ec3ae6afa8c7639ae015af62f455f2e414107712df72fe2747a16c9371b4335",
+            "source_extract": "we automatically delete inputs and outputs on our backend within 30 days"
+          },
+          "gaps": ["Retention: zero only by signed agreement (basis kind signed, human_attested)."],
+          "invokable": true,
+          "invoke_evidence": "Official model page lists it as legacy-but-available GA"
+        }"#;
+        let facts: FactsDossier = serde_json::from_str(json).expect("real anthropic shape parses");
+        let outcome = validate(&facts).await;
+        assert_eq!(
+            outcome.status,
+            Status::Draft,
+            "reason: {:?}",
+            outcome.refuse_reason
+        );
+        assert_eq!(outcome.posture, Some(RetentionPosture::Standard));
+        let stanza = outcome.stanza_toml.unwrap();
+        assert!(
+            !stanza.contains(".retention]"),
+            "a standard lane on a standard provider needs no override"
+        );
+        assert!(
+            !stanza.contains(".rates.conditional]]"),
+            "no real context tier"
+        );
+        assert!(
+            !outcome
+                .flags
+                .iter()
+                .any(|f| f.contains("NEEDS RETENTION EVIDENCE")),
+            "standard_evidence is the receipt"
+        );
+        assert!(outcome.flags.iter().any(|f| f.contains("IGNORED")));
     }
 
     // ---- verified-date resolution ------------------------------------------
