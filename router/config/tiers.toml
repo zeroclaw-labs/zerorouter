@@ -3075,3 +3075,32 @@ tool_call = true
 input_per_mtok = 1.32
 cached_input_per_mtok = 0.13
 output_per_mtok = 3.96
+
+# --- proposed by zerorouter-currency-bot (vertex__gemini-3.8-flash) — review before merge ---
+[tiers."vertex/gemini-3.8-flash"]
+
+[tiers."vertex/gemini-3.8-flash".rates]
+input_per_mtok = 0.75
+cached_input_per_mtok = 0.075
+output_per_mtok = 3.75
+
+[[tiers."vertex/gemini-3.8-flash".candidates]]
+id = "vertex/gemini-3.8-flash"
+provider = "vertex"
+model = "gemini-3.8-flash"
+
+[tiers."vertex/gemini-3.8-flash".candidates.metadata]
+context_window = 1048576
+
+[tiers."vertex/gemini-3.8-flash".candidates.rates]
+input_per_mtok = 0.75
+cached_input_per_mtok = 0.075
+output_per_mtok = 3.75
+
+[tiers."vertex/gemini-3.8-flash".retention]
+posture = "standard"
+description = "Google's official Vertex/Gemini (Gemini Enterprise Agent Platform) zero-data-retention doc states the PUBLIC DEFAULT for the Gemini API surface is NOT zero: customer data is retained for limited periods by default — prompts may be logged for abuse monitoring per GCP TOS Section 4.3 (an exception must be requested), and Google's published Gemini models cache inputs/outputs/derived data in-memory with a 24-hour TTL by default (disable is a per-project action). Zero data retention is achieved only by customers taking specific per-project actions (abuse-monitoring exception, disabling caching, not enabling optional logging/session features) — i.e. an enforced account/project configuration, not a published default. Therefore a lane not covered by a per-project ZDR exception is standard. Training is not at issue here; this receipt is about retention, not training."
+source_url = "https://docs.cloud.google.com/gemini-enterprise-agent-platform/resources/zero-data-retention"
+verified = "2026-09-04"
+source_sha256 = "ceb8e1d197fa35db3e6b22d9a888912357bc7a2119ad6b3b257a71cb1b4a9619"
+
