@@ -44,9 +44,16 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
 
 use crate::config::TierCatalog;
+
+/// The default recency window for the `New` category: a model whose
+/// `release_date` is older than this many days is dropped from New. Chosen so
+/// the weekly report stays scannable — see [`filter_new_by_recency`] for why
+/// only New is filtered and why an undated model is kept regardless.
+pub const DEFAULT_NEW_SINCE_DAYS: i64 = 90;
 
 /// Which of the three discovery questions a candidate answers. Ordered by the
 /// precedence [`discover`] applies, strongest first.
@@ -100,6 +107,13 @@ pub struct Candidate {
 struct SourceModel {
     #[serde(default)]
     modalities: Option<SourceModalities>,
+    /// When the model shipped, used ONLY to age out stale `New` findings (see
+    /// [`filter_new_by_recency`]). The source spells it either as a full date
+    /// (`2026-08-14`) or a year-month (`2026-01`); absent or unparseable is a
+    /// model whose age is unknown, and an unknown age is never a reason to drop
+    /// a candidate.
+    #[serde(default)]
+    release_date: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -265,6 +279,22 @@ fn canonical(model: &str) -> String {
     bare
 }
 
+/// Parse a models.dev `release_date`, or `None` when it is absent or in a shape
+/// this does not recognise.
+///
+/// The source uses two spellings: a full `YYYY-MM-DD` and a `YYYY-MM`
+/// year-month, the latter treated as the FIRST of that month — the most recent
+/// interpretation, which keeps a coarsely-dated model in the window a day
+/// longer rather than a day less, the conservative direction. `None` on
+/// anything else is deliberate: the caller keeps an undated model, so a parse
+/// that fails must look the same as an absent date, never drop the row.
+fn parse_release_date(raw: &str) -> Option<NaiveDate> {
+    let raw = raw.trim();
+    NaiveDate::parse_from_str(raw, "%Y-%m-%d")
+        .ok()
+        .or_else(|| NaiveDate::parse_from_str(&format!("{raw}-01"), "%Y-%m-%d").ok())
+}
+
 /// A bare name split into the fixed family around a single release version, or
 /// `None` when it carries no version this module is willing to compare.
 ///
@@ -390,17 +420,26 @@ impl Carried {
 /// exactly which providers exist without installing a global. See
 /// [`discover_from_inventory`] for the production wiring, and
 /// [`crate::drift::reconcile_with`] for the same seam pattern.
+///
+/// `today` and `new_since_days` bound the `New` category only — see
+/// [`filter_new_by_recency`]. `today` is a parameter rather than a call to the
+/// clock so the recency window is deterministic under test.
 #[must_use]
 pub fn discover(
     catalog: &TierCatalog,
     source: &str,
     credentialed: &[(String, String)],
+    today: NaiveDate,
+    new_since_days: i64,
 ) -> Vec<Candidate> {
     let providers: BTreeMap<String, SourceProvider> =
         serde_json::from_str(source).unwrap_or_default();
     let carried = Carried::from_catalog(catalog);
 
-    let mut out = Vec::new();
+    // Each candidate carries its parsed release date alongside, for the recency
+    // pass below. The date never reaches the public [`Candidate`] — it is a
+    // sort/filter key, not part of the report's contract.
+    let mut scored: Vec<(Candidate, Option<NaiveDate>)> = Vec::new();
     // One finding per (provider, canonical model): a provider's five regional
     // spellings of one model, or its dated and undated forms, are one
     // opportunity, not five rows.
@@ -426,17 +465,78 @@ pub fn discover(
                 continue;
             }
 
-            let candidate = classify(provider, model, &name, &carried);
-            out.push(candidate);
+            let release = entry.release_date.as_deref().and_then(parse_release_date);
+            let candidate = classify(provider, model, &name, &carried, release);
+            scored.push((candidate, release));
         }
     }
 
-    out
+    filter_new_by_recency(scored, today, new_since_days)
+}
+
+/// Age out stale `New` findings, and only those.
+///
+/// `New` is the firehose: every model under a credentialed provider we do not
+/// carry, which on the live catalog is hundreds of rows going back to
+/// `gpt-3.5-turbo`. A weekly report nobody can read is a report nobody reads,
+/// so a `New` model whose `release_date` is older than `new_since_days` before
+/// `today` is dropped, and the survivors are sorted newest-first.
+///
+/// The rule is applied to `New` and to nothing else, on purpose:
+/// [`Category::CrossCloud`] and [`Category::VersionBump`] are actionable at any
+/// age — a twin of a lane we run, or a higher version of a family we carry, is
+/// worth acting on whether the model shipped last week or last year — so they
+/// pass through untouched, in their original order.
+///
+/// A model with no parseable `release_date` is KEPT, and placed after every
+/// dated survivor. Dropping it would be guessing a model is old because the
+/// source did not say how old it is, which is exactly the missed-new-model
+/// failure the whole job exists to prevent — the same reason an uncomparable
+/// version degrades to `New` rather than vanishing.
+fn filter_new_by_recency(
+    scored: Vec<(Candidate, Option<NaiveDate>)>,
+    today: NaiveDate,
+    new_since_days: i64,
+) -> Vec<Candidate> {
+    let cutoff = today - chrono::Duration::days(new_since_days.max(0));
+
+    let (new, other): (Vec<_>, Vec<_>) = scored
+        .into_iter()
+        .partition(|(candidate, _)| candidate.category == Category::New);
+
+    let mut fresh_new: Vec<(Candidate, Option<NaiveDate>)> = new
+        .into_iter()
+        // Keep an undated model (release is `None`), and any dated model on or
+        // after the cutoff. `>=` makes the boundary inclusive.
+        .filter(|(_, release)| release.is_none_or(|date| date >= cutoff))
+        .collect();
+    // Newest first. `Reverse` flips the ordering so a later date sorts earlier;
+    // `None` is the smallest `Option`, so reversed it is the largest and undated
+    // rows land last. `sort_by_key` is stable, leaving same-date rows in their
+    // prior (name-sorted) order.
+    fresh_new.sort_by_key(|(_, release)| std::cmp::Reverse(*release));
+
+    // Cross-cloud and version bumps first, in the order they were found, then
+    // the recency-ranked new models.
+    other
+        .into_iter()
+        .chain(fresh_new)
+        .map(|(candidate, _)| candidate)
+        .collect()
 }
 
 /// Decide which category one uncarried source model falls into, strongest
 /// first — the precedence documented on [`Category`].
-fn classify(provider: &str, model: &str, name: &str, carried: &Carried) -> Candidate {
+///
+/// `release` is threaded through only to date the `New` note; the categories
+/// themselves do not depend on when a model shipped.
+fn classify(
+    provider: &str,
+    model: &str,
+    name: &str,
+    carried: &Carried,
+    release: Option<NaiveDate>,
+) -> Candidate {
     // Cross-cloud: this exact model is carried on some OTHER provider. Checked
     // first because a twin is the most valuable thing it could be.
     if let Some(providers) = carried.providers_by_model.get(name) {
@@ -481,11 +581,17 @@ fn classify(provider: &str, model: &str, name: &str, carried: &Carried) -> Candi
         }
     }
 
+    // The release date rides in the note so a newest-first list reads as one,
+    // and an undated model says so rather than looking like a missing field.
+    let shipped = release.map_or_else(
+        || "release date unknown".to_owned(),
+        |date| format!("released {date}"),
+    );
     Candidate {
         category: Category::New,
         provider: provider.to_owned(),
         model: model.to_owned(),
-        note: "no catalog candidate carries this model".to_owned(),
+        note: format!("{shipped}; no catalog candidate carries this model"),
     }
 }
 
@@ -508,11 +614,19 @@ fn render_version(version: &[u64]) -> String {
 /// candidate the source actually contains wins; a provider none of whose
 /// candidate keys appear in the source is skipped, because the source cannot
 /// tell us anything about a vendor it does not cover.
+///
+/// `today` (the caller's clock) and `new_since_days` bound the `New` category,
+/// as in [`discover`].
 #[must_use]
-pub fn discover_from_inventory(catalog: &TierCatalog, source: &str) -> Vec<Candidate> {
+pub fn discover_from_inventory(
+    catalog: &TierCatalog,
+    source: &str,
+    today: NaiveDate,
+    new_since_days: i64,
+) -> Vec<Candidate> {
     let inventory = crate::providers::inventory_source_keys();
     let credentialed = resolve_source_keys(source, &inventory);
-    discover(catalog, source, &credentialed)
+    discover(catalog, source, &credentialed, today, new_since_days)
 }
 
 /// Resolve each inventory provider to the single models.dev key present in the
@@ -631,13 +745,24 @@ mod tests {
         ]
     }
 
+    /// A fixed "today" for the recency-agnostic tests.
+    fn today() -> NaiveDate {
+        NaiveDate::from_ymd_opt(2026, 8, 20).expect("a valid date")
+    }
+
+    /// A window wide enough that the recency pass never removes a fixture model
+    /// — used by every test not about recency. The models in [`SOURCE`] carry
+    /// no `release_date` and so are kept regardless, but this makes the intent
+    /// explicit.
+    const WIDE_WINDOW: i64 = 3650;
+
     #[test]
     fn a_new_chat_model_is_reported_and_an_embedding_is_filtered() {
         let catalog = catalog(&[
             ("xai", "grok-4.6"),
             ("fireworks", "accounts/fireworks/models/glm-5p2"),
         ]);
-        let found = discover(&catalog, SOURCE, &credentialed());
+        let found = discover(&catalog, SOURCE, &credentialed(), today(), WIDE_WINDOW);
 
         // grok-4.7: a family we carry (4.6) with a higher version — reported.
         assert!(
@@ -661,7 +786,7 @@ mod tests {
     fn a_higher_version_in_a_carried_family_is_a_version_bump() {
         // glm-5.2 in the catalog (spelled glm-5p2), glm-5.3 in the source.
         let catalog = catalog(&[("fireworks", "accounts/fireworks/models/glm-5p2")]);
-        let found = discover(&catalog, SOURCE, &credentialed());
+        let found = discover(&catalog, SOURCE, &credentialed(), today(), WIDE_WINDOW);
         let bump =
             find(&found, "accounts/fireworks/models/glm-5p3").expect("glm-5.3 must be discovered");
         assert_eq!(bump.category, Category::VersionBump);
@@ -673,7 +798,7 @@ mod tests {
         // grok-4.6 carried on xai; the source lists it under amazon-bedrock,
         // which resolves to our bedrock lane.
         let catalog = catalog(&[("xai", "grok-4.6")]);
-        let found = discover(&catalog, SOURCE, &credentialed());
+        let found = discover(&catalog, SOURCE, &credentialed(), today(), WIDE_WINDOW);
         let twin = find(&found, "xai.grok-4.6").expect("grok on bedrock must surface");
         assert_eq!(twin.category, Category::CrossCloud);
         assert_eq!(twin.provider, "bedrock");
@@ -690,7 +815,7 @@ mod tests {
         // twin). Both categories apply, so this pins the precedence: the twin
         // wins.
         let catalog = catalog(&[("xai", "grok-4.6"), ("bedrock", "xai.grok-4.3")]);
-        let found = discover(&catalog, SOURCE, &credentialed());
+        let found = discover(&catalog, SOURCE, &credentialed(), today(), WIDE_WINDOW);
         let twin = find(&found, "xai.grok-4.6").expect("grok on bedrock must surface");
         assert_eq!(twin.category, Category::CrossCloud);
     }
@@ -704,7 +829,7 @@ mod tests {
             ("fireworks", "accounts/fireworks/models/glm-5p2"),
             ("fireworks", "accounts/fireworks/models/glm-5p3"),
         ]);
-        let found = discover(&catalog, SOURCE, &credentialed());
+        let found = discover(&catalog, SOURCE, &credentialed(), today(), WIDE_WINDOW);
         assert!(find(&found, "grok-4.3").is_none(), "grok-4.3 is carried");
         assert!(find(&found, "grok-4.6").is_none(), "grok-4.6 is carried");
         assert!(
@@ -717,7 +842,7 @@ mod tests {
     fn a_provider_we_are_not_credentialed_for_is_not_reported() {
         // cohere is in the source but not in the credentialed set.
         let catalog = catalog(&[("xai", "grok-4.6")]);
-        let found = discover(&catalog, SOURCE, &credentialed());
+        let found = discover(&catalog, SOURCE, &credentialed(), today(), WIDE_WINDOW);
         assert!(
             find(&found, "command-r-plus").is_none(),
             "a provider we cannot dispatch on must never appear"
@@ -734,7 +859,13 @@ mod tests {
           "grok-4.6": { "modalities": { "output": ["text"] } }
         } } }"#;
         let catalog = catalog(&[("xai", "grok-4.6")]);
-        let found = discover(&catalog, source, &[("xai".to_owned(), "xai".to_owned())]);
+        let found = discover(
+            &catalog,
+            source,
+            &[("xai".to_owned(), "xai".to_owned())],
+            today(),
+            WIDE_WINDOW,
+        );
         let lower = find(&found, "grok-4.3").expect("an uncarried lower version still surfaces");
         assert_eq!(
             lower.category,
@@ -753,7 +884,13 @@ mod tests {
           "openai/gpt-oss-120b": { "modalities": { "output": ["text"] } }
         } } }"#;
         let catalog = catalog(&[("groq", "openai/gpt-oss-20b")]);
-        let found = discover(&catalog, source, &[("groq".to_owned(), "groq".to_owned())]);
+        let found = discover(
+            &catalog,
+            source,
+            &[("groq".to_owned(), "groq".to_owned())],
+            today(),
+            WIDE_WINDOW,
+        );
         let bigger = find(&found, "openai/gpt-oss-120b").expect("the 120b model surfaces");
         assert_eq!(
             bigger.category,
@@ -771,7 +908,13 @@ mod tests {
           "grok-build-0.1": { "modalities": { "output": ["text"] } }
         } } }"#;
         let catalog = catalog(&[("xai", "grok-4.6")]);
-        let found = discover(&catalog, source, &[("xai".to_owned(), "xai".to_owned())]);
+        let found = discover(
+            &catalog,
+            source,
+            &[("xai".to_owned(), "xai".to_owned())],
+            today(),
+            WIDE_WINDOW,
+        );
         let built = find(&found, "grok-build-0.1").expect("an uncomparable model still surfaces");
         // grok-build-0.1 shares no (prefix, suffix) family with grok-4.6
         // (suffix differs), so it cannot be a bump; the point is that it is
@@ -794,6 +937,8 @@ mod tests {
             &catalog,
             source,
             &[("bedrock".to_owned(), "amazon-bedrock".to_owned())],
+            today(),
+            WIDE_WINDOW,
         );
         let bedrock: Vec<_> = found.iter().filter(|c| c.provider == "bedrock").collect();
         assert_eq!(
@@ -828,7 +973,7 @@ mod tests {
     #[test]
     fn the_json_shape_matches_the_candidate_fields() {
         let catalog = catalog(&[("xai", "grok-4.6")]);
-        let found = discover(&catalog, SOURCE, &credentialed());
+        let found = discover(&catalog, SOURCE, &credentialed(), today(), WIDE_WINDOW);
         let twin = find(&found, "xai.grok-4.6").expect("cross-cloud grok");
         let value = serde_json::to_value(twin).expect("a candidate serializes");
         assert_eq!(value["category"], "cross-cloud");
@@ -838,5 +983,129 @@ mod tests {
         // Exactly the four documented fields, no rates leaked in.
         let object = value.as_object().expect("an object");
         assert_eq!(object.len(), 4);
+    }
+
+    // ---- recency of the NEW category ----------------------------------------
+
+    /// A single xai provider carrying nothing, so every source model is a NEW
+    /// candidate the recency window can act on. Dates chosen against a `today`
+    /// of 2026-08-20.
+    const DATED_SOURCE: &str = r#"{
+      "xai": { "models": {
+        "aurora-ancient": { "modalities": { "output": ["text"] }, "release_date": "2023-01-01" },
+        "aurora-fresh":   { "modalities": { "output": ["text"] }, "release_date": "2026-08-14" },
+        "aurora-undated": { "modalities": { "output": ["text"] } }
+      } }
+    }"#;
+
+    fn xai_only() -> Vec<(String, String)> {
+        vec![("xai".to_owned(), "xai".to_owned())]
+    }
+
+    #[test]
+    fn an_ancient_new_model_is_filtered_by_recency() {
+        // 2023 is well outside a 90-day window ending 2026-08-20.
+        let catalog = catalog(&[]);
+        let found = discover(&catalog, DATED_SOURCE, &xai_only(), today(), 90);
+        assert!(
+            find(&found, "aurora-ancient").is_none(),
+            "a model years old is not a currency finding"
+        );
+    }
+
+    #[test]
+    fn a_recent_new_model_is_kept() {
+        // 2026-08-14 is six days before today — inside the window.
+        let catalog = catalog(&[]);
+        let found = discover(&catalog, DATED_SOURCE, &xai_only(), today(), 90);
+        let fresh = find(&found, "aurora-fresh").expect("a recent model must surface");
+        assert_eq!(fresh.category, Category::New);
+    }
+
+    #[test]
+    fn an_undated_new_model_is_kept_regardless_of_window() {
+        // Even at a one-day window, a model with no release_date survives:
+        // unknown age is never a reason to drop.
+        let catalog = catalog(&[]);
+        let found = discover(&catalog, DATED_SOURCE, &xai_only(), today(), 1);
+        assert!(
+            find(&found, "aurora-undated").is_some(),
+            "an undated model is kept — dropping it would be guessing it is old"
+        );
+        // ...while the dated-but-old ones are gone at this window.
+        assert!(find(&found, "aurora-ancient").is_none());
+        assert!(find(&found, "aurora-fresh").is_none());
+    }
+
+    #[test]
+    fn the_recency_cutoff_boundary_is_exact_and_year_month_parses_as_the_first() {
+        // today - 31 days = 2026-05-01 exactly, so the cutoff is 2026-05-01.
+        let today = NaiveDate::from_ymd_opt(2026, 6, 1).unwrap();
+        let source = r#"{ "xai": { "models": {
+          "on-cutoff":   { "modalities": { "output": ["text"] }, "release_date": "2026-05-01" },
+          "day-before":  { "modalities": { "output": ["text"] }, "release_date": "2026-04-30" },
+          "year-month":  { "modalities": { "output": ["text"] }, "release_date": "2026-05" }
+        } } }"#;
+        let catalog = catalog(&[]);
+        let found = discover(&catalog, source, &xai_only(), today, 31);
+        assert!(
+            find(&found, "on-cutoff").is_some(),
+            "a model dated exactly on the cutoff is kept (inclusive boundary)"
+        );
+        assert!(
+            find(&found, "day-before").is_none(),
+            "one day past the cutoff is dropped"
+        );
+        assert!(
+            find(&found, "year-month").is_some(),
+            "`2026-05` parses as 2026-05-01, which is on the cutoff and kept"
+        );
+    }
+
+    #[test]
+    fn cross_cloud_and_version_bump_ignore_the_recency_window() {
+        // grok-4.6 carried on xai. The source offers, with ANCIENT dates: a
+        // cross-cloud twin on bedrock and a version bump on xai. Even at a
+        // one-day window both must survive — recency touches only NEW.
+        let catalog = catalog(&[("xai", "grok-4.6")]);
+        let source = r#"{
+          "xai": { "models": {
+            "grok-4.6": { "modalities": { "output": ["text"] }, "release_date": "2019-01-01" },
+            "grok-4.7": { "modalities": { "output": ["text"] }, "release_date": "2019-01-01" }
+          } },
+          "amazon-bedrock": { "models": {
+            "xai.grok-4.6": { "modalities": { "output": ["text"] }, "release_date": "2018-01-01" }
+          } }
+        }"#;
+        let credentialed = vec![
+            ("xai".to_owned(), "xai".to_owned()),
+            ("bedrock".to_owned(), "amazon-bedrock".to_owned()),
+        ];
+        let found = discover(&catalog, source, &credentialed, today(), 1);
+        let bump = find(&found, "grok-4.7").expect("an old version bump still surfaces");
+        assert_eq!(bump.category, Category::VersionBump);
+        let twin = find(&found, "xai.grok-4.6").expect("an old cross-cloud twin still surfaces");
+        assert_eq!(twin.category, Category::CrossCloud);
+    }
+
+    #[test]
+    fn new_is_sorted_newest_first_with_undated_last() {
+        let source = r#"{ "xai": { "models": {
+          "older":   { "modalities": { "output": ["text"] }, "release_date": "2026-07-01" },
+          "newer":   { "modalities": { "output": ["text"] }, "release_date": "2026-08-01" },
+          "undated": { "modalities": { "output": ["text"] } }
+        } } }"#;
+        let catalog = catalog(&[]);
+        let found = discover(&catalog, source, &xai_only(), today(), 90);
+        let order: Vec<&str> = found
+            .iter()
+            .filter(|candidate| candidate.category == Category::New)
+            .map(|candidate| candidate.model.as_str())
+            .collect();
+        assert_eq!(
+            order,
+            vec!["newer", "older", "undated"],
+            "newest first, undated last"
+        );
     }
 }

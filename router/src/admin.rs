@@ -230,6 +230,14 @@ pub struct DiscoverArgs {
     /// what widens the credentialed-provider set discovery scans.
     #[arg(long)]
     pub providers: Option<std::path::PathBuf>,
+    /// How recent a NEW model must be to report. A model whose models.dev
+    /// `release_date` is older than this many days is dropped from the NEW
+    /// category (only NEW — cross-cloud twins and version bumps are actionable
+    /// at any age and are never aged out). Undated models are always kept.
+    /// Defaults to 90 so the weekly issue stays scannable rather than listing
+    /// every model back to gpt-3.5-turbo.
+    #[arg(long, default_value_t = crate::discover::DEFAULT_NEW_SINCE_DAYS)]
+    pub new_since_days: i64,
     /// Emit the candidates as a JSON array `[{category, provider, model,
     /// note}]` for a CI job to render into an issue, instead of the human
     /// report.
@@ -1600,7 +1608,14 @@ async fn discover(args: DiscoverArgs) -> Result<()> {
         None => fetch_source(&args.source_url).await?,
     };
 
-    let candidates = discover_from_inventory(&catalog, &source);
+    if args.new_since_days < 0 {
+        bail!("new-since-days cannot be negative")
+    }
+    // The clock is read here, once, and handed to the pure core so the recency
+    // window is a property of when the command ran rather than of anything the
+    // discovery logic reaches for itself.
+    let today = chrono::Utc::now().date_naive();
+    let candidates = discover_from_inventory(&catalog, &source, today, args.new_since_days);
 
     if args.json {
         // The candidates already serialize to exactly `{category, provider,

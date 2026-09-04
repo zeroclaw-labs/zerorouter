@@ -74,7 +74,13 @@ jobs:
           GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          ./target/debug/zerorouter admin discover --tiers config/tiers.toml --json > candidates.json
+          # --new-since-days 90 is the default, stated here so the window this
+          # weekly issue is scoped to is visible in the workflow. It bounds ONLY
+          # the "new models" section — cross-cloud twins and version bumps are
+          # actionable at any age and are never aged out — so the issue lists
+          # recent arrivals rather than every model back to gpt-3.5-turbo.
+          ./target/debug/zerorouter admin discover \
+            --tiers config/tiers.toml --new-since-days 90 --json > candidates.json
           count=$(jq 'length' candidates.json)
           echo "discovered ${count} candidate(s)"
           if [ "${count}" -eq 0 ]; then
