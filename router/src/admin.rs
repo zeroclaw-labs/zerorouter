@@ -254,9 +254,19 @@ pub struct DiscoverArgs {
     /// every model back to gpt-3.5-turbo.
     #[arg(long, default_value_t = crate::discover::DEFAULT_NEW_SINCE_DAYS)]
     pub new_since_days: i64,
+    /// Scan the OTHER direction: providers this deployment holds NO credential
+    /// for, ranked by how many models the catalog already carries that they
+    /// also serve. A second source for a lane is price competition,
+    /// redundancy, and sometimes a better retention story; the ranked rows are
+    /// outreach leads, never actions. Known router/aggregator keys are tagged
+    /// (routing through another router stacks margin and hides retention), not
+    /// hidden. Providers with zero overlap are counted in one summary line
+    /// rather than listed.
+    #[arg(long)]
+    pub new_providers: bool,
     /// Emit the candidates as a JSON array `[{category, provider, model,
     /// note}]` for a CI job to render into an issue, instead of the human
-    /// report.
+    /// report. With --new-providers: the provider report object instead.
     #[arg(long)]
     pub json: bool,
     /// Exit non-zero if any candidate is found. OFF by default: discovery is
@@ -1661,6 +1671,50 @@ async fn discover(args: DiscoverArgs) -> Result<()> {
             .with_context(|| format!("reading the catalog source from {}", path.display()))?,
         None => fetch_source(&args.source_url).await?,
     };
+
+    if args.new_providers {
+        let report = crate::discover::discover_providers_from_inventory(&catalog, &source);
+        if args.json {
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        } else if report.candidates.is_empty() {
+            println!(
+                "No uncredentialed provider serves anything the catalog carries \
+                 ({} zero-overlap provider(s) not listed).",
+                report.zero_overlap_dropped
+            );
+        } else {
+            println!(
+                "{} uncredentialed provider(s) serve models the catalog already carries. Each \
+                 is an outreach lead, not a decision — adding a provider needs wire support, a \
+                 credential, a transcribed price list, and a retention basis a human must \
+                 supply. ({} zero-overlap provider(s) not listed.)\n",
+                report.candidates.len(),
+                report.zero_overlap_dropped
+            );
+            for row in &report.candidates {
+                let tag = if row.aggregator {
+                    "  [router/aggregator: margin-stacking, retention-opaque]".to_owned()
+                } else if row.frontier_families >= 2 {
+                    format!(
+                        "  [serves {} competing closed-frontier families — aggregator or \
+                         hyperscaler]",
+                        row.frontier_families
+                    )
+                } else {
+                    String::new()
+                };
+                println!(
+                    "  {:<24} {:>3} of {:>3} chat models carried here too — {}{}",
+                    row.key,
+                    row.overlap,
+                    row.chat_models,
+                    row.overlap_examples.join(", "),
+                    tag,
+                );
+            }
+        }
+        return Ok(());
+    }
 
     if args.new_since_days < 0 {
         bail!("new-since-days cannot be negative")
