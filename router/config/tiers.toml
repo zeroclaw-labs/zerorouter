@@ -3075,3 +3075,27 @@ tool_call = true
 input_per_mtok = 1.32
 cached_input_per_mtok = 0.13
 output_per_mtok = 3.96
+
+# --- proposed by zerorouter-currency-bot (anthropic__claude-opus-4-8) — review before merge ---
+[tiers."anthropic/claude-opus-4-8"]
+
+[tiers."anthropic/claude-opus-4-8".rates]
+input_per_mtok = 5.00
+cached_input_per_mtok = 0.50
+cache_write_per_mtok = 6.25
+output_per_mtok = 25.00
+
+[[tiers."anthropic/claude-opus-4-8".candidates]]
+id = "anthropic/claude-opus-4-8"
+provider = "anthropic"
+model = "claude-opus-4-8"
+
+[tiers."anthropic/claude-opus-4-8".candidates.metadata]
+context_window = 1000000
+
+[tiers."anthropic/claude-opus-4-8".candidates.rates]
+input_per_mtok = 5.00
+cached_input_per_mtok = 0.50
+cache_write_per_mtok = 6.25
+output_per_mtok = 25.00
+
