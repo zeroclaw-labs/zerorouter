@@ -2920,7 +2920,7 @@ mod tests {
     #[test]
     fn a_text_only_array_needs_nothing_an_ordinary_string_does_not() {
         let request: ChatCompletionRequest = serde_json::from_value(json!({
-            "model": "fireworks/glm-5.2",
+            "model": "fireworks/glm-5.3",
             "messages": [
                 {"role": "system", "content": [{"type": "text", "text": "be terse"}]},
                 {"role": "user", "content": [

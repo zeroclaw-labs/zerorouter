@@ -319,7 +319,7 @@ async fn models_are_materialized_from_tiers_toml() {
             "bedrock/claude-sonnet-4-5",
             "fireworks/deepseek-v4-flash",
             "fireworks/deepseek-v4-pro",
-            "fireworks/glm-5.2",
+            "fireworks/glm-5.3",
             "fireworks/kimi-k3",
             "fireworks/minimax-m3",
             "fireworks/qwen3.8-max",
@@ -564,7 +564,7 @@ async fn every_shipped_model_publishes_what_it_can_take_and_produce() {
     const NO_IMAGE_INPUT: [&str; 13] = [
         "fireworks/deepseek-v4-flash",
         "fireworks/deepseek-v4-pro",
-        "fireworks/glm-5.2",
+        "fireworks/glm-5.3",
         // Omits the modality list entirely: Fireworks' own two pages contradict
         // each other about whether this model takes images.
         "fireworks/minimax-m3",
@@ -947,7 +947,7 @@ async fn every_shipped_lane_publishes_a_retention_posture() {
             "bedrock/claude-sonnet-4-5",
             "fireworks/deepseek-v4-flash",
             "fireworks/deepseek-v4-pro",
-            "fireworks/glm-5.2",
+            "fireworks/glm-5.3",
             "fireworks/kimi-k3",
             "fireworks/minimax-m3",
             "groq/gpt-oss-120b",
@@ -1055,7 +1055,7 @@ async fn a_closed_weight_fireworks_lane_publishes_standard_from_its_tier_overrid
     // than a provider-wide relabelling.
     for sibling in [
         "fireworks/kimi-k3",
-        "fireworks/glm-5.2",
+        "fireworks/glm-5.3",
         "fireworks/deepseek-v4-pro",
         "fireworks/deepseek-v4-flash",
         "fireworks/minimax-m3",
@@ -1254,7 +1254,7 @@ async fn bundled_tier_catalog_has_expected_virtual_models() {
             "bedrock/claude-sonnet-4-5",
             "fireworks/deepseek-v4-flash",
             "fireworks/deepseek-v4-pro",
-            "fireworks/glm-5.2",
+            "fireworks/glm-5.3",
             "fireworks/kimi-k3",
             "fireworks/minimax-m3",
             "fireworks/qwen3.8-max",
@@ -1308,7 +1308,7 @@ async fn bundled_tier_catalog_has_expected_virtual_models() {
          ARE NOT: Fireworks addresses models as \
          `accounts/fireworks/models/<slug>`, which carries two slashes and so \
          cannot be a {{vendor}}/{{model}} id at all, and it writes decimals as \
-         `p` (`glm-5p2`). `fireworks/glm-5.2` (`glm-5p2`) and \
+         `p` (`glm-5p3`). `fireworks/glm-5.3` (`glm-5p3`) and \
          `fireworks/qwen3.8-max` (`qwen3p8-max`) are the two whose model \
          strings differ by more than a prefix. \
          \
@@ -1794,7 +1794,7 @@ async fn a_basis_hike_above_sell_withholds_that_tier_and_nothing_else() {
             "bedrock/claude-sonnet-4-5",
             "fireworks/deepseek-v4-flash",
             "fireworks/deepseek-v4-pro",
-            "fireworks/glm-5.2",
+            "fireworks/glm-5.3",
             "fireworks/kimi-k3",
             "fireworks/minimax-m3",
             "fireworks/qwen3.8-max",
@@ -2021,7 +2021,7 @@ const PASS_THROUGH_TIERS: [&str; 32] = [
     // `routers/`-prefixed Fast or US id — which costs 10-50% more — without
     // moving the rates to match.
     "fireworks/kimi-k3",
-    "fireworks/glm-5.2",
+    "fireworks/glm-5.3",
     "fireworks/deepseek-v4-pro",
     "fireworks/deepseek-v4-flash",
     "fireworks/minimax-m3",

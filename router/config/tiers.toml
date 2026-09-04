@@ -1995,35 +1995,39 @@ output_per_mtok = 15.00
 # GLM 5.2, not 5.3 — see the section header. Text only: both Fireworks pages and
 # models.dev agree this model takes no image input, which is worth stating
 # rather than omitting, because the neighbouring Kimi lane does.
-[tiers."fireworks/glm-5.2"]
+# BUMPED 5.2 -> 5.3 on 2026-09-04. Fireworks shipped glm-5.3 (the successor,
+# open-weight, same in/out price 1.4/4.4) and still serves 5.2, but carrying the
+# superseded version as our sole GLM lane is the wrong default. The one rate
+# that MOVED is the cache read: 0.14 -> 0.26 (models.dev, both sources), so it is
+# transcribed rather than carried forward. Open-weight, so the lane stays inside
+# `[retention.fireworks]`'s zero pin (no per-tier override, unlike glm-5.3-flash,
+# which is closed-weight + multimodal and is a separate candidate). Context is
+# the round 1_000_000 for 5.3 (5.2's odd 1048575 was that model's figure).
+[tiers."fireworks/glm-5.3"]
 
-[tiers."fireworks/glm-5.2".rates]
+[tiers."fireworks/glm-5.3".rates]
 input_per_mtok = 1.40
-cached_input_per_mtok = 0.14
+cached_input_per_mtok = 0.26
 output_per_mtok = 4.40
 
-[[tiers."fireworks/glm-5.2".candidates]]
-id = "fireworks/glm-5.2"
+[[tiers."fireworks/glm-5.3".candidates]]
+id = "fireworks/glm-5.3"
 provider = "fireworks"
-# `glm-5p2`, not `glm-5.2`. Fireworks writes a decimal point as `p` in every
+# `glm-5p3`, not `glm-5.3`. Fireworks writes a decimal point as `p` in every
 # slug (`qwen3p7-plus`, `deepseek-v4-flash-0731`), so the tier id and the
 # dispatched string differ by more than a prefix here. Do not "fix" either to
 # match the other.
-model = "accounts/fireworks/models/glm-5p2"
+model = "accounts/fireworks/models/glm-5p3"
 
-# 1048575 — one token short of a round 1M — is models.dev's figure verbatim, and
-# the oddness is why it is trusted: it is the shape of a number read off an API
-# rather than typed by a person. Fireworks' page says "1M tokens", which does not
-# contradict it.
-[tiers."fireworks/glm-5.2".candidates.metadata]
-context_window = 1048575
+[tiers."fireworks/glm-5.3".candidates.metadata]
+context_window = 1000000
 max_output_tokens = 131072
 input_modalities = ["text"]
 tool_call = true
 
-[tiers."fireworks/glm-5.2".candidates.rates]
+[tiers."fireworks/glm-5.3".candidates.rates]
 input_per_mtok = 1.40
-cached_input_per_mtok = 0.14
+cached_input_per_mtok = 0.26
 output_per_mtok = 4.40
 
 # PINNED AT THE DATED `-0813` ID SINCE 2026-08-31, and the move happened exactly
