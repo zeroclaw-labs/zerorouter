@@ -102,6 +102,22 @@ pub enum AdminCommand {
     /// non-zero exit for anyone who wants it as a tripwire; the scheduled job
     /// does not use it.
     Discover(DiscoverArgs),
+    /// Draft a `tiers.toml` lane from a research agent's "facts dossier" — the
+    /// phase-2 companion to `discover`. Read-only and database-free, so it runs
+    /// beside `discover` and `catalog-drift`.
+    ///
+    /// Takes a JSON dossier about ONE discovered candidate (`--facts <path>`)
+    /// and emits the PROPOSED stanza(s) to add, plus the evidence behind every
+    /// claim. It never writes `tiers.toml` and never merges — a human reads the
+    /// draft and opens the pull request.
+    ///
+    /// Fail-safe always beats fail-open: an unproven invoke, a missing or
+    /// untraceable price, or any uncertainty in a retention basis REFUSES or
+    /// falls back to `standard`. A `zero` label is emitted only on the narrow,
+    /// mechanically-checkable grounds `docs/DEPLOY.md` permits, and whatever is
+    /// emitted is run back through the router's own tier loader — a draft the
+    /// router could not load is never produced.
+    DraftPin(DraftPinArgs),
 }
 
 #[derive(Debug, Args)]
@@ -249,6 +265,29 @@ pub struct DiscoverArgs {
     /// tripwire.
     #[arg(long)]
     pub fail_on_candidates: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct DraftPinArgs {
+    /// The facts dossier JSON to draft from. Required — the whole input.
+    #[arg(long)]
+    pub facts: std::path::PathBuf,
+    /// The `verified` date to stamp on every emitted retention pin, as
+    /// `YYYY-MM-DD`. Required unless the dossier carries its own `verified`
+    /// field; `--verified` wins when both are present. NEVER the system clock —
+    /// a draft must be byte-reproducible from its inputs, which is also what
+    /// makes it testable and matches how the file records `verified`.
+    #[arg(long)]
+    pub verified: Option<String>,
+    /// Emit the outcome as JSON (`{status, refuse_reason?, display_id, posture,
+    /// stanza_toml, dossier_markdown, flags}`) for a tool to consume, instead of
+    /// the human dossier.
+    #[arg(long)]
+    pub json: bool,
+    /// Validate and decide only: print the status and reason (and any flags) and
+    /// emit no stanza. For CI / dry runs.
+    #[arg(long)]
+    pub check: bool,
 }
 
 #[derive(Debug, Args)]
@@ -505,6 +544,13 @@ pub async fn run(args: AdminArgs) -> Result<()> {
     if let AdminCommand::Discover(args) = args.command {
         return discover(args).await;
     }
+    // Drafting a lane reads only the facts dossier the caller hands it (and, for
+    // the load-validation check, a temp file it writes and removes). Nothing in
+    // the ledger, so it answers before the pool for the same reason `discover`
+    // does — which is what lets CI run it with no database.
+    if let AdminCommand::DraftPin(args) = args.command {
+        return draft_pin(args).await;
+    }
 
     let pool = database_pool_from_env().await?;
     migrate(&pool).await?;
@@ -531,7 +577,8 @@ pub async fn run(args: AdminArgs) -> Result<()> {
         // Handled above, before the pool exists.
         AdminCommand::CatalogDrift(_)
         | AdminCommand::RetentionDrift(_)
-        | AdminCommand::Discover(_) => {
+        | AdminCommand::Discover(_)
+        | AdminCommand::DraftPin(_) => {
             unreachable!("dispatched before the pool")
         }
     }
@@ -1656,6 +1703,82 @@ async fn discover(args: DiscoverArgs) -> Result<()> {
             "{} discovery candidate(s) found (--fail-on-candidates)",
             candidates.len()
         );
+    }
+    Ok(())
+}
+
+/// Draft a `tiers.toml` lane from a research agent's facts dossier — phase 2 of
+/// the currency loop `discover` opens.
+///
+/// Database-free by construction, exactly like `discover`: it reads the dossier
+/// the caller names, resolves the draft in a pure core (`crate::draft_pin`), and
+/// runs the result back through the router's own tier loader before showing it.
+/// It never writes `tiers.toml`, and the drafting logic never reads the system
+/// clock — the `verified` date is an input — so a dossier plus a `--verified`
+/// date always yields the same draft.
+async fn draft_pin(args: DraftPinArgs) -> Result<()> {
+    use crate::draft_pin::{FactsDossier, Status, draft_and_validate, resolve_verified};
+
+    let facts_text = tokio::fs::read_to_string(&args.facts)
+        .await
+        .with_context(|| format!("reading the facts dossier from {}", args.facts.display()))?;
+    let facts: FactsDossier = serde_json::from_str(&facts_text)
+        .with_context(|| format!("parsing the facts dossier at {}", args.facts.display()))?;
+
+    // The clock is never read; the date comes from --verified or the dossier.
+    let verified = resolve_verified(args.verified.as_deref(), facts.verified.as_deref())
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+
+    let outcome = draft_and_validate(&facts, &verified)
+        .await
+        .context("writing the temp fragment for load-validation")?;
+
+    if args.json {
+        // A machine's input: only the JSON on stdout, no status chatter.
+        println!("{}", serde_json::to_string_pretty(&outcome.to_json())?);
+        return Ok(());
+    }
+
+    if args.check {
+        match outcome.status {
+            Status::Draft => println!(
+                "DRAFT ok: {} — posture {}",
+                outcome.display_id,
+                outcome
+                    .posture
+                    .map_or("?", crate::config::RetentionPosture::wire_token),
+            ),
+            // The reason is self-describing and already begins with REFUSED,
+            // so it is printed as-is rather than prefixed again.
+            Status::Refused => {
+                println!("{}", outcome.refuse_reason.as_deref().unwrap_or("REFUSED"),)
+            }
+        }
+        for flag in &outcome.flags {
+            println!("  flag: {flag}");
+        }
+        return Ok(());
+    }
+
+    // The human report.
+    match outcome.status {
+        Status::Draft => {
+            if let Some(markdown) = &outcome.dossier_markdown {
+                print!("{markdown}");
+                if !markdown.ends_with('\n') {
+                    println!();
+                }
+            }
+        }
+        Status::Refused => {
+            println!("{}", outcome.refuse_reason.as_deref().unwrap_or("REFUSED"));
+            if !outcome.flags.is_empty() {
+                println!("\nFlags:");
+                for flag in &outcome.flags {
+                    println!("- {flag}");
+                }
+            }
+        }
     }
     Ok(())
 }
