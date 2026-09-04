@@ -276,7 +276,23 @@ fn canonical(model: &str) -> String {
         bare = head.to_owned();
     }
 
-    bare
+    // Fireworks encodes version dots as `p` (`glm-5p3`, `qwen3p8-max`) because
+    // its ids live in URL paths. Fold digit-`p`-digit to the dot spelling so
+    // one model canonicalizes the same everywhere — without this, a `glm-5.3`
+    // appearing on a second provider never matches the fireworks lane and the
+    // cross-cloud scan is blind to the highest-value find it exists for.
+    // Digit-bounded on both sides, so names like `phi-4` are untouched.
+    let bytes = bare.as_bytes();
+    let mut folded = String::with_capacity(bare.len());
+    for (index, &byte) in bytes.iter().enumerate() {
+        let dotted = byte == b'p'
+            && index > 0
+            && bytes[index - 1].is_ascii_digit()
+            && bytes.get(index + 1).is_some_and(u8::is_ascii_digit);
+        folded.push(if dotted { '.' } else { byte as char });
+    }
+
+    folded
 }
 
 /// Parse a models.dev `release_date`, or `None` when it is absent or in a shape
@@ -657,6 +673,167 @@ fn resolve_source_keys(
                 .map(|key| (provider.clone(), key))
         })
         .collect()
+}
+
+/// models.dev keys that are themselves routers/aggregators rather than
+/// first-party inference providers. ZeroRouter routing through another router
+/// stacks margin and makes the retention story opaque (the aggregator's
+/// upstream choice, not ours), so these are the wrong upstream leads.
+///
+/// TAGGED, NOT HIDDEN — the same philosophy as `is_non_chat`'s blocklist:
+/// a wrong entry here costs a mislabelled row the reader can see, never a
+/// silently missing one. The list is advisory; a human reading the report
+/// decides. Keys observed in the live source on 2026-09-04, plus the two
+/// gateways too well-known to omit.
+const KNOWN_AGGREGATORS: &[&str] = &[
+    "empiriolabs",
+    "kilo",
+    "llmgateway",
+    "llmgateway-providers",
+    "nano-gpt",
+    "openrouter",
+    "orcarouter",
+    "pioneer",
+    "vercel",
+];
+
+/// One uncredentialed provider that serves models the catalog already carries —
+/// an upstream LEAD, ranked by how much of our catalog it could also serve.
+///
+/// This is the opposite question from [`Candidate`]: discovery asks "what do
+/// our providers serve that we don't carry?"; this asks "who else serves what
+/// we DO carry?". The answer feeds provider outreach — a second source for a
+/// lane is price competition, redundancy, and sometimes a better retention
+/// story — and, like every discovery product, it is a lead and never an action:
+/// adding a provider needs wire support, a credential, a transcribed price
+/// list, and a retention basis a human must supply.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ProviderCandidate {
+    /// The models.dev provider key, exactly as the source spells it.
+    pub key: String,
+    /// How many of our carried models this provider also serves (distinct
+    /// canonical names — five regional spellings of one model count once).
+    pub overlap: usize,
+    /// Up to five of the overlapping canonical names, sorted, so the report
+    /// says WHICH lanes a second source exists for without flooding the row.
+    pub overlap_examples: Vec<String>,
+    /// Distinct canonical chat models the provider serves in total.
+    pub chat_models: usize,
+    /// Listed in [`KNOWN_AGGREGATORS`] — a router, not a first-party upstream.
+    pub aggregator: bool,
+    /// How many DISTINCT closed-frontier vendor families (claude, non-oss gpt,
+    /// gemini, grok) the provider serves. No first-party host carries two
+    /// competing labs' closed models — only aggregators and hyperscaler
+    /// clouds do — so 2+ is the computed aggregator signal the const list
+    /// cannot keep up with, while 0 marks the open-weight GPU hosts that are
+    /// the prime outreach targets.
+    pub frontier_families: usize,
+}
+
+/// The provider scan's whole result. `zero_overlap_dropped` exists so the
+/// report can say how many providers it declined to list rather than
+/// truncating silently — a provider serving nothing we carry is not an
+/// outreach lead, but "37 others had no overlap" is one honest line.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ProviderReport {
+    pub candidates: Vec<ProviderCandidate>,
+    pub zero_overlap_dropped: usize,
+}
+
+/// Scan the source for uncredentialed providers, ranked by catalog overlap.
+///
+/// Sort order is the read order: first-party providers before aggregators,
+/// then overlap descending (the outreach signal), then breadth, then key for
+/// determinism.
+pub fn discover_providers(
+    catalog: &TierCatalog,
+    source: &str,
+    credentialed: &[(String, String)],
+) -> ProviderReport {
+    let providers: BTreeMap<String, SourceProvider> =
+        serde_json::from_str(source).unwrap_or_default();
+    let carried = Carried::from_catalog(catalog);
+
+    let credentialed_keys: BTreeSet<&str> = credentialed
+        .iter()
+        .map(|(_, source_key)| source_key.as_str())
+        .collect();
+
+    let mut candidates = Vec::new();
+    let mut zero_overlap_dropped = 0usize;
+
+    for (key, source_provider) in &providers {
+        if credentialed_keys.contains(key.as_str()) {
+            continue;
+        }
+
+        let mut chat: BTreeSet<String> = BTreeSet::new();
+        for (model, entry) in &source_provider.models {
+            if is_non_chat(model, entry) {
+                continue;
+            }
+            chat.insert(canonical(model));
+        }
+
+        let overlapping: Vec<&String> = chat
+            .iter()
+            .filter(|name| carried.providers_by_model.contains_key(*name))
+            .collect();
+        if overlapping.is_empty() {
+            // A provider serving nothing we carry may still matter one day,
+            // but it is not an outreach lead; counted, not listed.
+            if !chat.is_empty() {
+                zero_overlap_dropped += 1;
+            }
+            continue;
+        }
+
+        let frontier_families = [
+            |name: &str| name.starts_with("claude"),
+            |name: &str| name.starts_with("gpt-") && !name.starts_with("gpt-oss"),
+            |name: &str| name.starts_with("gemini"),
+            |name: &str| name.starts_with("grok"),
+        ]
+        .iter()
+        .filter(|family| chat.iter().any(|name| family(name)))
+        .count();
+
+        candidates.push(ProviderCandidate {
+            key: key.clone(),
+            overlap: overlapping.len(),
+            overlap_examples: overlapping.iter().take(5).map(|s| (*s).clone()).collect(),
+            chat_models: chat.len(),
+            aggregator: KNOWN_AGGREGATORS.contains(&key.as_str()),
+            frontier_families,
+        });
+    }
+
+    // Read order = outreach order: const-tagged aggregators last of all, then
+    // multi-frontier resellers (aggregator or hyperscaler — a human tells them
+    // apart), and the open-weight hosts that are the actionable leads first;
+    // overlap breaks ties.
+    candidates.sort_by(|a, b| {
+        a.aggregator
+            .cmp(&b.aggregator)
+            .then((a.frontier_families >= 2).cmp(&(b.frontier_families >= 2)))
+            .then(b.overlap.cmp(&a.overlap))
+            .then(b.chat_models.cmp(&a.chat_models))
+            .then(a.key.cmp(&b.key))
+    });
+
+    ProviderReport {
+        candidates,
+        zero_overlap_dropped,
+    }
+}
+
+/// [`discover_providers`] against the shipped provider inventory — the same
+/// resolution [`discover_from_inventory`] uses, so the two scans agree on what
+/// "credentialed" means.
+pub fn discover_providers_from_inventory(catalog: &TierCatalog, source: &str) -> ProviderReport {
+    let inventory = crate::providers::inventory_source_keys();
+    let credentialed = resolve_source_keys(source, &inventory);
+    discover_providers(catalog, source, &credentialed)
 }
 
 #[cfg(test)]
@@ -1107,5 +1284,156 @@ mod tests {
             vec!["newer", "older", "undated"],
             "newest first, undated last"
         );
+    }
+
+    // ---- provider discovery (the other direction) ---------------------------
+
+    /// A source with two uncredentialed providers: `baseten` (first-party,
+    /// serves two models we carry plus one we don't, plus an embedding) and
+    /// `openrouter` (a known aggregator with a BIGGER overlap — the sort must
+    /// still put the first-party row first). `cohere` serves nothing we carry
+    /// and must be counted, not listed. Regional respellings of one model
+    /// (`us.` prefix) must count once.
+    const PROVIDER_SOURCE: &str = r#"{
+      "xai": { "models": {
+        "grok-4.6": { "modalities": { "output": ["text"] } }
+      } },
+      "baseten": { "models": {
+        "zai-org/GLM-5.3": { "modalities": { "output": ["text"] } },
+        "moonshotai/Kimi-K3": { "modalities": { "output": ["text"] } },
+        "nvidia/Nemotron-120B-A12B": { "modalities": { "output": ["text"] } },
+        "baseten/text-embedding": { "modalities": { "output": ["embedding"] } }
+      } },
+      "openrouter": { "models": {
+        "z-ai/glm-5.3": { "modalities": { "output": ["text"] } },
+        "moonshotai/kimi-k3": { "modalities": { "output": ["text"] } },
+        "x-ai/grok-4.6": { "modalities": { "output": ["text"] } },
+        "us.x-ai/grok-4.6": { "modalities": { "output": ["text"] } }
+      } },
+      "cohere": { "models": {
+        "command-r-plus": { "modalities": { "output": ["text"] } }
+      } }
+    }"#;
+
+    fn provider_catalog() -> TierCatalog {
+        catalog(&[
+            ("fireworks", "accounts/fireworks/models/glm-5p3"),
+            ("moonshot", "kimi-k3"),
+            ("xai", "grok-4.6"),
+        ])
+    }
+
+    #[test]
+    fn uncredentialed_providers_rank_by_overlap_with_first_party_before_aggregators() {
+        let report = discover_providers(&provider_catalog(), PROVIDER_SOURCE, &xai_only());
+        let keys: Vec<&str> = report
+            .candidates
+            .iter()
+            .map(|candidate| candidate.key.as_str())
+            .collect();
+        // openrouter overlaps 3 (glm-5.3, kimi-k3, grok-4.6) to baseten's 2,
+        // but baseten is first-party and leads anyway.
+        assert_eq!(keys, vec!["baseten", "openrouter"]);
+        assert!(!report.candidates[0].aggregator);
+        assert!(report.candidates[1].aggregator, "openrouter is tagged");
+        assert_eq!(report.candidates[0].overlap, 2, "glm-5.3 + kimi-k3");
+        assert_eq!(report.candidates[1].overlap, 3);
+    }
+
+    #[test]
+    fn credentialed_providers_are_excluded_from_the_provider_scan() {
+        let report = discover_providers(&provider_catalog(), PROVIDER_SOURCE, &xai_only());
+        assert!(
+            report
+                .candidates
+                .iter()
+                .all(|candidate| candidate.key != "xai"),
+            "a provider we hold a credential for is not an outreach lead"
+        );
+    }
+
+    #[test]
+    fn zero_overlap_providers_are_counted_not_listed() {
+        let report = discover_providers(&provider_catalog(), PROVIDER_SOURCE, &xai_only());
+        assert!(
+            report
+                .candidates
+                .iter()
+                .all(|candidate| candidate.key != "cohere")
+        );
+        assert_eq!(
+            report.zero_overlap_dropped, 1,
+            "cohere: counted, not listed"
+        );
+    }
+
+    #[test]
+    fn regional_respellings_and_non_chat_models_do_not_inflate_the_counts() {
+        let report = discover_providers(&provider_catalog(), PROVIDER_SOURCE, &xai_only());
+        let openrouter = report
+            .candidates
+            .iter()
+            .find(|candidate| candidate.key == "openrouter")
+            .expect("openrouter is listed");
+        // Four raw rows, but `x-ai/grok-4.6` and `us.x-ai/grok-4.6` are one
+        // canonical model: 3 chat models, all overlapping.
+        assert_eq!(openrouter.chat_models, 3);
+        let baseten = report
+            .candidates
+            .iter()
+            .find(|candidate| candidate.key == "baseten")
+            .expect("baseten is listed");
+        // The embedding is filtered by modality; three chat models remain.
+        assert_eq!(baseten.chat_models, 3);
+        assert_eq!(
+            baseten.overlap_examples,
+            vec!["glm-5.3", "kimi-k3"],
+            "examples are the overlapping canonicals, sorted"
+        );
+    }
+
+    /// No first-party host serves two competing labs' closed models, so 2+
+    /// frontier families is the computed aggregator signal — sorted between
+    /// the open-weight hosts (the actionable leads) and the const-tagged
+    /// aggregators, because the reseller might still be a hyperscaler worth
+    /// talking to.
+    #[test]
+    fn a_multi_frontier_reseller_is_tagged_and_sorts_after_open_weight_hosts() {
+        let source = r#"{
+          "gpuhost": { "models": {
+            "zai-org/GLM-5.3": { "modalities": { "output": ["text"] } }
+          } },
+          "megagateway": { "models": {
+            "claude-opus-5":    { "modalities": { "output": ["text"] } },
+            "gpt-5.6-sol":      { "modalities": { "output": ["text"] } },
+            "gemini-3.7-flash": { "modalities": { "output": ["text"] } }
+          } },
+          "openrouter": { "models": {
+            "z-ai/glm-5.3": { "modalities": { "output": ["text"] } }
+          } }
+        }"#;
+        let catalog = catalog(&[
+            ("anthropic", "claude-opus-5"),
+            ("openai", "gpt-5.6-sol"),
+            ("google", "gemini-3.7-flash"),
+            ("fireworks", "accounts/fireworks/models/glm-5p3"),
+        ]);
+        let report = discover_providers(&catalog, source, &xai_only());
+        let keys: Vec<&str> = report
+            .candidates
+            .iter()
+            .map(|candidate| candidate.key.as_str())
+            .collect();
+        // gpuhost overlaps only 1 to megagateway's 3, and still leads: an
+        // open-weight host outranks any multi-frontier reseller.
+        assert_eq!(keys, vec!["gpuhost", "megagateway", "openrouter"]);
+        assert_eq!(report.candidates[1].frontier_families, 3);
+        assert!(
+            !report.candidates[1].aggregator,
+            "computed, not const-listed"
+        );
+        // The p-notation fold makes fireworks' `glm-5p3` and zai's `GLM-5.3`
+        // one canonical model — the overlap that motivated the fold.
+        assert_eq!(report.candidates[0].overlap, 1);
     }
 }
