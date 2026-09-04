@@ -854,7 +854,7 @@ test('a provider key can be attached, is shown only by fingerprint, and is never
 // worth making: the page shows the real claim, not a flattering default.
 const MOCK_LANE = 'google/gemini-3.5-flash-lite'
 // A lane that DECLARES text-only input, for the capability gate.
-const TEXT_ONLY_LANE = 'fireworks/glm-5.2'
+const TEXT_ONLY_LANE = 'fireworks/glm-5.3'
 
 test('the playground groups its lane picker by retention posture, zero first', async ({ page }) => {
   await signIn(page)
