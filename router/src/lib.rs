@@ -7,6 +7,7 @@ pub mod config;
 pub mod corroborate;
 pub mod db;
 pub mod device;
+pub mod discover;
 pub mod drift;
 pub mod error;
 pub mod estimator;

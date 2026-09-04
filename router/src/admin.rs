@@ -87,6 +87,21 @@ pub enum AdminCommand {
     /// changed page means a human must re-read it and re-pin; it does not mean
     /// the posture flipped. Nothing here ever writes to `tiers.toml`.
     RetentionDrift(RetentionDriftArgs),
+    /// Discover models the upstream world carries that `tiers.toml` does not:
+    /// brand-new models, higher versions of a family we already carry
+    /// (glm-5.2 → glm-5.3), and models we serve on one cloud that appear on
+    /// another we are also credentialed for (grok on Bedrock). Read-only and
+    /// database-free, so it runs in CI beside `catalog-drift`.
+    ///
+    /// Reports candidates; NEVER writes `tiers.toml`. Adding a lane needs a
+    /// transcribed price, a retention basis, and judgement — none of it safe to
+    /// automate — so this surfaces what to look at and a human does the adding.
+    ///
+    /// Exits zero by default even when candidates are found: discovery is
+    /// informational, never a merge gate. `--fail-on-candidates` opts into a
+    /// non-zero exit for anyone who wants it as a tripwire; the scheduled job
+    /// does not use it.
+    Discover(DiscoverArgs),
 }
 
 #[derive(Debug, Args)]
@@ -194,6 +209,46 @@ pub struct CatalogDriftArgs {
     /// Report and exit zero even when something drifted.
     #[arg(long)]
     pub allow_drift: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct DiscoverArgs {
+    /// Public catalog to read. The SAME source `catalog-drift` reconciles
+    /// against — discovery diffs it the other direction.
+    #[arg(long, default_value = crate::drift::DEFAULT_SOURCE_URL)]
+    pub source_url: String,
+    /// Read the source from a file instead of the network (offline / CI).
+    /// Mirrors `catalog-drift --source-file`.
+    #[arg(long)]
+    pub source_file: Option<std::path::PathBuf>,
+    /// Tier file to diff against. Defaults to the same path the server serves.
+    #[arg(long)]
+    pub tiers: Option<std::path::PathBuf>,
+    /// Operator provider inventory, if the tier file names upstreams the
+    /// shipped inventory does not (edge mode). Defaults to
+    /// `ZEROROUTER_PROVIDERS_PATH`, the same variable the server reads — and
+    /// what widens the credentialed-provider set discovery scans.
+    #[arg(long)]
+    pub providers: Option<std::path::PathBuf>,
+    /// How recent a NEW model must be to report. A model whose models.dev
+    /// `release_date` is older than this many days is dropped from the NEW
+    /// category (only NEW — cross-cloud twins and version bumps are actionable
+    /// at any age and are never aged out). Undated models are always kept.
+    /// Defaults to 90 so the weekly issue stays scannable rather than listing
+    /// every model back to gpt-3.5-turbo.
+    #[arg(long, default_value_t = crate::discover::DEFAULT_NEW_SINCE_DAYS)]
+    pub new_since_days: i64,
+    /// Emit the candidates as a JSON array `[{category, provider, model,
+    /// note}]` for a CI job to render into an issue, instead of the human
+    /// report.
+    #[arg(long)]
+    pub json: bool,
+    /// Exit non-zero if any candidate is found. OFF by default: discovery is
+    /// informational and the scheduled job must stay green so its finding
+    /// reaches an issue rather than a failed run nobody opens. Opt in for a
+    /// tripwire.
+    #[arg(long)]
+    pub fail_on_candidates: bool,
 }
 
 #[derive(Debug, Args)]
@@ -443,6 +498,13 @@ pub async fn run(args: AdminArgs) -> Result<()> {
     if let AdminCommand::RetentionDrift(args) = args.command {
         return retention_drift(args).await;
     }
+    // Discovery diffs the tier file against a public catalog — a property of two
+    // files and nothing in the ledger — so it answers before the pool for the
+    // same reason `catalog-drift` does, which is what lets CI run it with no
+    // database.
+    if let AdminCommand::Discover(args) = args.command {
+        return discover(args).await;
+    }
 
     let pool = database_pool_from_env().await?;
     migrate(&pool).await?;
@@ -467,7 +529,9 @@ pub async fn run(args: AdminArgs) -> Result<()> {
         AdminCommand::OwedSettlements(args) => owed_settlements(&pool, args).await,
         AdminCommand::SettleOwed(args) => settle_owed(&pool, args).await,
         // Handled above, before the pool exists.
-        AdminCommand::CatalogDrift(_) | AdminCommand::RetentionDrift(_) => {
+        AdminCommand::CatalogDrift(_)
+        | AdminCommand::RetentionDrift(_)
+        | AdminCommand::Discover(_) => {
             unreachable!("dispatched before the pool")
         }
     }
@@ -1491,6 +1555,109 @@ async fn catalog_drift(args: CatalogDriftArgs) -> Result<()> {
             .as_ref()
             .map_or(args.source_url.clone(), |p| p.display().to_string())
     )
+}
+
+/// Discover models the upstream world carries that `tiers.toml` does not.
+///
+/// The inverse of `catalog_drift`: same fetched source, diffed the other way.
+/// Read-only by construction — it prints candidates and, only when asked, sets
+/// an exit code. It NEVER writes a lane, for the reason spelled out on the
+/// subcommand: adding one is a human judgement, not a mechanical diff.
+///
+/// The provider-inventory load mirrors `catalog_drift` exactly, and for a
+/// second reason beyond parity: the credentialed set discovery scans IS the
+/// inventory, so an edge deployment that adds an upstream must load its overlay
+/// here or discovery would never look at that provider's models.
+async fn discover(args: DiscoverArgs) -> Result<()> {
+    use crate::discover::{Category, discover_from_inventory};
+    use crate::drift::fetch_source;
+
+    let tiers_path = args.tiers.unwrap_or_else(|| {
+        std::env::var("ZEROROUTER_TIERS_PATH")
+            .unwrap_or_else(|_| crate::config::DEFAULT_TIER_CONFIG_PATH.to_owned())
+            .into()
+    });
+    let providers_path = args.providers.or_else(|| {
+        std::env::var_os(crate::providers::PROVIDER_INVENTORY_PATH_ENV)
+            .map(std::path::PathBuf::from)
+    });
+    if let Some(path) = providers_path {
+        let count = crate::providers::load_operator_inventory(&path).with_context(|| {
+            format!(
+                "loading the operator provider inventory from {}",
+                path.display()
+            )
+        })?;
+        // Only on the human report: the JSON is a machine's input and a stray
+        // status line would break a parser reading stdout.
+        if !args.json {
+            println!(
+                "operator providers: {count} from {path}",
+                path = path.display()
+            );
+        }
+    }
+    let catalog = crate::config::load_tier_catalog(&tiers_path)
+        .await
+        .with_context(|| format!("loading the tier catalog from {}", tiers_path.display()))?;
+
+    let source = match &args.source_file {
+        Some(path) => tokio::fs::read_to_string(path)
+            .await
+            .with_context(|| format!("reading the catalog source from {}", path.display()))?,
+        None => fetch_source(&args.source_url).await?,
+    };
+
+    if args.new_since_days < 0 {
+        bail!("new-since-days cannot be negative")
+    }
+    // The clock is read here, once, and handed to the pure core so the recency
+    // window is a property of when the command ran rather than of anything the
+    // discovery logic reaches for itself.
+    let today = chrono::Utc::now().date_naive();
+    let candidates = discover_from_inventory(&catalog, &source, today, args.new_since_days);
+
+    if args.json {
+        // The candidates already serialize to exactly `{category, provider,
+        // model, note}`, category kebab-cased — the CI job's contract.
+        println!("{}", serde_json::to_string_pretty(&candidates)?);
+    } else if candidates.is_empty() {
+        println!("No discovery candidates: the catalog carries everything the source lists.");
+    } else {
+        println!(
+            "{} discovery candidate(s). Each is a lead, not a decision — adding a lane needs a \
+             transcribed price and a retention basis a human must supply.\n",
+            candidates.len()
+        );
+        // Grouped strongest-first, the order `Category` documents, so the
+        // cross-cloud twins — the highest-value finds — lead the report.
+        for category in [Category::CrossCloud, Category::VersionBump, Category::New] {
+            let group: Vec<_> = candidates
+                .iter()
+                .filter(|candidate| candidate.category == category)
+                .collect();
+            if group.is_empty() {
+                continue;
+            }
+            println!("{} ({})", category.label(), group.len());
+            for candidate in group {
+                println!("  {:<10} {}", candidate.provider, candidate.model);
+                println!("      {}", candidate.note);
+            }
+            println!();
+        }
+    }
+
+    // Exit code last, and opt-in. The scheduled job runs this bare and stays
+    // green so its finding reaches an issue rather than a red run nobody opens;
+    // `--fail-on-candidates` is the tripwire for anyone who wants one.
+    if args.fail_on_candidates && !candidates.is_empty() {
+        anyhow::bail!(
+            "{} discovery candidate(s) found (--fail-on-candidates)",
+            candidates.len()
+        );
+    }
+    Ok(())
 }
 
 /// Re-read the evidence behind every pinned retention label.
