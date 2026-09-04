@@ -386,8 +386,8 @@ openrouter_slug = "openai"
 posture = "standard"
 description = "On paid Gemini API quota Google does not use prompts or responses to improve its products, but logs them for a limited, unstated period to detect Prohibited Use Policy violations."
 source_url = "https://ai.google.dev/gemini-api/terms"
-verified = "2026-09-03"
-source_sha256 = "dd91420ee8b7ad642a658097b6a76763562b6f61c562c729cfe86c8776a1fa2b"
+verified = "2026-09-04"
+source_sha256 = "24d9bfcf79418e793ed1f31e3cb13f70a443866c32acdbee8c031f4cb8ac98f8"
 openrouter_slug = "google-ai-studio"
 
 # THE FIRST ZERO-RETENTION LANE (2026-08-20), and the one pin here whose
@@ -543,8 +543,8 @@ openrouter_slug = "amazon-bedrock"
 posture = "zero"
 description = "Fireworks has zero data retention by default: prompt and generation data exist only in volatile memory — for the duration of the request, or for several minutes when prompt caching holds KV data — and are never written to persistent storage. Only metadata such as token counts is logged."
 source_url = "https://docs.fireworks.ai/guides/security_compliance/data_handling"
-verified = "2026-08-31"
-source_sha256 = "6db0700ed334b8d8de1a932de1d7f7d740c260ecb24ef9421e8381bb4ab3f4ab"
+verified = "2026-09-04"
+source_sha256 = "bc24ea62582d6edb76c738fd9942ce170316f91fb2b672b222d06b21d7fa7d3d"
 openrouter_slug = "fireworks"
 
 # THE STRONGEST VERIFICATION STORY IN THIS TABLE, and it is worth saying plainly
@@ -2263,8 +2263,8 @@ output_per_mtok = 1.20
 posture = "standard"
 description = "Fireworks' published zero-data-retention default is scoped to open models — it states that prompt and generation data are not logged or stored 'for any open models' — and Qwen 3.8 Max is closed-weight, so that commitment does not extend to this lane. Nothing Fireworks publishes states what is retained here, so ZeroRouter makes no zero-retention claim for it."
 source_url = "https://docs.fireworks.ai/guides/security_compliance/data_handling"
-verified = "2026-08-31"
-source_sha256 = "6db0700ed334b8d8de1a932de1d7f7d740c260ecb24ef9421e8381bb4ab3f4ab"
+verified = "2026-09-04"
+source_sha256 = "bc24ea62582d6edb76c738fd9942ce170316f91fb2b672b222d06b21d7fa7d3d"
 
 [tiers."fireworks/qwen3.8-max".rates]
 input_per_mtok = 2.00
