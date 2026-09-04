@@ -1518,6 +1518,37 @@ pub fn provider_source_key(provider: &str) -> Option<String> {
     })
 }
 
+/// Every provider this deployment is credentialed for, each paired with the
+/// key it is filed under in the reconciliation source when it declares one.
+///
+/// The whole assembled inventory — shipped entries plus any operator overlay —
+/// so a caller that must reason about ALL upstreams reads the same list the
+/// dispatch path and the drift check read, rather than restating the vendor set
+/// in a third place. `admin discover` is that caller: to find models the source
+/// lists under a provider ZeroRouter holds a credential for, it must first know
+/// which providers those are.
+///
+/// The pair mirrors [`provider_source_key`] exactly — `None` means "no declared
+/// source key", the common case — so a caller applies the same identity-or-
+/// declared rule that function documents. It deliberately does NOT resolve the
+/// key down to a single string: `bedrock` declares no `source_provider_key` at
+/// all (it carries an `unreconcilable_reason` instead, because the source
+/// prices its SKU class wrongly), and only a caller that knows whether it is
+/// asking a PRICING question or a mere EXISTENCE one can decide what to do with
+/// that. Resolving here would have to pick one answer for both.
+#[must_use]
+pub fn inventory_source_keys() -> Vec<(String, Option<String>)> {
+    ProviderInventory::load().map_or_else(
+        |_| Vec::new(),
+        |inventory| {
+            inventory
+                .providers()
+                .map(|metadata| (metadata.key.clone(), metadata.source_provider_key.clone()))
+                .collect()
+        },
+    )
+}
+
 /// The environment variables one provider reads: its credential, and its region
 /// when it has a regional endpoint.
 ///
