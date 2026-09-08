@@ -661,8 +661,18 @@ openrouter_slug = "fireworks"
 posture = "zero"
 description = "xAI under team-level Zero Data Retention: API request inputs and outputs are never persisted to disk, and the default 30-day encrypted audit retention does not apply. xAI does not train on API data without explicit permission. Uniquely in this catalog the guarantee is re-verified at runtime — every response carries an x-zero-data-retention attestation that ZeroRouter asserts is true before serving, and refuses the request when it is not."
 source_url = "https://docs.x.ai/developers/faq/security"
-verified = "2026-09-03"
-source_sha256 = "351bf9771f91315d0496d66352e48788bd4d0fe1eca8bd470949fffb7a5c97cc"
+verified = "2026-09-08"
+# Anchored on 2026-09-08 after the third whole-page churn re-pin in a week —
+# the same narrowing the openai and vertex pins earned. The three commitments
+# below are the pin's whole claim: no disk persistence under ZDR, the
+# per-response attestation header the dispatch path asserts, and no training
+# without permission. All three verified verbatim on the live page today.
+source_sha256 = "332bafa8726aeeb38bd724fc31a50fb0785e7a6bf2a586ba62b2ad256f217751"
+source_extract_anchors = [
+  "are never persisted to disk",
+  "includes an x-zero-data-retention header",
+  "xAI never trains on your API inputs or outputs",
+]
 openrouter_slug = "xai"
 
 # THE SAME GEMINI MODELS AS `[retention.google]`, ON A DIFFERENT PRODUCT WITH A
