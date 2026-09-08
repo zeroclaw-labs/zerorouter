@@ -3112,10 +3112,17 @@ output_per_mtok = 3.75
 [[tiers."vertex/gemini-3.8-flash".candidates]]
 id = "vertex/gemini-3.8-flash"
 provider = "vertex"
-model = "gemini-3.8-flash"
+# The google/ prefix is the vendor's own naming on Vertex's OpenAI-compatible
+# surface, same as every sibling vertex lane. The drafted stanza carried the
+# bare id — as drafted, every request would have 404'd upstream; caught in
+# human review, which is what the draft gate is for.
+model = "google/gemini-3.8-flash"
 
 [tiers."vertex/gemini-3.8-flash".candidates.metadata]
 context_window = 1048576
+max_output_tokens = 65536
+input_modalities = ["text", "image"]
+tool_call = true
 
 [tiers."vertex/gemini-3.8-flash".candidates.rates]
 input_per_mtok = 0.75
