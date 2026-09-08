@@ -3134,5 +3134,14 @@ posture = "standard"
 description = "Google's official Vertex/Gemini (Gemini Enterprise Agent Platform) zero-data-retention doc states the PUBLIC DEFAULT for the Gemini API surface is NOT zero: customer data is retained for limited periods by default — prompts may be logged for abuse monitoring per GCP TOS Section 4.3 (an exception must be requested), and Google's published Gemini models cache inputs/outputs/derived data in-memory with a 24-hour TTL by default (disable is a per-project action). Zero data retention is achieved only by customers taking specific per-project actions (abuse-monitoring exception, disabling caching, not enabling optional logging/session features) — i.e. an enforced account/project configuration, not a published default. Therefore a lane not covered by a per-project ZDR exception is standard. Training is not at issue here; this receipt is about retention, not training."
 source_url = "https://docs.cloud.google.com/gemini-enterprise-agent-platform/resources/zero-data-retention"
 verified = "2026-09-04"
-source_sha256 = "ceb8e1d197fa35db3e6b22d9a888912357bc7a2119ad6b3b257a71cb1b4a9619"
+# Anchored to the same three commitments [retention.vertex] pins on this same
+# page, with the digest that pin verified UNCHANGED on 2026-09-08 — the
+# whole-page hash the drafter emitted went red within days on doc churn, the
+# exact failure mode the anchored-extract mechanism exists for.
+source_sha256 = "4f53b20a6c4e9810bcb035db83b997b604720cd21598e6f35341e63d1aaaeeca"
+source_extract_anchors = [
+  "use your data to train or fine-tune any AI/ML models",
+  "Request-response logging",
+  "In-memory data caching",
+]
 
