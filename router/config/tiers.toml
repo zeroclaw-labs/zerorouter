@@ -1028,11 +1028,11 @@ openrouter_slug = "groq"
 # the same published default this pin actually rests on, rather than a default
 # the pin exists to escape.
 [retention.together]
-posture = "zero"
-description = "Together does not store inputs or outputs by default — zero data retention is the platform default rather than a setting to negotiate — and this organization leaves all three Privacy toggles off, so prompts and responses are not stored, not used for training, and never forwarded to a third-party passthrough provider. Models run on Together's own infrastructure and the model authors receive nothing. Together does state that temporary caching may be used to improve performance unless otherwise configured, and publishes no further detail on it."
+posture = "standard"
+description = "Together stores prompts and model responses by default and may use them for product improvements; deletable, not shared with third parties. Zero data retention exists only as organization-admin Privacy toggles (storage off => content not persisted to non-volatile storage, metadata retained). FLIPPED FROM zero ON 2026-09-08: Together inverted their published default — the prior basis-3 sentence (does not store by default) is gone from the page. Restore zero ONLY as basis 2 with the operator's attestation that the org toggles are off."
 source_url = "https://docs.together.ai/docs/privacy-and-security"
-verified = "2026-08-31"
-source_sha256 = "c12ecf3bc64c7e4628f19ac0eeee48a778fa362dc8d29beb8b6bf9d1a4c99ea8"
+verified = "2026-09-08"
+source_sha256 = "768f6a8c19e2e48c198141a3d82c9944e759225bc192b5ac837cfd1fc7c4ff41"
 # THREE ANCHORS, AND THE THIRD IS HERE BECAUSE IT WAS MEASURED TO BE MISSING.
 # Each anchor hashes 2,000 characters running forward from itself, so the set
 # has to be checked against the CLAIMS rather than eyeballed. The first two
@@ -1049,9 +1049,8 @@ source_sha256 = "c12ecf3bc64c7e4628f19ac0eeee48a778fa362dc8d29beb8b6bf9d1a4c99ea
 # quotes today and a CMS switching to curly ones would redden the pin for a
 # typographic change.
 source_extract_anchors = [
-  "Together does not store inputs or outputs by default",
-  "meaning that Together forwards your prompts and responses directly to the upstream provider",
-  "Models published by third-party authors",
+  "By default, Together stores the prompts you send and the responses models return",
+  "which enables zero data retention (ZDR)",
 ]
 openrouter_slug = "together"
 
