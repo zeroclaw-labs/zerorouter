@@ -661,8 +661,18 @@ openrouter_slug = "fireworks"
 posture = "zero"
 description = "xAI under team-level Zero Data Retention: API request inputs and outputs are never persisted to disk, and the default 30-day encrypted audit retention does not apply. xAI does not train on API data without explicit permission. Uniquely in this catalog the guarantee is re-verified at runtime — every response carries an x-zero-data-retention attestation that ZeroRouter asserts is true before serving, and refuses the request when it is not."
 source_url = "https://docs.x.ai/developers/faq/security"
-verified = "2026-09-03"
-source_sha256 = "351bf9771f91315d0496d66352e48788bd4d0fe1eca8bd470949fffb7a5c97cc"
+verified = "2026-09-08"
+# Anchored on 2026-09-08 after the third whole-page churn re-pin in a week —
+# the same narrowing the openai and vertex pins earned. The three commitments
+# below are the pin's whole claim: no disk persistence under ZDR, the
+# per-response attestation header the dispatch path asserts, and no training
+# without permission. All three verified verbatim on the live page today.
+source_sha256 = "332bafa8726aeeb38bd724fc31a50fb0785e7a6bf2a586ba62b2ad256f217751"
+source_extract_anchors = [
+  "are never persisted to disk",
+  "includes an x-zero-data-retention header",
+  "xAI never trains on your API inputs or outputs",
+]
 openrouter_slug = "xai"
 
 # THE SAME GEMINI MODELS AS `[retention.google]`, ON A DIFFERENT PRODUCT WITH A
@@ -1018,11 +1028,11 @@ openrouter_slug = "groq"
 # the same published default this pin actually rests on, rather than a default
 # the pin exists to escape.
 [retention.together]
-posture = "zero"
-description = "Together does not store inputs or outputs by default — zero data retention is the platform default rather than a setting to negotiate — and this organization leaves all three Privacy toggles off, so prompts and responses are not stored, not used for training, and never forwarded to a third-party passthrough provider. Models run on Together's own infrastructure and the model authors receive nothing. Together does state that temporary caching may be used to improve performance unless otherwise configured, and publishes no further detail on it."
+posture = "standard"
+description = "Together stores prompts and model responses by default and may use them for product improvements; deletable, not shared with third parties. Zero data retention exists only as organization-admin Privacy toggles (storage off => content not persisted to non-volatile storage, metadata retained). FLIPPED FROM zero ON 2026-09-08: Together inverted their published default — the prior basis-3 sentence (does not store by default) is gone from the page. Restore zero ONLY as basis 2 with the operator's attestation that the org toggles are off."
 source_url = "https://docs.together.ai/docs/privacy-and-security"
-verified = "2026-08-31"
-source_sha256 = "c12ecf3bc64c7e4628f19ac0eeee48a778fa362dc8d29beb8b6bf9d1a4c99ea8"
+verified = "2026-09-08"
+source_sha256 = "768f6a8c19e2e48c198141a3d82c9944e759225bc192b5ac837cfd1fc7c4ff41"
 # THREE ANCHORS, AND THE THIRD IS HERE BECAUSE IT WAS MEASURED TO BE MISSING.
 # Each anchor hashes 2,000 characters running forward from itself, so the set
 # has to be checked against the CLAIMS rather than eyeballed. The first two
@@ -1039,9 +1049,8 @@ source_sha256 = "c12ecf3bc64c7e4628f19ac0eeee48a778fa362dc8d29beb8b6bf9d1a4c99ea
 # quotes today and a CMS switching to curly ones would redden the pin for a
 # typographic change.
 source_extract_anchors = [
-  "Together does not store inputs or outputs by default",
-  "meaning that Together forwards your prompts and responses directly to the upstream provider",
-  "Models published by third-party authors",
+  "By default, Together stores the prompts you send and the responses models return",
+  "which enables zero data retention (ZDR)",
 ]
 openrouter_slug = "together"
 
