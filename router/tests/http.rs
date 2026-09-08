@@ -295,7 +295,7 @@ async fn models_are_materialized_from_tiers_toml() {
     // in the catalog carries. Together deliberately does NOT twin the five
     // models it shares with Fireworks — on every one of them Fireworks is the
     // same price or cheaper, so a twin would add a row and nothing else.
-    assert_eq!(data.len(), 32);
+    assert_eq!(data.len(), 33);
     assert!(data.iter().all(|model| model["object"] == "model"));
 
     let ids = data
@@ -311,6 +311,7 @@ async fn models_are_materialized_from_tiers_toml() {
         std::collections::BTreeSet::from([
             "anthropic/claude-fable-5",
             "anthropic/claude-haiku-4-5",
+            "anthropic/claude-opus-4-8",
             "anthropic/claude-opus-5",
             "anthropic/claude-sonnet-5",
             "bedrock/claude-haiku-4-5",
@@ -1182,15 +1183,16 @@ async fn a_lane_whose_credential_is_absent_is_not_advertised() {
         "an uncredentialed lane must not appear in /v1/models: {ids:?}"
     );
     // And the rest of the catalog is untouched — a missing key removes its own
-    // lanes and nothing else. The count is the shipped twenty minus Bedrock's
-    // four AND minus Fireworks' six, because this deployment names only three
-    // providers and so holds neither key. Note the Fireworks six includes
+    // lanes and nothing else. The count is every lane whose provider IS one of
+    // the three named here — five Anthropic (opus-4-8 joined 2026-09-08), three
+    // Google, three OpenAI — because a lane's advertisability follows its
+    // credential and nothing else. Note the Fireworks six includes
     // `fireworks/qwen3.8-max`, whose retention override does NOT make it a
     // separate provider: dispatchability follows the credential, and it goes
     // dark with its siblings. Asserting the survivors by name would just restate
     // the catalog; asserting that the ONLY lanes lost are the ones whose
     // credentials are absent is the claim.
-    assert_eq!(ids.len(), 10, "{ids:?}");
+    assert_eq!(ids.len(), 11, "{ids:?}");
     assert!(ids.iter().any(|id| id == "anthropic/claude-sonnet-5"));
 }
 
@@ -1246,6 +1248,7 @@ async fn bundled_tier_catalog_has_expected_virtual_models() {
         [
             "anthropic/claude-fable-5",
             "anthropic/claude-haiku-4-5",
+            "anthropic/claude-opus-4-8",
             "anthropic/claude-opus-5",
             "anthropic/claude-sonnet-5",
             "bedrock/claude-haiku-4-5",
@@ -1277,7 +1280,7 @@ async fn bundled_tier_catalog_has_expected_virtual_models() {
             "xai/grok-4.3",
             "xai/grok-4.6",
         ],
-        "the thirty-two vendor-named model pins (Gemini flash + flash-lite added \
+        "the thirty-three vendor-named model pins (Gemini flash + flash-lite added \
          2026-08-18; Gemini Pro joined them once conditional rates could \
          express the 200,000-token boundary Google prices it at; the four \
          Bedrock classic-runtime zero-retention lanes on 2026-08-20, the \
@@ -1512,6 +1515,7 @@ async fn renamed_pins_resolve_and_the_retired_zero_ids_do_not() {
         ("openai/gpt-5.6-sol", "gpt-5.6-sol"),
         ("anthropic/claude-haiku-4-5", "claude-haiku-4-5-20251001"),
         ("anthropic/claude-sonnet-5", "claude-sonnet-5"),
+        ("anthropic/claude-opus-4-8", "claude-opus-4-8"),
         ("anthropic/claude-opus-5", "claude-opus-5"),
         ("anthropic/claude-fable-5", "claude-fable-5"),
     ] {
@@ -1785,6 +1789,7 @@ async fn a_basis_hike_above_sell_withholds_that_tier_and_nothing_else() {
         [
             "anthropic/claude-fable-5",
             "anthropic/claude-haiku-4-5",
+            "anthropic/claude-opus-4-8",
             "anthropic/claude-opus-5",
             // The Bedrock lanes are untouched by a first-party Anthropic
             // repricing: different account, different rate card, own pins.
@@ -1856,12 +1861,12 @@ async fn a_basis_hike_above_sell_withholds_that_tier_and_nothing_else() {
     assert_eq!(sell.output_per_mtok, Some(10.00));
 
     // And the public catalog stops advertising what it cannot serve: the
-    // thirty-one surviving pins, one row each. A Bedrock lane is among the survivors and
+    // thirty-two surviving pins, one row each. A Bedrock lane is among the survivors and
     // that is the point of naming one — Bedrock lanes are a different account
     // with their own rate card, so a repricing of a first-party Anthropic lane
     // withholds only that first-party lane.
     let listed = listed_model_ids(RouterState::fully_credentialed(path)).await;
-    assert_eq!(listed.len(), 31);
+    assert_eq!(listed.len(), 32);
     assert!(listed.iter().any(|id| id == "bedrock/claude-sonnet-4-5"));
     assert!(listed.iter().any(|id| id == "openai/gpt-5.6-luna"));
     assert!(listed.iter().any(|id| id == "anthropic/claude-haiku-4-5"));
@@ -1887,7 +1892,7 @@ async fn the_shipped_catalog_withholds_no_tier_today() {
         "the shipped catalog withholds {:?}",
         catalog.unavailable.keys().collect::<Vec<_>>()
     );
-    assert_eq!(catalog.tiers.len(), 32);
+    assert_eq!(catalog.tiers.len(), 33);
 }
 
 /// Every conditional rate the shipped catalog declares, transcribed from
@@ -1988,7 +1993,7 @@ async fn every_shipped_conditional_rate_is_the_one_the_vendor_publishes() {
 // rungs across >=2 providers). Every tier is pass-through until a second
 // provider serves a model class again.
 const ROUTED_TIERS: [&str; 0] = [];
-const PASS_THROUGH_TIERS: [&str; 32] = [
+const PASS_THROUGH_TIERS: [&str; 33] = [
     // Model pins, keyed by their OpenRouter-standard {vendor}/{model} ids.
     "openai/gpt-5.6-luna",
     "anthropic/claude-haiku-4-5",
@@ -1996,6 +2001,7 @@ const PASS_THROUGH_TIERS: [&str; 32] = [
     "anthropic/claude-sonnet-5",
     "openai/gpt-5.6-sol",
     "anthropic/claude-opus-5",
+    "anthropic/claude-opus-4-8",
     "anthropic/claude-fable-5",
     "google/gemini-3.7-flash",
     "google/gemini-3.5-flash-lite",

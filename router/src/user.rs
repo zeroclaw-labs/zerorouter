@@ -1154,7 +1154,7 @@ mod tests {
         // moving from one side of the sentence to the other.
         //
         // Zero: four Bedrock, five open-weight Fireworks, two xAI, three Groq,
-        // four Together and three Vertex. Standard: four Anthropic, three
+        // four Together and three Vertex. Standard: five Anthropic, three
         // Google, three OpenAI, and the one overridden Fireworks lane this
         // test is about.
         //
@@ -1175,8 +1175,13 @@ mod tests {
         // the pin at `standard`. The three Google lanes remain standard: same
         // models, different product, different data policy, which is the whole
         // reason both twins exist.
+        //
+        // `anthropic/claude-opus-4-8` joined the STANDARD side on 2026-09-08 —
+        // the first lane added through the currency drafting pipeline (draft
+        // PR #147, researched dossier, human-merged). Anthropic count four →
+        // five; a plain lane inheriting `[retention.anthropic]`, no override.
         assert_eq!(posture_count(rows, "zero"), 21);
-        assert_eq!(posture_count(rows, "standard"), 11);
-        assert_eq!(rows.len(), 32, "every shipped lane is counted exactly once");
+        assert_eq!(posture_count(rows, "standard"), 12);
+        assert_eq!(rows.len(), 33, "every shipped lane is counted exactly once");
     }
 }
