@@ -1155,8 +1155,8 @@ mod tests {
         //
         // Zero: four Bedrock, five open-weight Fireworks, two xAI, three Groq,
         // four Together and three Vertex. Standard: five Anthropic, three
-        // Google, three OpenAI, and the one overridden Fireworks lane this
-        // test is about.
+        // Google, three OpenAI, the one overridden Fireworks lane this test is
+        // about, and the overridden `vertex/gemini-3.8-flash`.
         //
         // The zero side grew by seven on 2026-08-22 and the standard side did
         // not move, which is worth a sentence because it is the first time the
@@ -1180,8 +1180,17 @@ mod tests {
         // the first lane added through the currency drafting pipeline (draft
         // PR #147, researched dossier, human-merged). Anthropic count four →
         // five; a plain lane inheriting `[retention.anthropic]`, no override.
+        //
+        // `vertex/gemini-3.8-flash` joined the STANDARD side on 2026-09-08 via
+        // the catalog's second per-tier override (draft PR #148): the vertex
+        // provider pin is `zero`, but that pin's basis is the operator's
+        // project configuration, which nobody has yet re-verified for this
+        // model — so the lane is pinned `standard` explicitly rather than
+        // inheriting a zero it has not earned. If the operator attests the
+        // project's ZDR coverage for this model, the override is removed and
+        // these tallies become 22/12.
         assert_eq!(posture_count(rows, "zero"), 21);
-        assert_eq!(posture_count(rows, "standard"), 12);
-        assert_eq!(rows.len(), 33, "every shipped lane is counted exactly once");
+        assert_eq!(posture_count(rows, "standard"), 13);
+        assert_eq!(rows.len(), 34, "every shipped lane is counted exactly once");
     }
 }
