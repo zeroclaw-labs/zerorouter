@@ -3092,6 +3092,9 @@ model = "claude-opus-4-8"
 
 [tiers."anthropic/claude-opus-4-8".candidates.metadata]
 context_window = 1000000
+max_output_tokens = 128000
+input_modalities = ["text", "image"]
+tool_call = true
 
 [tiers."anthropic/claude-opus-4-8".candidates.rates]
 input_per_mtok = 5.00
