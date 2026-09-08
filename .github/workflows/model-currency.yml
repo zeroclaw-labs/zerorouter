@@ -83,8 +83,19 @@ jobs:
             --tiers config/tiers.toml --new-since-days 90 --json > candidates.json
           count=$(jq 'length' candidates.json)
           echo "discovered ${count} candidate(s)"
-          if [ "${count}" -eq 0 ]; then
-            echo "Nothing the catalog does not already carry; no issue."
+
+          # The other direction: providers we hold NO credential for, ranked by
+          # how much of the catalog they could second-source. Same source fetch,
+          # same "lead, never action" contract. Rendered as its own section so
+          # the outreach queue (workjj) has one place to read leads from each
+          # week; it never gates the issue — an empty report renders nothing.
+          ./target/debug/zerorouter admin discover \
+            --tiers config/tiers.toml --new-providers --json > providers.json
+          leads=$(jq '[.candidates[] | select(.aggregator | not) | select(.frontier_families < 2)] | length' providers.json)
+          echo "ranked ${leads} first-party second-source lead(s)"
+
+          if [ "${count}" -eq 0 ] && [ "${leads}" -eq 0 ]; then
+            echo "Nothing the catalog does not already carry and no second-source lead; no issue."
             exit 0
           fi
 
@@ -109,6 +120,25 @@ jobs:
               section("version-bump"; "Version bumps"),
               section("new"; "New models")
             ' candidates.json
+
+            # Second-source leads: first-party hosts first (the actionable
+            # outreach targets), capped at 10 rows; aggregators and
+            # multi-frontier resellers are counted, not listed — routing
+            # through another router stacks margin and hides retention, and a
+            # hyperscaler is a procurement motion, not an email. Row shape is
+            # fixed because a downstream job parses it:
+            #   - **<key>** — <overlap> of <chat_models> chat models carried here too: <examples>
+            jq -r '
+              ([.candidates[] | select(.aggregator | not) | select(.frontier_families < 2)]) as $leads
+              | ([.candidates[] | select(.aggregator or .frontier_families >= 2)] | length) as $skipped
+              | if ($leads | length) > 0 then
+                  "## Second-source provider leads (\($leads | length))\n"
+                  + "_Uncredentialed first-party providers serving models we already carry, ranked by overlap. A second source is price competition, redundancy, and sometimes a better retention story — each row is an outreach lead, never an action. \($skipped) router/aggregator or multi-frontier reseller(s) and \(.zero_overlap_dropped) zero-overlap provider(s) not listed._\n\n"
+                  + ($leads[:10] | map("- **\(.key)** — \(.overlap) of \(.chat_models) chat models carried here too: \(.overlap_examples | join(", "))") | join("\n"))
+                  + (if ($leads | length) > 10 then "\n- _…and \(($leads | length) - 10) more with less overlap_" else "" end)
+                  + "\n"
+                else "" end
+            ' providers.json
           } > body.md
 
           existing=$(gh issue list --state open --search "Model currency in:title" \
