@@ -83,6 +83,26 @@ hex = "0.4"
 # there is one of each. 0.12.1 carries no advisory, and this crate's use of it
 # is two calls in `src/stripe.rs`.
 #
+# CORRECTION (sqlx 0.9.0 bump). The paragraph above is now wrong on its
+# arithmetic, and the correction is recorded here rather than by rewriting it,
+# because how the situation changed is the useful part. `sqlx-postgres` 0.9.0
+# moved its SCRAM implementation to `sha2` 0.11 / `hmac` 0.13 / `hkdf` 0.13, so
+# the second RustCrypto stack the paragraph refused — `digest` 0.11, `sha2`
+# 0.11, `crypto-common` 0.2, `hybrid-array`, plus `cmov` and `ctutils` — is in
+# the binary anyway, pulled by a dependency rather than chosen here. Before the
+# bump the lockfile held exactly one of each; it now holds two of `sha2`,
+# `hmac`, `hkdf`, `digest`, `crypto-common`, and `block-buffer`. `cargo deny`
+# still passes (`multiple-versions = "warn"`), and no advisory is involved.
+#
+# The pin itself is UNCHANGED and still correct: `gcp_auth.rs` builds
+# `rsa::pkcs1v15::SigningKey<Sha256>`, `rsa` 0.9 is still a `digest` 0.10
+# crate, and its 0.10 is still only a release candidate. What has lapsed is
+# only the "in exchange for nothing" argument — the cost it weighed is now
+# sunk. Whether that makes bumping this crate's own `hmac` worthwhile is a call
+# for the repo owner, not a side effect of a sqlx upgrade; note that it was NOT
+# verified to compile, since `stripe.rs` would then need `Sha256` from `sha2`
+# 0.11 while `gcp_auth.rs` keeps the 0.10 one.
+#
 # Revisit when `rsa` 0.10 is stable, and then move the whole RustCrypto stack
 # in one commit rather than one crate at a time.
 hmac = "0.12"
@@ -109,8 +129,25 @@ rust_decimal = "1.40"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"
-sqlx-core = { version = "0.8.6", default-features = false, features = ["_rt-tokio", "_tls-rustls-ring-webpki", "chrono", "migrate", "rust_decimal", "uuid"] }
-sqlx-postgres = { version = "0.8.6", default-features = false, features = ["chrono", "migrate", "rust_decimal", "uuid"] }
+# The two internal features carry over from 0.8.6 unrenamed and unchanged:
+# `_rt-tokio` is still `["tokio", "tokio-stream"]` and
+# `_tls-rustls-ring-webpki` is still `["_tls-rustls", "rustls/ring",
+# "webpki-roots"]`, so the TLS stack — rustls over ring, verifying against the
+# webpki root bundle — is byte-for-byte the one this crate has always built.
+#
+# `json` is NEW here, and it restores rather than adds. Through 0.8.6
+# `serde_json` was a NON-optional dependency of `sqlx-postgres`, so its
+# `Type`/`Decode`/`Encode` impls for `serde_json::Value` compiled whether or not
+# anything asked for them; 0.9.0 made the dependency `optional = true` and put
+# those impls behind this feature. The router reads the JSONB `sell_rates` /
+# `basis_rates` columns off `usage_events` — the per-request record of what the
+# customer was charged and what it cost us — so without the feature that
+# read-back stops compiling. Nothing enters the dependency graph: `serde_json`
+# is already a direct dependency above and was already built by `sqlx-postgres`
+# at 0.8.6. It is listed on both crates the way every other shared feature here
+# is, though `sqlx-postgres/json` alone would forward to `sqlx-core/json`.
+sqlx-core = { version = "0.9.0", default-features = false, features = ["_rt-tokio", "_tls-rustls-ring-webpki", "chrono", "json", "migrate", "rust_decimal", "uuid"] }
+sqlx-postgres = { version = "0.9.0", default-features = false, features = ["chrono", "json", "migrate", "rust_decimal", "uuid"] }
 thiserror = "2.0"
 tokio = { version = "1.50", features = ["fs", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-stream = "0.1"
