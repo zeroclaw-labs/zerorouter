@@ -955,6 +955,10 @@ async fn every_shipped_lane_publishes_a_retention_posture() {
             "groq/gpt-oss-120b",
             "groq/gpt-oss-20b",
             "groq/qwen3.6-27b",
+            "together/deepseek-v4-pro-0813",
+            "together/kimi-k2.7-code",
+            "together/nemotron-3-ultra",
+            "together/qwen3.6-plus",
             // Rejoined 2026-08-30, exactly as the comment that used to sit
             // here prescribed: Google's abuse-monitoring exception (filed
             // 2026-08-21) was approved for project number 416940592816 —
