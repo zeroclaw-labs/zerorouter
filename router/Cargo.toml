@@ -128,7 +128,7 @@ ring = "0.17"
 rust_decimal = "1.40"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-sha2 = "0.10"
+sha2 = "0.11"
 # The two internal features carry over from 0.8.6 unrenamed and unchanged:
 # `_rt-tokio` is still `["tokio", "tokio-stream"]` and
 # `_tls-rustls-ring-webpki` is still `["_tls-rustls", "rustls/ring",
