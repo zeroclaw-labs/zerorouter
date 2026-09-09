@@ -1000,11 +1000,25 @@ async fn settles_at_five_percent_once_the_allowance_is_spent(upstream_url: &str)
     .expect("a usage debit must exist");
     assert_eq!(debit, -Decimal::new(12, 7), "the debit is the fee, negated");
 
-    // The last-used stamp is the one piece of state the dispatch writes back.
-    let listed = byok::list_keys(&pool, user_id).await.expect("list");
+    // The last-used stamp is the one piece of state the dispatch writes back —
+    // and it is written by a spawned task deliberately off the request's
+    // critical path (`stamp_byok_use`), so the contract is EVENTUAL
+    // visibility, not visibility-by-settle. Under sqlx 0.8 the spawn happened
+    // to win this race every time; 0.9's pool made it lose on CI, which is
+    // the test mis-stating the contract, not the code regressing. Poll with a
+    // bound: two seconds is three orders of magnitude past the one UPDATE the
+    // task performs.
+    let mut listed = byok::list_keys(&pool, user_id).await.expect("list");
+    for _ in 0..80 {
+        if listed[0].last_used_at.is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        listed = byok::list_keys(&pool, user_id).await.expect("list");
+    }
     assert!(
         listed[0].last_used_at.is_some(),
-        "dispatching on the credential must record that it was used"
+        "dispatching on the credential must record that it was used (within 2s)"
     );
 }
 

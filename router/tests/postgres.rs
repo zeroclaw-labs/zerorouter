@@ -2,7 +2,9 @@ use std::str::FromStr;
 
 use chrono::Utc;
 use rust_decimal::Decimal;
-use sqlx_core::{query::query, query_as::query_as, query_scalar::query_scalar};
+use sqlx_core::{
+    query::query, query_as::query_as, query_scalar::query_scalar, sql_str::AssertSqlSafe,
+};
 use sqlx_postgres::{PgConnectOptions, PgPool, PgPoolOptions};
 use uuid::Uuid;
 use zerorouter::provider::ModelRates;
@@ -801,7 +803,11 @@ async fn migration_chain_applies_on_a_fresh_database() {
         .connect_with(PgConnectOptions::from_str(&admin_url).expect("admin url must parse"))
         .await
         .expect("maintenance database must connect");
-    query(&format!("CREATE DATABASE {fresh_db}"))
+    // `fresh_db` is minted three lines up as `zr_migchain_<uuid-simple>` — 32
+    // hex characters after a fixed prefix. CREATE/DROP DATABASE takes no bind
+    // parameters, and sqlx's own `PgConnection::create_database` builds this
+    // same statement by interpolation.
+    query(AssertSqlSafe(format!("CREATE DATABASE {fresh_db}")))
         .execute(&admin)
         .await
         .expect("fresh database must be created");
@@ -1174,7 +1180,7 @@ async fn migration_chain_applies_on_a_fresh_database() {
     .await;
 
     // Always drop the throwaway database, even if a probe above failed.
-    let _ = query(&format!("DROP DATABASE {fresh_db}"))
+    let _ = query(AssertSqlSafe(format!("DROP DATABASE {fresh_db}")))
         .execute(&admin)
         .await;
 
