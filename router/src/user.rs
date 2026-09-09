@@ -1153,11 +1153,11 @@ mod tests {
         // override silently stopping working would show up here as a lane
         // moving from one side of the sentence to the other.
         //
-        // Zero: four Bedrock, five open-weight Fireworks, two xAI, three Groq
-        // and three Vertex. Standard: five Anthropic, three Google, three
-        // OpenAI, four Together (vendor default-flip, 2026-09-08), the one
-        // overridden Fireworks lane this test is about, and the overridden
-        // `vertex/gemini-3.8-flash`.
+        // Zero: four Bedrock, five open-weight Fireworks, two xAI, three Groq,
+        // four Together (basis 2 since 2026-09-09, operator-attested) and
+        // three Vertex. Standard: five Anthropic, three Google, three OpenAI,
+        // the one overridden Fireworks lane this test is about, and the
+        // overridden `vertex/gemini-3.8-flash`.
         //
         // The zero side grew by seven on 2026-08-22 and the standard side did
         // not move, which is worth a sentence because it is the first time the
@@ -1201,8 +1201,16 @@ mod tests {
         // falsification-by-console risk the paragraph above recorded on the
         // day the lanes were added, realized in the sharpest form: the vendor
         // flipped the default out from under everyone at once.
-        assert_eq!(posture_count(rows, "zero"), 17);
-        assert_eq!(posture_count(rows, "standard"), 17);
+        //
+        // RESTORED 2026-09-09: the operator checked the Together console and
+        // attested the org's Privacy storage toggles are off, so the four
+        // Together lanes return to the ZERO side on basis 2 (enforced org
+        // setting, ZDR-page semantics pinned) — one day after the vendor's
+        // default-flip forced them to standard. The pin now names the setting
+        // rather than a published default, which is the honest shape it
+        // should have had from the start.
+        assert_eq!(posture_count(rows, "zero"), 21);
+        assert_eq!(posture_count(rows, "standard"), 13);
         assert_eq!(rows.len(), 34, "every shipped lane is counted exactly once");
     }
 }
