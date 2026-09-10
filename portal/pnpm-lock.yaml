@@ -9,11 +9,11 @@ importers:
   .:
     dependencies:
       '@stripe/react-stripe-js':
-        specifier: ^6.8.1
-        version: 6.8.1(@stripe/stripe-js@9.13.0)(react-dom@18.3.1(react@18.3.1))(react@18.3.1)
+        specifier: ^6.9.0
+        version: 6.9.0(@stripe/stripe-js@9.15.0)(react-dom@18.3.1(react@18.3.1))(react@18.3.1)
       '@stripe/stripe-js':
-        specifier: ^9.13.0
-        version: 9.13.0
+        specifier: ^9.15.0
+        version: 9.15.0
       react:
         specifier: ^18.3.1
         version: 18.3.1
@@ -25,8 +25,8 @@ importers:
         version: 7.18.2(react-dom@18.3.1(react@18.3.1))(react@18.3.1)
     devDependencies:
       '@playwright/test':
-        specifier: ^1.62.1
-        version: 1.62.1
+        specifier: ^1.63.0
+        version: 1.63.0
       '@types/react':
         specifier: ^18.3.23
         version: 18.3.31
@@ -150,8 +150,8 @@ packages:
   '@oxc-project/types@0.148.0':
     resolution: {integrity: sha512-Nm4s/jB+4FpFsPhWGEC4h7rzksesmtnMXomo6rCMcg/b8zLQuOziRgkCS1fxDCXOlJB/6Q8oABOZ/OP6RIPj9A==}
 
-  '@playwright/test@1.62.1':
-    resolution: {integrity: sha512-DTcUc8qii+cpHvtOwggMtBRMjKZHXYWdw8syRYu2vtzuq4Wxphqq4NfCs5Zt44L6mA8rfDfj+PHnxFc/FeK6mQ==}
+  '@playwright/test@1.63.0':
+    resolution: {integrity: sha512-oxMK4vllB9RK5NQ2l1pq1IfOf2AvnEuj/vYGDj0H2nMtmtZpKtCwt/l00GEO6xjGfpBNAvjovvYdCm50dRQkpQ==}
     engines: {node: '>=20'}
     hasBin: true
 
@@ -257,15 +257,15 @@ packages:
   '@rolldown/pluginutils@1.0.1':
     resolution: {integrity: sha512-2j9bGt5Jh8hj+vPtgzPtl72j0yRxHAyumoo6TNfAjsLB04UtpSvPbPcDcBMxz7n+9CYB0c1GxQFxYRg2jimqGw==}
 
-  '@stripe/react-stripe-js@6.8.1':
-    resolution: {integrity: sha512-Wzy7KCF8lM819x8rVFSKUr2ofITdX1c/49ceJprJzGhPzHb3fhrcAoEmNQwV5UYRci7YY1joyG8oz3So3JAMRg==}
+  '@stripe/react-stripe-js@6.9.0':
+    resolution: {integrity: sha512-wyFt2sT2EdXfyo8YNSTeEm9gb2yFJf03Da8acQOeDxzjWGwD5xDF7ecSPI64upvJ2IjvypqEF9IIVUnxtPY+zA==}
     peerDependencies:
-      '@stripe/stripe-js': '>=9.5.0 <10.0.0'
+      '@stripe/stripe-js': '>=9.10.0 <10.0.0'
       react: '>=16.8.0 <20.0.0'
       react-dom: '>=16.8.0 <20.0.0'
 
-  '@stripe/stripe-js@9.13.0':
-    resolution: {integrity: sha512-/0c72BUgzzVkVTlsw5uBn8x3waTdVJ/PZGfQ6jY1eu6K7olUPf4d9lgDPA9/0sIdsR8j7o3QIG8fOCO6ItcL7A==}
+  '@stripe/stripe-js@9.15.0':
+    resolution: {integrity: sha512-0ySfsYH9XzfEspNS6MXMU2cjGsxNXWDQT9JxS43nOAatj6jDEP0fLBm2BanfblzU/GL/kDjFFcKmGInHmrASeg==}
     engines: {node: '>=12.16'}
 
   '@types/babel__core@7.20.5':
@@ -469,11 +469,6 @@ packages:
       picomatch:
         optional: true
 
-  fsevents@2.3.2:
-    resolution: {integrity: sha512-xiqMQR4xAeHTuB9uWm+fFRcIOgKBMiOBP+eXiyT7jsgVCq1bkVygt00oASowB7EdtpOHaaPgKt812P9ab+DDKA==}
-    engines: {node: ^8.16.0 || ^10.6.0 || >=11.0.0}
-    os: [darwin]
-
   fsevents@2.3.3:
     resolution: {integrity: sha512-5xoDfX+fL7faATnagmWPpbFtwh/R77WmMMqqHGS65C3vvB0YHrgF+B1YmZ3441tMj5n63k0212XNoJwzlhffQw==}
     engines: {node: ^8.16.0 || ^10.6.0 || >=11.0.0}
@@ -634,13 +629,13 @@ packages:
     resolution: {integrity: sha512-qcJu88Q2IWqJsDD529JKMdwGm/dvInW4HvQnRwiH9JtihJvzGOscDtHE3x1pBKeUOTysQ8kVmLnJ2kJu7yhcGA==}
     engines: {node: '>=12'}
 
-  playwright-core@1.62.1:
-    resolution: {integrity: sha512-wPYSwEBJY9GHraISXqyqtx0na0LpO3XEX7jNDhntbex7tzUS7kLnZsOlFruFJB4Hi/rhDMjXGqHewDZ68nYZVw==}
+  playwright-core@1.63.0:
+    resolution: {integrity: sha512-rYCsBF/M5HjUch52bbtVONEFjv6Xu8sm8h72dNlR5bzIE1fvC/bxgspzkjSfU+MweEMmPM8KJebG6nnyxo5mCg==}
     engines: {node: '>=20'}
     hasBin: true
 
-  playwright@1.62.1:
-    resolution: {integrity: sha512-0M+L3LAD8/nm554LOla9Ayx0j0tmFZ0FBcoQ7F1VuVHpM/XpiC8RcDzBQB8W5+hA8L22THxELzeF+2WcUzvcLg==}
+  playwright@1.63.0:
+    resolution: {integrity: sha512-+7ziBLidS4NaNCdt57SUDT+wYmmd5fmiQejUic/kb+YsYSCPyOOE9sebzMjNmQrsnNpDJqd4WHvV/8lfKfUDUg==}
     engines: {node: '>=20'}
     hasBin: true
 
@@ -916,9 +911,9 @@ snapshots:
 
   '@oxc-project/types@0.148.0': {}
 
-  '@playwright/test@1.62.1':
+  '@playwright/test@1.63.0':
     dependencies:
-      playwright: 1.62.1
+      playwright: 1.63.0
 
   '@rolldown/binding-android-arm-eabi@1.2.7':
     optional: true
@@ -969,14 +964,14 @@ snapshots:
 
   '@rolldown/pluginutils@1.0.1': {}
 
-  '@stripe/react-stripe-js@6.8.1(@stripe/stripe-js@9.13.0)(react-dom@18.3.1(react@18.3.1))(react@18.3.1)':
+  '@stripe/react-stripe-js@6.9.0(@stripe/stripe-js@9.15.0)(react-dom@18.3.1(react@18.3.1))(react@18.3.1)':
     dependencies:
-      '@stripe/stripe-js': 9.13.0
+      '@stripe/stripe-js': 9.15.0
       prop-types: 15.8.1
       react: 18.3.1
       react-dom: 18.3.1(react@18.3.1)
 
-  '@stripe/stripe-js@9.13.0': {}
+  '@stripe/stripe-js@9.15.0': {}
 
   '@types/babel__core@7.20.5':
     dependencies:
@@ -1114,9 +1109,6 @@ snapshots:
     optionalDependencies:
       picomatch: 4.0.7
 
-  fsevents@2.3.2:
-    optional: true
-
   fsevents@2.3.3:
     optional: true
 
@@ -1232,13 +1224,11 @@ snapshots:
 
   picomatch@4.0.7: {}
 
-  playwright-core@1.62.1: {}
+  playwright-core@1.63.0: {}
 
-  playwright@1.62.1:
+  playwright@1.63.0:
     dependencies:
-      playwright-core: 1.62.1
-    optionalDependencies:
-      fsevents: 2.3.2
+      playwright-core: 1.63.0
 
   postcss@8.5.28:
     dependencies:
