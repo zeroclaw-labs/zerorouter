@@ -2029,8 +2029,13 @@ provider = "fireworks"
 model = "accounts/fireworks/models/glm-5p3"
 
 [tiers."fireworks/glm-5.3".candidates.metadata]
-context_window = 1000000
-max_output_tokens = 131072
+# Re-pinned 2026-09-04 -> 2026-09-10: the source (mirroring Fireworks' own API
+# metadata) moved to 1,048,573 (2^20 minus a 3-token reserve) and 262,144, and
+# held those values stably for a week. The old numbers were the launch-day
+# transcription; carrying them under-admitted requests the lane can serve.
+# Prices are untouched and reconcile unchanged.
+context_window = 1048573
+max_output_tokens = 262144
 input_modalities = ["text"]
 tool_call = true
 
