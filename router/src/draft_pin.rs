@@ -39,6 +39,43 @@
 //! draft the router could not load is never produced. That check reuses the real
 //! loader rather than a reimplementation of it, so the day the loader learns a
 //! new rule the drafter inherits it for free.
+//!
+//! ## What the first two live drafts taught it
+//!
+//! `admin draft-pin` was used in earnest twice — PR #147
+//! (`anthropic/claude-opus-4-8`) and PR #148 (`vertex/gemini-3.8-flash`) — and a
+//! human had to repair the same three things both times. Each repair is now a
+//! rule here, and all three take the same shape: **the drafter says more, and
+//! still writes nothing it cannot source.**
+//!
+//! 1. **Anchored extracts instead of a bare whole-page hash.** The drafted
+//!    retention override carried a digest over the entire page and went red
+//!    within four days on documentation churn that touched nothing about
+//!    retention — the exact failure
+//!    [`crate::config::RetentionPin::source_extract_anchors`] exists for. An
+//!    evidence object may now carry anchors and the raw page they were read
+//!    from, and the digest is recomputed as the ANCHORED one through
+//!    [`crate::retention`]'s own [`crate::retention::normalize`],
+//!    [`crate::retention::extract`], and [`crate::retention::hash`] — the same
+//!    three functions `retention-drift` will verify it with. Anchors without a
+//!    document, or anchors the document does not fit, emit the dossier's own
+//!    digest and a warning; nothing here ever invents one. See
+//!    [`AnchoredDigest`].
+//!
+//! 2. **Metadata completeness.** Drafted lanes declared only a context window,
+//!    so every draft tripped the shipped catalog's own listing tests, which
+//!    require a max output, an input-modality list, and tool calling. The
+//!    dossier can now carry all three, and what it does not carry is named
+//!    field by field in the flags rather than discovered in CI. Absent stays
+//!    absent — see [`metadata_gap_flags`].
+//!
+//! 3. **Provider dispatch conventions.** The drafted vertex lane dispatched a
+//!    bare `gemini-3.8-flash` while every sibling vertex lane in the very file
+//!    the drafter had already loaded dispatched `google/<model>`; as drafted,
+//!    every request would have 404'd. The convention is now derived from those
+//!    existing lanes and a mismatch is WARNED about — never rewritten, because
+//!    a model id the researcher did not verify is as much a fabrication as a
+//!    price. See [`dispatch_convention`].
 
 use std::fmt::Write as _;
 
@@ -114,7 +151,7 @@ pub struct FactsDossier {
     pub verified: Option<String>,
 }
 
-/// A retention receipt for a `standard` posture: the same four evidence fields a
+/// A retention receipt for a `standard` posture: the same evidence fields a
 /// [`Basis`] carries, but asserting the honest default rather than a `zero`
 /// claim. It never on its own produces a `zero` label.
 #[derive(Debug, Clone, Deserialize)]
@@ -127,6 +164,13 @@ pub struct StandardEvidence {
     pub source_sha256: String,
     #[serde(default)]
     pub source_extract: String,
+    /// See [`Basis::source_extract_anchors`] — identical meaning and identical
+    /// handling; both evidence objects feed the same [`anchor_digest`].
+    #[serde(default)]
+    pub source_extract_anchors: Vec<String>,
+    /// See [`Basis::source_document`].
+    #[serde(default)]
+    pub source_document: Option<String>,
 }
 
 impl StandardEvidence {
@@ -192,8 +236,32 @@ pub struct Prices {
     pub cached_input_per_mtok: Option<f64>,
     #[serde(default)]
     pub cache_write_per_mtok: Option<f64>,
+    // --- The candidate's MODEL METADATA -------------------------------------
+    //
+    // Not prices, and the object is named `prices` — a wart worth naming rather
+    // than quietly widening. `context_window` has always lived here because the
+    // researcher reads it off the same vendor page as the rates, and splitting
+    // the three fields below into a second object would have meant two places
+    // to look for one lane's static facts, plus a precedence rule for a
+    // `context_window` that could then be stated twice. One container and one
+    // rule beat a better name and two rules.
+    //
+    // They exist at all because the first two live drafts tripped the shipped
+    // catalog's own completeness tests (`router/tests/http.rs`): a lane must
+    // state a max output and its input modalities, and must support tool
+    // calling. Both drafts had to be completed by hand. Absent is still
+    // absent — nothing here is defaulted or inferred, because an invented
+    // `max_output_tokens` is a claim to a client about what it may ask for —
+    // but absence is now FLAGGED, so the gap is visible before the PR opens
+    // rather than in CI after it.
     #[serde(default)]
     pub context_window: Option<u64>,
+    #[serde(default)]
+    pub max_output_tokens: Option<u64>,
+    #[serde(default)]
+    pub input_modalities: Option<Vec<String>>,
+    #[serde(default)]
+    pub tool_call: Option<bool>,
     /// Conditional rate bands. Only a band keyed on `min_prompt_tokens` — the
     /// OpenAI 272k repricing shape — is a lane rate this drafter models. Research
     /// agents overload this list with cache-TTL, batch, region, and time
@@ -265,6 +333,35 @@ pub struct Basis {
     pub source_sha256: String,
     #[serde(default)]
     pub source_extract: String,
+    /// Phrases that select the bounded regions of `source_url` this evidence
+    /// actually lives in — the researcher's side of
+    /// [`crate::config::RetentionPin::source_extract_anchors`].
+    ///
+    /// Present because the first live `draft-pin` shipped a whole-page digest
+    /// and it went red within four days on documentation churn that touched
+    /// nothing about retention. That is the exact failure the anchor mechanism
+    /// exists for, and the fix has to reach the DRAFTER: a human who has to add
+    /// anchors by hand after every draft will eventually not.
+    ///
+    /// Anchors are emitted verbatim beside the pin. They are never invented,
+    /// never trimmed, and never filtered here — a blank or ambiguous anchor is
+    /// refused by the loader ([`crate::config`]) or reported by the extractor
+    /// ([`crate::retention::extract`]), and both refusals are louder and more
+    /// specific than anything this module could say.
+    #[serde(default)]
+    pub source_extract_anchors: Vec<String>,
+    /// The raw page text or HTML of `source_url` as the researcher fetched it,
+    /// when they kept it. Optional, and only ever read to RECOMPUTE
+    /// `source_sha256` as the anchored digest — see [`anchor_digest`].
+    ///
+    /// It lives on the evidence object rather than at the top of the dossier on
+    /// purpose. A dossier can carry two evidence objects citing two different
+    /// pages, and a digest computed from the wrong page is a fabricated digest
+    /// — the one thing this module must never emit. Keeping the document beside
+    /// the `source_url` it was fetched from makes that mismatch unrepresentable
+    /// rather than merely unlikely.
+    #[serde(default)]
+    pub source_document: Option<String>,
 }
 
 impl Basis {
@@ -312,6 +409,61 @@ impl BasisKind {
     /// default. These are the bases that require `human_attested`.
     const fn is_account_private(self) -> bool {
         matches!(self, Self::Signed | Self::Enforced)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The other input: what the operator's LIVE tiers.toml already says.
+// ---------------------------------------------------------------------------
+
+/// The facts the drafter reads from the operator's live `config/tiers.toml`,
+/// narrowed to the candidate's provider.
+///
+/// A struct rather than a widening argument list because both fields answer the
+/// same question — *what does this catalog already do with this provider?* —
+/// and both exist to stop the drafter proposing something the file itself
+/// contradicts:
+///
+/// - [`Self::provider_posture`] is the retention pin, which closes the
+///   false-zero fail-open (FIX 3, see [`resolve_posture`]).
+/// - [`Self::provider_models`] are the dispatch strings its existing lanes use,
+///   which is how a bare `gemini-3.8-flash` gets caught before it 404s (see
+///   [`dispatch_convention`]).
+#[derive(Debug, Clone, Default)]
+pub struct CatalogFacts {
+    /// The candidate provider's live `[retention.<provider>]` posture, or
+    /// `None` when the provider carries no pin yet.
+    pub provider_posture: Option<RetentionPosture>,
+    /// Every `model` dispatch string the live catalog already carries for the
+    /// candidate's provider, deduplicated, in catalog order.
+    pub provider_models: Vec<String>,
+}
+
+impl CatalogFacts {
+    /// Read both facts out of a loaded catalog for one provider.
+    ///
+    /// WITHHELD tiers are read too. A lane the file carries but declines to
+    /// serve for being priced below cost still records how the operator
+    /// dispatches on that provider, and dropping it would make the convention
+    /// check quietly weaker exactly when the file is in a state someone is
+    /// mid-way through fixing. The synthesized `unified` view is NOT read: it
+    /// is a copy of `tiers`, so reading it would count the same lane twice.
+    #[must_use]
+    pub fn for_provider(catalog: &TierCatalog, provider: &str) -> Self {
+        let mut provider_models: Vec<String> = Vec::new();
+        let definitions = catalog
+            .tiers
+            .values()
+            .chain(catalog.unavailable.values().map(|held| &held.definition));
+        for candidate in definitions.flat_map(|definition| &definition.candidates) {
+            if candidate.provider == provider && !provider_models.contains(&candidate.model) {
+                provider_models.push(candidate.model.clone());
+            }
+        }
+        Self {
+            provider_posture: catalog.retention.get(provider).map(|pin| pin.posture),
+            provider_models,
+        }
     }
 }
 
@@ -382,19 +534,17 @@ impl Draft {
 
 /// Draft a lane from a dossier, applying every fail-safe gate. Pure: no IO, no
 /// clock. `verified` is the already-resolved, already-validated ISO date;
-/// `provider_posture` is the candidate provider's LIVE `[retention.<provider>]`
-/// posture read from the operator's `tiers.toml` (`None` if the provider has no
-/// pin there yet) — the fact that closes the false-zero fail-open (FIX 3).
+/// `live` is what the operator's own `tiers.toml` already says about this
+/// candidate's provider — its retention pin, which closes the false-zero
+/// fail-open (FIX 3), and its existing dispatch strings, which catch a model id
+/// that would 404 (see [`CatalogFacts`]).
 ///
 /// The load-validation gate (invariant 5) is NOT here — it needs the loader,
 /// which is async and file-backed — so a bare `draft` result is "would draft,
 /// pending the load check". [`draft_and_validate`] is the whole story.
 #[must_use]
-pub fn draft(
-    facts: &FactsDossier,
-    verified: &str,
-    provider_posture: Option<RetentionPosture>,
-) -> Decision {
+pub fn draft(facts: &FactsDossier, verified: &str, live: &CatalogFacts) -> Decision {
+    let provider_posture = live.provider_posture;
     // 1. Not proven invokable ⇒ refuse. A draft asserts "ready to serve".
     if let Some(reason) = refuse_if_not_invokable(facts) {
         return Decision::Refused { reason };
@@ -428,6 +578,14 @@ pub fn draft(
 
     // 6. Sanity FLAGS (warn, never refuse).
     let mut flags = price_sanity_flags(&facts.prices, input, output);
+    flags.extend(metadata_gap_flags(&facts.prices));
+    if let Some(flag) = dispatch_convention_flag(
+        &facts.candidate.provider,
+        &facts.candidate.model,
+        &live.provider_models,
+    ) {
+        flags.push(flag);
+    }
     flags.extend(resolution.flags.clone());
 
     let posture = resolution.posture;
@@ -441,6 +599,12 @@ pub fn draft(
         PinPlacement::ProviderScaffold(pin) => (None, Some(pin)),
     };
     let override_emitted = override_pin.is_some();
+    // How the EMITTED pin's digest was reached, warned about only when there is
+    // an emitted pin: a scaffold never reaches a human or a file, so its digest
+    // provenance is not a fact about anything.
+    if let Some(flag) = override_pin.as_ref().and_then(digest_flag) {
+        flags.push(flag);
+    }
     let stanza_toml = render_stanza(
         &facts.display_id,
         &facts.candidate,
@@ -733,33 +897,37 @@ fn build_standard_override(
     verified: &str,
 ) -> Option<PinFields> {
     if let Some(evidence) = standard_evidence.filter(|evidence| evidence.is_usable()) {
-        return Some(PinFields {
-            posture: RetentionPosture::Standard,
-            description: evidence.description.clone(),
-            source_url: evidence.source_url.clone(),
-            verified: verified.to_owned(),
-            source_sha256: evidence.source_sha256.clone(),
-        });
+        return Some(pin_from_standard_evidence(evidence, verified));
     }
     if let Some(basis) = basis.filter(|basis| basis.is_pin_usable()) {
         let kind_ok = !basis.kind.is_account_private() || basis.human_attested;
-        let description = if basis.posture == RetentionPosture::Zero {
-            override_description(basis, weight_open, kind_ok)
-        } else {
-            nonblank(
-                &basis.description,
-                "retention basis (see source); description not supplied in the dossier",
-            )
-        };
-        return Some(PinFields {
-            posture: RetentionPosture::Standard,
-            description,
-            source_url: basis.source_url.clone(),
-            verified: verified.to_owned(),
-            source_sha256: basis.source_sha256.clone(),
-        });
+        let mut pin = pin_from_basis(basis, RetentionPosture::Standard, verified);
+        if basis.posture == RetentionPosture::Zero {
+            pin.description = override_description(basis, weight_open, kind_ok);
+        }
+        return Some(pin);
     }
     None
+}
+
+/// The pin a usable [`StandardEvidence`] receipt builds, anchored exactly as a
+/// [`Basis`] would be — the two evidence objects differ in what they assert,
+/// never in how their digest is taken.
+fn pin_from_standard_evidence(evidence: &StandardEvidence, verified: &str) -> PinFields {
+    let anchored = anchor_digest(
+        &evidence.source_sha256,
+        &evidence.source_extract_anchors,
+        evidence.source_document.as_deref(),
+    );
+    PinFields {
+        posture: RetentionPosture::Standard,
+        description: evidence.description.clone(),
+        source_url: evidence.source_url.clone(),
+        verified: verified.to_owned(),
+        source_sha256: anchored.source_sha256,
+        source_extract_anchors: anchored.anchors,
+        digest_origin: anchored.origin,
+    }
 }
 
 /// The scaffold for a plain `standard` lane, plus whether the evidence was too
@@ -773,16 +941,7 @@ fn standard_scaffold_any(
     verified: &str,
 ) -> (PinFields, bool) {
     if let Some(evidence) = standard_evidence.filter(|evidence| evidence.is_usable()) {
-        return (
-            PinFields {
-                posture: RetentionPosture::Standard,
-                description: evidence.description.clone(),
-                source_url: evidence.source_url.clone(),
-                verified: verified.to_owned(),
-                source_sha256: evidence.source_sha256.clone(),
-            },
-            false,
-        );
+        return (pin_from_standard_evidence(evidence, verified), false);
     }
     if let Some(basis) = basis.filter(|basis| basis.is_pin_usable()) {
         return (
@@ -878,9 +1037,148 @@ struct PinFields {
     source_url: String,
     verified: String,
     source_sha256: String,
+    /// Emitted verbatim beside the digest when non-empty. The two are one
+    /// claim: an anchored digest with the anchors dropped, or anchors beside a
+    /// whole-page digest, are both a pin that verifies nothing.
+    source_extract_anchors: Vec<String>,
+    /// How `source_sha256` was arrived at — the fact the emitted-override
+    /// warning is derived from. Carried on the pin rather than returned
+    /// alongside it because the pin travels through three constructors and two
+    /// placements before anyone asks; a parallel return value would have to be
+    /// threaded through all of them and could be dropped at any hop.
+    digest_origin: DigestOrigin,
+}
+
+/// How a pin's `source_sha256` was arrived at.
+///
+/// The distinction the whole refinement turns on: a digest this module COMPUTED
+/// from a document it was given is verifiable, and a digest it merely COPIED
+/// from the dossier is a claim it cannot check. Both get emitted; only one of
+/// them gets emitted quietly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DigestOrigin {
+    /// Recomputed here as the anchored digest, from the evidence object's own
+    /// `source_document`, through [`crate::retention`]'s real functions.
+    Recomputed,
+    /// Anchors present, no `source_document` to recompute against. The
+    /// dossier's digest is emitted verbatim beside them and cannot be trusted
+    /// to be the anchored one.
+    NotRecomputed,
+    /// Anchors present and a document present, but the extractor could not take
+    /// them from it. Carries the extractor's own reason.
+    Unextractable(String),
+    /// No anchors: the dossier's whole-page digest, exactly as before.
+    WholePage,
+}
+
+/// The digest and anchors a pin will carry, and how they were reached.
+///
+/// The precedence is the whole safety argument, so it is stated once, here:
+///
+/// 1. **Anchors AND a document** → normalize, extract, hash. The emitted digest
+///    is then the same number [`crate::retention::check`] will compute on the
+///    next `retention-drift` run, because it is computed by the same functions
+///    over the same text.
+/// 2. **Anchors, no document** → emit the anchors and the dossier's digest
+///    UNCHANGED, and warn. Recomputing is impossible without the page, and the
+///    alternative — dropping the anchors to make the digest consistent — throws
+///    away the researcher's work and re-ships the whole-page hash that failed.
+/// 3. **Anchors and a document the anchors do not fit** → same as (2), with the
+///    extractor's reason. Emitting a mismatched pair is deliberate and it fails
+///    LOUD: the next drift run reports PAGE CHANGED on a pin nobody merged
+///    blind, which is the correct direction to be wrong in. Silently hashing
+///    whatever the broken extractor produced is the failure
+///    [`crate::retention::extract`] refuses to allow, and this refuses it too.
+/// 4. **No anchors** → today's behaviour, plus the churn warning. A document
+///    without anchors does NOT trigger a recompute: there is nothing to narrow,
+///    the researcher's digest is a whole-page digest already, and re-deriving
+///    it here would only assert that the page we were handed is the page they
+///    hashed — which is precisely what we cannot know.
+///
+/// In no branch is a digest invented. The dossier's number is either replaced
+/// by one computed from the dossier's own document, or passed through untouched.
+struct AnchoredDigest {
+    source_sha256: String,
+    anchors: Vec<String>,
+    origin: DigestOrigin,
+}
+
+fn anchor_digest(
+    supplied_sha256: &str,
+    anchors: &[String],
+    document: Option<&str>,
+) -> AnchoredDigest {
+    let supplied = supplied_sha256.to_owned();
+    if anchors.is_empty() {
+        return AnchoredDigest {
+            source_sha256: supplied,
+            anchors: Vec::new(),
+            origin: DigestOrigin::WholePage,
+        };
+    }
+    let anchors = anchors.to_vec();
+    let Some(document) = document else {
+        return AnchoredDigest {
+            source_sha256: supplied,
+            anchors,
+            origin: DigestOrigin::NotRecomputed,
+        };
+    };
+    match crate::retention::extract(&crate::retention::normalize(document), &anchors) {
+        Ok(evidence) => AnchoredDigest {
+            source_sha256: crate::retention::hash(&evidence),
+            anchors,
+            origin: DigestOrigin::Recomputed,
+        },
+        Err(reason) => AnchoredDigest {
+            source_sha256: supplied,
+            anchors,
+            origin: DigestOrigin::Unextractable(reason),
+        },
+    }
+}
+
+/// The warning an EMITTED pin's digest provenance earns, if any.
+///
+/// Only ever consulted for a pin that actually reaches the stanza. A scaffold
+/// pin is never seen by anyone and never merged, so warning about how its
+/// digest was reached would be noise about a value that does not exist.
+fn digest_flag(pin: &PinFields) -> Option<String> {
+    match &pin.digest_origin {
+        DigestOrigin::Recomputed => None,
+        DigestOrigin::NotRecomputed => Some(
+            "ANCHORED DIGEST NOT RECOMPUTED: the dossier supplied source_extract_anchors but no \
+             source_document to compute against, so source_sha256 is the dossier's own number \
+             emitted beside them — it may still be a WHOLE-PAGE digest, which would read PAGE \
+             CHANGED on the first check. Run `admin retention-drift` and re-pin the observed \
+             digest before merge."
+                .to_owned(),
+        ),
+        DigestOrigin::Unextractable(reason) => Some(format!(
+            "ANCHORED DIGEST NOT RECOMPUTED: the dossier supplied both anchors and a \
+             source_document, but the extract could not be taken from it — {reason}. The anchors \
+             and the dossier's own digest are emitted unchanged rather than a digest of whatever \
+             the failed extract produced; a fabricated digest would turn this check off \
+             permanently. Fix the anchors against the real page and re-pin before merge."
+        )),
+        DigestOrigin::WholePage => Some(
+            "WHOLE-PAGE HASH: this override pins source_sha256 over the entire normalized page \
+             and declares no source_extract_anchors, so any edit anywhere on it — a nav bar, an \
+             unrelated doc the vendor published — reads as PAGE CHANGED. The first drafted \
+             override shipped this way and went red in four days. Prefer anchors: supply \
+             source_extract_anchors (and a source_document to compute the digest from) in the \
+             dossier."
+                .to_owned(),
+        ),
+    }
 }
 
 fn pin_from_basis(basis: &Basis, posture: RetentionPosture, verified: &str) -> PinFields {
+    let anchored = anchor_digest(
+        &basis.source_sha256,
+        &basis.source_extract_anchors,
+        basis.source_document.as_deref(),
+    );
     PinFields {
         posture,
         // A zero basis is required to have provenance but not necessarily a
@@ -892,7 +1190,9 @@ fn pin_from_basis(basis: &Basis, posture: RetentionPosture, verified: &str) -> P
         ),
         source_url: basis.source_url.clone(),
         verified: verified.to_owned(),
-        source_sha256: basis.source_sha256.clone(),
+        source_sha256: anchored.source_sha256,
+        source_extract_anchors: anchored.anchors,
+        digest_origin: anchored.origin,
     }
 }
 
@@ -909,6 +1209,8 @@ fn placeholder_pin(posture: RetentionPosture, verified: &str) -> PinFields {
         source_url: "https://retention-scaffold.invalid/".to_owned(),
         verified: verified.to_owned(),
         source_sha256: "0".repeat(64),
+        source_extract_anchors: Vec::new(),
+        digest_origin: DigestOrigin::WholePage,
     }
 }
 
@@ -951,6 +1253,93 @@ fn context_bands(prices: &Prices) -> Vec<&ConditionalPrice> {
 /// `min_prompt_tokens`.
 fn ignored_conditional_count(prices: &Prices) -> usize {
     prices.conditional.len() - context_bands(prices).len()
+}
+
+// ---------------------------------------------------------------------------
+// Provider dispatch conventions — derived from the live file, never invented.
+// ---------------------------------------------------------------------------
+
+/// The namespace prefix a provider's EXISTING lanes all dispatch under, if it
+/// has one: the longest common prefix of their `model` strings, cut back to and
+/// including its last `/`.
+///
+/// The `vertex/gemini-3.8-flash` draft is why this exists. Every sibling vertex
+/// lane dispatches `google/<model>` — the vendor's own naming on Vertex's
+/// OpenAI-compatible surface — and the drafted stanza carried the bare
+/// `gemini-3.8-flash`. Every request on that lane would have 404'd upstream.
+/// A human caught it in review, which is what review is for, but the fact was
+/// sitting in the same file the drafter had already loaded.
+///
+/// Three deliberate narrownesses, each of which is what keeps this from firing
+/// on providers that simply have no convention:
+///
+/// - **Cut at the last `/`.** A convention is a NAMESPACE, not a family
+///   resemblance. Anthropic's lanes share `claude-`, OpenAI's share `gpt-5.6-`,
+///   xAI's share `grok-4.`, Google's share `gemini-3.` — every one of those is
+///   a model-naming coincidence, and warning "your model should start
+///   `claude-`" on a lane called `opus-5` would be noise that trains a reader
+///   to skip the flags. Only a prefix that ends in a path separator is a
+///   dispatch namespace: `google/`, `accounts/fireworks/models/`.
+/// - **At least two existing lanes.** One lane is an anecdote. Its whole model
+///   string is trivially the "common prefix" of the set, so a single
+///   `us.anthropic.claude-opus-4-8` would otherwise "prove" a convention.
+/// - **Shared by ALL of them.** A prefix two lanes out of five carry is a
+///   subgroup, not a rule for the provider.
+///
+/// Compared over `char`s rather than bytes: a byte-wise prefix can end inside a
+/// multi-byte codepoint, and slicing a `str` there panics. Model ids are ASCII
+/// today, which is exactly the kind of thing that is true until it is not.
+fn dispatch_convention(models: &[String]) -> Option<String> {
+    if models.len() < 2 {
+        return None;
+    }
+    let mut shared: Vec<char> = models.first()?.chars().collect();
+    for model in &models[1..] {
+        let common = shared
+            .iter()
+            .copied()
+            .zip(model.chars())
+            .take_while(|(mine, theirs)| mine == theirs)
+            .count();
+        shared.truncate(common);
+        if shared.is_empty() {
+            return None;
+        }
+    }
+    // Cut back to the last path separator, inclusive. `position` from the right
+    // over the char vector keeps this on character boundaries by construction.
+    let last_slash = shared.iter().rposition(|&c| c == '/')?;
+    Some(shared[..=last_slash].iter().collect())
+}
+
+/// Warn when the drafted `model` does not carry its provider's dispatch
+/// convention.
+///
+/// **WARN, never rewrite.** The drafter could trivially prepend the prefix, and
+/// it must not: the model id is what the request is dispatched on, a researcher
+/// verified some exact string against the vendor, and a drafter that invents
+/// `google/gemini-3.8-flash` has produced an id nobody checked — which is the
+/// same class of act as inventing a price. The suggestion is spelled out so the
+/// human's fix is a copy-paste, and the human is the one who makes it.
+fn dispatch_convention_flag(
+    provider: &str,
+    model: &str,
+    provider_models: &[String],
+) -> Option<String> {
+    let convention = dispatch_convention(provider_models)?;
+    if model.starts_with(&convention) {
+        return None;
+    }
+    Some(format!(
+        "DISPATCH CONVENTION: every one of provider `{provider}`'s {count} existing lanes \
+         dispatches under `{convention}` (e.g. `{example}`), and the drafted model `{model}` does \
+         not — as drafted this lane would very likely 404 upstream, which is exactly how the first \
+         vertex draft read before review. Suggested: `{convention}{model}`. NOT rewritten: the \
+         drafter must never emit a model id the researcher did not verify against the vendor, so \
+         confirm the real id and edit it by hand.",
+        count = provider_models.len(),
+        example = provider_models.first().map_or("", String::as_str),
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -1037,11 +1426,15 @@ fn render_stanza(
     let _ = writeln!(out, "provider = {}", toml_basic_string(&candidate.provider));
     let _ = writeln!(out, "model = {}", toml_basic_string(&candidate.model));
 
-    // Candidate metadata: only context_window is known from the dossier.
-    if let Some(window) = prices.context_window {
+    // Candidate metadata. Every field is optional and an ABSENT field is
+    // omitted rather than defaulted — `ModelMetadata`'s contract is that a
+    // missing key means "nobody has described this", which is a true statement,
+    // while a plausible-looking default would be a false one. The whole table
+    // is skipped when the dossier knows nothing, exactly as before.
+    let metadata = render_metadata_block(&format!("tiers.{key}.candidates.metadata"), prices);
+    if !metadata.is_empty() {
         out.push('\n');
-        let _ = writeln!(out, "[tiers.{key}.candidates.metadata]");
-        let _ = writeln!(out, "context_window = {window}");
+        out.push_str(&metadata);
     }
 
     // Candidate cost basis mirrors the tier sell schedule (basis == sell).
@@ -1062,6 +1455,68 @@ fn render_stanza(
     }
 
     out
+}
+
+/// Render the candidate `metadata` table, or the empty string when the dossier
+/// describes nothing at all.
+///
+/// Key order matches [`crate::config::ModelMetadata`]'s own declaration order,
+/// which is also the order every hand-written lane in `config/tiers.toml` uses:
+/// window, max output, modalities, tool calling.
+fn render_metadata_block(header: &str, prices: &Prices) -> String {
+    let mut body = String::new();
+    if let Some(window) = prices.context_window {
+        let _ = writeln!(body, "context_window = {window}");
+    }
+    if let Some(max_output) = prices.max_output_tokens {
+        let _ = writeln!(body, "max_output_tokens = {max_output}");
+    }
+    if let Some(modalities) = &prices.input_modalities {
+        let rendered: Vec<String> = modalities.iter().map(|m| toml_basic_string(m)).collect();
+        let _ = writeln!(body, "input_modalities = [{}]", rendered.join(", "));
+    }
+    if let Some(tool_call) = prices.tool_call {
+        let _ = writeln!(body, "tool_call = {tool_call}");
+    }
+    if body.is_empty() {
+        return body;
+    }
+    format!("[{header}]\n{body}")
+}
+
+/// Flag each metadata field the dossier did not research, by name.
+///
+/// The shipped catalog's own listing tests (`router/tests/http.rs`) require a
+/// max output, an input-modality list, and tool calling of every lane, so a
+/// draft missing any of them is a PR that fails CI — which is what happened to
+/// both of the first two live drafts, and both were completed by hand. Naming
+/// the specific missing field turns that from a CI surprise into a line in the
+/// draft dossier the researcher can act on.
+///
+/// Never a refusal, and never a default. Unlike a price, absent metadata makes
+/// no false claim — it is the state every lane written before the metadata
+/// table existed is still in.
+fn metadata_gap_flags(prices: &Prices) -> Vec<String> {
+    let mut flags = Vec::new();
+    let mut missing = Vec::new();
+    if prices.max_output_tokens.is_none() {
+        missing.push("max_output_tokens");
+    }
+    if prices.input_modalities.is_none() {
+        missing.push("input_modalities");
+    }
+    if prices.tool_call.is_none() {
+        missing.push("tool_call");
+    }
+    for field in missing {
+        flags.push(format!(
+            "METADATA INCOMPLETE: {field} absent — the drafted lane declares none, and the \
+             shipped-catalog completeness tests in router/tests/http.rs will fail until it is \
+             researched. Nothing is defaulted here: an invented value is a claim to a client \
+             about what this model can do."
+        ));
+    }
+    flags
 }
 
 /// Render one `rates` table (and its conditional bands) under `base_header`,
@@ -1116,6 +1571,19 @@ fn render_pin_body(pin: &PinFields) -> String {
         "source_sha256 = {}",
         toml_basic_string(&pin.source_sha256)
     );
+    // Anchors go immediately after the digest they narrow, matching how
+    // `[retention.vertex]` and `[retention.openai]` are written by hand — the
+    // digest and the region it was taken over read as one claim, because they
+    // are one. An empty list is omitted entirely rather than emitted as `[]`:
+    // absent means "the whole page", which is what the loader already reads a
+    // missing key as, and `[]` would be a second spelling of the same thing.
+    if !pin.source_extract_anchors.is_empty() {
+        out.push_str("source_extract_anchors = [\n");
+        for anchor in &pin.source_extract_anchors {
+            let _ = writeln!(out, "  {},", toml_basic_string(anchor));
+        }
+        out.push_str("]\n");
+    }
     out
 }
 
@@ -1168,6 +1636,29 @@ fn quote_or_none(value: &str) -> String {
     } else {
         format!("\"{value}\"")
     }
+}
+
+/// One line describing an evidence object's anchors AND whether a document came
+/// with them, because the pair is what decides whether the emitted digest was
+/// computed or copied — and a reader of the draft should not have to infer that
+/// from the flags.
+fn describe_anchors(anchors: &[String], document: Option<&str>) -> String {
+    if anchors.is_empty() {
+        return "(none supplied — the digest covers the WHOLE page)".to_owned();
+    }
+    let listed = anchors
+        .iter()
+        .map(|anchor| format!("{anchor:?}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let document = match document {
+        Some(_) => {
+            "source_document supplied — the digest beside them was recomputed here, or the \
+                    failure to recompute it is flagged below"
+        }
+        None => "no source_document — the digest beside them was NOT recomputed",
+    };
+    format!("[{listed}] ({document})")
 }
 
 // ---------------------------------------------------------------------------
@@ -1233,6 +1724,14 @@ fn render_dossier(
                 "  - source_extract: {}",
                 quote_or_none(&basis.source_extract)
             );
+            let _ = writeln!(
+                out,
+                "  - source_extract_anchors: {}",
+                describe_anchors(
+                    &basis.source_extract_anchors,
+                    basis.source_document.as_deref()
+                )
+            );
         }
     }
     match &facts.standard_evidence {
@@ -1259,6 +1758,14 @@ fn render_dossier(
                 "  - source_extract: {}",
                 quote_or_none(&evidence.source_extract)
             );
+            let _ = writeln!(
+                out,
+                "  - source_extract_anchors: {}",
+                describe_anchors(
+                    &evidence.source_extract_anchors,
+                    evidence.source_document.as_deref()
+                )
+            );
         }
     }
     out.push('\n');
@@ -1277,6 +1784,24 @@ fn render_dossier(
             let _ = writeln!(out, "- context_window = {window}");
         }
         None => out.push_str("- context_window = (absent)\n"),
+    }
+    match facts.prices.max_output_tokens {
+        Some(max_output) => {
+            let _ = writeln!(out, "- max_output_tokens = {max_output}");
+        }
+        None => out.push_str("- max_output_tokens = (absent)\n"),
+    }
+    match &facts.prices.input_modalities {
+        Some(modalities) => {
+            let _ = writeln!(out, "- input_modalities = {modalities:?}");
+        }
+        None => out.push_str("- input_modalities = (absent)\n"),
+    }
+    match facts.prices.tool_call {
+        Some(tool_call) => {
+            let _ = writeln!(out, "- tool_call = {tool_call}");
+        }
+        None => out.push_str("- tool_call = (absent)\n"),
     }
     for band in context_bands(&facts.prices) {
         let min = band.min_prompt_tokens.unwrap_or_default();
@@ -1460,11 +1985,12 @@ pub struct OutcomeJson {
     pub flags: Vec<String>,
 }
 
-/// Draft, then prove the draft loads. `provider_posture` is the candidate
-/// provider's live `[retention.<provider>]` posture (see [`draft`]). `Ok(Outcome)`
-/// covers both a draft and a refusal (including a load-validation refusal and the
-/// FIX-3 false-zero refusal); `Err` is reserved for an environment failure
-/// writing the temp fragment, which is not the dossier's fault.
+/// Draft, then prove the draft loads. `live` is what the operator's own
+/// `tiers.toml` already says about the candidate's provider (see [`draft`]).
+/// `Ok(Outcome)` covers both a draft and a refusal (including a load-validation
+/// refusal and the FIX-3 false-zero refusal); `Err` is reserved for an
+/// environment failure writing the temp fragment, which is not the dossier's
+/// fault.
 ///
 /// # Errors
 ///
@@ -1473,9 +1999,9 @@ pub struct OutcomeJson {
 pub async fn draft_and_validate(
     facts: &FactsDossier,
     verified: &str,
-    provider_posture: Option<RetentionPosture>,
+    live: &CatalogFacts,
 ) -> Result<Outcome, std::io::Error> {
-    let draft = match draft(facts, verified, provider_posture) {
+    let draft = match draft(facts, verified, live) {
         Decision::Refused { reason } => {
             return Ok(Outcome::refused(&facts.display_id, reason, Vec::new()));
         }
@@ -1597,6 +2123,13 @@ mod tests {
                 cached_input_per_mtok: Some(0.5),
                 cache_write_per_mtok: Some(6.25),
                 context_window: Some(200_000),
+                // The refinement-2 metadata fields are deliberately ABSENT in
+                // the baseline: it is the OLD dossier shape, and every
+                // pre-existing test's expectations are expectations about that
+                // shape. Tests that care set them explicitly.
+                max_output_tokens: None,
+                input_modalities: None,
+                tool_call: None,
                 conditional: Vec::new(),
                 source_url: "https://www.anthropic.com/pricing".to_owned(),
                 source_sha256: "a".repeat(64),
@@ -1613,6 +2146,8 @@ mod tests {
                     source_url: "https://privacy.claude.com/".to_owned(),
                     source_sha256: "b".repeat(64),
                     source_extract: "deletes API inputs and outputs within 30 days".to_owned(),
+                    source_extract_anchors: Vec::new(),
+                    source_document: None,
                 }),
             },
             standard_evidence: None,
@@ -1640,36 +2175,39 @@ mod tests {
         }
     }
 
+    /// The default live-catalog view a test sees: the provider's real pin and
+    /// NO existing lanes, so the dispatch-convention check is silent unless a
+    /// test deliberately supplies siblings. Keeping the default empty is what
+    /// makes every pre-existing test's expectations still mean what they meant.
+    fn test_live(facts: &FactsDossier) -> CatalogFacts {
+        CatalogFacts {
+            provider_posture: test_provider_pin(&facts.candidate.provider),
+            provider_models: Vec::new(),
+        }
+    }
+
     fn drafted(facts: &FactsDossier) -> Draft {
-        match draft(
-            facts,
-            VERIFIED,
-            test_provider_pin(&facts.candidate.provider),
-        ) {
+        drafted_with(facts, &test_live(facts))
+    }
+
+    fn drafted_with(facts: &FactsDossier, live: &CatalogFacts) -> Draft {
+        match draft(facts, VERIFIED, live) {
             Decision::Drafted(draft) => *draft,
             Decision::Refused { reason } => panic!("expected a draft, got refusal: {reason}"),
         }
     }
 
     fn refusal(facts: &FactsDossier) -> String {
-        match draft(
-            facts,
-            VERIFIED,
-            test_provider_pin(&facts.candidate.provider),
-        ) {
+        match draft(facts, VERIFIED, &test_live(facts)) {
             Decision::Refused { reason } => reason,
             Decision::Drafted(_) => panic!("expected a refusal, got a draft"),
         }
     }
 
     async fn validate(facts: &FactsDossier) -> Outcome {
-        draft_and_validate(
-            facts,
-            VERIFIED,
-            test_provider_pin(&facts.candidate.provider),
-        )
-        .await
-        .expect("no io error")
+        draft_and_validate(facts, VERIFIED, &test_live(facts))
+            .await
+            .expect("no io error")
     }
 
     /// A usable standard retention receipt for FIX-2 / FIX-3 tests.
@@ -1680,6 +2218,9 @@ mod tests {
             source_url: "https://example.com/data-retention".to_owned(),
             source_sha256: "d".repeat(64),
             source_extract: "we retain inputs and outputs for up to 30 days".to_owned(),
+            // Old-shape by default, for the same reason `baseline` is.
+            source_extract_anchors: Vec::new(),
+            source_document: None,
         }
     }
 
@@ -1690,7 +2231,7 @@ mod tests {
         // MUTATION: if `is_proven` returned true for non-`true` values, the
         // `false`/`unknown` tests below would stop refusing.
         assert!(matches!(
-            draft(&baseline(), VERIFIED, test_provider_pin("anthropic")),
+            draft(&baseline(), VERIFIED, &test_live(&baseline())),
             Decision::Drafted(_)
         ));
     }
@@ -1775,6 +2316,8 @@ mod tests {
                 .to_owned(),
             source_sha256: "c".repeat(64),
             source_extract: "prompt and generation data exist only in volatile memory".to_owned(),
+            source_extract_anchors: Vec::new(),
+            source_document: None,
         });
         facts
     }
@@ -2053,6 +2596,8 @@ mod tests {
             source_url: "https://cloud.google.com/vertex-ai/zdr".to_owned(),
             source_sha256: "e".repeat(64),
             source_extract: "no request or response data is retained".to_owned(),
+            source_extract_anchors: Vec::new(),
+            source_document: None,
         });
         let outcome = validate(&facts).await;
         assert_eq!(
@@ -2374,6 +2919,913 @@ mod tests {
             "standard_evidence is the receipt"
         );
         assert!(outcome.flags.iter().any(|f| f.contains("IGNORED")));
+    }
+
+    // ---- BACKWARD COMPATIBILITY: the pre-refinement emitted bytes ----------
+    //
+    // These two goldens were captured from the drafter BEFORE the anchors /
+    // metadata / dispatch-convention refinements landed, and they are the
+    // tripwire for the one promise those refinements make about old input: a
+    // dossier carrying none of the new fields must still emit the SAME BYTES.
+    // The flag list is deliberately not pinned here — new flags are the point
+    // of the refinements, and a flag changes no lane. The stanza is what gets
+    // pasted into `tiers.toml`, so the stanza is what must not move.
+
+    /// The exact stanza the pre-refinement drafter emitted for [`baseline`] — a
+    /// plain `standard` anthropic lane with no retention override.
+    const GOLDEN_BASELINE_STANZA: &str = r#"[tiers."anthropic/claude-opus-4-8"]
+
+[tiers."anthropic/claude-opus-4-8".rates]
+input_per_mtok = 5.00
+cached_input_per_mtok = 0.50
+cache_write_per_mtok = 6.25
+output_per_mtok = 25.00
+
+[[tiers."anthropic/claude-opus-4-8".candidates]]
+id = "anthropic/claude-opus-4-8"
+provider = "anthropic"
+model = "claude-opus-4-8"
+
+[tiers."anthropic/claude-opus-4-8".candidates.metadata]
+context_window = 200000
+
+[tiers."anthropic/claude-opus-4-8".candidates.rates]
+input_per_mtok = 5.00
+cached_input_per_mtok = 0.50
+cache_write_per_mtok = 6.25
+output_per_mtok = 25.00
+"#;
+
+    /// The exact stanza the pre-refinement drafter emitted for the gemini
+    /// fixture WITH a standard receipt — the shape that carries an explicit
+    /// `[tiers."<id>".retention]` override, whole-page-hashed and anchorless.
+    const GOLDEN_GEMINI_OVERRIDE_STANZA: &str = r#"[tiers."vertex/gemini-3.8-flash"]
+
+[tiers."vertex/gemini-3.8-flash".rates]
+input_per_mtok = 5.00
+cached_input_per_mtok = 0.50
+output_per_mtok = 25.00
+
+[[tiers."vertex/gemini-3.8-flash".candidates]]
+id = "vertex/gemini-3.8-flash"
+provider = "vertex"
+model = "gemini-3.8-flash"
+
+[tiers."vertex/gemini-3.8-flash".candidates.metadata]
+context_window = 200000
+
+[tiers."vertex/gemini-3.8-flash".candidates.rates]
+input_per_mtok = 5.00
+cached_input_per_mtok = 0.50
+output_per_mtok = 25.00
+
+[tiers."vertex/gemini-3.8-flash".retention]
+posture = "standard"
+description = "Provider retains API inputs and outputs up to 30 days; not zero."
+source_url = "https://example.com/data-retention"
+verified = "2026-09-04"
+source_sha256 = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+"#;
+
+    #[test]
+    fn an_old_shaped_dossier_emits_the_pre_refinement_bytes() {
+        let draft = drafted(&baseline());
+        assert_eq!(draft.stanza_toml, GOLDEN_BASELINE_STANZA);
+        assert_eq!(draft.posture, RetentionPosture::Standard);
+        assert!(!draft.override_emitted);
+    }
+
+    #[test]
+    fn an_old_shaped_override_dossier_emits_the_pre_refinement_bytes() {
+        let mut facts = gemini_basis_null();
+        facts.standard_evidence = Some(standard_evidence());
+        let draft = drafted(&facts);
+        assert_eq!(draft.stanza_toml, GOLDEN_GEMINI_OVERRIDE_STANZA);
+        assert_eq!(draft.posture, RetentionPosture::Standard);
+        assert!(draft.override_emitted);
+    }
+
+    // ---- REFINEMENT 1: anchored extracts, never a bare whole-page hash -----
+
+    /// A policy page in the shape that caused the problem: real evidence
+    /// sentences buried under navigation the vendor redeploys constantly, plus
+    /// a `<script>` carrying a build id. The three anchors mirror the ones
+    /// `[retention.vertex]` pins on the real page.
+    fn policy_page(nav: &str) -> String {
+        format!(
+            "<html><head><style>.a{{color:red}}</style>\
+             <script>var build=\"{nav}-99172\";</script></head>\
+             <body><nav>{nav}</nav>\
+             <h1>Customer data retention</h1>\
+             <p>Request-response logging is disabled by default.</p>\
+             <p>Google does not use your data to train or fine-tune any AI/ML models.</p>\
+             <p>In-memory data caching has a 24-hour TTL and is disabled per project.</p>\
+             <footer>Copyright 2026</footer></body></html>"
+        )
+    }
+
+    fn policy_anchors() -> Vec<String> {
+        vec![
+            "use your data to train or fine-tune any AI/ML models".to_owned(),
+            "Request-response logging".to_owned(),
+            "In-memory data caching".to_owned(),
+        ]
+    }
+
+    /// The gemini/vertex override shape — the only shape that emits a
+    /// `[tiers."<id>".retention]` block — with the receipt's anchors and
+    /// document under the test's control.
+    fn anchored_override_facts(anchors: Vec<String>, document: Option<String>) -> FactsDossier {
+        let mut facts = gemini_basis_null();
+        let mut evidence = standard_evidence();
+        evidence.source_extract_anchors = anchors;
+        evidence.source_document = document;
+        facts.standard_evidence = Some(evidence);
+        facts
+    }
+
+    /// Rebuild a `RetentionPin` from what the drafter EMITTED, so the assertion
+    /// runs through the very code `admin retention-drift` runs.
+    fn pin_from_emitted(stanza: &str, anchors: &[String]) -> crate::config::RetentionPin {
+        let digest = stanza
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("source_sha256 = "))
+            .expect("the emitted override states a digest")
+            .trim_matches('"')
+            .to_owned();
+        crate::config::RetentionPin {
+            posture: RetentionPosture::Standard,
+            description: "emitted".to_owned(),
+            source_url: "https://example.com/data-retention".to_owned(),
+            verified: VERIFIED.to_owned(),
+            source_sha256: digest,
+            source_extract_anchors: anchors.to_vec(),
+            openrouter_slug: None,
+        }
+    }
+
+    #[test]
+    fn an_anchored_override_recomputes_the_digest_through_the_real_retention_functions() {
+        // MUTATION: make `anchor_digest` pass the dossier's digest through in
+        // the Recomputed branch instead of hashing the extract, and this fails
+        // — the emitted number stops being the one `retention::check` computes.
+        let document = policy_page("Docs Home Pricing Support");
+        let anchors = policy_anchors();
+        let facts = anchored_override_facts(anchors.clone(), Some(document.clone()));
+        let draft = drafted(&facts);
+        assert!(draft.override_emitted, "this fixture emits an override");
+
+        // The emitted digest is EXACTLY the anchored evidence digest, composed
+        // the way `retention::evidence` composes it.
+        let pin = pin_from_emitted(&draft.stanza_toml, &anchors);
+        let expected = crate::retention::hash(
+            &crate::retention::evidence(&pin, &document).expect("the anchors are extractable"),
+        );
+        assert!(
+            draft
+                .stanza_toml
+                .contains(&format!("source_sha256 = \"{expected}\"")),
+            "emitted stanza must carry the recomputed anchored digest {expected}:\n{}",
+            draft.stanza_toml
+        );
+        // It is NOT the dossier's own number, and not the whole-page digest.
+        assert!(!draft.stanza_toml.contains(&"d".repeat(64)));
+        assert_ne!(expected, crate::retention::digest(&document));
+
+        // And the anchors travel with it — a digest without them verifies
+        // nothing, because the checker would hash the whole page instead.
+        for anchor in &anchors {
+            assert!(
+                draft.stanza_toml.contains(anchor),
+                "anchor {anchor:?} must be emitted beside the digest"
+            );
+        }
+        assert!(draft.stanza_toml.contains("source_extract_anchors = ["));
+        // No warning: this is the good path.
+        assert!(
+            !draft.flags.iter().any(|f| f.contains("ANCHORED DIGEST")),
+            "a recomputed digest earns no warning: {:?}",
+            draft.flags
+        );
+        assert!(!draft.flags.iter().any(|f| f.contains("WHOLE-PAGE HASH")));
+    }
+
+    #[test]
+    fn the_drafted_pin_reads_unchanged_against_its_own_source_document() {
+        // The end-to-end claim, asserted with the real drift checker rather
+        // than by comparing strings: a pin this drafter emits is GREEN on the
+        // page it was drafted from. The first live draft was not.
+        let document = policy_page("Docs Home Pricing Support");
+        let anchors = policy_anchors();
+        let draft = drafted(&anchored_override_facts(
+            anchors.clone(),
+            Some(document.clone()),
+        ));
+        let pin = pin_from_emitted(&draft.stanza_toml, &anchors);
+        let check = crate::retention::check("vertex/gemini-3.8-flash", &pin, &document);
+        assert_eq!(
+            check.verdict,
+            crate::retention::Verdict::Unchanged,
+            "error: {:?}",
+            check.error
+        );
+    }
+
+    #[test]
+    fn the_anchored_digest_survives_the_navigation_churn_that_broke_the_first_draft() {
+        // The whole reason refinement 1 exists. Two fetches of the same policy
+        // page whose ONLY difference is the navigation and the build id — the
+        // shape of the deploy that turned the first drafted pin red in four
+        // days. The anchored digest must not move.
+        let anchors = policy_anchors();
+        let before = policy_page("Docs Home Pricing Support");
+        let after = policy_page("Docs Home Pricing Support Changelog Blog Status");
+        let first = drafted(&anchored_override_facts(
+            anchors.clone(),
+            Some(before.clone()),
+        ));
+        let second = drafted(&anchored_override_facts(anchors, Some(after.clone())));
+        assert_eq!(
+            first.stanza_toml, second.stanza_toml,
+            "navigation churn must not move an anchored digest"
+        );
+        // Equality alone would also hold if the drafter had emitted the
+        // dossier's number twice and computed nothing, so pin what the digest
+        // actually IS: recomputed, and neither of the whole-page digests.
+        let whole_before = crate::retention::digest(&before);
+        let whole_after = crate::retention::digest(&after);
+        assert_ne!(
+            whole_before, whole_after,
+            "the control: a whole-page digest DOES move on this churn, which is \
+             the failure being avoided"
+        );
+        for rejected in [&"d".repeat(64), &whole_before, &whole_after] {
+            assert!(
+                !first
+                    .stanza_toml
+                    .contains(&format!("source_sha256 = \"{rejected}\"")),
+                "the emitted digest must be the anchored one, not {rejected}"
+            );
+        }
+    }
+
+    #[test]
+    fn anchors_without_a_source_document_emit_the_supplied_digest_and_warn() {
+        // Precedence case 2. There is no page to compute against, so the
+        // dossier's number is passed through UNTOUCHED beside the anchors, and
+        // the mismatch risk is named.
+        let anchors = policy_anchors();
+        let draft = drafted(&anchored_override_facts(anchors.clone(), None));
+        assert!(draft.override_emitted);
+        assert!(
+            draft
+                .stanza_toml
+                .contains(&format!("source_sha256 = \"{}\"", "d".repeat(64))),
+            "the dossier's own digest is emitted verbatim, never replaced"
+        );
+        for anchor in &anchors {
+            assert!(draft.stanza_toml.contains(anchor));
+        }
+        let flag = draft
+            .flags
+            .iter()
+            .find(|f| f.contains("ANCHORED DIGEST NOT RECOMPUTED"))
+            .expect("an un-recomputed anchored digest must warn");
+        assert!(flag.contains("retention-drift"), "names the way to fix it");
+    }
+
+    #[test]
+    fn anchors_the_document_does_not_fit_never_fabricate_a_digest() {
+        // Precedence case 3, and the fail-safe that matters most: the extractor
+        // could not find the anchor, so there is NOTHING honest to hash. The
+        // dossier's digest is emitted unchanged and the extractor's own reason
+        // is surfaced. A digest of the failed extract would silently pin the
+        // check to nothing forever.
+        let document = policy_page("Docs Home");
+        let anchors = vec!["a sentence this page does not contain".to_owned()];
+        let draft = drafted(&anchored_override_facts(anchors, Some(document)));
+        assert!(
+            draft
+                .stanza_toml
+                .contains(&format!("source_sha256 = \"{}\"", "d".repeat(64))),
+            "no fabricated digest — the dossier's number is passed through"
+        );
+        let flag = draft
+            .flags
+            .iter()
+            .find(|f| f.contains("ANCHORED DIGEST NOT RECOMPUTED"))
+            .expect("an unextractable anchor must warn");
+        assert!(
+            flag.contains("no longer appears on the page"),
+            "carries the extractor's own reason: {flag}"
+        );
+    }
+
+    #[test]
+    fn an_ambiguous_anchor_is_reported_rather_than_hashed_around() {
+        // The extractor's other refusal: an anchor that matches twice no longer
+        // identifies one region. Same fail-safe, same passthrough.
+        let document = policy_page("Request-response logging");
+        let anchors = vec!["Request-response logging".to_owned()];
+        let draft = drafted(&anchored_override_facts(anchors, Some(document)));
+        assert!(
+            draft
+                .stanza_toml
+                .contains(&format!("source_sha256 = \"{}\"", "d".repeat(64)))
+        );
+        assert!(
+            draft
+                .flags
+                .iter()
+                .any(|f| f.contains("no longer identifies one region")),
+            "flags: {:?}",
+            draft.flags
+        );
+    }
+
+    #[test]
+    fn an_override_with_no_anchors_flags_the_whole_page_hash() {
+        // Precedence case 4: today's behaviour, now visible. The bytes are the
+        // pre-refinement bytes (pinned by the golden above); what is new is
+        // that the reader is told what they are signing up for.
+        let mut facts = gemini_basis_null();
+        facts.standard_evidence = Some(standard_evidence());
+        let draft = drafted(&facts);
+        assert!(draft.override_emitted);
+        assert!(!draft.stanza_toml.contains("source_extract_anchors"));
+        let flag = draft
+            .flags
+            .iter()
+            .find(|f| f.contains("WHOLE-PAGE HASH"))
+            .expect("an anchorless override must flag the churn it invites");
+        assert!(flag.contains("source_extract_anchors"), "names the fix");
+    }
+
+    #[test]
+    fn a_document_without_anchors_does_not_trigger_a_recompute() {
+        // There is nothing to narrow, and re-deriving the whole-page digest here
+        // would assert only that the page we were handed is the page the
+        // researcher hashed — which is exactly what cannot be known. So the
+        // dossier's digest stands, and the churn warning still fires.
+        let mut facts = gemini_basis_null();
+        let mut evidence = standard_evidence();
+        evidence.source_document = Some(policy_page("Docs Home"));
+        facts.standard_evidence = Some(evidence);
+        let draft = drafted(&facts);
+        assert!(
+            draft
+                .stanza_toml
+                .contains(&format!("source_sha256 = \"{}\"", "d".repeat(64)))
+        );
+        assert!(draft.flags.iter().any(|f| f.contains("WHOLE-PAGE HASH")));
+    }
+
+    #[test]
+    fn a_lane_with_no_emitted_override_earns_no_digest_flag() {
+        // A scaffold pin is never shown and never merged, so warning about how
+        // its digest was reached would be noise about a value that does not
+        // exist. The plain anthropic lane emits no override.
+        let draft = drafted(&baseline());
+        assert!(!draft.override_emitted);
+        assert!(
+            !draft
+                .flags
+                .iter()
+                .any(|f| f.contains("WHOLE-PAGE HASH") || f.contains("ANCHORED DIGEST")),
+            "flags: {:?}",
+            draft.flags
+        );
+    }
+
+    #[test]
+    fn a_zero_basis_override_is_anchored_the_same_way() {
+        // Anchoring is a property of an EVIDENCE OBJECT, not of the standard
+        // path: a `zero` override built from a basis gets the identical
+        // treatment. (A zero lane on a non-zero provider emits the override.)
+        let document = policy_page("Docs Home");
+        let anchors = policy_anchors();
+        let mut facts = zero_published_default_open();
+        facts.candidate.provider = "google".to_owned(); // live pin: standard
+        facts.display_id = "google/qwen3.7-plus".to_owned();
+        let basis = facts.retention.basis.as_mut().unwrap();
+        basis.source_extract_anchors = anchors.clone();
+        basis.source_document = Some(document.clone());
+        let draft = drafted(&facts);
+        assert_eq!(draft.posture, RetentionPosture::Zero);
+        assert!(draft.override_emitted);
+        let pin = crate::config::RetentionPin {
+            posture: RetentionPosture::Zero,
+            description: "emitted".to_owned(),
+            source_url: basis_url(&facts),
+            verified: VERIFIED.to_owned(),
+            source_sha256: String::new(),
+            source_extract_anchors: anchors,
+            openrouter_slug: None,
+        };
+        let expected = crate::retention::hash(
+            &crate::retention::evidence(&pin, &document).expect("extractable"),
+        );
+        assert!(
+            draft
+                .stanza_toml
+                .contains(&format!("source_sha256 = \"{expected}\"")),
+            "stanza:\n{}",
+            draft.stanza_toml
+        );
+    }
+
+    fn basis_url(facts: &FactsDossier) -> String {
+        facts
+            .retention
+            .basis
+            .as_ref()
+            .expect("fixture has a basis")
+            .source_url
+            .clone()
+    }
+
+    #[tokio::test]
+    async fn an_anchored_override_loads_through_the_real_loader() {
+        // Invariant 5 still holds over the new field: the emitted anchors must
+        // survive `load_tier_catalog`, which refuses a blank one.
+        let facts = anchored_override_facts(policy_anchors(), Some(policy_page("Docs Home")));
+        let outcome = validate(&facts).await;
+        assert_eq!(
+            outcome.status,
+            Status::Draft,
+            "reason: {:?}",
+            outcome.refuse_reason
+        );
+        assert!(
+            outcome
+                .stanza_toml
+                .unwrap()
+                .contains("source_extract_anchors = [")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_blank_anchor_is_refused_by_the_loader_rather_than_filtered_here() {
+        // The drafter does not second-guess the loader. A blank anchor would
+        // match everywhere, and `config.rs` refuses it by name; routing around
+        // that here would be a second definition of "an anchor that points
+        // nowhere", free to drift from the one that matters.
+        let facts = anchored_override_facts(vec!["   ".to_owned()], None);
+        let outcome = validate(&facts).await;
+        assert_eq!(outcome.status, Status::Refused);
+        assert!(
+            outcome
+                .refuse_reason
+                .unwrap()
+                .contains("source_extract_anchors")
+        );
+    }
+
+    #[test]
+    fn anchored_dossiers_parse_from_the_researcher_wire_shape() {
+        // The wire contract for the two new evidence fields, exercised through
+        // serde rather than through Rust struct literals.
+        let json = r#"{
+          "candidate": { "category": "version-bump", "provider": "vertex",
+            "model": "google/gemini-3.8-flash", "note": "" },
+          "display_id": "vertex/gemini-3.8-flash",
+          "prices": {
+            "input_per_mtok": 0.75, "output_per_mtok": 3.75,
+            "context_window": 1048576,
+            "source_url": "https://cloud.google.com/pricing",
+            "source_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "source_extract": "Gemini 3.8 Flash $0.75 / $3.75"
+          },
+          "retention": { "weight_open": false, "basis": null },
+          "standard_evidence": {
+            "description": "Retention is limited-period by default, not zero.",
+            "source_url": "https://docs.cloud.google.com/zdr",
+            "source_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "source_extract": "Request-response logging is disabled by default.",
+            "source_extract_anchors": ["Request-response logging"],
+            "source_document": "<p>Request-response logging is disabled by default.</p>"
+          },
+          "invokable": true
+        }"#;
+        let facts: FactsDossier = serde_json::from_str(json).expect("anchored shape parses");
+        let evidence = facts.standard_evidence.as_ref().expect("receipt present");
+        assert_eq!(
+            evidence.source_extract_anchors,
+            vec!["Request-response logging".to_owned()]
+        );
+        assert!(evidence.source_document.is_some());
+        let draft = drafted(&facts);
+        assert!(draft.stanza_toml.contains("source_extract_anchors = ["));
+        assert!(
+            !draft.stanza_toml.contains(&"b".repeat(64)),
+            "the digest was recomputed, so the dossier's number is gone"
+        );
+    }
+
+    // ---- REFINEMENT 2: metadata completeness -------------------------------
+
+    #[test]
+    fn metadata_fields_are_emitted_when_the_dossier_carries_them() {
+        let mut facts = baseline();
+        facts.prices.max_output_tokens = Some(128_000);
+        facts.prices.input_modalities = Some(vec!["text".to_owned(), "image".to_owned()]);
+        facts.prices.tool_call = Some(true);
+        let draft = drafted(&facts);
+        assert!(draft.stanza_toml.contains("context_window = 200000"));
+        assert!(draft.stanza_toml.contains("max_output_tokens = 128000"));
+        assert!(
+            draft
+                .stanza_toml
+                .contains("input_modalities = [\"text\", \"image\"]")
+        );
+        assert!(draft.stanza_toml.contains("tool_call = true"));
+        assert!(
+            !draft
+                .flags
+                .iter()
+                .any(|f| f.contains("METADATA INCOMPLETE")),
+            "a complete dossier earns no gap flag: {:?}",
+            draft.flags
+        );
+    }
+
+    #[test]
+    fn each_absent_metadata_field_is_flagged_by_name() {
+        // The baseline is the OLD dossier shape: window only. Each of the three
+        // fields the shipped-catalog tests require is named individually,
+        // because "metadata incomplete" alone does not tell a researcher what
+        // to go and look up.
+        let draft = drafted(&baseline());
+        for field in ["max_output_tokens", "input_modalities", "tool_call"] {
+            assert!(
+                draft
+                    .flags
+                    .iter()
+                    .any(|f| f.contains("METADATA INCOMPLETE") && f.contains(field)),
+                "{field} must be flagged by name: {:?}",
+                draft.flags
+            );
+        }
+        // And still no invented values in the emitted table.
+        assert!(!draft.stanza_toml.contains("max_output_tokens"));
+        assert!(!draft.stanza_toml.contains("input_modalities"));
+        assert!(!draft.stanza_toml.contains("tool_call"));
+    }
+
+    #[test]
+    fn a_partially_researched_dossier_flags_only_what_is_missing() {
+        let mut facts = baseline();
+        facts.prices.max_output_tokens = Some(64_000);
+        let draft = drafted(&facts);
+        assert!(
+            !draft
+                .flags
+                .iter()
+                .any(|f| f.contains("METADATA INCOMPLETE") && f.contains("max_output_tokens")),
+            "a researched field must not be flagged: {:?}",
+            draft.flags
+        );
+        assert!(
+            draft
+                .flags
+                .iter()
+                .any(|f| f.contains("METADATA INCOMPLETE") && f.contains("input_modalities"))
+        );
+    }
+
+    #[test]
+    fn a_dossier_describing_nothing_still_omits_the_metadata_table_entirely() {
+        // The optionality contract: absent is not `0`, and an empty table is
+        // not a claim. This is the shape of every lane written before the
+        // metadata table existed.
+        let mut facts = baseline();
+        facts.prices.context_window = None;
+        let draft = drafted(&facts);
+        assert!(
+            !draft.stanza_toml.contains(".candidates.metadata]"),
+            "no known metadata means no table:\n{}",
+            draft.stanza_toml
+        );
+    }
+
+    #[tokio::test]
+    async fn a_fully_described_lane_loads_through_the_real_loader() {
+        let mut facts = baseline();
+        facts.prices.max_output_tokens = Some(128_000);
+        facts.prices.input_modalities = Some(vec!["text".to_owned(), "image".to_owned()]);
+        facts.prices.tool_call = Some(true);
+        let outcome = validate(&facts).await;
+        assert_eq!(
+            outcome.status,
+            Status::Draft,
+            "reason: {:?}",
+            outcome.refuse_reason
+        );
+        assert!(
+            outcome
+                .stanza_toml
+                .unwrap()
+                .contains("input_modalities = [\"text\", \"image\"]")
+        );
+    }
+
+    #[tokio::test]
+    async fn metadata_that_says_nothing_is_refused_by_the_loader() {
+        // A dossier stating `max_output_tokens: 0` is an authoring accident the
+        // loader already refuses by name. The drafter does not pre-filter it —
+        // one definition of "present but says nothing", and it lives where the
+        // file is validated.
+        let mut facts = baseline();
+        facts.prices.max_output_tokens = Some(0);
+        let outcome = validate(&facts).await;
+        assert_eq!(outcome.status, Status::Refused);
+        assert!(
+            outcome
+                .refuse_reason
+                .unwrap()
+                .contains("did not load through the router's own tier loader")
+        );
+    }
+
+    #[test]
+    fn metadata_parses_from_the_researcher_wire_shape() {
+        let json = r#"{
+          "candidate": { "category": "new", "provider": "anthropic", "model": "claude-opus-4-8" },
+          "display_id": "anthropic/claude-opus-4-8",
+          "prices": {
+            "input_per_mtok": 5.0, "output_per_mtok": 25.0,
+            "context_window": 1000000,
+            "max_output_tokens": 128000,
+            "input_modalities": ["text", "image"],
+            "tool_call": true,
+            "source_url": "https://platform.claude.com/pricing",
+            "source_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "source_extract": "Claude Opus 4.8 $5 / $25"
+          },
+          "retention": { "weight_open": false, "basis": null },
+          "invokable": true
+        }"#;
+        let facts: FactsDossier = serde_json::from_str(json).expect("metadata shape parses");
+        assert_eq!(facts.prices.max_output_tokens, Some(128_000));
+        assert_eq!(facts.prices.tool_call, Some(true));
+        assert_eq!(
+            facts.prices.input_modalities.as_deref(),
+            Some(["text".to_owned(), "image".to_owned()].as_slice())
+        );
+        let draft = drafted(&facts);
+        assert!(draft.stanza_toml.contains("max_output_tokens = 128000"));
+        assert!(draft.stanza_toml.contains("tool_call = true"));
+    }
+
+    // ---- REFINEMENT 3: provider dispatch conventions -----------------------
+
+    fn models(list: &[&str]) -> Vec<String> {
+        list.iter().map(|m| (*m).to_owned()).collect()
+    }
+
+    #[test]
+    fn a_namespaced_provider_yields_its_convention() {
+        assert_eq!(
+            dispatch_convention(&models(&[
+                "google/gemini-3.7-flash",
+                "google/gemini-3.5-flash-lite",
+                "google/gemini-3.1-pro-preview",
+            ])),
+            Some("google/".to_owned())
+        );
+        assert_eq!(
+            dispatch_convention(&models(&[
+                "accounts/fireworks/models/kimi-k3",
+                "accounts/fireworks/models/deepseek-v4-pro-0813",
+                "accounts/fireworks/models/minimax-m3",
+            ])),
+            Some("accounts/fireworks/models/".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_family_resemblance_is_not_a_convention() {
+        // The four providers the brief names, in their real shapes. Each shares
+        // a model-naming prefix and NONE of them shares a namespace, so warning
+        // on any of them would be noise a reader learns to skip.
+        // MUTATION: drop the `rposition('/')` cut and every one of these fires.
+        for (provider, list) in [
+            (
+                "anthropic",
+                models(&[
+                    "claude-haiku-4-5-20251001",
+                    "claude-sonnet-5",
+                    "claude-opus-5",
+                    "claude-fable-5",
+                ]),
+            ),
+            (
+                "openai",
+                models(&["gpt-5.6-pro", "gpt-5.6-mini", "gpt-5.6-nano"]),
+            ),
+            ("xai", models(&["grok-4.3", "grok-4.6"])),
+            (
+                "google",
+                models(&[
+                    "gemini-3.7-flash",
+                    "gemini-3.5-flash-lite",
+                    "gemini-3.1-pro",
+                ]),
+            ),
+        ] {
+            assert_eq!(
+                dispatch_convention(&list),
+                None,
+                "{provider} has no dispatch namespace and must not claim one"
+            );
+        }
+    }
+
+    #[test]
+    fn models_sharing_nothing_yield_no_convention() {
+        assert_eq!(
+            dispatch_convention(&models(&["kimi-k2.7-code", "nemotron-3-ultra"])),
+            None
+        );
+    }
+
+    #[test]
+    fn one_existing_lane_is_an_anecdote_not_a_convention() {
+        // A single lane's whole model string is trivially the "common prefix"
+        // of the set, so without this guard one `google/gemini-3.7-flash` would
+        // "prove" the rule — and a brand-new provider would warn on its own
+        // first lane.
+        // MUTATION: relax `models.len() < 2` to `is_empty` and this fires.
+        assert_eq!(
+            dispatch_convention(&models(&["google/gemini-3.7-flash"])),
+            None
+        );
+        assert_eq!(dispatch_convention(&[]), None);
+    }
+
+    #[test]
+    fn a_convention_must_be_shared_by_every_existing_lane() {
+        // Two of three is a subgroup, not a provider rule.
+        assert_eq!(
+            dispatch_convention(&models(&[
+                "google/gemini-3.7-flash",
+                "google/gemini-3.5-flash-lite",
+                "gemini-3.1-pro-preview",
+            ])),
+            None
+        );
+    }
+
+    #[test]
+    fn the_vertex_dispatch_bug_is_warned_about_and_not_rewritten() {
+        // The exact draft that shipped: a bare `gemini-3.8-flash` on a provider
+        // every one of whose lanes dispatches `google/<model>`.
+        // MUTATION: make `dispatch_convention_flag` return None and this fails.
+        let facts = gemini_basis_null();
+        let live = CatalogFacts {
+            provider_posture: Some(RetentionPosture::Zero),
+            provider_models: models(&[
+                "google/gemini-3.7-flash",
+                "google/gemini-3.5-flash-lite",
+                "google/gemini-3.1-pro-preview",
+            ]),
+        };
+        let mut facts = facts;
+        facts.standard_evidence = Some(standard_evidence());
+        let draft = drafted_with(&facts, &live);
+        let flag = draft
+            .flags
+            .iter()
+            .find(|f| f.contains("DISPATCH CONVENTION"))
+            .expect("a bare vertex model must be warned about");
+        assert!(flag.contains("google/"), "names the convention: {flag}");
+        assert!(
+            flag.contains("google/gemini-3.8-flash"),
+            "spells out the suggestion: {flag}"
+        );
+        assert!(flag.contains("404"), "says what goes wrong: {flag}");
+        // NOT REWRITTEN. The stanza still dispatches exactly what the
+        // researcher verified; the human decides.
+        assert!(
+            draft.stanza_toml.contains("model = \"gemini-3.8-flash\""),
+            "the drafter must never invent a model id:\n{}",
+            draft.stanza_toml
+        );
+        assert!(!draft.stanza_toml.contains("model = \"google/gemini"));
+    }
+
+    #[test]
+    fn an_anthropic_shaped_catalog_never_warns() {
+        // The negative case, end to end through `draft` rather than only
+        // through the detector: anthropic's lanes share `claude-` and nothing
+        // else, so a lane called `claude-opus-4-8` must draft silently.
+        let live = CatalogFacts {
+            provider_posture: Some(RetentionPosture::Standard),
+            provider_models: models(&[
+                "claude-haiku-4-5-20251001",
+                "claude-sonnet-5",
+                "claude-opus-5",
+                "claude-fable-5",
+            ]),
+        };
+        let draft = drafted_with(&baseline(), &live);
+        assert!(
+            !draft
+                .flags
+                .iter()
+                .any(|f| f.contains("DISPATCH CONVENTION")),
+            "flags: {:?}",
+            draft.flags
+        );
+    }
+
+    #[test]
+    fn a_model_already_carrying_the_convention_never_warns() {
+        let mut facts = gemini_basis_null();
+        facts.candidate.model = "google/gemini-3.8-flash".to_owned();
+        facts.standard_evidence = Some(standard_evidence());
+        let live = CatalogFacts {
+            provider_posture: Some(RetentionPosture::Zero),
+            provider_models: models(&["google/gemini-3.7-flash", "google/gemini-3.5-flash-lite"]),
+        };
+        let draft = drafted_with(&facts, &live);
+        assert!(
+            !draft
+                .flags
+                .iter()
+                .any(|f| f.contains("DISPATCH CONVENTION"))
+        );
+    }
+
+    #[test]
+    fn a_provider_with_no_existing_lanes_never_warns() {
+        // A brand-new provider has no convention to violate.
+        let mut facts = baseline();
+        facts.candidate.provider = "anthropic".to_owned();
+        let live = CatalogFacts {
+            provider_posture: Some(RetentionPosture::Standard),
+            provider_models: Vec::new(),
+        };
+        assert!(
+            !drafted_with(&facts, &live)
+                .flags
+                .iter()
+                .any(|f| f.contains("DISPATCH CONVENTION"))
+        );
+    }
+
+    #[tokio::test]
+    async fn the_shipped_catalog_yields_conventions_only_where_one_really_exists() {
+        // Read against the REAL `config/tiers.toml` rather than a fixture,
+        // because the claim being made is about that file: two of its providers
+        // dispatch under a namespace and the rest do not. A provider that grows
+        // a namespace (or loses one) should fail here and be looked at.
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("config/tiers.toml");
+        let catalog = crate::config::load_tier_catalog(&path)
+            .await
+            .expect("the shipped catalog loads");
+        for (provider, expected) in [
+            ("vertex", Some("google/")),
+            ("fireworks", Some("accounts/fireworks/models/")),
+            ("anthropic", None),
+            ("openai", None),
+            ("xai", None),
+            ("google", None),
+            ("bedrock", None),
+        ] {
+            let live = CatalogFacts::for_provider(&catalog, provider);
+            assert!(
+                live.provider_models.len() >= 2,
+                "{provider} should have at least two shipped lanes to reason about"
+            );
+            assert_eq!(
+                dispatch_convention(&live.provider_models).as_deref(),
+                expected,
+                "{provider} lanes: {:?}",
+                live.provider_models
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn catalog_facts_reads_the_pin_and_the_lanes_for_one_provider() {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("config/tiers.toml");
+        let catalog = crate::config::load_tier_catalog(&path)
+            .await
+            .expect("the shipped catalog loads");
+        let vertex = CatalogFacts::for_provider(&catalog, "vertex");
+        assert_eq!(vertex.provider_posture, Some(RetentionPosture::Zero));
+        assert!(
+            vertex
+                .provider_models
+                .iter()
+                .all(|model| model.starts_with("google/")),
+            "{:?}",
+            vertex.provider_models
+        );
+        let unknown = CatalogFacts::for_provider(&catalog, "not-a-provider");
+        assert_eq!(unknown.provider_posture, None);
+        assert!(unknown.provider_models.is_empty());
     }
 
     // ---- verified-date resolution ------------------------------------------
