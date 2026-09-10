@@ -295,7 +295,7 @@ async fn models_are_materialized_from_tiers_toml() {
     // in the catalog carries. Together deliberately does NOT twin the five
     // models it shares with Fireworks — on every one of them Fireworks is the
     // same price or cheaper, so a twin would add a row and nothing else.
-    assert_eq!(data.len(), 34);
+    assert_eq!(data.len(), 37);
     assert!(data.iter().all(|model| model["object"] == "model"));
 
     let ids = data
@@ -314,6 +314,9 @@ async fn models_are_materialized_from_tiers_toml() {
             "anthropic/claude-opus-4-8",
             "anthropic/claude-opus-5",
             "anthropic/claude-sonnet-5",
+            "baseten/deepseek-v4-flash",
+            "baseten/glm-5.3",
+            "baseten/kimi-k3",
             "bedrock/claude-haiku-4-5",
             "bedrock/claude-opus-4-5",
             "bedrock/claude-opus-4-6",
@@ -563,7 +566,13 @@ async fn every_shipped_model_publishes_what_it_can_take_and_produce() {
         "xai/grok-4.3",
         "xai/grok-4.6",
     ];
-    const NO_IMAGE_INPUT: [&str; 13] = [
+    const NO_IMAGE_INPUT: [&str; 15] = [
+        // Baseten's serving of the same model is likewise text-only, per its
+        // own vision-support docs.
+        "baseten/deepseek-v4-flash",
+        // Text-only pending empirical proof: Baseten's vision docs claim image
+        // support for GLM-5.3, models.dev disagrees, and no key exists to test.
+        "baseten/glm-5.3",
         "fireworks/deepseek-v4-flash",
         "fireworks/deepseek-v4-pro",
         "fireworks/glm-5.3",
@@ -943,6 +952,9 @@ async fn every_shipped_lane_publishes_a_retention_posture() {
     assert_eq!(
         zero,
         [
+            "baseten/deepseek-v4-flash",
+            "baseten/glm-5.3",
+            "baseten/kimi-k3",
             "bedrock/claude-haiku-4-5",
             "bedrock/claude-opus-4-5",
             "bedrock/claude-opus-4-6",
@@ -1252,6 +1264,9 @@ async fn bundled_tier_catalog_has_expected_virtual_models() {
             "anthropic/claude-opus-4-8",
             "anthropic/claude-opus-5",
             "anthropic/claude-sonnet-5",
+            "baseten/deepseek-v4-flash",
+            "baseten/glm-5.3",
+            "baseten/kimi-k3",
             "bedrock/claude-haiku-4-5",
             "bedrock/claude-opus-4-5",
             "bedrock/claude-opus-4-6",
@@ -1282,7 +1297,7 @@ async fn bundled_tier_catalog_has_expected_virtual_models() {
             "xai/grok-4.3",
             "xai/grok-4.6",
         ],
-        "the thirty-four vendor-named model pins (Gemini flash + flash-lite added \
+        "the thirty-seven vendor-named model pins (Gemini flash + flash-lite added \
          2026-08-18; Gemini Pro joined them once conditional rates could \
          express the 200,000-token boundary Google prices it at; the four \
          Bedrock classic-runtime zero-retention lanes on 2026-08-20, the \
@@ -1361,6 +1376,7 @@ async fn bundled_tier_catalog_has_expected_virtual_models() {
                     | "google"
                     | "bedrock"
                     | "fireworks"
+                    | "baseten"
                     | "xai"
                     | "vertex"
                     | "groq"
@@ -1793,6 +1809,9 @@ async fn a_basis_hike_above_sell_withholds_that_tier_and_nothing_else() {
             "anthropic/claude-haiku-4-5",
             "anthropic/claude-opus-4-8",
             "anthropic/claude-opus-5",
+            "baseten/deepseek-v4-flash",
+            "baseten/glm-5.3",
+            "baseten/kimi-k3",
             // The Bedrock lanes are untouched by a first-party Anthropic
             // repricing: different account, different rate card, own pins.
             "bedrock/claude-haiku-4-5",
@@ -1869,7 +1888,7 @@ async fn a_basis_hike_above_sell_withholds_that_tier_and_nothing_else() {
     // with their own rate card, so a repricing of a first-party Anthropic lane
     // withholds only that first-party lane.
     let listed = listed_model_ids(RouterState::fully_credentialed(path)).await;
-    assert_eq!(listed.len(), 33);
+    assert_eq!(listed.len(), 36);
     assert!(listed.iter().any(|id| id == "bedrock/claude-sonnet-4-5"));
     assert!(listed.iter().any(|id| id == "openai/gpt-5.6-luna"));
     assert!(listed.iter().any(|id| id == "anthropic/claude-haiku-4-5"));
@@ -1895,7 +1914,7 @@ async fn the_shipped_catalog_withholds_no_tier_today() {
         "the shipped catalog withholds {:?}",
         catalog.unavailable.keys().collect::<Vec<_>>()
     );
-    assert_eq!(catalog.tiers.len(), 34);
+    assert_eq!(catalog.tiers.len(), 37);
 }
 
 /// Every conditional rate the shipped catalog declares, transcribed from
@@ -1996,7 +2015,7 @@ async fn every_shipped_conditional_rate_is_the_one_the_vendor_publishes() {
 // rungs across >=2 providers). Every tier is pass-through until a second
 // provider serves a model class again.
 const ROUTED_TIERS: [&str; 0] = [];
-const PASS_THROUGH_TIERS: [&str; 34] = [
+const PASS_THROUGH_TIERS: [&str; 37] = [
     // Model pins, keyed by their OpenRouter-standard {vendor}/{model} ids.
     "openai/gpt-5.6-luna",
     "anthropic/claude-haiku-4-5",
@@ -2066,6 +2085,9 @@ const PASS_THROUGH_TIERS: [&str; 34] = [
     "vertex/gemini-3.5-flash-lite",
     "vertex/gemini-3.1-pro-preview",
     "vertex/gemini-3.8-flash",
+    "baseten/deepseek-v4-flash",
+    "baseten/glm-5.3",
+    "baseten/kimi-k3",
     // The Groq latency lanes (2026-08-22). Pass-through at Groq's published
     // per-1M rates. The equality the assertion below checks earns its keep on
     // the CACHED dimension in particular: Groq publishes no per-model cached
