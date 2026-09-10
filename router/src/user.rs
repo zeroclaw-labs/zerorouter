@@ -1153,9 +1153,9 @@ mod tests {
         // override silently stopping working would show up here as a lane
         // moving from one side of the sentence to the other.
         //
-        // Zero: four Bedrock, five open-weight Fireworks, two xAI, three Groq,
-        // four Together (basis 2 since 2026-09-09, operator-attested) and
-        // three Vertex. Standard: five Anthropic, three Google, three OpenAI,
+        // Zero: four Bedrock, five open-weight Fireworks, three Baseten, two
+        // xAI, three Groq, four Together (basis 2 since 2026-09-09,
+        // operator-attested) and three Vertex. Standard: five Anthropic, three Google, three OpenAI,
         // the one overridden Fireworks lane this test is about, and the
         // overridden `vertex/gemini-3.8-flash`.
         //
@@ -1209,8 +1209,15 @@ mod tests {
         // default-flip forced them to standard. The pin now names the setting
         // rather than a published default, which is the honest shape it
         // should have had from the start.
-        assert_eq!(posture_count(rows, "zero"), 21);
+        //
+        // The three Baseten lanes joined the ZERO side on 2026-09-10 — the
+        // first whole-provider addition sourced through the currency
+        // pipeline's provider scan. Basis 3 (a platform-wide published
+        // default), the same watch as fireworks and the same lesson as
+        // Together: a published default is one vendor rewrite away from
+        // falsification, and retention-drift is the tripwire.
+        assert_eq!(posture_count(rows, "zero"), 24);
         assert_eq!(posture_count(rows, "standard"), 13);
-        assert_eq!(rows.len(), 34, "every shipped lane is counted exactly once");
+        assert_eq!(rows.len(), 37, "every shipped lane is counted exactly once");
     }
 }

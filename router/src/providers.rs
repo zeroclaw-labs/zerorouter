@@ -2758,6 +2758,9 @@ mod tests {
                 ("google", ProviderAdapter::ChatCompletions),
                 ("bedrock", ProviderAdapter::Anthropic),
                 ("fireworks", ProviderAdapter::ChatCompletions),
+                // Baseten joined 2026-09-10: shared Model APIs on the generic
+                // chat-completions wire, same shape as fireworks/groq.
+                ("baseten", ProviderAdapter::ChatCompletions),
                 ("xai", ProviderAdapter::ChatCompletions),
                 ("vertex", ProviderAdapter::ChatCompletions),
                 ("groq", ProviderAdapter::ChatCompletions),
@@ -2976,6 +2979,7 @@ mod tests {
                 "google",
                 "bedrock",
                 "fireworks",
+                "baseten",
                 "xai",
                 "vertex",
                 "groq",
@@ -4215,6 +4219,9 @@ mod tests {
             ("google", None),
             ("bedrock", None),
             ("fireworks", Some("fireworks-ai".to_owned())),
+            // Baseten is the other coincidence: models.dev files it under
+            // `baseten`, ZeroRouter's own key, so identity joins it.
+            ("baseten", None),
             ("xai", None),
             ("vertex", Some("google-vertex".to_owned())),
             // Groq is one of the coincidences: models.dev files it under
