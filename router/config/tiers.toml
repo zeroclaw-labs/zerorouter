@@ -657,6 +657,31 @@ openrouter_slug = "fireworks"
 # Advisory either way — corroboration cannot change an exit code — and this is
 # the one pin least in need of a second opinion, because it re-verifies itself
 # on every request.
+[retention.baseten]
+posture = "zero"
+description = "Baseten's published platform default: model inputs and outputs are not stored — 'Baseten does not store model inputs, outputs, or weights by default. This zero data retention (ZDR) policy applies to synchronous inference.' ZeroRouter's lanes are synchronous chat completions, so the default covers them. Async inference inputs are temporarily stored until processing completes (outputs never) — ZeroRouter does not use Baseten's async surface. SOC 2 Type II and HIPAA per the same page."
+source_url = "https://docs.baseten.co/observability/security.md"
+verified = "2026-09-10"
+source_sha256 = "0ad6a8026ffa6e84abb043a72bfff9eb80ab8533113256054518e62ac04a3b2f"
+source_extract_anchors = [
+  "does not store model inputs",
+  "zero data retention (ZDR) policy",
+  "applies to synchronous inference",
+]
+
+# BASIS 3, LIKE FIREWORKS AND (ONCE) TOGETHER — a published default for every
+# customer — and the Together episode is the reason this pin's comment exists:
+# a published default is one vendor policy-rewrite away from falsification, and
+# when Together rewrote theirs (2026-09-08) the drift job caught it in days and
+# the lanes were flipped to standard the same day. Same watch applies here.
+# Unlike fireworks' pin, Baseten's statement is NOT scoped to open-weight
+# models: it is platform-wide for synchronous inference, so closed- and
+# open-weight lanes alike may inherit it. The one scope line that matters is
+# sync-only — async inputs are temporarily stored — and ZeroRouter dispatches
+# only synchronous chat completions on this provider.
+# The source_url is the raw-markdown endpoint (.md), which serves stable bytes;
+# the rendered page wraps the same text in a docs app that churns per deploy.
+
 [retention.xai]
 posture = "zero"
 description = "xAI under team-level Zero Data Retention: API request inputs and outputs are never persisted to disk, and the default 30-day encrypted audit retention does not apply. xAI does not train on API data without explicit permission. Uniquely in this catalog the guarantee is re-verified at runtime — every response carries an x-zero-data-retention attestation that ZeroRouter asserts is true before serving, and refuses the request when it is not."
@@ -3159,3 +3184,90 @@ source_extract_anchors = [
   "In-memory data caching",
 ]
 
+# --- Baseten lanes (2026-09-10): three second-sources on the shared Model APIs
+# plane, all inheriting [retention.baseten]'s platform-default zero pin. Prices
+# verified on baseten.co/pricing (sha 9834ec44…) and each model-library page,
+# unchanged since 2026-09-04. Metadata is BASETEN's declared serving limits,
+# not the models' theoretical ones. Kimi K3's video input and GLM-5.3's beyond-
+# image modalities are deliberately NOT declared: the lane describes what the
+# wire carries (text, image), not what the model could take — the same
+# lane-vs-model rule the 2026-08-21 modality sweep established.
+# INVOKABILITY: not yet proven — no key was held at draft time; admin draft-pin
+# refused all three on that gate, correctly. Before BASETEN_API_KEY ships to
+# prod, one live POST per slug against inference.baseten.co must succeed.
+# ToS note: Baseten's resale/"competitive product" clause needs their written
+# confirmation before real traffic — the operator holds that outreach.
+
+[tiers."baseten/deepseek-v4-flash"]
+
+[tiers."baseten/deepseek-v4-flash".rates]
+input_per_mtok = 0.13
+cached_input_per_mtok = 0.028
+output_per_mtok = 0.26
+
+[[tiers."baseten/deepseek-v4-flash".candidates]]
+id = "baseten/deepseek-v4-flash"
+provider = "baseten"
+model = "deepseek-ai/DeepSeek-V4-Flash-0731"
+
+[tiers."baseten/deepseek-v4-flash".candidates.metadata]
+context_window = 1048576
+max_output_tokens = 384000
+input_modalities = ["text"]
+tool_call = true
+
+[tiers."baseten/deepseek-v4-flash".candidates.rates]
+input_per_mtok = 0.13
+cached_input_per_mtok = 0.028
+output_per_mtok = 0.26
+
+[tiers."baseten/kimi-k3"]
+
+[tiers."baseten/kimi-k3".rates]
+input_per_mtok = 3.00
+cached_input_per_mtok = 0.30
+output_per_mtok = 15.00
+
+[[tiers."baseten/kimi-k3".candidates]]
+id = "baseten/kimi-k3"
+provider = "baseten"
+model = "moonshotai/Kimi-K3"
+
+[tiers."baseten/kimi-k3".candidates.metadata]
+context_window = 1048576
+max_output_tokens = 262144
+input_modalities = ["text", "image"]
+tool_call = true
+
+[tiers."baseten/kimi-k3".candidates.rates]
+input_per_mtok = 3.00
+cached_input_per_mtok = 0.30
+output_per_mtok = 15.00
+
+[tiers."baseten/glm-5.3"]
+
+[tiers."baseten/glm-5.3".rates]
+input_per_mtok = 1.40
+cached_input_per_mtok = 0.14
+output_per_mtok = 4.40
+
+[[tiers."baseten/glm-5.3".candidates]]
+id = "baseten/glm-5.3"
+provider = "baseten"
+model = "zai-org/GLM-5.3"
+
+[tiers."baseten/glm-5.3".candidates.metadata]
+context_window = 1048576
+max_output_tokens = 262144
+# Baseten's vision docs say GLM-5.3 accepts images; models.dev says text-only,
+# and no key exists yet to settle it empirically. Declared text-only for now —
+# under-declaring loses a convenience, over-declaring builds failing requests
+# and leaves catalog-drift permanently red. Widen after a real image request
+# succeeds on this lane.
+input_modalities = ["text"]
+tool_call = true
+
+[tiers."baseten/glm-5.3".candidates.rates]
+input_per_mtok = 1.40
+cached_input_per_mtok = 0.14
+output_per_mtok = 4.40

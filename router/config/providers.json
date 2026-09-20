@@ -43,6 +43,13 @@
       "source_provider_key": "fireworks-ai"
     },
     {
+      "key": "baseten",
+      "adapter": "chat_completions",
+      "credential_env": "BASETEN_API_KEY",
+      "secret_name": "baseten-api-key",
+      "base_url": "https://inference.baseten.co/v1/chat/completions"
+    },
+    {
       "key": "xai",
       "adapter": "chat_completions",
       "credential_env": "XAI_API_KEY",
