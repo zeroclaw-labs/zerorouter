@@ -54,7 +54,7 @@ chrono = { version = "0.4", features = ["clock", "serde"] }
 # implementation is a security defect rather than a corrupted token count, and
 # the failure would be silent in exactly the way that matters least — Google
 # would simply reject the assertion, until the day it did not.
-rsa = "0.9"
+rsa = { version = "0.9", features = ["sha2"] }
 pkcs8 = "0.11"
 clap = { version = "4.5", features = ["derive"] }
 crc = "3"
@@ -105,7 +105,7 @@ hex = "0.4"
 #
 # Revisit when `rsa` 0.10 is stable, and then move the whole RustCrypto stack
 # in one commit rather than one crate at a time.
-hmac = "0.12"
+hmac = "0.13"
 openidconnect = "4"
 rand = "0.10"
 reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls", "json"] }

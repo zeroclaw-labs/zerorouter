@@ -20,7 +20,7 @@ use axum::{
     http::{Request, StatusCode},
 };
 use chrono::{DateTime, Utc};
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use http_body_util::BodyExt;
 use rust_decimal::Decimal;
 use serde_json::{Value, json};

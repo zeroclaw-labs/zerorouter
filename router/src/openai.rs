@@ -1639,7 +1639,7 @@ pub fn tool_names_digest(tool_names: &[String]) -> String {
         hasher.update((name.len() as u64).to_be_bytes());
         hasher.update(name.as_bytes());
     }
-    format!("{:x}", hasher.finalize())
+    hex::encode(hasher.finalize())
 }
 
 /// First 16 hex chars of sha256 over the user-scoped request-shape segment
@@ -1684,7 +1684,7 @@ pub fn task_signature(
             .to_string()
             .as_bytes(),
     );
-    let digest = format!("{:x}", hasher.finalize());
+    let digest = hex::encode(hasher.finalize());
     TaskSignature {
         hex: digest[..16].to_owned(),
         scheme: TASK_SIGNATURE_SCHEME,

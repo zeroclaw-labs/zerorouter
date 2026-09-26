@@ -184,7 +184,7 @@ pub fn generate_api_key() -> String {
 
 #[must_use]
 pub fn hash_api_key(token: &str) -> String {
-    format!("{:x}", Sha256::digest(token.as_bytes()))
+    hex::encode(Sha256::digest(token.as_bytes()))
 }
 
 fn valid_key_shape(token: &str) -> bool {
