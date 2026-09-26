@@ -27,7 +27,7 @@ use crate::{
     },
     priority::Priority,
     sqlx::{
-        self, PgPool,
+        self, PgPool, SqlStr,
         migrate::{Migration, MigrationType, Migrator},
         postgres::{PgConnectOptions, PgPoolOptions, PgSslMode},
     },
@@ -958,35 +958,44 @@ pub async fn database_pool_from_env() -> Result<PgPool> {
     Ok(pool)
 }
 
-pub async fn migrate(pool: &PgPool) -> Result<()> {
-    let migrator = Migrator {
+/// The registered migration set, as a value rather than inline in
+/// [`migrate`], so a test can read the checksums the Migrator will compare
+/// against `_sqlx_migrations` without touching a database.
+///
+/// A migration's checksum is the only thing standing between a dependency
+/// bump and a production boot failure: sqlx refuses to start when a
+/// recorded checksum disagrees with the one it computes now
+/// (`MigrateError::VersionMismatch`). `migration_checksums_match_file_digests`
+/// pins every one of them to a digest computed outside sqlx entirely.
+fn migrator() -> Migrator {
+    Migrator {
         migrations: Cow::Owned(vec![
             Migration::new(
                 1,
                 Cow::Borrowed("b0 schema"),
                 MigrationType::Simple,
-                Cow::Borrowed(include_str!("../migrations/0001_b0_schema.sql")),
+                SqlStr::from_static(include_str!("../migrations/0001_b0_schema.sql")),
                 false,
             ),
             Migration::new(
                 2,
                 Cow::Borrowed("billing and web"),
                 MigrationType::Simple,
-                Cow::Borrowed(include_str!("../migrations/0002_billing_and_web.sql")),
+                SqlStr::from_static(include_str!("../migrations/0002_billing_and_web.sql")),
                 false,
             ),
             Migration::new(
                 3,
                 Cow::Borrowed("balance nonnegative"),
                 MigrationType::Simple,
-                Cow::Borrowed(include_str!("../migrations/0003_balance_nonnegative.sql")),
+                SqlStr::from_static(include_str!("../migrations/0003_balance_nonnegative.sql")),
                 false,
             ),
             Migration::new(
                 4,
                 Cow::Borrowed("estimate and select substrate"),
                 MigrationType::Simple,
-                Cow::Borrowed(include_str!(
+                SqlStr::from_static(include_str!(
                     "../migrations/0004_estimate_and_select_substrate.sql"
                 )),
                 false,
@@ -995,7 +1004,7 @@ pub async fn migrate(pool: &PgPool) -> Result<()> {
                 5,
                 Cow::Borrowed("stripe checkout intents"),
                 MigrationType::Simple,
-                Cow::Borrowed(include_str!(
+                SqlStr::from_static(include_str!(
                     "../migrations/0005_stripe_checkout_intents.sql"
                 )),
                 false,
@@ -1004,28 +1013,28 @@ pub async fn migrate(pool: &PgPool) -> Result<()> {
                 6,
                 Cow::Borrowed("settlement outbox"),
                 MigrationType::Simple,
-                Cow::Borrowed(include_str!("../migrations/0006_settlement_outbox.sql")),
+                SqlStr::from_static(include_str!("../migrations/0006_settlement_outbox.sql")),
                 false,
             ),
             Migration::new(
                 7,
                 Cow::Borrowed("ledger honesty"),
                 MigrationType::Simple,
-                Cow::Borrowed(include_str!("../migrations/0007_ledger_honesty.sql")),
+                SqlStr::from_static(include_str!("../migrations/0007_ledger_honesty.sql")),
                 false,
             ),
             Migration::new(
                 8,
                 Cow::Borrowed("autopay"),
                 MigrationType::Simple,
-                Cow::Borrowed(include_str!("../migrations/0008_autopay.sql")),
+                SqlStr::from_static(include_str!("../migrations/0008_autopay.sql")),
                 false,
             ),
             Migration::new(
                 9,
                 Cow::Borrowed("dispute freeze"),
                 MigrationType::Simple,
-                Cow::Borrowed(include_str!("../migrations/0009_dispute_freeze.sql")),
+                SqlStr::from_static(include_str!("../migrations/0009_dispute_freeze.sql")),
                 false,
             ),
             // 10-12 are reserved for concurrent branches; see the 0013 header.
@@ -1036,14 +1045,14 @@ pub async fn migrate(pool: &PgPool) -> Result<()> {
                 13,
                 Cow::Borrowed("dispute resolution"),
                 MigrationType::Simple,
-                Cow::Borrowed(include_str!("../migrations/0013_dispute_resolution.sql")),
+                SqlStr::from_static(include_str!("../migrations/0013_dispute_resolution.sql")),
                 false,
             ),
             Migration::new(
                 14,
                 Cow::Borrowed("dispatched reservations"),
                 MigrationType::Simple,
-                Cow::Borrowed(include_str!(
+                SqlStr::from_static(include_str!(
                     "../migrations/0014_dispatched_reservations.sql"
                 )),
                 false,
@@ -1052,21 +1061,21 @@ pub async fn migrate(pool: &PgPool) -> Result<()> {
                 15,
                 Cow::Borrowed("released reservations"),
                 MigrationType::Simple,
-                Cow::Borrowed(include_str!("../migrations/0015_released_reservations.sql")),
+                SqlStr::from_static(include_str!("../migrations/0015_released_reservations.sql")),
                 false,
             ),
             Migration::new(
                 16,
                 Cow::Borrowed("deposit fee"),
                 MigrationType::Simple,
-                Cow::Borrowed(include_str!("../migrations/0016_deposit_fee.sql")),
+                SqlStr::from_static(include_str!("../migrations/0016_deposit_fee.sql")),
                 false,
             ),
             Migration::new(
                 17,
                 Cow::Borrowed("stripe observed reversals"),
                 MigrationType::Simple,
-                Cow::Borrowed(include_str!(
+                SqlStr::from_static(include_str!(
                     "../migrations/0017_stripe_observed_reversals.sql"
                 )),
                 false,
@@ -1075,21 +1084,21 @@ pub async fn migrate(pool: &PgPool) -> Result<()> {
                 18,
                 Cow::Borrowed("autopay withheld state"),
                 MigrationType::Simple,
-                Cow::Borrowed(include_str!("../migrations/0018_autopay_withheld.sql")),
+                SqlStr::from_static(include_str!("../migrations/0018_autopay_withheld.sql")),
                 false,
             ),
             Migration::new(
                 19,
                 Cow::Borrowed("monthly spend rollup"),
                 MigrationType::Simple,
-                Cow::Borrowed(include_str!("../migrations/0019_monthly_spend_rollup.sql")),
+                SqlStr::from_static(include_str!("../migrations/0019_monthly_spend_rollup.sql")),
                 false,
             ),
             Migration::new(
                 20,
                 Cow::Borrowed("usage gap and real finish reason"),
                 MigrationType::Simple,
-                Cow::Borrowed(include_str!(
+                SqlStr::from_static(include_str!(
                     "../migrations/0020_usage_gap_and_real_finish_reason.sql"
                 )),
                 false,
@@ -1098,14 +1107,14 @@ pub async fn migrate(pool: &PgPool) -> Result<()> {
                 21,
                 Cow::Borrowed("autopay tax"),
                 MigrationType::Simple,
-                Cow::Borrowed(include_str!("../migrations/0021_autopay_tax.sql")),
+                SqlStr::from_static(include_str!("../migrations/0021_autopay_tax.sql")),
                 false,
             ),
             Migration::new(
                 22,
                 Cow::Borrowed("checkout intent cleanup"),
                 MigrationType::Simple,
-                Cow::Borrowed(include_str!(
+                SqlStr::from_static(include_str!(
                     "../migrations/0022_checkout_intent_cleanup.sql"
                 )),
                 false,
@@ -1114,7 +1123,7 @@ pub async fn migrate(pool: &PgPool) -> Result<()> {
                 23,
                 Cow::Borrowed("key expiry and credit limits"),
                 MigrationType::Simple,
-                Cow::Borrowed(include_str!(
+                SqlStr::from_static(include_str!(
                     "../migrations/0023_key_expiry_and_credit_limits.sql"
                 )),
                 false,
@@ -1123,28 +1132,28 @@ pub async fn migrate(pool: &PgPool) -> Result<()> {
                 24,
                 Cow::Borrowed("autopay tax lifecycle"),
                 MigrationType::Simple,
-                Cow::Borrowed(include_str!("../migrations/0024_autopay_tax_lifecycle.sql")),
+                SqlStr::from_static(include_str!("../migrations/0024_autopay_tax_lifecycle.sql")),
                 false,
             ),
             Migration::new(
                 25,
                 Cow::Borrowed("redemption tax"),
                 MigrationType::Simple,
-                Cow::Borrowed(include_str!("../migrations/0025_redemption_tax.sql")),
+                SqlStr::from_static(include_str!("../migrations/0025_redemption_tax.sql")),
                 false,
             ),
             Migration::new(
                 26,
                 Cow::Borrowed("byok provider keys"),
                 MigrationType::Simple,
-                Cow::Borrowed(include_str!("../migrations/0026_byok_provider_keys.sql")),
+                SqlStr::from_static(include_str!("../migrations/0026_byok_provider_keys.sql")),
                 false,
             ),
             Migration::new(
                 27,
                 Cow::Borrowed("byok monthly allowance"),
                 MigrationType::Simple,
-                Cow::Borrowed(include_str!(
+                SqlStr::from_static(include_str!(
                     "../migrations/0027_byok_monthly_allowance.sql"
                 )),
                 false,
@@ -1153,29 +1162,48 @@ pub async fn migrate(pool: &PgPool) -> Result<()> {
                 28,
                 Cow::Borrowed("byok fallback opt in"),
                 MigrationType::Simple,
-                Cow::Borrowed(include_str!("../migrations/0028_byok_fallback_opt_in.sql")),
+                SqlStr::from_static(include_str!("../migrations/0028_byok_fallback_opt_in.sql")),
                 false,
             ),
             Migration::new(
                 29,
                 Cow::Borrowed("cache write tokens"),
                 MigrationType::Simple,
-                Cow::Borrowed(include_str!("../migrations/0029_cache_write_tokens.sql")),
+                SqlStr::from_static(include_str!("../migrations/0029_cache_write_tokens.sql")),
                 false,
             ),
             Migration::new(
                 30,
                 Cow::Borrowed("key retention policy"),
                 MigrationType::Simple,
-                Cow::Borrowed(include_str!("../migrations/0030_key_retention_policy.sql")),
+                SqlStr::from_static(include_str!("../migrations/0030_key_retention_policy.sql")),
                 false,
             ),
         ]),
         ignore_missing: false,
         locking: true,
         no_tx: false,
-    };
-    migrator
+        // Both fields are new in sqlx 0.9 and are spelled out at their
+        // documented defaults rather than left to `Migrator::DEFAULT`, because
+        // each is a way this bump could silently break an existing database
+        // and the safe value should be visible at the call site.
+        //
+        // `table_name` is the bookkeeping table sqlx reads to decide what has
+        // already run. 0.8 hardcoded `_sqlx_migrations` into every statement it
+        // issued (`sqlx-postgres-0.8.6/src/migrate.rs`); 0.9 made it a field,
+        // and its own docs warn that changing it on a live database re-runs
+        // every migration. This is that exact literal, so the rows already in
+        // production are the rows 0.9 reads.
+        table_name: Cow::Borrowed("_sqlx_migrations"),
+        // Empty means "create no schemas", which is what 0.8 did — it had no
+        // such concept. The router's migrations live in `public` and the
+        // deploying role does not need CREATE on the database.
+        create_schemas: Cow::Borrowed(&[]),
+    }
+}
+
+pub async fn migrate(pool: &PgPool) -> Result<()> {
+    migrator()
         .run(pool)
         .await
         .context("database migration failed")
@@ -4387,6 +4415,203 @@ pub fn parse_decimal(value: &str, field: &str) -> Result<Decimal> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every registered migration's SHA-384 digest, computed OUTSIDE sqlx
+    /// (`shasum -a 384 migrations/*.sql`) so this table is not merely sqlx
+    /// agreeing with itself.
+    ///
+    /// This is the boot-safety pin for a sqlx upgrade. sqlx stores each
+    /// applied migration's checksum in `_sqlx_migrations` and refuses to
+    /// start when the recomputed value disagrees
+    /// (`MigrateError::VersionMismatch`), so a release that changed how the
+    /// checksum is derived would brick every database that already ran these
+    /// — production first. Pinning to a digest an outside tool computes means
+    /// this test fails on such a change instead of production doing so.
+    ///
+    /// It is equally the tripwire AGENTS.md asks for on editing an applied
+    /// migration: touching one byte of any file below — a comment included —
+    /// fails here.
+    const MIGRATION_FILE_DIGESTS: &[(i64, &str)] = &[
+        (
+            1,
+            "67648dc6f4d3bef358b65569ffa742819ac533ecd2e81bc21964d9bf847a5a76381ea778532163d55f45b3e95afe4529",
+        ),
+        (
+            2,
+            "aa83387bc777f0bde4b4ac9f4af82bcc5912636a5d3d3b706a73df66da425af5eb92fe645e43c68cc2872b4cf3a71d66",
+        ),
+        (
+            3,
+            "86d1ed20c5330fd72e4d173674f5271ff9b7c51ca7bcb29e11d6bdcc4d6ca3e02ae8dc8f9d8a92a996886ad98bd2b272",
+        ),
+        (
+            4,
+            "d640b972a9dbda9e0adedcfc03870698bf6a566f9ba19b14e5814efa91735154e5034047b76bc6b5ade62dcacf8bafc5",
+        ),
+        (
+            5,
+            "e40e89cdcbd86593093b65c97af364025f117304c4e90f43a0152ffc1bba6c19d00020fe800e2fc97144a678f5a6c9cc",
+        ),
+        (
+            6,
+            "36e9f0b26cd298465301d8edf3c10c1ee8ae1ddc3fa3ed9560e91f6b128375184cd130fd87eee2b719b58f4faa33308a",
+        ),
+        (
+            7,
+            "ef39547370f8692a99a863d180379b6acd8aee19e30db650c6d39c35377a7cfabbf4b94961445c06f3a7046460b98b63",
+        ),
+        (
+            8,
+            "9dddb7273978dfd7fa20be37e7e14f65dc3f222e07be25311ee11dcd0ccc26750b9db10646c7fb5da00a3fab17bb39ef",
+        ),
+        (
+            9,
+            "9e5e0e3775c3452894bdbefa475395193231423851092526165ff27ec8bf1bd56eee08077b0e928b8633a786159ccba6",
+        ),
+        (
+            13,
+            "cbb0a9d2de84a808c6df2b964d0ff286e7da56e9363ac1390e52d9ccc80fae1fbda724724ec4c6519575d4dc0428d872",
+        ),
+        (
+            14,
+            "1b52d070e8b46364609dfc34e2573faf64c3f2b83186c41e76913e33f6ead44f668840e035841fb0bce2413408a84eab",
+        ),
+        (
+            15,
+            "ddb2439b38eb107cf3ca2a30e9b5476fe05e55849ba655b4a6ba76b6d009bccd430342feb29d4444bd3dfc1713867773",
+        ),
+        (
+            16,
+            "88f0378d9c52d59c38a6cae304daeaa16b2e6fa51a7ddfe62e15eb36d7206a4f4a4e4a4af844aff33715dbe3990f6d97",
+        ),
+        (
+            17,
+            "ccfa72abb1c6cc37c6e50a9d381ea1a9c5777cbcee69de09275ec46af6e90b1ade18127e9b072e05f5510ebf9b6c5723",
+        ),
+        (
+            18,
+            "a1d66ac93f92488f8b197721ee66f252d9ed75210625c51f2282630e5cb9bdd48704fa22a13356418d2eecadfc601b5a",
+        ),
+        (
+            19,
+            "bfbeb6d4cd9d47841b2f6e67f6fb44f7193b3b4d17c310736cd740100fa72682a400a60430d78f61bc2d0d6119e4f784",
+        ),
+        (
+            20,
+            "80c97b5bd7e8fecded3f2812159f8f7ab3fb0cc99188c7136746b6bc73ba9cc30a1faad5a1669dd2fd07016de0a3ef88",
+        ),
+        (
+            21,
+            "f28f51fb29e6b7f3b7ba0f11b8a1cbead2a7f4aa76a88e9e764c972aabf5d2046e498c48b078a733a3f6f49ccf90d430",
+        ),
+        (
+            22,
+            "45e1ea16f22570b2fc62801486000209410eb4d8277a5d74b41d0147febdcf18467b265e8ce1950bee5db77fde41b5b2",
+        ),
+        (
+            23,
+            "133bf53bfe04d35801e3f7b213beb6bcf1ffefe2051efeb65dd73dc47910058b76a7e8445035e2cc83400950dc875b09",
+        ),
+        (
+            24,
+            "eed2000ec907fb7f456ca751886d59c5254eac1b33a32dcb1f71bf35b3e8bd05bd9e2d6beddaf5d00d9efe77595953fa",
+        ),
+        (
+            25,
+            "a581874b305bd8c87ddff506fcf9b9618b79d74a346977898fc45b15ec00cfa3d2e6dd648034cdfa8f6d97d024f423f8",
+        ),
+        (
+            26,
+            "41046b0ab582a6aeab7ab4a23ff03dfd10b097793c5fe4cc2299b57a440ed806bcc52f37c02a927f051c44c83ce8fc1d",
+        ),
+        (
+            27,
+            "f511728c1e242866fd5989ed300fb64e123367e71ea0fd1f9034c088eadd707f4d8f824120892f1dd0a42b64bb06bde5",
+        ),
+        (
+            28,
+            "05d8fb840877e1fd00f6e36431aec09c79fb4afbc2163337fad281eea8eb1a5208833598c869ea92f002ab646ed90469",
+        ),
+        (
+            29,
+            "1c09047e181df7174121bf1b9c09d68a74ec44a824ef81bb04804b93f134abb4c3996a3b6a2a690bd0c3440081cd20fe",
+        ),
+        (
+            30,
+            "5370326b9210dde52c526aedceec281b79619b83e1b4adaf6d1e4cbc96ee894938feb666c8dfae813b3be3b6c56f4f72",
+        ),
+    ];
+
+    #[test]
+    fn migration_checksums_match_file_digests() {
+        let migrator = migrator();
+        let registered: Vec<(i64, String)> = migrator
+            .iter()
+            .map(|migration| (migration.version, hex::encode(&migration.checksum)))
+            .collect();
+        let expected: Vec<(i64, String)> = MIGRATION_FILE_DIGESTS
+            .iter()
+            .map(|(version, digest)| (*version, (*digest).to_owned()))
+            .collect();
+        assert_eq!(
+            registered, expected,
+            "a registered migration's checksum no longer matches the digest of its file; \
+             every database that already applied it will refuse to boot"
+        );
+    }
+
+    /// The versions are what `_sqlx_migrations` keys on, so a duplicate or a
+    /// reordering is as damaging as a changed checksum: sqlx compares by
+    /// version, applies in iteration order, and errors on an applied version
+    /// the source no longer offers (`MigrateError::VersionMissing`). The gaps
+    /// (10, 11, 12) are burned numbers AGENTS.md says to expect.
+    #[test]
+    fn migration_versions_are_unique_and_strictly_increasing() {
+        let versions: Vec<i64> = migrator()
+            .iter()
+            .map(|migration| migration.version)
+            .collect();
+        assert!(
+            versions.windows(2).all(|pair| pair[0] < pair[1]),
+            "migrations must stay in strictly increasing version order: {versions:?}"
+        );
+        assert_eq!(versions.len(), MIGRATION_FILE_DIGESTS.len());
+    }
+
+    /// The second way a sqlx upgrade can brick a boot. sqlx 0.9 turned the
+    /// migrations bookkeeping table into a configurable field; 0.8 hardcoded
+    /// `_sqlx_migrations`. Pointing it anywhere else would make sqlx see an
+    /// empty history and re-run all 27 migrations against a populated
+    /// production database — sqlx's own docs call that data loss or
+    /// corruption. Nothing but this literal is correct.
+    #[test]
+    fn migrations_table_is_the_one_production_already_wrote() {
+        assert_eq!(migrator().table_name, "_sqlx_migrations");
+        assert!(
+            migrator().create_schemas.is_empty(),
+            "the migrator must not create schemas; the router's tables live in `public`"
+        );
+    }
+
+    /// Nothing here may be a down migration or run outside a transaction: the
+    /// former would be reverted by `undo`, the latter would leave a partially
+    /// applied schema behind on failure with no rollback.
+    #[test]
+    fn migrations_are_forward_only_and_transactional() {
+        for migration in migrator().iter() {
+            assert_eq!(
+                migration.migration_type,
+                MigrationType::Simple,
+                "migration {} must be a forward-only simple migration",
+                migration.version
+            );
+            assert!(
+                !migration.no_tx,
+                "migration {} must run inside a transaction",
+                migration.version
+            );
+        }
+    }
 
     #[test]
     fn token_counts_fail_instead_of_saturating() {

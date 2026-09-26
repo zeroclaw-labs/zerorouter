@@ -1154,9 +1154,10 @@ mod tests {
         // moving from one side of the sentence to the other.
         //
         // Zero: four Bedrock, five open-weight Fireworks, two xAI, three Groq,
-        // four Together and three Vertex. Standard: five Anthropic, three
-        // Google, three OpenAI, and the one overridden Fireworks lane this
-        // test is about.
+        // four Together (basis 2 since 2026-09-09, operator-attested) and
+        // three Vertex. Standard: five Anthropic, three Google, three OpenAI,
+        // the one overridden Fireworks lane this test is about, and the
+        // overridden `vertex/gemini-3.8-flash`.
         //
         // The zero side grew by seven on 2026-08-22 and the standard side did
         // not move, which is worth a sentence because it is the first time the
@@ -1180,8 +1181,36 @@ mod tests {
         // the first lane added through the currency drafting pipeline (draft
         // PR #147, researched dossier, human-merged). Anthropic count four →
         // five; a plain lane inheriting `[retention.anthropic]`, no override.
+        //
+        // `vertex/gemini-3.8-flash` joined the STANDARD side on 2026-09-08 via
+        // the catalog's second per-tier override (draft PR #148): the vertex
+        // provider pin is `zero`, but that pin's basis is the operator's
+        // project configuration, which nobody has yet re-verified for this
+        // model — so the lane is pinned `standard` explicitly rather than
+        // inheriting a zero it has not earned. If the operator attests the
+        // project's ZDR coverage for this model, the override is removed.
+        //
+        // The four Together lanes moved to the STANDARD side the same day —
+        // not by our choice but by the vendor's: Together inverted their
+        // published default (they now store prompts/responses by default; ZDR
+        // is an org-admin toggle). The basis-3 evidence under the zero pin
+        // ceased to exist, and an unsubstantiated zero is the one label this
+        // file must never carry. Restoring zero needs basis 2: the operator's
+        // attestation that the org's storage toggles are off — then those
+        // four lanes return and the tallies become 21/13 again. This is the
+        // falsification-by-console risk the paragraph above recorded on the
+        // day the lanes were added, realized in the sharpest form: the vendor
+        // flipped the default out from under everyone at once.
+        //
+        // RESTORED 2026-09-09: the operator checked the Together console and
+        // attested the org's Privacy storage toggles are off, so the four
+        // Together lanes return to the ZERO side on basis 2 (enforced org
+        // setting, ZDR-page semantics pinned) — one day after the vendor's
+        // default-flip forced them to standard. The pin now names the setting
+        // rather than a published default, which is the honest shape it
+        // should have had from the start.
         assert_eq!(posture_count(rows, "zero"), 21);
-        assert_eq!(posture_count(rows, "standard"), 12);
-        assert_eq!(rows.len(), 33, "every shipped lane is counted exactly once");
+        assert_eq!(posture_count(rows, "standard"), 13);
+        assert_eq!(rows.len(), 34, "every shipped lane is counted exactly once");
     }
 }

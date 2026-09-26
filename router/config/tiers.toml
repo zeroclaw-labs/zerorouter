@@ -661,8 +661,18 @@ openrouter_slug = "fireworks"
 posture = "zero"
 description = "xAI under team-level Zero Data Retention: API request inputs and outputs are never persisted to disk, and the default 30-day encrypted audit retention does not apply. xAI does not train on API data without explicit permission. Uniquely in this catalog the guarantee is re-verified at runtime — every response carries an x-zero-data-retention attestation that ZeroRouter asserts is true before serving, and refuses the request when it is not."
 source_url = "https://docs.x.ai/developers/faq/security"
-verified = "2026-09-03"
-source_sha256 = "351bf9771f91315d0496d66352e48788bd4d0fe1eca8bd470949fffb7a5c97cc"
+verified = "2026-09-08"
+# Anchored on 2026-09-08 after the third whole-page churn re-pin in a week —
+# the same narrowing the openai and vertex pins earned. The three commitments
+# below are the pin's whole claim: no disk persistence under ZDR, the
+# per-response attestation header the dispatch path asserts, and no training
+# without permission. All three verified verbatim on the live page today.
+source_sha256 = "332bafa8726aeeb38bd724fc31a50fb0785e7a6bf2a586ba62b2ad256f217751"
+source_extract_anchors = [
+  "are never persisted to disk",
+  "includes an x-zero-data-retention header",
+  "xAI never trains on your API inputs or outputs",
+]
 openrouter_slug = "xai"
 
 # THE SAME GEMINI MODELS AS `[retention.google]`, ON A DIFFERENT PRODUCT WITH A
@@ -1019,10 +1029,10 @@ openrouter_slug = "groq"
 # the pin exists to escape.
 [retention.together]
 posture = "zero"
-description = "Together does not store inputs or outputs by default — zero data retention is the platform default rather than a setting to negotiate — and this organization leaves all three Privacy toggles off, so prompts and responses are not stored, not used for training, and never forwarded to a third-party passthrough provider. Models run on Together's own infrastructure and the model authors receive nothing. Together does state that temporary caching may be used to improve performance unless otherwise configured, and publishes no further detail on it."
-source_url = "https://docs.together.ai/docs/privacy-and-security"
-verified = "2026-08-31"
-source_sha256 = "c12ecf3bc64c7e4628f19ac0eeee48a778fa362dc8d29beb8b6bf9d1a4c99ea8"
+description = "Together under organization-level zero data retention: the org's Privacy storage toggles are off, so request content is not persisted to non-volatile storage; request metadata (token counts, model ids, timestamps) is retained. Together's published DEFAULT stores prompts and responses — this lane's zero rests on the enforced org setting (basis 2), attested by the operator on 2026-09-09, with the setting's published semantics on the ZDR page pinned below."
+source_url = "https://docs.together.ai/docs/zero-data-retention"
+verified = "2026-09-09"
+source_sha256 = "da73d78b098942842b2a09d02afe6a4417684b1917a072c18d239b144bd1dbf9"
 # THREE ANCHORS, AND THE THIRD IS HERE BECAUSE IT WAS MEASURED TO BE MISSING.
 # Each anchor hashes 2,000 characters running forward from itself, so the set
 # has to be checked against the CLAIMS rather than eyeballed. The first two
@@ -1039,9 +1049,8 @@ source_sha256 = "c12ecf3bc64c7e4628f19ac0eeee48a778fa362dc8d29beb8b6bf9d1a4c99ea
 # quotes today and a CMS switching to curly ones would redden the pin for a
 # typographic change.
 source_extract_anchors = [
-  "Together does not store inputs or outputs by default",
-  "meaning that Together forwards your prompts and responses directly to the upstream provider",
-  "Models published by third-party authors",
+  "not persisted to non-volatile storage",
+  "ZDR applies to the content of your requests",
 ]
 openrouter_slug = "together"
 
@@ -2020,8 +2029,13 @@ provider = "fireworks"
 model = "accounts/fireworks/models/glm-5p3"
 
 [tiers."fireworks/glm-5.3".candidates.metadata]
-context_window = 1000000
-max_output_tokens = 131072
+# Re-pinned 2026-09-04 -> 2026-09-10: the source (mirroring Fireworks' own API
+# metadata) moved to 1,048,573 (2^20 minus a 3-token reserve) and 262,144, and
+# held those values stably for a week. The old numbers were the launch-day
+# transcription; carrying them under-admitted requests the lane can serve.
+# Prices are untouched and reconcile unchanged.
+context_window = 1048573
+max_output_tokens = 262144
 input_modalities = ["text"]
 tool_call = true
 
@@ -3101,4 +3115,47 @@ input_per_mtok = 5.00
 cached_input_per_mtok = 0.50
 cache_write_per_mtok = 6.25
 output_per_mtok = 25.00
+# --- proposed by zerorouter-currency-bot (vertex__gemini-3.8-flash) — review before merge ---
+[tiers."vertex/gemini-3.8-flash"]
+
+[tiers."vertex/gemini-3.8-flash".rates]
+input_per_mtok = 0.75
+cached_input_per_mtok = 0.075
+output_per_mtok = 3.75
+
+[[tiers."vertex/gemini-3.8-flash".candidates]]
+id = "vertex/gemini-3.8-flash"
+provider = "vertex"
+# The google/ prefix is the vendor's own naming on Vertex's OpenAI-compatible
+# surface, same as every sibling vertex lane. The drafted stanza carried the
+# bare id — as drafted, every request would have 404'd upstream; caught in
+# human review, which is what the draft gate is for.
+model = "google/gemini-3.8-flash"
+
+[tiers."vertex/gemini-3.8-flash".candidates.metadata]
+context_window = 1048576
+max_output_tokens = 65536
+input_modalities = ["text", "image"]
+tool_call = true
+
+[tiers."vertex/gemini-3.8-flash".candidates.rates]
+input_per_mtok = 0.75
+cached_input_per_mtok = 0.075
+output_per_mtok = 3.75
+
+[tiers."vertex/gemini-3.8-flash".retention]
+posture = "standard"
+description = "Google's official Vertex/Gemini (Gemini Enterprise Agent Platform) zero-data-retention doc states the PUBLIC DEFAULT for the Gemini API surface is NOT zero: customer data is retained for limited periods by default — prompts may be logged for abuse monitoring per GCP TOS Section 4.3 (an exception must be requested), and Google's published Gemini models cache inputs/outputs/derived data in-memory with a 24-hour TTL by default (disable is a per-project action). Zero data retention is achieved only by customers taking specific per-project actions (abuse-monitoring exception, disabling caching, not enabling optional logging/session features) — i.e. an enforced account/project configuration, not a published default. Therefore a lane not covered by a per-project ZDR exception is standard. Training is not at issue here; this receipt is about retention, not training."
+source_url = "https://docs.cloud.google.com/gemini-enterprise-agent-platform/resources/zero-data-retention"
+verified = "2026-09-04"
+# Anchored to the same three commitments [retention.vertex] pins on this same
+# page, with the digest that pin verified UNCHANGED on 2026-09-08 — the
+# whole-page hash the drafter emitted went red within days on doc churn, the
+# exact failure mode the anchored-extract mechanism exists for.
+source_sha256 = "4f53b20a6c4e9810bcb035db83b997b604720cd21598e6f35341e63d1aaaeeca"
+source_extract_anchors = [
+  "use your data to train or fine-tune any AI/ML models",
+  "Request-response logging",
+  "In-memory data caching",
+]
 

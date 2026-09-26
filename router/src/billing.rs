@@ -1894,7 +1894,10 @@ pub async fn autopay_candidates(
     pool: &PgPool,
     limit: i64,
 ) -> Result<Vec<AutopayCandidate>, sqlx::Error> {
-    let rows = sqlx::query_as::<_, (Uuid, String, Decimal)>(&format!(
+    // Injection-safe: interpolates only `AUTOPAY_ELIGIBILITY_PREDICATE`, a
+    // compile-time `const &str` of literal SQL, and no other placeholder. The one
+    // runtime value, `limit`, is bound as $1 and never reaches the query text.
+    let rows = sqlx::query_as::<_, (Uuid, String, Decimal)>(sqlx::AssertSqlSafe(format!(
         r#"
         SELECT u.id, u.stripe_customer_id, u.autopay_topup_usd
         FROM users u
@@ -1914,7 +1917,7 @@ pub async fn autopay_candidates(
         ORDER BY u.credit_balance_usd ASC
         LIMIT $1
         "#
-    ))
+    )))
     .bind(limit)
     .fetch_all(pool)
     .await?;
@@ -1954,7 +1957,10 @@ pub async fn claim_autopay_attempt(
     // user lowered cannot be charged at its old size. `amount_usd` is the NET
     // credit re-read from the row; `charge_amount_usd` is the GROSS the caller
     // priced from that same net topup.
-    let claimed = sqlx::query(&format!(
+    // Injection-safe: interpolates only `AUTOPAY_ELIGIBILITY_PREDICATE`, a
+    // compile-time `const &str` of literal SQL, and no other placeholder. The
+    // idempotency key, user id, and both amounts are bound as $1..$4.
+    let claimed = sqlx::query(sqlx::AssertSqlSafe(format!(
         r#"
         INSERT INTO stripe_autopay_intents
             (payment_intent_id, user_id, amount_usd, charge_amount_usd)
@@ -1976,7 +1982,7 @@ pub async fn claim_autopay_attempt(
           AND ({AUTOPAY_ELIGIBILITY_PREDICATE})
         ON CONFLICT DO NOTHING
         "#
-    ))
+    )))
     .bind(format!("local_{idempotency_key}"))
     .bind(user_id)
     .bind(amount_usd)
@@ -1999,9 +2005,11 @@ pub async fn claim_autopay_attempt(
 /// claim, which is correct for a stranded charge that may already have
 /// happened.
 pub async fn autopay_still_armed(pool: &PgPool, user_id: Uuid) -> Result<bool, sqlx::Error> {
-    sqlx::query_scalar::<_, bool>(&format!(
+    // Injection-safe: interpolates only `AUTOPAY_ELIGIBILITY_PREDICATE`, a
+    // compile-time `const &str` of literal SQL. `user_id` is bound as $1.
+    sqlx::query_scalar::<_, bool>(sqlx::AssertSqlSafe(format!(
         "SELECT autopay_enabled AND ({AUTOPAY_ELIGIBILITY_PREDICATE}) FROM users WHERE id = $1"
-    ))
+    )))
     .bind(user_id)
     .fetch_optional(pool)
     .await
@@ -2548,7 +2556,10 @@ pub async fn settle_autopay_intent(
     // time is what was charged), and re-reading them at settlement would wrongly
     // withhold a legitimately-collected credit when a concurrent top-up merely
     // lifted the balance back above threshold.
-    let balance_after = sqlx::query_scalar::<_, Decimal>(&format!(
+    // Injection-safe: interpolates only `AUTOPAY_ELIGIBILITY_PREDICATE`, a
+    // compile-time `const &str` of literal SQL. The user id and the credit amount
+    // — the two values that decide who is paid and how much — are bound as $1/$2.
+    let balance_after = sqlx::query_scalar::<_, Decimal>(sqlx::AssertSqlSafe(format!(
         r#"
         UPDATE users
         SET credit_balance_usd = credit_balance_usd + $2,
@@ -2556,7 +2567,7 @@ pub async fn settle_autopay_intent(
         WHERE id = $1 AND autopay_enabled AND ({AUTOPAY_ELIGIBILITY_PREDICATE})
         RETURNING credit_balance_usd
         "#
-    ))
+    )))
     .bind(user_id)
     .bind(amount_usd)
     .fetch_optional(&mut *transaction)

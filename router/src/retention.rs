@@ -275,7 +275,15 @@ pub fn digest(document: &str) -> String {
 }
 
 /// Hex SHA-256 of an already-normalized (or already-extracted) string.
-fn hash(text: &str) -> String {
+///
+/// Public so a pin's digest is only ever taken ONE way. [`check`] hashes
+/// [`evidence`] here to decide UNCHANGED, and [`crate::draft_pin`] hashes the
+/// same [`evidence`] to WRITE the digest it proposes; if the drafter reached
+/// for `Sha256` itself, the value it emitted and the value that verifies it
+/// would be two definitions free to drift, and the drift would surface as a
+/// pin that is red the day it is merged.
+#[must_use]
+pub fn hash(text: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(text.as_bytes());
     hex::encode(hasher.finalize())

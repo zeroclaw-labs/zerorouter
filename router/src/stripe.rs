@@ -5279,10 +5279,12 @@ async fn replay_charge(
     // `withheld` (needs-refund) state for an operator to refund out of band. A
     // frozen / indebted account is therefore never CREDITED by autopay, even in
     // the rare case its card was charged in this race.
-    let eligible = sqlx::query_scalar::<_, bool>(&format!(
+    // Injection-safe: interpolates only `billing::AUTOPAY_ELIGIBILITY_PREDICATE`,
+    // a compile-time `const &str` of literal SQL. `user_id` is bound as $1.
+    let eligible = sqlx::query_scalar::<_, bool>(sqlx::AssertSqlSafe(format!(
         "SELECT (autopay_enabled AND ({})) FROM users WHERE id = $1",
         billing::AUTOPAY_ELIGIBILITY_PREDICATE
-    ))
+    )))
     .bind(user_id)
     .fetch_one(pool)
     .await?;

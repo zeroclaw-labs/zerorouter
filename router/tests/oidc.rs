@@ -169,13 +169,21 @@ fn fresh_state(tag: &str) -> String {
 /// `lifetime` is relative to now and may be negative — the row is backdated an
 /// hour so an already-expired state still satisfies `expires_at > created_at`.
 async fn seed_state(pool: &PgPool, state: &str, lifetime: &str) {
-    query(&format!(
+    // Bound, not wrapped in `AssertSqlSafe`. Of the sites sqlx 0.9's gate
+    // flagged, this was the only one whose interpolation landed INSIDE a SQL
+    // string literal (`INTERVAL '{lifetime}'`), where one apostrophe closes the
+    // literal early and everything after it parses as SQL. Every caller passes
+    // a literal so nothing was exploitable, but an interval is a VALUE and
+    // values belong in bind parameters — asserting this one safe would have
+    // left the fragile shape in place for the next person to copy.
+    query(
         "INSERT INTO oidc_states (state, nonce, pkce_verifier, created_at, expires_at)
-         VALUES ($1, $2, $3, NOW() - INTERVAL '1 hour', NOW() + INTERVAL '{lifetime}')"
-    ))
+         VALUES ($1, $2, $3, NOW() - INTERVAL '1 hour', NOW() + $4::INTERVAL)",
+    )
     .bind(state)
     .bind(format!("nonce-{state}"))
     .bind(format!("verifier-{state}"))
+    .bind(lifetime)
     .execute(pool)
     .await
     .expect("test login state must insert");

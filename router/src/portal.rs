@@ -383,6 +383,10 @@ async fn list_keys(
     State(ctx): State<WebCtx>,
     user: PortalUser,
 ) -> Result<Json<KeysResponse>, PortalError> {
+    // Injection-safe: the query text below interpolates only
+    // `CREDIT_LIMIT_USED_SQL`, a compile-time `const &str` of literal SQL, and
+    // no other placeholder. The tenant scope — the value that decides whose
+    // keys are returned — is bound as $1.
     let keys = sqlx::query_as::<
         _,
         (
@@ -399,7 +403,7 @@ async fn list_keys(
             DateTime<Utc>,
             Option<DateTime<Utc>>,
         ),
-    >(&format!(
+    >(sqlx::AssertSqlSafe(format!(
         r#"
         SELECT id, name, disabled, spend_cap_usd, velocity_cap_tokens_per_min,
                default_priority, expires_at, credit_limit_usd, credit_limit_window,
@@ -409,7 +413,7 @@ async fn list_keys(
         WHERE user_id = $1
         ORDER BY created_at DESC, id DESC
         "#
-    ))
+    )))
     .bind(user.user_id)
     .fetch_all(&ctx.pool)
     .await?
@@ -1352,6 +1356,10 @@ async fn update_key(
         .execute(&mut *transaction)
         .await?;
     }
+    // Injection-safe: the query text below interpolates only
+    // `CREDIT_LIMIT_USED_SQL`, a compile-time `const &str` of literal SQL, and
+    // no other placeholder. The key id and the tenant scope — both
+    // request-derived — are bound as $1/$2.
     let row = sqlx::query_as::<
         _,
         (
@@ -1367,7 +1375,7 @@ async fn update_key(
             DateTime<Utc>,
             Option<DateTime<Utc>>,
         ),
-    >(&format!(
+    >(sqlx::AssertSqlSafe(format!(
         r#"
         SELECT name, disabled, spend_cap_usd, velocity_cap_tokens_per_min,
                default_priority, expires_at, credit_limit_usd, credit_limit_window,
@@ -1376,7 +1384,7 @@ async fn update_key(
         FROM api_keys
         WHERE id = $1 AND user_id = $2
         "#
-    ))
+    )))
     .bind(key_id)
     .bind(user.user_id)
     // In the SAME transaction, so the summary describes the row this request

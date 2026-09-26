@@ -7,7 +7,9 @@
 use std::str::FromStr;
 
 use rust_decimal::Decimal;
-use sqlx_core::{query::query, query_as::query_as, query_scalar::query_scalar};
+use sqlx_core::{
+    query::query, query_as::query_as, query_scalar::query_scalar, sql_str::AssertSqlSafe,
+};
 use sqlx_postgres::{PgConnectOptions, PgPool, PgPoolOptions};
 use uuid::Uuid;
 use zerorouter::provider::ModelRates;
@@ -832,15 +834,22 @@ impl SettleFault {
     /// Fail the first `failures` settle INSERTs for `request_id` with
     /// `errcode`, then let them through.
     async fn install(pool: &PgPool, request_id: Uuid, failures: i64, errcode: &str) -> Self {
+        // The four wraps below all interpolate the same closed set: `name`, a
+        // locally minted `zr_settle_fault_<uuid-simple>` identifier (32 hex
+        // characters, so not even quotable); `request_id`, a `Uuid` rendered by
+        // its own Display; `failures`, an `i64`; and `errcode`, which every
+        // caller passes as a five-character SQLSTATE literal. None of it can
+        // come from a request — this is a test-only trigger installer, and
+        // DDL cannot take bind parameters for object names anyway.
         let name = format!("zr_settle_fault_{}", Uuid::new_v4().simple());
-        query(&format!("CREATE SEQUENCE {name}"))
+        query(AssertSqlSafe(format!("CREATE SEQUENCE {name}")))
             .execute(pool)
             .await
             .expect("fault sequence must create");
         // Nested IFs, not `AND`: Postgres does not promise left-to-right
         // evaluation, so a single condition could burn the sequence on another
         // test's insert.
-        query(&format!(
+        query(AssertSqlSafe(format!(
             r#"
             CREATE FUNCTION {name}() RETURNS TRIGGER LANGUAGE plpgsql AS $fault$
             BEGIN
@@ -854,14 +863,14 @@ impl SettleFault {
             END;
             $fault$
             "#
-        ))
+        )))
         .execute(pool)
         .await
         .expect("fault function must create");
-        query(&format!(
+        query(AssertSqlSafe(format!(
             "CREATE TRIGGER {name} BEFORE INSERT ON usage_events \
              FOR EACH ROW EXECUTE FUNCTION {name}()"
-        ))
+        )))
         .execute(pool)
         .await
         .expect("fault trigger must create");
@@ -870,10 +879,12 @@ impl SettleFault {
 
     /// How many settle INSERTs this fault has seen for its request.
     async fn insert_attempts(&self, pool: &PgPool) -> i64 {
-        query_scalar::<_, i64>(&format!(
+        // Interpolates only `self.name`, the locally minted identifier from
+        // `install` above — a sequence name, which cannot be a bind parameter.
+        query_scalar::<_, i64>(AssertSqlSafe(format!(
             "SELECT last_value FROM {} WHERE is_called",
             self.name
-        ))
+        )))
         .fetch_optional(pool)
         .await
         .expect("fault sequence must query")
@@ -882,12 +893,13 @@ impl SettleFault {
 
     async fn remove(self, pool: &PgPool) {
         let name = self.name;
+        // Same locally minted identifier, in DROP form.
         for statement in [
             format!("DROP TRIGGER {name} ON usage_events"),
             format!("DROP FUNCTION {name}()"),
             format!("DROP SEQUENCE {name}"),
         ] {
-            query(&statement)
+            query(AssertSqlSafe(statement))
                 .execute(pool)
                 .await
                 .expect("fault teardown must succeed");

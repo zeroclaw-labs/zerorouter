@@ -1778,7 +1778,9 @@ async fn discover(args: DiscoverArgs) -> Result<()> {
 /// clock — the `verified` date is an input — so a dossier plus a `--verified`
 /// date always yields the same draft.
 async fn draft_pin(args: DraftPinArgs) -> Result<()> {
-    use crate::draft_pin::{FactsDossier, Status, draft_and_validate, resolve_verified};
+    use crate::draft_pin::{
+        CatalogFacts, FactsDossier, Status, draft_and_validate, resolve_verified,
+    };
 
     let facts_text = tokio::fs::read_to_string(&args.facts)
         .await
@@ -1791,8 +1793,11 @@ async fn draft_pin(args: DraftPinArgs) -> Result<()> {
         .map_err(|error| anyhow::anyhow!("{error}"))?;
 
     // Load the live tier file — resolved exactly as `discover` does — to learn
-    // the candidate provider's retention pin. That live posture is what stops a
-    // `standard` lane silently inheriting a provider's `zero` (FIX 3).
+    // two things about the candidate's provider. Its retention pin is what
+    // stops a `standard` lane silently inheriting a provider's `zero` (FIX 3).
+    // Its existing lanes' dispatch strings are what catch a model id that would
+    // 404: the first vertex draft dispatched a bare `gemini-3.8-flash` while
+    // every sibling lane in this very file dispatched `google/<model>`.
     let tiers_path = args.tiers.unwrap_or_else(|| {
         std::env::var(crate::config::TIER_CONFIG_PATH_ENV)
             .unwrap_or_else(|_| crate::config::DEFAULT_TIER_CONFIG_PATH.to_owned())
@@ -1806,12 +1811,9 @@ async fn draft_pin(args: DraftPinArgs) -> Result<()> {
                 tiers_path.display()
             )
         })?;
-    let provider_posture = live_catalog
-        .retention
-        .get(&facts.candidate.provider)
-        .map(|pin| pin.posture);
+    let live = CatalogFacts::for_provider(&live_catalog, &facts.candidate.provider);
 
-    let outcome = draft_and_validate(&facts, &verified, provider_posture)
+    let outcome = draft_and_validate(&facts, &verified, &live)
         .await
         .context("writing the temp fragment for load-validation")?;
 

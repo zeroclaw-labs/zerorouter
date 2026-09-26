@@ -295,7 +295,7 @@ async fn models_are_materialized_from_tiers_toml() {
     // in the catalog carries. Together deliberately does NOT twin the five
     // models it shares with Fireworks — on every one of them Fireworks is the
     // same price or cheaper, so a twin would add a row and nothing else.
-    assert_eq!(data.len(), 33);
+    assert_eq!(data.len(), 34);
     assert!(data.iter().all(|model| model["object"] == "model"));
 
     let ids = data
@@ -340,6 +340,7 @@ async fn models_are_materialized_from_tiers_toml() {
             "vertex/gemini-3.1-pro-preview",
             "vertex/gemini-3.5-flash-lite",
             "vertex/gemini-3.7-flash",
+            "vertex/gemini-3.8-flash",
             "xai/grok-4.3",
             "xai/grok-4.6",
         ]),
@@ -1277,10 +1278,11 @@ async fn bundled_tier_catalog_has_expected_virtual_models() {
             "vertex/gemini-3.1-pro-preview",
             "vertex/gemini-3.5-flash-lite",
             "vertex/gemini-3.7-flash",
+            "vertex/gemini-3.8-flash",
             "xai/grok-4.3",
             "xai/grok-4.6",
         ],
-        "the thirty-three vendor-named model pins (Gemini flash + flash-lite added \
+        "the thirty-four vendor-named model pins (Gemini flash + flash-lite added \
          2026-08-18; Gemini Pro joined them once conditional rates could \
          express the 200,000-token boundary Google prices it at; the four \
          Bedrock classic-runtime zero-retention lanes on 2026-08-20, the \
@@ -1819,6 +1821,7 @@ async fn a_basis_hike_above_sell_withholds_that_tier_and_nothing_else() {
             "vertex/gemini-3.1-pro-preview",
             "vertex/gemini-3.5-flash-lite",
             "vertex/gemini-3.7-flash",
+            "vertex/gemini-3.8-flash",
             "xai/grok-4.3",
             "xai/grok-4.6",
         ]
@@ -1866,7 +1869,7 @@ async fn a_basis_hike_above_sell_withholds_that_tier_and_nothing_else() {
     // with their own rate card, so a repricing of a first-party Anthropic lane
     // withholds only that first-party lane.
     let listed = listed_model_ids(RouterState::fully_credentialed(path)).await;
-    assert_eq!(listed.len(), 32);
+    assert_eq!(listed.len(), 33);
     assert!(listed.iter().any(|id| id == "bedrock/claude-sonnet-4-5"));
     assert!(listed.iter().any(|id| id == "openai/gpt-5.6-luna"));
     assert!(listed.iter().any(|id| id == "anthropic/claude-haiku-4-5"));
@@ -1892,7 +1895,7 @@ async fn the_shipped_catalog_withholds_no_tier_today() {
         "the shipped catalog withholds {:?}",
         catalog.unavailable.keys().collect::<Vec<_>>()
     );
-    assert_eq!(catalog.tiers.len(), 33);
+    assert_eq!(catalog.tiers.len(), 34);
 }
 
 /// Every conditional rate the shipped catalog declares, transcribed from
@@ -1993,7 +1996,7 @@ async fn every_shipped_conditional_rate_is_the_one_the_vendor_publishes() {
 // rungs across >=2 providers). Every tier is pass-through until a second
 // provider serves a model class again.
 const ROUTED_TIERS: [&str; 0] = [];
-const PASS_THROUGH_TIERS: [&str; 33] = [
+const PASS_THROUGH_TIERS: [&str; 34] = [
     // Model pins, keyed by their OpenRouter-standard {vendor}/{model} ids.
     "openai/gpt-5.6-luna",
     "anthropic/claude-haiku-4-5",
@@ -2062,6 +2065,7 @@ const PASS_THROUGH_TIERS: [&str; 33] = [
     "vertex/gemini-3.7-flash",
     "vertex/gemini-3.5-flash-lite",
     "vertex/gemini-3.1-pro-preview",
+    "vertex/gemini-3.8-flash",
     // The Groq latency lanes (2026-08-22). Pass-through at Groq's published
     // per-1M rates. The equality the assertion below checks earns its keep on
     // the CACHED dimension in particular: Groq publishes no per-model cached

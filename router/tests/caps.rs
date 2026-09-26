@@ -21,7 +21,7 @@ use axum::{
 use http_body_util::BodyExt;
 use rust_decimal::Decimal;
 use serde_json::{Value, json};
-use sqlx_core::{query::query, query_scalar::query_scalar};
+use sqlx_core::{query::query, query_scalar::query_scalar, sql_str::AssertSqlSafe};
 use sqlx_postgres::{PgConnectOptions, PgPool, PgPoolOptions};
 use tower::ServiceExt;
 use uuid::Uuid;
@@ -1242,7 +1242,13 @@ async fn velocity_counts_uncached_tokens_only() {
 /// Backdating is the point: the accrual trigger buckets on the row's own `ts`,
 /// so this is how a month boundary gets exercised without waiting for one.
 async fn seed_event_at(pool: &PgPool, key: &AuthenticatedKey, ts_sql: &str, cost_usd: Decimal) {
-    query(&format!(
+    // `ts_sql` is a SQL *expression*, not a value — that is the point of the
+    // helper, and it is why a bind parameter cannot express it. Every caller in
+    // this file passes a literal (`"NOW()"`, `"NOW() - INTERVAL '1 day'"`), the
+    // helper is private to this test binary, and nothing reaches it from a
+    // request. The row's identity and money — request id, key, cost — are
+    // bound as $1..$3.
+    query(AssertSqlSafe(format!(
         r#"
         INSERT INTO usage_events (
             request_id, api_key_id, ts, tier, upstream_provider, upstream_model,
@@ -1251,7 +1257,7 @@ async fn seed_event_at(pool: &PgPool, key: &AuthenticatedKey, ts_sql: &str, cost
         )
         VALUES ($1, $2, {ts_sql}, 'zero/test', 'test', 'test/model', 0, 0, 0, $3, 1, 200)
         "#
-    ))
+    )))
     .bind(Uuid::new_v4())
     .bind(key.id)
     .bind(cost_usd)
@@ -1599,7 +1605,11 @@ async fn create_limited_key(
     credit_limit_window: Option<&str>,
 ) -> AuthenticatedKey {
     let key_id = Uuid::new_v4();
-    query(&format!(
+    // `expires_at_sql` is a SQL expression like the `ts_sql` above — every
+    // caller in this file passes `"NULL"` or a literal `NOW() ± INTERVAL '…'`,
+    // which is exactly what a bind parameter cannot carry. The key id, owner,
+    // hash, and both credit-limit values are bound as $1..$5.
+    query(AssertSqlSafe(format!(
         r#"
         INSERT INTO api_keys (
             id, user_id, key_hash, name,
@@ -1608,7 +1618,7 @@ async fn create_limited_key(
         )
         VALUES ($1, $2, $3, 'limits-integration', 100000, 100000000, {expires_at_sql}, $4, $5)
         "#
-    ))
+    )))
     .bind(key_id)
     .bind(user_id)
     .bind(hash_api_key(&generate_api_key()))
