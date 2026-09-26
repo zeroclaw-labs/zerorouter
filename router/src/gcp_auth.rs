@@ -62,9 +62,9 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use rsa::RsaPrivateKey;
 use rsa::pkcs1v15::SigningKey;
 use rsa::pkcs8::DecodePrivateKey;
+use rsa::sha2::Sha256;
 use rsa::signature::{SignatureEncoding, Signer};
 use serde::Deserialize;
-use sha2::Sha256;
 
 /// The OAuth scope a Vertex call needs. Google documents no narrower scope for
 /// `aiplatform.googleapis.com`; `cloud-platform` is what its own client

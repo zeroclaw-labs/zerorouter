@@ -305,7 +305,7 @@ use axum::{
     routing::post,
 };
 use chrono::Utc;
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use rust_decimal::{Decimal, RoundingStrategy, prelude::ToPrimitive};
 use serde::Deserialize;
 use serde_json::Value;
