@@ -2,6 +2,8 @@
 
 ZeroRouter is a Rust LLM gateway with prepaid billing:
 
+[![ZeroRouter on StartupScores](https://startupscores.com/badge/zerorouter.svg?style=shield&v=combo&theme=dark)](https://startupscores.com/open-source/zerorouter)
+
 - an **OpenAI-compatible inference surface** (`POST /v1/chat/completions` with
   SSE streaming, public `GET /v1/models`, `GET /healthz`);
 - a **pinned model catalog** — OpenRouter-standard `{vendor}/{model}` ids
